@@ -11,6 +11,7 @@ mod publish;
 mod read_lease;
 mod replace_file;
 mod scan;
+mod snapshot_pruning;
 mod snapshot_retention;
 mod storage;
 pub use delete::{DeleteResult, MutationResult};
@@ -396,6 +397,7 @@ impl LocalSpace {
     }
 
     pub fn snapshots(&self) -> Result<Vec<(SnapshotId, String)>> {
+        self.snapshot_audit()?;
         Ok(self.journal.snapshots(&self.space_id)?)
     }
 
@@ -431,6 +433,7 @@ impl LocalSpace {
 
     pub fn verify(&self) -> Result<usize> {
         self.journal.integrity_check()?;
+        self.snapshot_audit()?;
         self.cleanup_plans()?;
         for lease in self.read_leases()? {
             if lease.state == sync_extend_journal::ReadLeaseState::Active {

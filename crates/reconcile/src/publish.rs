@@ -90,6 +90,7 @@ impl LocalSpace {
         snapshot: &SnapshotId,
         path: PortablePath,
     ) -> Result<PublishResult> {
+        self.journal.retained_snapshot(&self.space_id, snapshot)?;
         self.recover()?;
         self.scan_without_recovery()?;
         let source = self.journal.snapshot(&self.space_id, snapshot)?;
@@ -156,6 +157,8 @@ impl LocalSpace {
 
     pub fn recover(&mut self) -> Result<Vec<PublishResult>> {
         self.verify_root()?;
+        self.journal
+            .check_snapshot_prunings(&self.space_id, self.limits.max_storage_entries)?;
         self.recover_mutations()?;
         self.require_no_mutation()?;
         let publications = self.journal.outstanding_publications(&self.space_id)?;

@@ -44,6 +44,8 @@ pub struct StorageReport {
     pub cleanup_enabled: bool,
     pub explicit_move_marker_cleanup_available: bool,
     pub gc_enabled: bool,
+    pub pruned_snapshots: usize,
+    pub explicit_snapshot_pruning_available: bool,
     pub remote_backup_complete: bool,
 }
 
@@ -70,6 +72,11 @@ impl LocalSpace {
     pub fn storage_report(&self) -> Result<StorageReport> {
         self.verify_root()?;
         self.journal.integrity_check()?;
+        let pruned_snapshots = self
+            .snapshot_audit()?
+            .iter()
+            .filter(|s| !s.content_retained)
+            .count();
         self.journal
             .check_storage_metadata_limit(self.limits.max_storage_entries)?;
         self.journal.cleanup_plans(&self.space_id)?;
@@ -209,6 +216,8 @@ impl LocalSpace {
             cleanup_enabled: false,
             explicit_move_marker_cleanup_available: cfg!(windows),
             gc_enabled: false,
+            pruned_snapshots,
+            explicit_snapshot_pruning_available: true,
             remote_backup_complete: false,
         })
     }

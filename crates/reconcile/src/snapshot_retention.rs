@@ -41,6 +41,8 @@ pub struct RetentionReport {
     pub durable_snapshot_locks_available: bool,
     pub history_pruning_enabled: bool,
     pub gc_enabled: bool,
+    pub pruned_snapshots: usize,
+    pub explicit_snapshot_pruning_available: bool,
 }
 
 impl LocalSpace {
@@ -117,6 +119,11 @@ impl LocalSpace {
     pub fn retention_report(&self, policy: HistoryPolicy) -> Result<RetentionReport> {
         self.verify_root()?;
         self.journal.integrity_check()?;
+        let pruned_snapshots = self
+            .snapshot_audit()?
+            .iter()
+            .filter(|s| !s.content_retained)
+            .count();
         if policy.deleted_min_retention_days != 0 {
             return Err(ReconcileError::Invariant(
                 "minimum-days retention is not implemented",
@@ -226,13 +233,14 @@ impl LocalSpace {
                 "retained history has no current snapshot",
             ));
         }
-        let report = proposal(
+        let mut report = proposal(
             snapshots,
             current,
             reasons,
             policy,
             self.limits.max_storage_entries,
         )?;
+        report.pruned_snapshots = pruned_snapshots;
         self.verify_root()?;
         Ok(report)
     }
@@ -424,12 +432,14 @@ fn proposal(
         snapshots: report_snapshots,
         ordering_blockers,
         execution_blockers: vec![
-            "retained_pruned_audit_and_reference_removal_not_implemented",
+            "automatic_retention_and_terminal_audit_decoupling_not_implemented",
             "conflict_offline_transfer_protection_not_implemented",
             "persistent_mark_grace_revalidation_sweep_not_implemented",
         ],
         durable_snapshot_locks_available: true,
         history_pruning_enabled: false,
         gc_enabled: false,
+        pruned_snapshots: 0,
+        explicit_snapshot_pruning_available: true,
     })
 }

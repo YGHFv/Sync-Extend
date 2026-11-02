@@ -64,7 +64,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=8 => {}
+            1..=9 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -116,6 +116,11 @@ impl Journal {
             tx.execute_batch(include_str!("migration-008.sql"))?;
             tx.commit()?;
         }
+        if version < 9 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-009.sql"))?;
+            tx.commit()?;
+        }
         Ok(Self { connection })
     }
 
@@ -153,6 +158,17 @@ impl Journal {
     }
 
     pub fn current(&self, space: &SpaceId) -> Result<Option<Manifest>> {
+        let root: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT snapshot_id FROM current_manifests WHERE space_id=?1",
+                [space.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(root) = &root {
+            self.require_snapshot_retained(space, &root.parse()?)?;
+        }
         let json: Option<String> = self
             .connection
             .query_row(
@@ -197,7 +213,9 @@ impl Journal {
 
     pub fn snapshots(&self, space: &SpaceId) -> Result<Vec<(SnapshotId, String)>> {
         let mut statement = self.connection.prepare(
-            "SELECT snapshot_id,state FROM snapshots WHERE space_id=?1 ORDER BY created_at_ms, snapshot_id",
+            "SELECT snapshot_id,state FROM snapshots WHERE space_id=?1
+             AND snapshot_id NOT IN (SELECT snapshot_id FROM snapshot_prunings)
+             ORDER BY created_at_ms, snapshot_id",
         )?;
         let rows = statement.query_map([space.as_str()], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -210,9 +228,10 @@ impl Journal {
     }
 
     pub fn retained_manifests(&self, space: &SpaceId) -> Result<Vec<Manifest>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT snapshot_id,manifest FROM snapshots WHERE space_id=?1")?;
+        let mut statement = self.connection.prepare(
+            "SELECT snapshot_id,manifest FROM snapshots WHERE space_id=?1
+                AND snapshot_id NOT IN (SELECT snapshot_id FROM snapshot_prunings)",
+        )?;
         let rows = statement.query_map([space.as_str()], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -229,6 +248,7 @@ impl Journal {
     }
 
     pub fn snapshot(&self, space: &SpaceId, root: &SnapshotId) -> Result<Manifest> {
+        self.require_snapshot_retained(space, root)?;
         let json: String = self.connection.query_row(
             "SELECT manifest FROM snapshots WHERE space_id=?1 AND snapshot_id=?2",
             params![space.as_str(), root.as_str()],
@@ -1118,6 +1138,7 @@ impl Journal {
     ) -> Result<SnapshotId> {
         manifest.validate()?;
         let root = manifest.root()?;
+        self.require_unpruned_root(&root)?;
         let tx = self.connection.transaction()?;
         let mutation_active: Option<String> = tx.query_row(
             "SELECT transaction_id FROM mutations WHERE space_id=?1 AND state IN ('prepared','executing','quarantined','moved','replaced')",
@@ -1279,13 +1300,14 @@ fn check_storage_metadata_limit(
             + (SELECT count(*) FROM publications) + (SELECT count(*) FROM snapshot_objects)
             + (SELECT count(*) FROM mutation_objects) + (SELECT count(*) FROM publication_objects)
             + (SELECT count(*) FROM cleanup_plans) + (SELECT count(*) FROM read_leases)
-            + (SELECT count(*) FROM read_lease_objects),
+            + (SELECT count(*) FROM read_lease_objects) + (SELECT count(*) FROM snapshot_prunings),
             (SELECT coalesce(sum(length(CAST(manifest AS BLOB))),0) FROM snapshots)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))
                 + coalesce(length(CAST(execution AS BLOB)),0)),0) FROM mutations)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM publications)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM cleanup_plans)
-            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM read_leases)",
+            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM read_leases)
+            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM snapshot_prunings)",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1395,3 +1417,5 @@ mod read_lease;
 pub use read_lease::{read_lease_expiry, ReadLease, ReadLeaseIntent, ReadLeaseState};
 mod snapshot_retention;
 pub use snapshot_retention::RetainedSnapshot;
+mod snapshot_pruning;
+pub use snapshot_pruning::{SnapshotAudit, SnapshotPruning};

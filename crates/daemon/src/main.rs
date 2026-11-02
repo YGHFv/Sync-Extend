@@ -44,6 +44,20 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// List immutable snapshot audit metadata, including explicitly pruned non-restorable history.
+    SnapshotAudit {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Explicitly retire one old snapshot's own pins, preserving audit metadata and all CAS files.
+    PruneSnapshot {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long)]
+        baseline: String,
+    },
     /// Protect a retained materialized snapshot after validating its references and content.
     LockSnapshot {
         #[arg(long)]
@@ -308,6 +322,14 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::StorageReport { data_dir } => {
             print(&open(&data_dir)?.storage_report()?)?;
+        }
+        Command::SnapshotAudit { data_dir } => print(&open(&data_dir)?.snapshot_audit()?)?,
+        Command::PruneSnapshot {
+            data_dir,
+            snapshot,
+            baseline,
+        } => {
+            print(&open(&data_dir)?.prune_snapshot(&snapshot.parse()?, &baseline.parse()?)?)?;
         }
         Command::LockSnapshot { data_dir, snapshot } => {
             print(&open(&data_dir)?.lock_snapshot(&snapshot.parse()?)?)?;

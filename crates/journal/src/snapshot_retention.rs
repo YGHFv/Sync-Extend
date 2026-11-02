@@ -12,7 +12,7 @@ pub struct RetainedSnapshot {
     pub manifest: Manifest,
 }
 
-fn retained_snapshot(
+pub(crate) fn audit_snapshot(
     connection: &Connection,
     space: &SpaceId,
     id: &SnapshotId,
@@ -45,12 +45,17 @@ fn retained_snapshot(
     }
     let created_at_ms =
         u64::try_from(time).map_err(|_| JournalError::Invariant("invalid snapshot time"))?;
-    let expected: BTreeSet<_> = manifest
+    let pruning = super::snapshot_pruning::pruning(connection, space, id)?;
+    let mut expected: BTreeSet<_> = manifest
         .entries
         .values()
         .filter_map(|entry| entry.content.as_ref())
         .flat_map(|content| content.chunks.iter().map(|c| c.content_id.clone()))
         .collect();
+    if pruning.is_some() {
+        super::snapshot_pruning::validate_pruned_snapshot(connection, space, id, locked, &state)?;
+        expected.clear();
+    }
     let count: i64 = connection.query_row(
         "SELECT count(*) FROM snapshot_objects WHERE snapshot_id=?1",
         [id.as_str()],
@@ -86,7 +91,8 @@ fn retained_snapshot(
 
 impl Journal {
     pub fn retained_snapshot(&self, space: &SpaceId, id: &SnapshotId) -> Result<RetainedSnapshot> {
-        retained_snapshot(&self.connection, space, id)
+        self.require_snapshot_retained(space, id)?;
+        audit_snapshot(&self.connection, space, id)
     }
 
     pub fn retained_snapshots(
@@ -97,7 +103,8 @@ impl Journal {
         self.check_storage_metadata_limit(max_entries)?;
         let mut statement = self
             .connection
-            .prepare("SELECT snapshot_id FROM snapshots WHERE space_id=?1 ORDER BY snapshot_id")?;
+            .prepare("SELECT snapshot_id FROM snapshots WHERE space_id=?1
+                AND snapshot_id NOT IN (SELECT snapshot_id FROM snapshot_prunings) ORDER BY snapshot_id")?;
         let ids: Vec<String> = statement
             .query_map([space.as_str()], |r| r.get(0))?
             .collect::<std::result::Result<_, _>>()?;
@@ -113,7 +120,8 @@ impl Journal {
         locked: bool,
     ) -> Result<RetainedSnapshot> {
         let tx = self.connection.transaction()?;
-        let mut snapshot = retained_snapshot(&tx, space, id)?;
+        let mut snapshot = audit_snapshot(&tx, space, id)?;
+        super::snapshot_pruning::require_unpruned(&tx, id)?;
         if locked && snapshot.state != "materialized" {
             return Err(JournalError::Invariant("snapshot is not materialized"));
         }
