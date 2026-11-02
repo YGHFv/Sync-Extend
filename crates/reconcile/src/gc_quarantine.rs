@@ -255,6 +255,33 @@ mod windows {
         )
     }
     impl LocalSpace {
+        pub(crate) fn prepare_gc_disposal_platform(
+            &self,
+            id: &EntryId,
+        ) -> Result<sync_extend_journal::GcDisposalAudit> {
+            checkpoint("before_gc_disposal_prepare");
+            let (guards, audit) = self.journal.prepare_gc_disposal(
+                &self.space_id,
+                id,
+                self.limits.max_storage_entries,
+                crate::now_ms,
+                |e, q| {
+                    checkpoint("after_gc_disposal_journal_lock");
+                    let guards = inspect(self, e, &q.intent)?;
+                    if guards.at_original {
+                        return Err(ReconcileError::Invariant(
+                            "GC disposal object not quarantined",
+                        ));
+                    }
+                    checkpoint("after_gc_disposal_file_lock");
+                    verify_guards(self, &guards, &q.intent, &guards.quarantine)?;
+                    Ok(guards)
+                },
+            )?;
+            checkpoint("after_gc_disposal_prepare");
+            drop(guards);
+            Ok(audit)
+        }
         pub(super) fn gc_quarantine_platform(
             &self,
             id: &EntryId,

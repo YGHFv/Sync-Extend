@@ -57,6 +57,10 @@ pub struct StorageReport {
     pub quarantined_gc_objects: usize,
     pub quarantined_gc_logical_bytes: u64,
     pub explicit_gc_quarantine_available: bool,
+    pub gc_disposal_records: usize,
+    pub pending_gc_disposals: usize,
+    pub explicit_gc_disposal_preparation_available: bool,
+    pub disposition_executor_available: bool,
     pub pruned_snapshots: usize,
     pub explicit_snapshot_pruning_available: bool,
     pub remote_backup_complete: bool,
@@ -88,6 +92,7 @@ impl LocalSpace {
         let gc_authorization_records = self.gc_authorizations()?.len();
         let executions = self.gc_executions()?;
         let quarantines = self.gc_quarantines()?;
+        let disposals = self.gc_disposals()?;
         let active_gc_execution_fences = executions.iter().filter(|e| e.content_fenced).count();
         let gc_mark_records = self
             .journal
@@ -269,6 +274,10 @@ impl LocalSpace {
             quarantined_gc_objects,
             quarantined_gc_logical_bytes,
             explicit_gc_quarantine_available: cfg!(windows),
+            gc_disposal_records: disposals.len(),
+            pending_gc_disposals: disposals.iter().filter(|d| d.content_fenced).count(),
+            explicit_gc_disposal_preparation_available: cfg!(windows),
+            disposition_executor_available: false,
             pruned_snapshots,
             explicit_snapshot_pruning_available: true,
             remote_backup_complete: false,

@@ -74,6 +74,14 @@ impl Journal {
         max_entries: usize,
     ) -> Result<Vec<GcQuarantineAudit>> {
         let executions = self.gc_executions(space, max_entries)?;
+        self.audit_gc_quarantines(&executions, max_entries)
+    }
+
+    pub(crate) fn audit_gc_quarantines(
+        &self,
+        executions: &[GcExecutionAudit],
+        max_entries: usize,
+    ) -> Result<Vec<GcQuarantineAudit>> {
         let mut statement = self.connection.prepare(
             "SELECT execution_id,plan_id,CASE WHEN length(CAST(intent AS BLOB))<=2048 THEN intent ELSE '' END,intent_hash,state FROM gc_quarantines ORDER BY execution_id",
         )?;
@@ -129,6 +137,7 @@ impl Journal {
                 gc_enabled: false,
             });
         }
+        self.audit_gc_disposals(&audits, executions, max_entries)?;
         Ok(audits)
     }
 
@@ -307,6 +316,10 @@ impl Journal {
             .map_err(JournalError::from)?;
             if next == GcQuarantineState::Restored {
                 tx.execute("INSERT INTO gc_execution_aborts SELECT ?1,observed_at_ms FROM gc_clock WHERE singleton=1",[id.as_str()]).map_err(JournalError::from)?;
+                tx.execute(
+                    "INSERT INTO gc_disposal_restorations SELECT d.execution_id,c.observed_at_ms FROM gc_disposals d JOIN gc_clock c ON c.singleton=1 WHERE d.execution_id=?1",
+                    [id.as_str()],
+                ).map_err(JournalError::from)?;
             }
         }
         let q = self

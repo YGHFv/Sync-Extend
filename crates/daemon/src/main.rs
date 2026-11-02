@@ -117,6 +117,18 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Persist one single-use pre-disposition record; never request deletion.
+    PrepareGcDisposal {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        execution: String,
+    },
+    /// Audit disposal preparation/restoration metadata; executor is unavailable.
+    GcDisposals {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Restore only the exact admitted quarantine object, without overwrite.
     RestoreGcQuarantine {
         #[arg(long)]
@@ -459,6 +471,11 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             execution,
         } => print(&open(&data_dir)?.quarantine_gc_execution(&execution.parse()?)?)?,
         Command::GcQuarantines { data_dir } => print(&open(&data_dir)?.gc_quarantines()?)?,
+        Command::PrepareGcDisposal {
+            data_dir,
+            execution,
+        } => print(&open(&data_dir)?.prepare_gc_disposal(&execution.parse()?)?)?,
+        Command::GcDisposals { data_dir } => print(&open(&data_dir)?.gc_disposals()?)?,
         Command::RestoreGcQuarantine {
             data_dir,
             execution,

@@ -3,6 +3,7 @@ mod delete;
 mod fault;
 mod filesystem;
 mod gc_authorization;
+mod gc_disposal;
 mod gc_execution;
 mod gc_mark;
 mod gc_preflight;

@@ -65,7 +65,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=13 => {}
+            1..=14 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -140,6 +140,11 @@ impl Journal {
         if version < 13 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-013.sql"))?;
+            tx.commit()?;
+        }
+        if version < 14 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-014.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -1328,7 +1333,7 @@ fn check_storage_metadata_limit(
             + (SELECT 2*count(*) FROM gc_marks) + (SELECT count(*) FROM gc_cancellations)
             + (SELECT count(*) FROM gc_clock) + (SELECT count(*) FROM gc_authorizations)
             + (SELECT count(*) FROM gc_revocations) + (SELECT 2*count(*) FROM gc_executions)
-            + (SELECT count(*) FROM gc_quarantines),
+            + (SELECT count(*) FROM gc_quarantines) + (SELECT 2*count(*) FROM gc_disposals),
             (SELECT coalesce(sum(length(CAST(manifest AS BLOB))),0) FROM snapshots)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))
                 + coalesce(length(CAST(execution AS BLOB)),0)),0) FROM mutations)
@@ -1339,7 +1344,8 @@ fn check_storage_metadata_limit(
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_marks)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_authorizations)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_executions)
-            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_quarantines)",
+            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_quarantines)
+            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_disposals)",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1464,3 +1470,5 @@ mod cas_access;
 pub use cas_access::CasAccessGuard;
 mod gc_quarantine;
 pub use gc_quarantine::{GcQuarantineAudit, GcQuarantineIntent, GcQuarantineState};
+mod gc_disposal;
+pub use gc_disposal::{GcDisposalAudit, GcDisposalIntent, GcDisposalState};

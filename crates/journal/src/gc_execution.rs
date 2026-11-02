@@ -140,6 +140,7 @@ impl Journal {
                 gc_enabled: false,
             });
         }
+        self.audit_gc_quarantines(&audits, max_entries)?;
         Ok(audits)
     }
 
