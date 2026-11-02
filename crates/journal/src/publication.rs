@@ -37,6 +37,10 @@ pub struct PublicationIntent {
     pub source_snapshot: Option<SnapshotId>,
     pub created_at_ms: u64,
     pub attempt: u32,
+    #[serde(default)]
+    pub root_identity: Option<ContentId>,
+    #[serde(default)]
+    pub parent_identity: Option<ContentId>,
 }
 
 impl PublicationIntent {
@@ -45,6 +49,7 @@ impl PublicationIntent {
         if self.format_version != FORMAT_VERSION
             || self.attempt > 16
             || self.requested_path.parent() != self.target_path.parent()
+            || self.root_identity.is_some() != self.parent_identity.is_some()
         {
             return Err(JournalError::Invariant("invalid publication intent"));
         }

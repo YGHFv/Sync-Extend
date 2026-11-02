@@ -277,6 +277,11 @@ impl Journal {
                 ));
             }
         }
+        if intent.requested_baseline.is_some() && intent.target_path == intent.requested_path {
+            return Err(JournalError::Invariant(
+                "publication must not target an occupied baseline path",
+            ));
+        }
         let json = serde_json::to_string(intent)?;
         if json.len() > MAX_OPERATION_BYTES {
             return Err(JournalError::Invariant("publication resource limit"));
@@ -336,6 +341,7 @@ impl Journal {
         let publication = self.publication(id)?;
         if publication.state == PublicationState::Committed
             || path == publication.intent.target_path
+            || path == publication.intent.requested_path
         {
             return Err(JournalError::Invariant(
                 "cannot retarget committed or unchanged publication",
@@ -600,6 +606,10 @@ impl Journal {
             .pragma_query_value(None, "integrity_check", |r| r.get(0))?;
         if result != "ok" {
             return Err(JournalError::Invariant("SQLite integrity check failed"));
+        }
+        let mut foreign_keys = self.connection.prepare("PRAGMA foreign_key_check")?;
+        if foreign_keys.query([])?.next()?.is_some() {
+            return Err(JournalError::Invariant("SQLite foreign key check failed"));
         }
         Ok(())
     }

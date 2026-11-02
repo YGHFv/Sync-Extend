@@ -1,5 +1,7 @@
 mod identity;
+mod publish;
 mod scan;
+pub use publish::PublishResult;
 
 use fs2::FileExt;
 use serde::Serialize;
@@ -67,6 +69,9 @@ pub struct Status {
     pub network_enabled: bool,
     pub webdav_enabled: bool,
     pub history_pruning_enabled: bool,
+    pub outstanding_publications: usize,
+    pub publication_stages: Vec<sync_extend_journal::PublicationState>,
+    pub protected_objects: usize,
 }
 
 impl LocalSpace {
@@ -184,6 +189,11 @@ impl LocalSpace {
     }
 
     pub fn scan(&mut self) -> Result<ScanResult> {
+        self.recover()?;
+        self.scan_without_recovery()
+    }
+
+    fn stable_scan(&self) -> Result<scan::Scan> {
         self.verify_root()?;
         let first = scan::scan(&self.worktree, &self.cas)?;
         self.verify_root()?;
@@ -192,10 +202,44 @@ impl LocalSpace {
             return Err(ReconcileError::Unstable);
         }
         self.verify_root()?;
+        Ok(second)
+    }
+
+    fn scan_without_recovery(&mut self) -> Result<ScanResult> {
+        let second = self.stable_scan()?;
+        self.commit_scan(&second, None)
+    }
+
+    fn commit_scan(
+        &mut self,
+        second: &scan::Scan,
+        publication: Option<&sync_extend_journal::PublicationIntent>,
+    ) -> Result<ScanResult> {
         let old = self.journal.current(&self.space_id)?;
         let baseline = old.as_ref().map(Manifest::root).transpose()?;
         let previous = old.unwrap_or_else(|| Manifest::empty(self.space_id.clone()));
-        let mut manifest = build_manifest(&previous, &second)?;
+        let mut manifest = build_manifest(&previous, second)?;
+        if let Some(intent) = publication {
+            let observed = second
+                .get(&intent.target_path)
+                .ok_or(ReconcileError::Unstable)?;
+            if observed.content.as_ref() != Some(&intent.content) {
+                return Err(ReconcileError::Unstable);
+            }
+            manifest
+                .entries
+                .retain(|_, entry| entry.path != intent.target_path);
+            manifest.entries.insert(
+                intent.entry_id.clone(),
+                Entry {
+                    entry_id: intent.entry_id.clone(),
+                    path: intent.target_path.clone(),
+                    kind: EntryKind::File,
+                    content: Some(intent.content.clone()),
+                },
+            );
+            manifest.tombstones.remove(&intent.entry_id);
+        }
         let timestamp = now_ms()?;
         let mut changes = Vec::new();
         for entry in manifest.entries.values() {
@@ -254,7 +298,17 @@ impl LocalSpace {
                 self.cas.verify(content)?;
             }
         }
-        let root = if operations.is_empty() && baseline.is_some() {
+        let root = if let Some(intent) = publication {
+            self.journal.commit_publication(
+                &intent.transaction_id,
+                baseline
+                    .as_ref()
+                    .ok_or(ReconcileError::Invariant("missing publication baseline"))?,
+                &manifest,
+                &operations,
+                timestamp,
+            )?
+        } else if operations.is_empty() && baseline.is_some() {
             manifest.root()?
         } else {
             self.journal
@@ -288,8 +342,13 @@ impl LocalSpace {
         Ok(self.journal.operations(&self.space_id)?)
     }
 
+    pub fn snapshots(&self) -> Result<Vec<(SnapshotId, String)>> {
+        Ok(self.journal.snapshots(&self.space_id)?)
+    }
+
     pub fn status(&self) -> Result<Status> {
         let manifest = self.manifest()?;
+        let publications = self.journal.outstanding_publications(&self.space_id)?;
         Ok(Status {
             space_id: self.space_id.clone(),
             device_id: self.device_id.clone(),
@@ -300,6 +359,9 @@ impl LocalSpace {
             network_enabled: false,
             webdav_enabled: false,
             history_pruning_enabled: false,
+            outstanding_publications: publications.len(),
+            publication_stages: publications.iter().map(|p| p.state).collect(),
+            protected_objects: self.journal.protected_objects()?.len(),
         })
     }
 
@@ -307,9 +369,23 @@ impl LocalSpace {
         self.journal.integrity_check()?;
         let mut files = 0;
         let mut checked = std::collections::BTreeSet::new();
+        for publication in self.journal.outstanding_publications(&self.space_id)? {
+            self.cas.verify(&publication.intent.content)?;
+        }
+        let protected: std::collections::BTreeSet<_> =
+            self.journal.protected_objects()?.into_iter().collect();
         for manifest in self.journal.retained_manifests(&self.space_id)? {
             for entry in manifest.entries.values() {
                 if let Some(content) = &entry.content {
+                    if content
+                        .chunks
+                        .iter()
+                        .any(|chunk| !protected.contains(&chunk.content_id))
+                    {
+                        return Err(ReconcileError::Invariant(
+                            "retained snapshot object lacks a protection reference",
+                        ));
+                    }
                     if checked.insert(content.content_id.clone()) {
                         self.cas.verify(content)?;
                         files += 1;
@@ -329,7 +405,7 @@ impl LocalSpace {
         )?;
         if parent.starts_with(&self.worktree) || parent.starts_with(&self.data_dir) {
             return Err(ReconcileError::Invariant(
-                "export must be outside the worktree and internal data; restore is not implemented",
+                "export must be outside the worktree and internal data; use restore for retained versions",
             ));
         }
         let manifest = self

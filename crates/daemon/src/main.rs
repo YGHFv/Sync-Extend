@@ -57,6 +57,34 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Publish a single local file without overwriting an existing destination.
+    Publish {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        path: String,
+    },
+    /// Restore one retained file as a new local change; occupied paths keep a conflict copy.
+    Restore {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long)]
+        path: String,
+    },
+    /// Finish durable outstanding publications without rolling back newer writes.
+    Recover {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// List retained snapshot IDs for single-file restore.
+    Snapshots {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Validate configuration without starting any listener.
     CheckConfig {
         #[arg(long)]
@@ -125,6 +153,29 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let config: Config = serde_json::from_reader(std::fs::File::open(config)?)?;
             config.validate()?;
             print(&serde_json::json!({"valid": true, "listener_started": false}))?;
+        }
+        Command::Publish {
+            data_dir,
+            source,
+            path,
+        } => {
+            print(&LocalSpace::open(&data_dir)?.publish_file(&source, PortablePath::new(path)?)?)?;
+        }
+        Command::Restore {
+            data_dir,
+            snapshot,
+            path,
+        } => {
+            print(
+                &LocalSpace::open(&data_dir)?
+                    .restore_file(&snapshot.parse()?, PortablePath::new(path)?)?,
+            )?;
+        }
+        Command::Recover { data_dir } => {
+            print(&LocalSpace::open(&data_dir)?.recover()?)?;
+        }
+        Command::Snapshots { data_dir } => {
+            print(&LocalSpace::open(&data_dir)?.snapshots()?)?;
         }
         Command::Run {
             data_dir,
