@@ -190,7 +190,13 @@ impl Manifest {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.format_version != FORMAT_VERSION || self.policy_version == 0 {
+        if self.format_version != FORMAT_VERSION
+            || self.policy_version == 0
+            || self.version_vector.0.len() > 1024
+            || self.version_vector.0.values().any(|seq| *seq == 0)
+            || self.entries.len() > 1_000_000
+            || self.tombstones.len() > 1_000_000
+        {
             return Err(ModelError::InvalidData("unsupported manifest format"));
         }
         let mut paths = BTreeSet::new();

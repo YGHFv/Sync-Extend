@@ -2,3 +2,7 @@
 set -eu
 . "$(dirname "$0")/source-only.sh"
 git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR | check_paths
+if git grep --cached -n -E '#\[(test|cfg\(test\))\]|#\[tokio::test' -- '*.rs'; then
+    printf 'Source-only policy rejected inline Rust tests.\n' >&2
+    exit 1
+fi

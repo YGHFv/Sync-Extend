@@ -11,5 +11,6 @@ while read -r local_ref local_oid remote_ref remote_oid; do
     fi
     for commit in $(git rev-list "$range"); do
         git -c core.quotePath=false ls-tree -r --name-only "$commit" | check_paths
+        check_inline_tests "$commit"
     done
 done

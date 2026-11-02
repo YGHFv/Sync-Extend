@@ -1,0 +1,607 @@
+mod identity;
+mod scan;
+
+use fs2::FileExt;
+use serde::Serialize;
+use std::{
+    collections::BTreeMap,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+use sync_extend_cas::{is_reparse, sync_directory, Cas};
+use sync_extend_core_model::*;
+use sync_extend_journal::Journal;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReconcileError {
+    #[error("local filesystem error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("model error: {0}")]
+    Model(#[from] ModelError),
+    #[error("content storage error: {0}")]
+    Cas(#[from] sync_extend_cas::CasError),
+    #[error("journal error: {0}")]
+    Journal(#[from] sync_extend_journal::JournalError),
+    #[error("serialization error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("safety check failed: {0}")]
+    Invariant(&'static str),
+    #[error("worktree changed during scanning; retry after writers settle")]
+    Unstable,
+}
+
+pub type Result<T> = std::result::Result<T, ReconcileError>;
+
+pub struct LocalSpace {
+    pub space_id: SpaceId,
+    pub device_id: DeviceId,
+    worktree: PathBuf,
+    data_dir: PathBuf,
+    cas: Cas,
+    journal: Journal,
+    _lock: File,
+    _worktree_lock: File,
+}
+
+#[derive(Serialize)]
+pub struct ScanResult {
+    pub space_id: SpaceId,
+    pub snapshot_id: SnapshotId,
+    pub entries: usize,
+    pub operations: usize,
+    pub files: usize,
+    pub logical_bytes: u64,
+    pub network_enabled: bool,
+}
+
+#[derive(Serialize)]
+pub struct Status {
+    pub space_id: SpaceId,
+    pub device_id: DeviceId,
+    pub snapshot_id: Option<SnapshotId>,
+    pub entries: usize,
+    pub operations: usize,
+    pub snapshots: usize,
+    pub network_enabled: bool,
+    pub webdav_enabled: bool,
+    pub history_pruning_enabled: bool,
+}
+
+impl LocalSpace {
+    pub fn initialize(data_dir: &Path, worktree: &Path) -> Result<Self> {
+        check_ancestors(worktree)?;
+        check_ancestors(data_dir)?;
+        let worktree = fs::canonicalize(worktree)?;
+        if !fs::metadata(&worktree)?.is_dir() {
+            return Err(ReconcileError::Invariant("worktree must already exist"));
+        }
+        validate_roots(&canonical_destination(data_dir)?, &worktree)?;
+        create_private_directory(data_dir)?;
+        let data_dir = fs::canonicalize(data_dir)?;
+        validate_roots(&data_dir, &worktree)?;
+        let lock = acquire_lock(&data_dir)?;
+        let mut journal = Journal::open(&data_dir.join("journal.sqlite"))?;
+        if journal.state("space_id")?.is_some() {
+            return Err(ReconcileError::Invariant(
+                "space already initialized; use scan/status",
+            ));
+        }
+        let device_id = identity::load_or_create(&data_dir.join("device.secret"), true)?;
+        let marker_directory = worktree.join(".sync-extend");
+        let marker = marker_directory.join("space-id");
+        let space_id: SpaceId = if marker.try_exists()? {
+            read_marker(&marker)?
+        } else {
+            if marker_directory.try_exists()? {
+                return Err(ReconcileError::Invariant(
+                    "reserved worktree directory already exists",
+                ));
+            }
+            let space = SpaceId::random()?;
+            fs::create_dir(&marker_directory)?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)?;
+            file.write_all(space.as_str().as_bytes())?;
+            file.sync_all()?;
+            sync_directory(&marker_directory)?;
+            sync_directory(&worktree)?;
+            space
+        };
+        journal.initialize(
+            &space_id,
+            &device_id,
+            worktree
+                .to_str()
+                .ok_or(ReconcileError::Invariant("non-UTF8 root"))?,
+        )?;
+        let cas = Cas::open(&data_dir.join("cas"))?;
+        let worktree_lock = acquire_lock(&marker_directory)?;
+        Ok(Self {
+            space_id,
+            device_id,
+            worktree,
+            data_dir,
+            cas,
+            journal,
+            _lock: lock,
+            _worktree_lock: worktree_lock,
+        })
+    }
+
+    pub fn open(data_dir: &Path) -> Result<Self> {
+        check_ancestors(data_dir)?;
+        let data_dir = fs::canonicalize(data_dir)?;
+        let lock = acquire_lock(&data_dir)?;
+        if !data_dir.join("journal.sqlite").is_file() {
+            return Err(ReconcileError::Invariant("space is not initialized"));
+        }
+        let journal = Journal::open(&data_dir.join("journal.sqlite"))?;
+        let required = |key| {
+            journal
+                .state(key)?
+                .ok_or(ReconcileError::Invariant("incomplete initialization"))
+        };
+        let space_id = required("space_id")?.parse()?;
+        let device_id: DeviceId = required("device_id")?.parse()?;
+        let worktree = PathBuf::from(required("worktree")?);
+        if identity::load_or_create(&data_dir.join("device.secret"), false)? != device_id {
+            return Err(ReconcileError::Invariant("device public key mismatch"));
+        }
+        validate_roots(&data_dir, &worktree)?;
+        let cas = Cas::open(&data_dir.join("cas"))?;
+        let worktree_lock = acquire_lock(&worktree.join(".sync-extend"))?;
+        let local = Self {
+            space_id,
+            device_id,
+            worktree,
+            data_dir,
+            cas,
+            journal,
+            _lock: lock,
+            _worktree_lock: worktree_lock,
+        };
+        local.verify_root()?;
+        Ok(local)
+    }
+
+    fn verify_root(&self) -> Result<()> {
+        check_ancestors(&self.worktree)?;
+        let metadata = fs::symlink_metadata(&self.worktree)?;
+        if !metadata.is_dir()
+            || is_reparse(&metadata)
+            || metadata.file_type().is_symlink()
+            || read_marker(&self.worktree.join(".sync-extend/space-id"))? != self.space_id
+        {
+            return Err(ReconcileError::Invariant(
+                "worktree unavailable or identity marker changed",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn scan(&mut self) -> Result<ScanResult> {
+        self.verify_root()?;
+        let first = scan::scan(&self.worktree, &self.cas)?;
+        self.verify_root()?;
+        let second = scan::scan(&self.worktree, &self.cas)?;
+        if first != second {
+            return Err(ReconcileError::Unstable);
+        }
+        self.verify_root()?;
+        let old = self.journal.current(&self.space_id)?;
+        let baseline = old.as_ref().map(Manifest::root).transpose()?;
+        let previous = old.unwrap_or_else(|| Manifest::empty(self.space_id.clone()));
+        let mut manifest = build_manifest(&previous, &second)?;
+        let timestamp = now_ms()?;
+        let mut changes = Vec::new();
+        for entry in manifest.entries.values() {
+            match previous.entries.get(&entry.entry_id) {
+                None => changes.push(Change::Put {
+                    entry: entry.clone(),
+                }),
+                Some(old) => {
+                    if old.path != entry.path {
+                        changes.push(Change::Rename {
+                            entry_id: entry.entry_id.clone(),
+                            path: entry.path.clone(),
+                        });
+                    }
+                    if old.kind != entry.kind || old.content != entry.content {
+                        changes.push(Change::Put {
+                            entry: entry.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        for id in previous.entries.keys() {
+            if !manifest.entries.contains_key(id) {
+                changes.push(Change::Delete {
+                    entry_id: id.clone(),
+                });
+            }
+        }
+        let mut operations = Vec::new();
+        for change in changes {
+            let seq = manifest
+                .version_vector
+                .get(&self.device_id)
+                .checked_add(1)
+                .ok_or(ReconcileError::Invariant("sequence exhausted"))?;
+            let op = Operation::new(OperationPayload {
+                format_version: FORMAT_VERSION,
+                space_id: self.space_id.clone(),
+                origin_device_id: self.device_id.clone(),
+                origin_seq: seq,
+                causal: manifest.version_vector.clone(),
+                change,
+                created_at_ms: timestamp,
+            })?;
+            if let Change::Delete { entry_id } = &op.payload.change {
+                manifest
+                    .tombstones
+                    .insert(entry_id.clone(), op.op_id.clone());
+            }
+            manifest.version_vector.observe(self.device_id.clone(), seq);
+            operations.push(op);
+        }
+        for entry in manifest.entries.values() {
+            if let Some(content) = &entry.content {
+                self.cas.verify(content)?;
+            }
+        }
+        let root = if operations.is_empty() && baseline.is_some() {
+            manifest.root()?
+        } else {
+            self.journal
+                .commit_local(baseline.as_ref(), &manifest, &operations, timestamp)?
+        };
+        Ok(ScanResult {
+            space_id: self.space_id.clone(),
+            snapshot_id: root,
+            entries: manifest.entries.len(),
+            operations: operations.len(),
+            files: manifest
+                .entries
+                .values()
+                .filter(|e| e.kind == EntryKind::File)
+                .count(),
+            logical_bytes: manifest
+                .entries
+                .values()
+                .filter_map(|e| e.content.as_ref())
+                .map(|c| c.length)
+                .sum(),
+            network_enabled: false,
+        })
+    }
+
+    pub fn manifest(&self) -> Result<Option<Manifest>> {
+        Ok(self.journal.current(&self.space_id)?)
+    }
+
+    pub fn operations(&self) -> Result<Vec<Operation>> {
+        Ok(self.journal.operations(&self.space_id)?)
+    }
+
+    pub fn status(&self) -> Result<Status> {
+        let manifest = self.manifest()?;
+        Ok(Status {
+            space_id: self.space_id.clone(),
+            device_id: self.device_id.clone(),
+            snapshot_id: manifest.as_ref().map(Manifest::root).transpose()?,
+            entries: manifest.as_ref().map_or(0, |m| m.entries.len()),
+            operations: self.operations()?.len(),
+            snapshots: self.journal.snapshots(&self.space_id)?.len(),
+            network_enabled: false,
+            webdav_enabled: false,
+            history_pruning_enabled: false,
+        })
+    }
+
+    pub fn verify(&self) -> Result<usize> {
+        self.journal.integrity_check()?;
+        let mut files = 0;
+        let mut checked = std::collections::BTreeSet::new();
+        for manifest in self.journal.retained_manifests(&self.space_id)? {
+            for entry in manifest.entries.values() {
+                if let Some(content) = &entry.content {
+                    if checked.insert(content.content_id.clone()) {
+                        self.cas.verify(content)?;
+                        files += 1;
+                    }
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    pub fn export_file(&self, path: &PortablePath, output: &Path) -> Result<()> {
+        check_ancestors(output)?;
+        let parent = fs::canonicalize(
+            output
+                .parent()
+                .ok_or(ReconcileError::Invariant("output requires a parent"))?,
+        )?;
+        if parent.starts_with(&self.worktree) || parent.starts_with(&self.data_dir) {
+            return Err(ReconcileError::Invariant(
+                "export must be outside the worktree and internal data; restore is not implemented",
+            ));
+        }
+        let manifest = self
+            .manifest()?
+            .ok_or(ReconcileError::Invariant("no scanned manifest"))?;
+        let entry = manifest
+            .entries
+            .values()
+            .find(|entry| &entry.path == path)
+            .ok_or(ReconcileError::Invariant("file not found"))?;
+        let content = entry
+            .content
+            .as_ref()
+            .ok_or(ReconcileError::Invariant("path is a directory"))?;
+        self.cas.verify(content)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output)?;
+        self.cas.write_file(content, &mut file)?;
+        file.sync_all()?;
+        sync_directory(&parent)?;
+        Ok(())
+    }
+}
+
+fn build_manifest(old: &Manifest, scanned: &scan::Scan) -> Result<Manifest> {
+    let mut result = old.clone();
+    result.entries.clear();
+    let by_path: BTreeMap<_, _> = old.entries.values().map(|e| (e.path.clone(), e)).collect();
+    let mut unmatched_old = BTreeMap::<(EntryKindKey, String), Vec<EntryId>>::new();
+    let mut unmatched_new = BTreeMap::<(EntryKindKey, String), Vec<PortablePath>>::new();
+    for entry in old.entries.values() {
+        if scanned
+            .get(&entry.path)
+            .is_none_or(|e| e.kind != entry.kind)
+        {
+            unmatched_old
+                .entry(fingerprint_old(entry, old)?)
+                .or_default()
+                .push(entry.entry_id.clone());
+        }
+    }
+    for (path, entry) in scanned {
+        if by_path.get(path).is_none_or(|e| e.kind != entry.kind) {
+            unmatched_new
+                .entry(fingerprint_scan(path, entry, scanned)?)
+                .or_default()
+                .push(path.clone());
+        }
+    }
+    let mut renames = BTreeMap::new();
+    for (fingerprint, paths) in unmatched_new {
+        if paths.len() == 1 {
+            if let Some(ids) = unmatched_old.get(&fingerprint).filter(|ids| ids.len() == 1) {
+                renames.insert(paths[0].clone(), ids[0].clone());
+            }
+        }
+    }
+    // An unambiguous whole-directory move also identifies duplicate-content children.
+    let directory_moves: Vec<_> = renames
+        .iter()
+        .filter_map(|(new_path, id)| {
+            old.entries
+                .get(id)
+                .filter(|entry| entry.kind == EntryKind::Directory)
+                .map(|entry| (format!("{new_path}/"), format!("{}/", entry.path)))
+        })
+        .collect();
+    for (new_path, entry) in scanned {
+        if by_path
+            .get(new_path)
+            .is_some_and(|old| old.kind == entry.kind)
+        {
+            continue;
+        }
+        for (new_prefix, old_prefix) in &directory_moves {
+            if let Some(relative) = new_path.as_str().strip_prefix(new_prefix) {
+                let old_path = PortablePath::new(format!("{old_prefix}{relative}"))?;
+                if let Some(old_entry) = by_path
+                    .get(&old_path)
+                    .filter(|old| old.kind == entry.kind && old.content == entry.content)
+                {
+                    renames.insert(new_path.clone(), old_entry.entry_id.clone());
+                    break;
+                }
+            }
+        }
+    }
+    for (path, scanned) in scanned {
+        let id = if let Some(old) = by_path.get(path).filter(|e| e.kind == scanned.kind) {
+            old.entry_id.clone()
+        } else if let Some(id) = renames.get(path) {
+            id.clone()
+        } else {
+            EntryId::random()?
+        };
+        result.tombstones.remove(&id);
+        result.entries.insert(
+            id.clone(),
+            Entry {
+                entry_id: id,
+                path: path.clone(),
+                kind: scanned.kind,
+                content: scanned.content.clone(),
+            },
+        );
+    }
+    // Deleted IDs receive their tombstones when their new operations are formed.
+    result.validate()?;
+    Ok(result)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+enum EntryKindKey {
+    File,
+    Directory,
+}
+
+fn fingerprint_old(entry: &Entry, manifest: &Manifest) -> Result<(EntryKindKey, String)> {
+    if let Some(content) = &entry.content {
+        return Ok((EntryKindKey::File, content.content_id.to_string()));
+    }
+    let prefix = format!("{}/", entry.path);
+    let descendants: Vec<_> = manifest
+        .entries
+        .values()
+        .filter_map(|e| {
+            e.path.as_str().strip_prefix(&prefix).map(|relative| {
+                (
+                    relative.to_owned(),
+                    e.kind,
+                    e.content.as_ref().map(|c| &c.content_id),
+                )
+            })
+        })
+        .collect();
+    fingerprint_directory(descendants)
+}
+
+fn fingerprint_scan(
+    path: &PortablePath,
+    entry: &scan::ScannedEntry,
+    scan: &scan::Scan,
+) -> Result<(EntryKindKey, String)> {
+    if let Some(content) = &entry.content {
+        return Ok((EntryKindKey::File, content.content_id.to_string()));
+    }
+    let prefix = format!("{path}/");
+    let descendants: Vec<_> = scan
+        .iter()
+        .filter_map(|(p, e)| {
+            p.as_str().strip_prefix(&prefix).map(|relative| {
+                (
+                    relative.to_owned(),
+                    e.kind,
+                    e.content.as_ref().map(|c| &c.content_id),
+                )
+            })
+        })
+        .collect();
+    fingerprint_directory(descendants)
+}
+
+fn fingerprint_directory(
+    mut descendants: Vec<(String, EntryKind, Option<&ContentId>)>,
+) -> Result<(EntryKindKey, String)> {
+    descendants.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok((
+        EntryKindKey::Directory,
+        ContentId::hash(&serde_json::to_vec(&descendants)?).to_string(),
+    ))
+}
+
+fn now_ms() -> Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ReconcileError::Invariant("system clock predates epoch"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| ReconcileError::Invariant("timestamp overflow"))
+}
+
+fn validate_roots(data: &Path, worktree: &Path) -> Result<()> {
+    if data.starts_with(worktree) || worktree.starts_with(data) {
+        return Err(ReconcileError::Invariant(
+            "data and worktree roots must not overlap",
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_destination(path: &Path) -> Result<PathBuf> {
+    if path.try_exists()? {
+        return Ok(fs::canonicalize(path)?);
+    }
+    let parent = path
+        .parent()
+        .ok_or(ReconcileError::Invariant("missing root parent"))?;
+    let name = path
+        .file_name()
+        .ok_or(ReconcileError::Invariant("missing directory name"))?;
+    Ok(canonical_destination(parent)?.join(name))
+}
+
+fn check_ancestors(path: &Path) -> Result<()> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(ReconcileError::Invariant(
+            "root must be absolute without traversal",
+        ));
+    }
+    for ancestor in path.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() || is_reparse(&metadata) => {
+                return Err(ReconcileError::Invariant(
+                    "root contains a link/reparse point",
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+fn read_marker(path: &Path) -> Result<SpaceId> {
+    check_ancestors(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.len() != 32 {
+        return Err(ReconcileError::Invariant(
+            "invalid or unavailable worktree marker",
+        ));
+    }
+    let mut value = String::new();
+    File::open(path)?.take(33).read_to_string(&mut value)?;
+    Ok(value.parse()?)
+}
+
+fn acquire_lock(data: &Path) -> Result<File> {
+    let path = data.join("writer.lock");
+    check_ancestors(&path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    FileExt::try_lock_exclusive(&file)
+        .map_err(|_| ReconcileError::Invariant("another local writer is running"))?;
+    Ok(file)
+}
+
+fn create_private_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path)?;
+        use std::os::unix::fs::PermissionsExt;
+        if fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+            return Err(ReconcileError::Invariant(
+                "data directory permissions must be private",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(path)?;
+    Ok(())
+}

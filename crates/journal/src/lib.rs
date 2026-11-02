@@ -7,6 +7,8 @@ const MAX_PENDING_OPS: u64 = 10_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
+    #[error("journal filesystem error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("journal database error: {0}")]
     Sql(#[from] rusqlite::Error),
     #[error("journal serialization error: {0}")]
@@ -32,6 +34,24 @@ pub struct Journal {
 
 impl Journal {
     pub fn open(path: &Path) -> Result<Self> {
+        for ancestor in path.ancestors() {
+            match std::fs::symlink_metadata(ancestor) {
+                Ok(metadata) => {
+                    #[cfg(windows)]
+                    let reparse = {
+                        use std::os::windows::fs::MetadataExt;
+                        metadata.file_attributes() & 0x400 != 0
+                    };
+                    #[cfg(not(windows))]
+                    let reparse = false;
+                    if metadata.file_type().is_symlink() || reparse {
+                        return Err(JournalError::Invariant("unsafe database path"));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -96,6 +116,17 @@ impl Journal {
         json.map(|json| {
             let manifest: Manifest = serde_json::from_str(&json)?;
             manifest.validate()?;
+            if manifest.space_id != *space {
+                return Err(JournalError::Invariant("current manifest space mismatch"));
+            }
+            let stored_root: String = self.connection.query_row(
+                "SELECT snapshot_id FROM current_manifests WHERE space_id=?1",
+                [space.as_str()],
+                |r| r.get(0),
+            )?;
+            if manifest.root()?.as_str() != stored_root {
+                return Err(JournalError::Invariant("current manifest root mismatch"));
+            }
             Ok(manifest)
         })
         .transpose()
@@ -127,6 +158,25 @@ impl Journal {
             Ok((id.parse()?, state))
         })
         .collect()
+    }
+
+    pub fn retained_manifests(&self, space: &SpaceId) -> Result<Vec<Manifest>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT snapshot_id,manifest FROM snapshots WHERE space_id=?1")?;
+        let rows = statement.query_map([space.as_str()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut manifests = Vec::new();
+        for row in rows {
+            let (root, json) = row?;
+            let manifest: Manifest = serde_json::from_str(&json)?;
+            if manifest.space_id != *space || manifest.root()?.as_str() != root {
+                return Err(JournalError::Invariant("retained snapshot root mismatch"));
+            }
+            manifests.push(manifest);
+        }
+        Ok(manifests)
     }
 
     pub fn cursor(&self, space: &SpaceId, device: &DeviceId) -> Result<u64> {
@@ -206,10 +256,22 @@ impl Journal {
         if existing.as_deref() != expected_root.map(SnapshotId::as_str) {
             return Err(JournalError::Invariant("manifest baseline changed"));
         }
+        let previous_json: Option<String> = tx
+            .query_row(
+                "SELECT manifest FROM snapshots WHERE snapshot_id=?1",
+                [existing.as_deref().unwrap_or("")],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut expected_vector = match previous_json {
+            Some(json) => serde_json::from_str::<Manifest>(&json)?.version_vector,
+            None => VersionVector::default(),
+        };
         for op in operations {
             op.validate()?;
             let p = &op.payload;
             if p.space_id != manifest.space_id
+                || p.causal != expected_vector
                 || p.origin_seq != cursor(&tx, &p.space_id, &p.origin_device_id)? + 1
             {
                 return Err(JournalError::Invariant("local sequence discontinuity"));
@@ -230,6 +292,12 @@ impl Journal {
                 ],
             )?;
             set_cursor(&tx, &p.space_id, &p.origin_device_id, p.origin_seq)?;
+            expected_vector.observe(p.origin_device_id.clone(), p.origin_seq);
+        }
+        if manifest.version_vector != expected_vector {
+            return Err(JournalError::Invariant(
+                "manifest vector does not match committed operations",
+            ));
         }
         tx.execute(
             "INSERT OR IGNORE INTO snapshots VALUES (?1,?2,?3,?4,'materialized',0)",

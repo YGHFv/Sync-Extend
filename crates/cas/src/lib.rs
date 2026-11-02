@@ -32,6 +32,16 @@ pub struct Cas {
 
 impl Cas {
     pub fn open(root: &Path) -> Result<Self> {
+        for ancestor in root.ancestors() {
+            match fs::symlink_metadata(ancestor) {
+                Ok(metadata) if metadata.file_type().is_symlink() || is_reparse(&metadata) => {
+                    return Err(CasError::UnsafeDirectory);
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         fs::create_dir_all(root.join("objects"))?;
         fs::create_dir_all(root.join("tmp"))?;
         for path in [root, &root.join("objects"), &root.join("tmp")] {
