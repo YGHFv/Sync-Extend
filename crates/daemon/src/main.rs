@@ -44,6 +44,34 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Persist one verified unreferenced CAS observation; never authorize deletion.
+    MarkGcObject {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        object: String,
+        #[arg(long, default_value_t=86400, value_parser=clap::value_parser!(u64).range(1..=604800))]
+        grace_secs: u64,
+    },
+    /// Audit persistent GC marks without touching content or advancing time.
+    GcMarks {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Cancel only one GC mark; preserve every file and reference.
+    CancelGcMark {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        mark: String,
+    },
+    /// Recheck a GC observation after grace; the result never authorizes deletion.
+    RevalidateGcMark {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        mark: String,
+    },
     /// List immutable snapshot audit metadata, including explicitly pruned non-restorable history.
     SnapshotAudit {
         #[arg(long)]
@@ -322,6 +350,20 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::StorageReport { data_dir } => {
             print(&open(&data_dir)?.storage_report()?)?;
+        }
+        Command::MarkGcObject {
+            data_dir,
+            object,
+            grace_secs,
+        } => {
+            print(&open(&data_dir)?.mark_gc_object(&object.parse()?, grace_secs)?)?;
+        }
+        Command::GcMarks { data_dir } => print(&open(&data_dir)?.gc_marks()?)?,
+        Command::CancelGcMark { data_dir, mark } => {
+            print(&open(&data_dir)?.cancel_gc_mark(&mark.parse()?)?)?;
+        }
+        Command::RevalidateGcMark { data_dir, mark } => {
+            print(&open(&data_dir)?.revalidate_gc_mark(&mark.parse()?)?)?;
         }
         Command::SnapshotAudit { data_dir } => print(&open(&data_dir)?.snapshot_audit()?)?,
         Command::PruneSnapshot {

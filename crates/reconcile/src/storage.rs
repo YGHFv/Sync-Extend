@@ -44,26 +44,28 @@ pub struct StorageReport {
     pub cleanup_enabled: bool,
     pub explicit_move_marker_cleanup_available: bool,
     pub gc_enabled: bool,
+    pub persistent_gc_marks_available: bool,
+    pub gc_mark_records: usize,
     pub pruned_snapshots: usize,
     pub explicit_snapshot_pruning_available: bool,
     pub remote_backup_complete: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct Observation {
-    identity: ContentId,
-    length: u64,
-    modified: SystemTime,
+pub(crate) struct Observation {
+    pub(crate) identity: ContentId,
+    pub(crate) length: u64,
+    pub(crate) modified: SystemTime,
     directory: bool,
     counted: bool,
-    object: Option<ContentId>,
+    pub(crate) object: Option<ContentId>,
     temporary: bool,
 }
 
-type Inventory = BTreeMap<PathBuf, Observation>;
+pub(crate) type Inventory = BTreeMap<PathBuf, Observation>;
 
 #[derive(Clone, Copy)]
-enum Region {
+pub(crate) enum Region {
     Worktree,
     Cas,
 }
@@ -72,6 +74,10 @@ impl LocalSpace {
     pub fn storage_report(&self) -> Result<StorageReport> {
         self.verify_root()?;
         self.journal.integrity_check()?;
+        let gc_mark_records = self
+            .journal
+            .gc_marks(&self.space_id, self.limits.max_storage_entries)?
+            .len();
         let pruned_snapshots = self
             .snapshot_audit()?
             .iter()
@@ -216,6 +222,8 @@ impl LocalSpace {
             cleanup_enabled: false,
             explicit_move_marker_cleanup_available: cfg!(windows),
             gc_enabled: false,
+            persistent_gc_marks_available: true,
+            gc_mark_records,
             pruned_snapshots,
             explicit_snapshot_pruning_available: true,
             remote_backup_complete: false,
@@ -236,7 +244,7 @@ impl LocalSpace {
         Ok(())
     }
 
-    fn storage_inventory(&self, region: Region) -> Result<Inventory> {
+    pub(crate) fn storage_inventory(&self, region: Region) -> Result<Inventory> {
         let root = match region {
             Region::Worktree => self.worktree.clone(),
             Region::Cas => self.data_dir.join("cas"),

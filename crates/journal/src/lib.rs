@@ -64,7 +64,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=9 => {}
+            1..=10 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -119,6 +119,11 @@ impl Journal {
         if version < 9 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-009.sql"))?;
+            tx.commit()?;
+        }
+        if version < 10 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-010.sql"))?;
             tx.commit()?;
         }
         Ok(Self { connection })
@@ -1300,14 +1305,17 @@ fn check_storage_metadata_limit(
             + (SELECT count(*) FROM publications) + (SELECT count(*) FROM snapshot_objects)
             + (SELECT count(*) FROM mutation_objects) + (SELECT count(*) FROM publication_objects)
             + (SELECT count(*) FROM cleanup_plans) + (SELECT count(*) FROM read_leases)
-            + (SELECT count(*) FROM read_lease_objects) + (SELECT count(*) FROM snapshot_prunings),
+            + (SELECT count(*) FROM read_lease_objects) + (SELECT count(*) FROM snapshot_prunings)
+            + (SELECT 2*count(*) FROM gc_marks) + (SELECT count(*) FROM gc_cancellations)
+            + (SELECT count(*) FROM gc_clock),
             (SELECT coalesce(sum(length(CAST(manifest AS BLOB))),0) FROM snapshots)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))
                 + coalesce(length(CAST(execution AS BLOB)),0)),0) FROM mutations)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM publications)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM cleanup_plans)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM read_leases)
-            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM snapshot_prunings)",
+            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM snapshot_prunings)
+            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_marks)",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1419,3 +1427,5 @@ mod snapshot_retention;
 pub use snapshot_retention::RetainedSnapshot;
 mod snapshot_pruning;
 pub use snapshot_pruning::{SnapshotAudit, SnapshotPruning};
+mod gc_mark;
+pub use gc_mark::{gc_grace_until, GcCheck, GcMark, GcMarkAudit, GcObservation, GcState};

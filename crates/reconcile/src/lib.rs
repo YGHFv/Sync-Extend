@@ -2,6 +2,7 @@ mod cleanup;
 mod delete;
 mod fault;
 mod filesystem;
+mod gc_mark;
 #[cfg(windows)]
 mod guarded_mutation;
 mod identity;
@@ -15,6 +16,7 @@ mod snapshot_pruning;
 mod snapshot_retention;
 mod storage;
 pub use delete::{DeleteResult, MutationResult};
+pub use gc_mark::GcRevalidation;
 pub use mutation::MutationCheck;
 pub use publish::PublishResult;
 pub use read_lease::LeasedExportResult;
@@ -433,6 +435,7 @@ impl LocalSpace {
 
     pub fn verify(&self) -> Result<usize> {
         self.journal.integrity_check()?;
+        self.gc_marks()?;
         self.snapshot_audit()?;
         self.cleanup_plans()?;
         for lease in self.read_leases()? {

@@ -156,6 +156,7 @@ impl LocalSpace {
     }
 
     pub fn recover(&mut self) -> Result<Vec<PublishResult>> {
+        self.gc_marks()?;
         self.verify_root()?;
         self.journal
             .check_snapshot_prunings(&self.space_id, self.limits.max_storage_entries)?;

@@ -434,7 +434,7 @@ fn proposal(
         execution_blockers: vec![
             "automatic_retention_and_terminal_audit_decoupling_not_implemented",
             "conflict_offline_transfer_protection_not_implemented",
-            "persistent_mark_grace_revalidation_sweep_not_implemented",
+            "gc_sweep_and_deletion_authorization_not_implemented",
         ],
         durable_snapshot_locks_available: true,
         history_pruning_enabled: false,
