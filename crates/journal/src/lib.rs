@@ -1477,3 +1477,5 @@ mod gc_quarantine;
 pub use gc_quarantine::{GcQuarantineAudit, GcQuarantineIntent, GcQuarantineState};
 mod gc_disposal;
 pub use gc_disposal::{GcDisposalAudit, GcDisposalIntent, GcDisposalState, GcDisposalStep};
+mod diagnostics;
+pub use diagnostics::GcDiagnostics;

@@ -39,6 +39,11 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Audit one bounded metadata snapshot; report implementation and certification gaps.
+    Diagnostics {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Audit local storage and references without importing, recovering or deleting.
     StorageReport {
         #[arg(long)]
@@ -439,6 +444,9 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Status { data_dir } => {
             print(&open(&data_dir)?.status()?)?;
+        }
+        Command::Diagnostics { data_dir } => {
+            print(&open(&data_dir)?.diagnostics()?)?;
         }
         Command::StorageReport { data_dir } => {
             print(&open(&data_dir)?.storage_report()?)?;

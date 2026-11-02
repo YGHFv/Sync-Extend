@@ -1,5 +1,6 @@
 mod cleanup;
 mod delete;
+mod diagnostics;
 mod fault;
 mod filesystem;
 mod gc_authorization;
@@ -21,6 +22,7 @@ mod snapshot_pruning;
 mod snapshot_retention;
 mod storage;
 pub use delete::{DeleteResult, MutationResult};
+pub use diagnostics::Diagnostics;
 pub use gc_authorization::GcAuthorizationCheck;
 pub use gc_mark::GcRevalidation;
 pub use gc_preflight::GcPreflight;
@@ -124,6 +126,7 @@ pub struct Status {
     pub windows_move_executor_available: bool,
     pub windows_replace_executor_available: bool,
     pub mutation_executor_actions: Vec<&'static str>,
+    pub gc: sync_extend_journal::GcDiagnostics,
 }
 
 impl LocalSpace {
@@ -424,6 +427,17 @@ impl LocalSpace {
     }
 
     pub fn status(&self) -> Result<Status> {
+        self.verify_root()?;
+        self.journal
+            .with_gc_diagnostics(&self.space_id, self.limits.max_storage_entries, |gc| {
+                fault::checkpoint("after_status_read_snapshot");
+                let status = self.status_in_snapshot(gc)?;
+                self.verify_root()?;
+                Ok(status)
+            })
+    }
+
+    fn status_in_snapshot(&self, gc: &sync_extend_journal::GcDiagnostics) -> Result<Status> {
         let manifest = self.manifest()?;
         let publications = self.journal.outstanding_publications(&self.space_id)?;
         Ok(Status {
@@ -431,7 +445,9 @@ impl LocalSpace {
             device_id: self.device_id.clone(),
             snapshot_id: manifest.as_ref().map(Manifest::root).transpose()?,
             entries: manifest.as_ref().map_or(0, |m| m.entries.len()),
-            operations: self.operations()?.len(),
+            operations: self
+                .journal
+                .diagnostic_operation_count(&self.space_id, self.limits.max_storage_entries)?,
             snapshots: self.journal.snapshots(&self.space_id)?.len(),
             network_enabled: false,
             webdav_enabled: false,
@@ -450,6 +466,7 @@ impl LocalSpace {
             } else {
                 vec![]
             },
+            gc: gc.clone(),
         })
     }
 
