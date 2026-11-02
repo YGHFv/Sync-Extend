@@ -615,6 +615,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sync-extend-platform-fs"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "sync-extend-reconcile"
 version = "0.1.0"
 dependencies = [
@@ -629,6 +636,7 @@ dependencies = [
  "sync-extend-cas",
  "sync-extend-core-model",
  "sync-extend-journal",
+ "sync-extend-platform-fs",
  "thiserror",
  "windows-dpapi",
 ]

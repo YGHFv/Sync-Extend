@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core-model", "crates/cas", "crates/journal", "crates/reconcile", "crates/daemon"]
+members = ["crates/core-model", "crates/cas", "crates/journal", "crates/platform-fs", "crates/reconcile", "crates/daemon"]
 exclude = ["tests"]
 resolver = "2"
 

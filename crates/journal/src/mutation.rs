@@ -58,10 +58,29 @@ impl MutationIntent {
 pub enum MutationState {
     Prepared,
     Cancelled,
+    Executing,
+    Quarantined,
+    Committed,
+}
+
+impl MutationState {
+    pub fn active(self) -> bool {
+        matches!(self, Self::Prepared | Self::Executing | Self::Quarantined)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteExecution {
+    pub execution_id: EntryId,
+    pub directory_identity: ContentId,
+    pub owner_identity: ContentId,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Mutation {
     pub intent: MutationIntent,
     pub state: MutationState,
+    pub execution: Option<DeleteExecution>,
+    pub committed_snapshot: Option<SnapshotId>,
 }

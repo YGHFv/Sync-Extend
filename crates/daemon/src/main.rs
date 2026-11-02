@@ -78,7 +78,7 @@ enum Command {
         #[arg(long)]
         path: String,
     },
-    /// Finish durable outstanding publications without rolling back newer writes.
+    /// Resume authorized mutations/publications without rolling back newer writes.
     Recover {
         #[arg(long)]
         data_dir: PathBuf,
@@ -117,6 +117,18 @@ enum Command {
         data_dir: PathBuf,
         #[arg(long)]
         transaction: String,
+    },
+    /// Explicitly execute a prepared Windows local NTFS single-file delete; retain original.
+    ExecuteMutation {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        transaction: String,
+    },
+    /// Resume authorized delete executions, never automatically authorize preparations.
+    RecoverMutations {
+        #[arg(long)]
+        data_dir: PathBuf,
     },
     /// Validate configuration without starting any listener.
     CheckConfig {
@@ -244,6 +256,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut local = open(&data_dir)?;
             let snapshot = snapshot.parse()?;
             let path = PortablePath::new(path)?;
+            let executor_available = cfg!(windows) && matches!(&action, PrepareAction::Delete);
             let mutation = match action {
                 PrepareAction::Replace { source } => {
                     local.prepare_replace(&snapshot, &path, &source)?
@@ -254,7 +267,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             print(&serde_json::json!({
-                "mutation": mutation, "executor_available": false,
+                "mutation": mutation, "executor_available": executor_available,
                 "worktree_modified": false, "remote_backup_complete": false,
             }))?;
         }
@@ -272,6 +285,13 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             open(&data_dir)?.cancel_mutation(&transaction.parse()?)?;
             print(&serde_json::json!({"cancelled": true, "worktree_modified": false}))?;
         }
+        Command::ExecuteMutation {
+            data_dir,
+            transaction,
+        } => {
+            print(&open(&data_dir)?.execute_mutation(&transaction.parse()?)?)?;
+        }
+        Command::RecoverMutations { data_dir } => print(&open(&data_dir)?.recover_mutations()?)?,
         Command::Run {
             data_dir,
             scan_interval_secs,

@@ -16,7 +16,7 @@ pub struct MutationCheck {
     pub state: MutationState,
     pub baseline_valid: bool,
     pub executor_available: bool,
-    pub worktree_modified: bool,
+    pub worktree_modified: Option<bool>,
     pub remote_backup_complete: bool,
 }
 
@@ -28,7 +28,7 @@ impl LocalSpace {
             .is_empty()
         {
             return Err(ReconcileError::Invariant(
-                "prepared mutation requires explicit check/cancel; executor is unavailable",
+                "active mutation requires explicit execute/cancel or forward recovery",
             ));
         }
         Ok(())
@@ -252,8 +252,12 @@ impl LocalSpace {
             transaction_id: id.clone(),
             state: mutation.state,
             baseline_valid: valid,
-            executor_available: false,
-            worktree_modified: false,
+            executor_available: cfg!(windows) && intent.action == MutationAction::Delete && active,
+            worktree_modified: match mutation.state {
+                MutationState::Executing => None,
+                MutationState::Prepared | MutationState::Cancelled => Some(false),
+                MutationState::Quarantined | MutationState::Committed => Some(true),
+            },
             remote_backup_complete: false,
         })
     }

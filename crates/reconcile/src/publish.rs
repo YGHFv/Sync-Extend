@@ -156,6 +156,7 @@ impl LocalSpace {
 
     pub fn recover(&mut self) -> Result<Vec<PublishResult>> {
         self.verify_root()?;
+        self.recover_mutations()?;
         self.require_no_mutation()?;
         let publications = self.journal.outstanding_publications(&self.space_id)?;
         let mut results = Vec::new();

@@ -1,9 +1,11 @@
+mod delete;
 mod fault;
 mod filesystem;
 mod identity;
 mod mutation;
 mod publish;
 mod scan;
+pub use delete::DeleteResult;
 pub use mutation::MutationCheck;
 pub use publish::PublishResult;
 
@@ -84,6 +86,8 @@ pub struct Status {
     pub local_limits: LocalLimits,
     pub outstanding_mutations: usize,
     pub destructive_mutation_enabled: bool,
+    pub windows_delete_executor_available: bool,
+    pub mutation_executor_actions: Vec<&'static str>,
 }
 
 impl LocalSpace {
@@ -400,7 +404,13 @@ impl LocalSpace {
             protected_objects: self.journal.protected_objects()?.len(),
             local_limits: self.limits.clone(),
             outstanding_mutations: self.journal.outstanding_mutations(&self.space_id)?.len(),
-            destructive_mutation_enabled: false,
+            destructive_mutation_enabled: cfg!(windows),
+            windows_delete_executor_available: cfg!(windows),
+            mutation_executor_actions: if cfg!(windows) {
+                vec!["delete"]
+            } else {
+                vec![]
+            },
         })
     }
 
@@ -424,7 +434,7 @@ impl LocalSpace {
             {
                 return Err(ReconcileError::Invariant("mutation baseline mismatch"));
             }
-            if mutation.state == sync_extend_journal::MutationState::Prepared {
+            if mutation.state.active() {
                 for content in std::iter::once(intent.baseline_entry.content.as_ref().ok_or(
                     ReconcileError::Invariant("mutation baseline content missing"),
                 )?)

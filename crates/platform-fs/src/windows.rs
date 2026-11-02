@@ -1,0 +1,196 @@
+use crate::FileKey;
+use std::{
+    fs::{File, OpenOptions},
+    io,
+    mem::{offset_of, size_of},
+    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
+    path::Path,
+    ptr,
+};
+use windows_sys::Win32::{
+    Foundation::{GENERIC_READ, HANDLE},
+    Storage::FileSystem::{
+        FileIdInfo, FileRenameInfo, GetDriveTypeW, GetFileInformationByHandle,
+        GetFileInformationByHandleEx, GetVolumeInformationByHandleW, GetVolumePathNameW,
+        SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    },
+    System::WindowsProgramming::DRIVE_FIXED,
+};
+
+fn key(file: &File) -> io::Result<FileKey> {
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: file owns a live handle; info is an aligned, sized writable output.
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileIdInfo,
+            ptr::from_mut(&mut info).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(FileKey {
+        volume: info.VolumeSerialNumber,
+        id: u128::from_le_bytes(info.FileId.Identifier),
+    })
+}
+
+fn invalid(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, message)
+}
+
+fn regular(file: &File, directory: bool) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || (directory && !metadata.is_dir())
+        || (!directory && !metadata.is_file())
+    {
+        return Err(invalid(
+            "expected a real directory or regular non-reparse file",
+        ));
+    }
+    if !directory {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the handle is live and info is valid writable output storage.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if info.nNumberOfLinks != 1 {
+            return Err(invalid("delete executor requires a single-link file"));
+        }
+    }
+    Ok(())
+}
+
+fn wide(path: &Path) -> io::Result<Vec<u16>> {
+    let mut name: Vec<_> = path.as_os_str().encode_wide().collect();
+    if !path.is_absolute() || name.contains(&0) {
+        return Err(invalid("an absolute non-NUL path is required"));
+    }
+    name.push(0);
+    Ok(name)
+}
+
+fn local_ntfs(file: &File, path: &Path) -> io::Result<()> {
+    let name = wide(path)?;
+    let mut root = [0u16; 32768];
+    // SAFETY: name is terminated and root is a sized writable output buffer.
+    if unsafe { GetVolumePathNameW(name.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful GetVolumePathNameW returned a terminated volume path.
+    if unsafe { GetDriveTypeW(root.as_ptr()) } != DRIVE_FIXED {
+        return Err(invalid("delete executor requires a fixed local volume"));
+    }
+    let mut filesystem = [0u16; 32];
+    // SAFETY: handle is live; optional outputs are null and filesystem is sized.
+    let result = unsafe {
+        GetVolumeInformationByHandleW(
+            file.as_raw_handle() as HANDLE,
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            filesystem.as_mut_ptr(),
+            filesystem.len() as u32,
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if filesystem[..5] != [b'N' as u16, b'T' as u16, b'F' as u16, b'S' as u16, 0] {
+        return Err(invalid("delete executor requires NTFS"));
+    }
+    Ok(())
+}
+
+pub struct LockedDirectory {
+    file: File,
+}
+
+impl LockedDirectory {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        regular(&file, true)?;
+        Ok(Self { file })
+    }
+
+    pub fn key(&self) -> io::Result<FileKey> {
+        key(&self.file)
+    }
+}
+
+pub struct LockedFile {
+    file: File,
+}
+
+impl LockedFile {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .access_mode(GENERIC_READ | DELETE)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        regular(&file, false)?;
+        local_ntfs(&file, path)?;
+        Ok(Self { file })
+    }
+
+    pub fn key(&self) -> io::Result<FileKey> {
+        key(&self.file)
+    }
+
+    pub fn reader(&self) -> &File {
+        &self.file
+    }
+
+    pub fn rename_no_replace(&self, destination: &Path) -> io::Result<()> {
+        let name = wide(destination)?;
+        let name_bytes = name
+            .len()
+            .saturating_sub(1)
+            .checked_mul(2)
+            .ok_or_else(|| invalid("name too long"))?;
+        let length = offset_of!(FILE_RENAME_INFO, FileName)
+            .checked_add(name_bytes + 2)
+            .ok_or_else(|| invalid("name too long"))?
+            .max(size_of::<FILE_RENAME_INFO>());
+        let length_u32 = u32::try_from(length).map_err(|_| invalid("name too long"))?;
+        // Word storage supplies the alignment required by the ABI header.
+        let mut storage = vec![0usize; length.div_ceil(size_of::<usize>())];
+        let header = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        // SAFETY: storage is aligned and large enough for the header and UTF-16
+        // tail including a terminator required by the Win32 wrapper (not counted
+        // in FileNameLength). Name remains live. The live source handle owns
+        // DELETE access. RootDirectory is null; no destination replacement.
+        let result = unsafe {
+            ptr::write(header, FILE_RENAME_INFO::default());
+            (*header).FileNameLength = name_bytes as u32;
+            ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                ptr::addr_of_mut!((*header).FileName).cast(),
+                name.len(),
+            );
+            SetFileInformationByHandle(
+                self.file.as_raw_handle() as HANDLE,
+                FileRenameInfo,
+                header.cast(),
+                length_u32,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}

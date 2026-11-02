@@ -64,7 +64,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=3 => {}
+            1..=4 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -89,6 +89,11 @@ impl Journal {
         if version < 3 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-003.sql"))?;
+            tx.commit()?;
+        }
+        if version < 4 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-004.sql"))?;
             tx.commit()?;
         }
         Ok(Self { connection })
@@ -408,9 +413,43 @@ impl Journal {
         let state = match state.as_str() {
             "prepared" => MutationState::Prepared,
             "cancelled" => MutationState::Cancelled,
+            "executing" => MutationState::Executing,
+            "quarantined" => MutationState::Quarantined,
+            "committed" => MutationState::Committed,
             _ => return Err(JournalError::Invariant("unsupported mutation state")),
         };
-        Ok(Mutation { intent, state })
+        let (json, hash, root): (Option<String>, Option<String>, Option<String>) = self.connection.query_row(
+            "SELECT execution,execution_hash,committed_snapshot FROM mutations WHERE transaction_id=?1",
+            [id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let execution = match (json, hash) {
+            (None, None) if matches!(state, MutationState::Prepared | MutationState::Cancelled) => {
+                None
+            }
+            (Some(json), Some(hash))
+                if matches!(intent.action, MutationAction::Delete)
+                    && !matches!(state, MutationState::Prepared | MutationState::Cancelled)
+                    && json.len() <= MAX_OPERATION_BYTES
+                    && ContentId::hash(json.as_bytes()).as_str() == hash =>
+            {
+                Some(serde_json::from_str::<DeleteExecution>(&json)?)
+            }
+            _ => {
+                return Err(JournalError::Invariant(
+                    "mutation execution integrity mismatch",
+                ))
+            }
+        };
+        let committed_snapshot = root.map(|root| root.parse()).transpose()?;
+        if (state == MutationState::Committed) != committed_snapshot.is_some() {
+            return Err(JournalError::Invariant("mutation completion row mismatch"));
+        }
+        Ok(Mutation {
+            intent,
+            state,
+            execution,
+            committed_snapshot,
+        })
     }
 
     pub fn mutations(&self, space: &SpaceId) -> Result<Vec<Mutation>> {
@@ -427,7 +466,7 @@ impl Journal {
 
     pub fn outstanding_mutations(&self, space: &SpaceId) -> Result<Vec<Mutation>> {
         let mut statement = self.connection.prepare(
-            "SELECT transaction_id FROM mutations WHERE space_id=?1 AND state='prepared'",
+            "SELECT transaction_id FROM mutations WHERE space_id=?1 AND state IN ('prepared','executing','quarantined')",
         )?;
         let ids: Vec<String> = statement
             .query_map([space.as_str()], |r| r.get(0))?
@@ -447,7 +486,7 @@ impl Journal {
             ));
         }
         let mut expected = std::collections::BTreeSet::new();
-        if mutation.state == MutationState::Prepared {
+        if mutation.state.active() {
             for content in std::iter::once(
                 intent
                     .baseline_entry
@@ -476,6 +515,20 @@ impl Journal {
             return Err(JournalError::Invariant(
                 "mutation object protection mismatch",
             ));
+        }
+        if let Some(root) = &mutation.committed_snapshot {
+            let completed = self.snapshot(&intent.space_id, root)?;
+            if completed
+                .entries
+                .contains_key(&intent.baseline_entry.entry_id)
+                || !completed
+                    .tombstones
+                    .contains_key(&intent.baseline_entry.entry_id)
+            {
+                return Err(JournalError::Invariant(
+                    "mutation completion snapshot mismatch",
+                ));
+            }
         }
         Ok(())
     }
@@ -511,7 +564,7 @@ impl Journal {
             return Err(JournalError::Invariant("mutation baseline changed"));
         }
         tx.execute(
-            "INSERT INTO mutations VALUES (?1,?2,?3,?4,?5,'prepared')",
+            "INSERT INTO mutations (transaction_id,space_id,baseline_root,intent,intent_hash,state) VALUES (?1,?2,?3,?4,?5,'prepared')",
             params![
                 intent.transaction_id.as_str(),
                 intent.space_id.as_str(),
@@ -563,6 +616,59 @@ impl Journal {
             [id.as_str()],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn start_delete(
+        &mut self,
+        space: &SpaceId,
+        id: &EntryId,
+        execution: &DeleteExecution,
+    ) -> Result<()> {
+        let mutation = self.mutation(id)?;
+        self.verify_mutation_references(id)?;
+        if mutation.intent.space_id != *space
+            || mutation.state != MutationState::Prepared
+            || mutation.intent.action != MutationAction::Delete
+        {
+            return Err(JournalError::Invariant(
+                "only a prepared delete can execute",
+            ));
+        }
+        let json = serde_json::to_string(execution)?;
+        let tx = self.connection.transaction()?;
+        let root: String = tx.query_row(
+            "SELECT snapshot_id FROM current_manifests WHERE space_id=?1",
+            [space.as_str()],
+            |r| r.get(0),
+        )?;
+        if root != mutation.intent.baseline_root.as_str() {
+            return Err(JournalError::Invariant("mutation baseline changed"));
+        }
+        if tx.execute(
+            "UPDATE mutations SET state='executing',execution=?1,execution_hash=?2 WHERE transaction_id=?3 AND state='prepared'",
+            params![json, ContentId::hash(json.as_bytes()).as_str(), id.as_str()],
+        )? != 1 {
+            return Err(JournalError::Invariant("mutation state changed"));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_delete_quarantined(&mut self, space: &SpaceId, id: &EntryId) -> Result<()> {
+        let mutation = self.mutation(id)?;
+        if mutation.intent.space_id != *space
+            || mutation.state != MutationState::Executing
+            || mutation.intent.action != MutationAction::Delete
+        {
+            return Err(JournalError::Invariant("delete is not executing"));
+        }
+        if self.connection.execute(
+            "UPDATE mutations SET state='quarantined' WHERE transaction_id=?1 AND state='executing'",
+            [id.as_str()],
+        )? != 1 {
+            return Err(JournalError::Invariant("mutation state changed"));
+        }
         Ok(())
     }
 
@@ -641,7 +747,13 @@ impl Journal {
         operations: &[Operation],
         timestamp: u64,
     ) -> Result<SnapshotId> {
-        self.commit_local_inner(expected_root, manifest, operations, timestamp, None)
+        self.commit_local_inner(
+            expected_root,
+            manifest,
+            operations,
+            timestamp,
+            Completion::None,
+        )
     }
 
     pub fn commit_publication(
@@ -674,7 +786,51 @@ impl Journal {
             manifest,
             operations,
             timestamp,
-            Some(id),
+            Completion::Publication(id),
+        )
+    }
+
+    pub fn commit_delete(
+        &mut self,
+        id: &EntryId,
+        manifest: &Manifest,
+        operation: &Operation,
+        timestamp: u64,
+    ) -> Result<SnapshotId> {
+        let mutation = self.mutation(id)?;
+        self.verify_mutation_references(id)?;
+        let intent = &mutation.intent;
+        if mutation.state != MutationState::Quarantined
+            || intent.action != MutationAction::Delete
+            || operation.payload.space_id != intent.space_id
+            || operation.payload.change
+                != (Change::Delete {
+                    entry_id: intent.baseline_entry.entry_id.clone(),
+                })
+        {
+            return Err(JournalError::Invariant("invalid delete completion"));
+        }
+        let mut expected = self.snapshot(&intent.space_id, &intent.baseline_root)?;
+        expected.entries.remove(&intent.baseline_entry.entry_id);
+        expected.tombstones.insert(
+            intent.baseline_entry.entry_id.clone(),
+            operation.op_id.clone(),
+        );
+        expected.version_vector.observe(
+            operation.payload.origin_device_id.clone(),
+            operation.payload.origin_seq,
+        );
+        if &expected != manifest {
+            return Err(JournalError::Invariant(
+                "delete completion changed unrelated baseline entries",
+            ));
+        }
+        self.commit_local_inner(
+            Some(&intent.baseline_root),
+            manifest,
+            std::slice::from_ref(operation),
+            timestamp,
+            Completion::Mutation(id),
         )
     }
 
@@ -684,19 +840,26 @@ impl Journal {
         manifest: &Manifest,
         operations: &[Operation],
         timestamp: u64,
-        publication: Option<&EntryId>,
+        completion: Completion<'_>,
     ) -> Result<SnapshotId> {
         manifest.validate()?;
         let root = manifest.root()?;
         let tx = self.connection.transaction()?;
-        let mutation_active: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM mutations WHERE space_id=?1 AND state='prepared')",
-            [manifest.space_id.as_str()],
-            |r| r.get(0),
-        )?;
-        if mutation_active {
+        let mutation_active: Option<String> = tx.query_row(
+            "SELECT transaction_id FROM mutations WHERE space_id=?1 AND state IN ('prepared','executing','quarantined')",
+            [manifest.space_id.as_str()], |r| r.get(0),
+        ).optional()?;
+        let mutation = match completion {
+            Completion::Mutation(id) => Some(id),
+            _ => None,
+        };
+        let publication = match completion {
+            Completion::Publication(id) => Some(id),
+            _ => None,
+        };
+        if mutation_active.as_deref() != mutation.map(EntryId::as_str) {
             return Err(JournalError::Invariant(
-                "prepared mutation must be resolved first",
+                "active mutation must be resolved first",
             ));
         }
         let active: Option<String> = tx.query_row(
@@ -792,6 +955,18 @@ impl Journal {
                 [id.as_str()],
             )?;
         }
+        if let Some(id) = mutation {
+            if tx.execute(
+                "UPDATE mutations SET state='committed',committed_snapshot=?1 WHERE transaction_id=?2 AND state='quarantined'",
+                params![root.as_str(), id.as_str()],
+            )? != 1 {
+                return Err(JournalError::Invariant("mutation changed before completion"));
+            }
+            tx.execute(
+                "DELETE FROM mutation_objects WHERE transaction_id=?1",
+                [id.as_str()],
+            )?;
+        }
         tx.commit()?;
         Ok(root)
     }
@@ -809,6 +984,13 @@ impl Journal {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy)]
+enum Completion<'a> {
+    None,
+    Publication(&'a EntryId),
+    Mutation(&'a EntryId),
 }
 
 fn pin_snapshot(tx: &Transaction<'_>, root: &str, manifest: &Manifest) -> Result<()> {
@@ -891,4 +1073,4 @@ fn promote_pending(tx: &Transaction<'_>) -> Result<()> {
 mod publication;
 pub use publication::{Publication, PublicationIntent, PublicationState};
 mod mutation;
-pub use mutation::{Mutation, MutationAction, MutationIntent, MutationState};
+pub use mutation::{DeleteExecution, Mutation, MutationAction, MutationIntent, MutationState};
