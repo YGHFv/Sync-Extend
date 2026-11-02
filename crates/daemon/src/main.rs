@@ -100,7 +100,7 @@ enum Command {
         #[arg(long)]
         authorization: String,
     },
-    /// Audit durable single-use execution admissions; executor remains unavailable.
+    /// Audit durable single-use execution admissions and independent terminal states.
     GcExecutions {
         #[arg(long)]
         data_dir: PathBuf,
@@ -124,7 +124,14 @@ enum Command {
         #[arg(long)]
         execution: String,
     },
-    /// Audit disposal preparation/restoration metadata; executor is unavailable.
+    /// Explicitly dispose one prepared quarantine; pending readers retain its fence.
+    ExecuteGcDisposal {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        execution: String,
+    },
+    /// Audit disposal preparation/restoration/deletion without executing physical recovery.
     GcDisposals {
         #[arg(long)]
         data_dir: PathBuf,
@@ -476,6 +483,10 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             execution,
         } => print(&open(&data_dir)?.prepare_gc_disposal(&execution.parse()?)?)?,
         Command::GcDisposals { data_dir } => print(&open(&data_dir)?.gc_disposals()?)?,
+        Command::ExecuteGcDisposal {
+            data_dir,
+            execution,
+        } => print(&open(&data_dir)?.execute_gc_disposal(&execution.parse()?)?)?,
         Command::RestoreGcQuarantine {
             data_dir,
             execution,

@@ -21,6 +21,7 @@ pub struct GcExecutionIntent {
 pub enum GcExecutionState {
     Fenced,
     Aborted,
+    Deleted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -28,6 +29,7 @@ pub struct GcExecutionAudit {
     pub intent: GcExecutionIntent,
     pub state: GcExecutionState,
     pub aborted_at_watermark_ms: Option<u64>,
+    pub deleted_at_watermark_ms: Option<u64>,
     pub content_fenced: bool,
     pub deletion_authorized: bool,
     pub sweep_available: bool,
@@ -38,7 +40,8 @@ impl Journal {
     pub fn require_cas_access(&self, content: &ContentId) -> Result<()> {
         let fenced: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM gc_executions e WHERE e.content_id=?1
-                AND NOT EXISTS (SELECT 1 FROM gc_execution_aborts WHERE execution_id=e.execution_id))",
+                AND NOT EXISTS (SELECT 1 FROM gc_execution_aborts WHERE execution_id=e.execution_id)
+                AND NOT EXISTS (SELECT 1 FROM gc_execution_deletions WHERE execution_id=e.execution_id))",
             [content.as_str()], |r| r.get(0),
         )?;
         if fenced {
@@ -66,6 +69,12 @@ impl Journal {
                 WHERE e.execution_id IS NULL)", [], |r| r.get(0))?;
         if orphan {
             return Err(JournalError::Invariant("orphan GC execution abort"));
+        }
+        let orphan_deleted: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gc_execution_deletions d LEFT JOIN gc_executions e USING(execution_id) WHERE e.execution_id IS NULL)",
+            [], |r| r.get(0))?;
+        if orphan_deleted {
+            return Err(JournalError::Invariant("orphan GC deletion terminal"));
         }
         let mut statement = self.connection.prepare(
             "SELECT execution_id,authorization_id,content_id,
@@ -115,10 +124,21 @@ impl Journal {
                     |r| r.get(0),
                 )
                 .optional()?;
+            let deleted: Option<i64> = self.connection.query_row(
+                "SELECT deleted_at_watermark_ms FROM gc_execution_deletions WHERE execution_id=?1",
+                [&id], |r| r.get(0)).optional()?;
+            if (deleted.is_some() && aborted.is_some())
+                || deleted.is_some_and(|t| t < time || watermark.is_none_or(|w| t > w))
+            {
+                return Err(JournalError::Invariant(
+                    "GC deletion terminal time mismatch",
+                ));
+            }
             if aborted.is_some_and(|t| t < time || watermark.is_none_or(|w| t > w)) {
                 return Err(JournalError::Invariant("GC execution abort time mismatch"));
             }
             if aborted.is_none()
+                && deleted.is_none()
                 && (!active.insert(content.clone())
                     || self.gc_protected(&intent.authorization.mark.content_id)?)
             {
@@ -130,11 +150,14 @@ impl Journal {
                 intent,
                 state: if aborted.is_some() {
                     GcExecutionState::Aborted
+                } else if deleted.is_some() {
+                    GcExecutionState::Deleted
                 } else {
                     GcExecutionState::Fenced
                 },
                 aborted_at_watermark_ms: aborted.map(|t| t as u64),
-                content_fenced: aborted.is_none(),
+                deleted_at_watermark_ms: deleted.map(|t| t as u64),
+                content_fenced: aborted.is_none() && deleted.is_none(),
                 deletion_authorized: false,
                 sweep_available: false,
                 gc_enabled: false,
@@ -251,6 +274,9 @@ impl Journal {
         if old.state == GcExecutionState::Aborted {
             tx.commit()?;
             return Ok(old);
+        }
+        if old.state == GcExecutionState::Deleted {
+            return Err(JournalError::Invariant("deleted GC execution cannot abort"));
         }
         self.connection.execute(
             "INSERT INTO gc_execution_aborts SELECT ?1,observed_at_ms FROM gc_clock WHERE singleton=1",

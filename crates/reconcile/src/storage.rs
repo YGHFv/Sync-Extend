@@ -277,7 +277,7 @@ impl LocalSpace {
             gc_disposal_records: disposals.len(),
             pending_gc_disposals: disposals.iter().filter(|d| d.content_fenced).count(),
             explicit_gc_disposal_preparation_available: cfg!(windows),
-            disposition_executor_available: false,
+            disposition_executor_available: cfg!(windows),
             pruned_snapshots,
             explicit_snapshot_pruning_available: true,
             remote_backup_complete: false,

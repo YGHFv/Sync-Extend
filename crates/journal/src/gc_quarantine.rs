@@ -24,6 +24,7 @@ pub enum GcQuarantineState {
     Quarantined,
     RestorePending,
     Restored,
+    Deleted,
 }
 
 impl GcQuarantineState {
@@ -33,6 +34,7 @@ impl GcQuarantineState {
             Self::Quarantined => "quarantined",
             Self::RestorePending => "restore_pending",
             Self::Restored => "restored",
+            Self::Deleted => "deleted",
         }
     }
 }
@@ -109,6 +111,9 @@ impl Journal {
             )?;
             let state = match state.as_str() {
                 "prepared" => GcQuarantineState::Prepared,
+                "quarantined" if execution.state == GcExecutionState::Deleted => {
+                    GcQuarantineState::Deleted
+                }
                 "quarantined" => GcQuarantineState::Quarantined,
                 "restore_pending" => GcQuarantineState::RestorePending,
                 "restored" => GcQuarantineState::Restored,
@@ -126,6 +131,8 @@ impl Journal {
                     .is_some_and(|time| time < intent.prepared_at_watermark_ms)
                 || (state == GcQuarantineState::Restored)
                     != (execution.state == GcExecutionState::Aborted)
+                || (state == GcQuarantineState::Deleted)
+                    != (execution.state == GcExecutionState::Deleted)
             {
                 return Err(JournalError::Invariant("GC quarantine integrity mismatch"));
             }
@@ -263,7 +270,10 @@ impl Journal {
             .into_iter()
             .find(|q| q.intent.execution_id == *id)
             .ok_or(JournalError::Invariant("unknown GC quarantine"))?;
-        if old.state == GcQuarantineState::Restored {
+        if matches!(
+            old.state,
+            GcQuarantineState::Restored | GcQuarantineState::Deleted
+        ) {
             tx.commit().map_err(JournalError::from)?;
             return Ok((None, old));
         }

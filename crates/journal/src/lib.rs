@@ -65,7 +65,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=14 => {}
+            1..=15 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -145,6 +145,11 @@ impl Journal {
         if version < 14 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-014.sql"))?;
+            tx.commit()?;
+        }
+        if version < 15 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-015.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -1471,4 +1476,4 @@ pub use cas_access::CasAccessGuard;
 mod gc_quarantine;
 pub use gc_quarantine::{GcQuarantineAudit, GcQuarantineIntent, GcQuarantineState};
 mod gc_disposal;
-pub use gc_disposal::{GcDisposalAudit, GcDisposalIntent, GcDisposalState};
+pub use gc_disposal::{GcDisposalAudit, GcDisposalIntent, GcDisposalState, GcDisposalStep};

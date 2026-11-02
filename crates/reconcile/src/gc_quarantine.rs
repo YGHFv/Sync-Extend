@@ -47,11 +47,26 @@ mod windows {
     struct Guards {
         _directories: Vec<LockedDirectory>,
         owner: GuardedReadFile,
-        object: LockedFile,
+        object: Option<LockedFile>,
+        _original_guard: Option<GuardedReadFile>,
         original: PathBuf,
         quarantine: PathBuf,
         at_original: bool,
         execution: GcExecutionAudit,
+    }
+    impl Guards {
+        fn file(&self) -> Result<&LockedFile> {
+            self.object
+                .as_ref()
+                .ok_or(ReconcileError::Invariant("GC payload handle missing"))
+        }
+    }
+    fn slot_present(path: &std::path::Path) -> Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
     fn paths(local: &LocalSpace, q: &GcQuarantineIntent) -> (PathBuf, PathBuf) {
         let tmp = local.data_dir.join("cas/tmp");
@@ -60,7 +75,12 @@ mod windows {
             tmp.join(format!("gc-{}.object", q.plan_id)),
         )
     }
-    fn inspect(local: &LocalSpace, e: &GcExecutionAudit, q: &GcQuarantineIntent) -> Result<Guards> {
+    fn inspect(
+        local: &LocalSpace,
+        e: &GcExecutionAudit,
+        q: &GcQuarantineIntent,
+        allow_absent: bool,
+    ) -> Result<Guards> {
         local.verify()?;
         local.storage_report()?;
         let original = local
@@ -96,24 +116,41 @@ mod windows {
         if bytes != format!("{}:{}", q.execution_id, q.plan_id).as_bytes() {
             return Err(ReconcileError::Invariant("GC quarantine owner mismatch"));
         }
-        let at_original = original.try_exists()?;
-        if at_original == quarantine.try_exists()? {
+        let at_original = slot_present(&original)?;
+        let at_quarantine = slot_present(&quarantine)?;
+        if (at_original && at_quarantine) || (!allow_absent && !at_original && !at_quarantine) {
             return Err(ReconcileError::Invariant(
                 "GC quarantine object absent or ambiguous",
             ));
         }
-        let path = if at_original { &original } else { &quarantine };
-        let object = LockedFile::open(path)?;
-        crate::gc_preflight::windows::verify_reader(
-            object.reader(),
-            identity(&object)?,
-            path,
-            &e.intent.authorization.mark,
-        )?;
+        let mut original_guard = None;
+        let object = if allow_absent && !at_quarantine {
+            if at_original {
+                let file = GuardedReadFile::open(&original)?;
+                if ContentId::hash(file.key()?.to_string().as_bytes())
+                    == e.intent.authorization.mark.observation.physical_identity
+                {
+                    return Err(ReconcileError::Invariant("GC original reappeared"));
+                }
+                original_guard = Some(file);
+            }
+            None
+        } else {
+            let path = if at_original { &original } else { &quarantine };
+            let object = LockedFile::open(path)?;
+            crate::gc_preflight::windows::verify_reader(
+                object.reader(),
+                identity(&object)?,
+                path,
+                &e.intent.authorization.mark,
+            )?;
+            Some(object)
+        };
         Ok(Guards {
             _directories: directories,
             owner,
             object,
+            _original_guard: original_guard,
             original,
             quarantine,
             at_original,
@@ -162,7 +199,7 @@ mod windows {
             owner_identity,
             ..q
         };
-        let guards = inspect(local, e, &q)?;
+        let guards = inspect(local, e, &q, false)?;
         checkpoint("after_gc_quarantine_owner");
         Ok((guards, q))
     }
@@ -199,7 +236,7 @@ mod windows {
                         local.limits.max_storage_entries,
                         crate::now_ms,
                     )?;
-                    guards.object.rename_no_replace(&guards.quarantine)?;
+                    guards.file()?.rename_no_replace(&guards.quarantine)?;
                     checkpoint("after_gc_quarantine_rename");
                     verify_guards(local, guards, &q.intent, &guards.quarantine)?;
                 }
@@ -215,13 +252,13 @@ mod windows {
                 if !guards.at_original {
                     checkpoint("before_gc_quarantine_restore");
                     verify_guards(local, guards, &q.intent, &guards.quarantine)?;
-                    guards.object.rename_no_replace(&guards.original)?;
+                    guards.file()?.rename_no_replace(&guards.original)?;
                     checkpoint("after_gc_quarantine_restore");
                     verify_guards(local, guards, &q.intent, &guards.original)?;
                 }
                 Ok(GcQuarantineState::Restored)
             }
-            GcQuarantineState::Restored => Ok(q.state),
+            GcQuarantineState::Restored | GcQuarantineState::Deleted => Ok(q.state),
         }
     }
     fn verify_guards(
@@ -230,6 +267,15 @@ mod windows {
         q: &GcQuarantineIntent,
         path: &std::path::Path,
     ) -> Result<()> {
+        verify_namespace(local, guards, q)?;
+        crate::gc_preflight::windows::verify_reader(
+            guards.file()?.reader(),
+            identity(guards.file()?)?,
+            path,
+            &guards.execution.intent.authorization.mark,
+        )
+    }
+    fn verify_namespace(local: &LocalSpace, guards: &Guards, q: &GcQuarantineIntent) -> Result<()> {
         for directory in &guards._directories {
             directory.require_case_insensitive()?;
         }
@@ -247,14 +293,121 @@ mod windows {
         if bytes != format!("{}:{}", q.execution_id, q.plan_id).as_bytes() {
             return Err(ReconcileError::Invariant("GC quarantine owner mismatch"));
         }
-        crate::gc_preflight::windows::verify_reader(
-            guards.object.reader(),
-            identity(&guards.object)?,
-            path,
-            &guards.execution.intent.authorization.mark,
-        )
+        Ok(())
+    }
+    fn verify_absence(
+        local: &LocalSpace,
+        guards: &mut Guards,
+        q: &GcQuarantineIntent,
+    ) -> Result<()> {
+        verify_namespace(local, guards, q)?;
+        if slot_present(&guards.quarantine)? {
+            return Err(ReconcileError::Invariant("GC quarantine reappeared"));
+        }
+        if slot_present(&guards.original)? && guards._original_guard.is_none() {
+            let original = GuardedReadFile::open(&guards.original)?;
+            if ContentId::hash(original.key()?.to_string().as_bytes())
+                == guards
+                    .execution
+                    .intent
+                    .authorization
+                    .mark
+                    .observation
+                    .physical_identity
+            {
+                return Err(ReconcileError::Invariant("GC original reappeared"));
+            }
+            guards._original_guard = Some(original);
+        }
+        Ok(())
     }
     impl LocalSpace {
+        pub(crate) fn execute_gc_disposal_platform(
+            &self,
+            id: &EntryId,
+        ) -> Result<sync_extend_journal::GcDisposalAudit> {
+            use sync_extend_journal::{GcDisposalState, GcDisposalStep};
+            let old = self
+                .gc_disposals()?
+                .into_iter()
+                .find(|d| d.intent.execution_id == *id)
+                .ok_or(ReconcileError::Invariant("GC disposal preparation missing"))?;
+            if old.state == GcDisposalState::RestorePending {
+                self.gc_quarantine_platform(id, true)?;
+                return self
+                    .gc_disposals()?
+                    .into_iter()
+                    .find(|d| d.intent.execution_id == *id)
+                    .ok_or(ReconcileError::Invariant("GC disposal disappeared"));
+            }
+            checkpoint("before_gc_disposition");
+            let (guards, audit) = self.journal.with_gc_disposition(
+                &self.space_id,
+                id,
+                self.limits.max_storage_entries,
+                |e, d| {
+                    checkpoint("after_gc_disposition_journal_lock");
+                    let guards = inspect(self, e, &d.intent.quarantine, true)?;
+                    checkpoint("after_gc_disposition_file_lock");
+                    Ok(guards)
+                },
+                (
+                    |guards: &mut Guards, d: &sync_extend_journal::GcDisposalAudit| {
+                        if guards.object.is_none() {
+                            verify_absence(self, guards, &d.intent.quarantine)?;
+                            checkpoint("after_gc_disposition_absence");
+                            verify_absence(self, guards, &d.intent.quarantine)?;
+                            return Ok(GcDisposalStep::Deleted);
+                        }
+                        checkpoint("before_gc_disposition_request");
+                        verify_guards(self, guards, &d.intent.quarantine, &guards.quarantine)?;
+                        if self.journal.gc_disposition_requires_restore(
+                            &self.space_id,
+                            id,
+                            self.limits.max_storage_entries,
+                            crate::now_ms,
+                        )? {
+                            return Ok(GcDisposalStep::RestorePending);
+                        }
+                        guards.file()?.delete_on_close()?;
+                        checkpoint("after_gc_disposition_request");
+                        drop(guards.object.take());
+                        checkpoint("after_gc_disposition_close");
+                        verify_namespace(self, guards, &d.intent.quarantine)?;
+                        match slot_present(&guards.quarantine) {
+                            Ok(false) => {}
+                            Ok(true) => return Ok(GcDisposalStep::Pending),
+                            Err(ReconcileError::Io(error))
+                                if error
+                                    .raw_os_error()
+                                    .is_some_and(|n| matches!(n, 5 | 32 | 33 | 303)) =>
+                            {
+                                return Ok(GcDisposalStep::Pending)
+                            }
+                            Err(error) => return Err(error),
+                        }
+                        verify_absence(self, guards, &d.intent.quarantine)?;
+                        checkpoint("after_gc_disposition_absence");
+                        verify_absence(self, guards, &d.intent.quarantine)?;
+                        Ok(GcDisposalStep::Deleted)
+                    },
+                    |guards: &mut Guards, d: &sync_extend_journal::GcDisposalAudit| {
+                        verify_absence(self, guards, &d.intent.quarantine)
+                    },
+                ),
+            )?;
+            checkpoint("after_gc_disposition_commit");
+            drop(guards);
+            if audit.state == GcDisposalState::RestorePending {
+                self.gc_quarantine_platform(id, true)?;
+                return self
+                    .gc_disposals()?
+                    .into_iter()
+                    .find(|d| d.intent.execution_id == *id)
+                    .ok_or(ReconcileError::Invariant("GC disposal disappeared"));
+            }
+            Ok(audit)
+        }
         pub(crate) fn prepare_gc_disposal_platform(
             &self,
             id: &EntryId,
@@ -267,7 +420,7 @@ mod windows {
                 crate::now_ms,
                 |e, q| {
                     checkpoint("after_gc_disposal_journal_lock");
-                    let guards = inspect(self, e, &q.intent)?;
+                    let guards = inspect(self, e, &q.intent, false)?;
                     if guards.at_original {
                         return Err(ReconcileError::Invariant(
                             "GC disposal object not quarantined",
@@ -292,7 +445,10 @@ mod windows {
                 .into_iter()
                 .find(|q| q.intent.execution_id == *id)
             {
-                if q.state == GcQuarantineState::Restored {
+                if matches!(
+                    q.state,
+                    GcQuarantineState::Restored | GcQuarantineState::Deleted
+                ) {
                     return Ok(q);
                 }
             } else {
@@ -316,7 +472,7 @@ mod windows {
                     id,
                     (self.limits.max_storage_entries, restore),
                     crate::now_ms,
-                    |e, q| inspect(self, e, &q.intent),
+                    |e, q| inspect(self, e, &q.intent, false),
                     |g, q, r| apply(self, g, q, r),
                 )?;
                 checkpoint("after_gc_quarantine_step");

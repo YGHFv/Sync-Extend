@@ -24,6 +24,7 @@ pub enum GcDisposalState {
     DeletePending,
     RestorePending,
     Restored,
+    Deleted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -31,11 +32,19 @@ pub struct GcDisposalAudit {
     pub intent: GcDisposalIntent,
     pub state: GcDisposalState,
     pub restored_at_watermark_ms: Option<u64>,
+    pub deleted_at_watermark_ms: Option<u64>,
     pub content_fenced: bool,
     pub deletion_authorized: bool,
     pub disposition_executor_available: bool,
     pub sweep_available: bool,
     pub gc_enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GcDisposalStep {
+    Deleted,
+    RestorePending,
+    Pending,
 }
 
 impl Journal {
@@ -57,6 +66,22 @@ impl Journal {
             [], |r| r.get(0))?;
         if orphan {
             return Err(JournalError::Invariant("orphan GC disposal restoration"));
+        }
+        if executions.iter().any(|e| {
+            e.state == GcExecutionState::Deleted
+                && !quarantines
+                    .iter()
+                    .any(|q| q.intent.execution_id == e.intent.execution_id)
+        }) {
+            return Err(JournalError::Invariant(
+                "deleted GC execution quarantine missing",
+            ));
+        }
+        let missing_disposal: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gc_execution_deletions t LEFT JOIN gc_disposals d USING(execution_id) WHERE d.execution_id IS NULL)",
+            [], |r|r.get(0))?;
+        if missing_disposal {
+            return Err(JournalError::Invariant("deleted GC disposal missing"));
         }
         let mut statement = self.connection.prepare(
             "SELECT execution_id,disposal_id,CASE WHEN length(CAST(intent AS BLOB))<=4096 THEN intent ELSE '' END,intent_hash,admitted_at_ms FROM gc_disposals ORDER BY admitted_at_ms,execution_id",
@@ -106,6 +131,9 @@ impl Journal {
                 || q.state == GcQuarantineState::Prepared
                 || (restored.is_some() != (q.state == GcQuarantineState::Restored))
                 || (restored.is_some() != (e.state == GcExecutionState::Aborted))
+                || (q.state == GcQuarantineState::Deleted) != (e.state == GcExecutionState::Deleted)
+                || e.deleted_at_watermark_ms
+                    .is_some_and(|t| t < intent.admitted_at_ms)
                 || restored.is_some_and(|r| {
                     r < time || r > watermark || Some(r as u64) != e.aborted_at_watermark_ms
                 })
@@ -114,7 +142,9 @@ impl Journal {
             }
             audits.push(GcDisposalAudit {
                 intent,
-                state: if restored.is_some() {
+                state: if e.state == GcExecutionState::Deleted {
+                    GcDisposalState::Deleted
+                } else if restored.is_some() {
                     GcDisposalState::Restored
                 } else if q.state == GcQuarantineState::RestorePending {
                     GcDisposalState::RestorePending
@@ -122,14 +152,127 @@ impl Journal {
                     GcDisposalState::DeletePending
                 },
                 restored_at_watermark_ms: restored.map(|r| r as u64),
-                content_fenced: restored.is_none(),
+                deleted_at_watermark_ms: e.deleted_at_watermark_ms,
+                content_fenced: e.content_fenced,
                 deletion_authorized: false,
-                disposition_executor_available: false,
+                disposition_executor_available: cfg!(windows),
                 sweep_available: false,
                 gc_enabled: false,
             });
         }
         Ok(audits)
+    }
+
+    /// Denied authority selects restoration; clock rollback still defers new deletion.
+    pub fn gc_disposition_requires_restore<E>(
+        &self,
+        space: &SpaceId,
+        id: &EntryId,
+        max: usize,
+        now: impl Fn() -> std::result::Result<u64, E>,
+    ) -> std::result::Result<bool, E>
+    where
+        E: From<JournalError>,
+    {
+        self.audit_gc_owners(space, max)?;
+        let e = self
+            .gc_executions(space, max)?
+            .into_iter()
+            .find(|e| e.intent.execution_id == *id)
+            .ok_or(JournalError::Invariant("unknown GC execution"))?;
+        if !e.content_fenced {
+            return Err(JournalError::Invariant("GC execution is terminal").into());
+        }
+        let revoked: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM gc_revocations WHERE authorization_id=?1)",
+                [e.intent.authorization.authorization_id.as_str()],
+                |r| r.get(0),
+            )
+            .map_err(JournalError::from)?;
+        let mark = self
+            .gc_marks(space, max)?
+            .into_iter()
+            .find(|m| m.intent.mark_id == e.intent.authorization.mark.mark_id)
+            .ok_or(JournalError::Invariant("GC execution mark missing"))?;
+        if revoked || mark.state != crate::GcState::Marked {
+            return Ok(true);
+        }
+        let time = now()?;
+        self.gc_observe_clock(time, max)?;
+        if time >= e.intent.authorization.expires_at_ms {
+            return Ok(true);
+        }
+        self.recheck_gc_execution_authority(space, id, max, now)?;
+        Ok(false)
+    }
+
+    /// Apply one explicit pending step while retaining namespace and CAS guards.
+    /// Deleted is caller evidence of exact absence, never request-success evidence.
+    pub fn with_gc_disposition<T, E>(
+        &self,
+        space: &SpaceId,
+        id: &EntryId,
+        max: usize,
+        inspect: impl FnOnce(&GcExecutionAudit, &GcDisposalAudit) -> std::result::Result<T, E>,
+        steps: (
+            impl FnOnce(&mut T, &GcDisposalAudit) -> std::result::Result<GcDisposalStep, E>,
+            impl FnOnce(&mut T, &GcDisposalAudit) -> std::result::Result<(), E>,
+        ),
+    ) -> std::result::Result<(Option<(CasAccessGuard, T)>, GcDisposalAudit), E>
+    where
+        E: From<JournalError>,
+    {
+        let (apply, verify_absence) = steps;
+        let mut coordination = self.acquire_cas_coordination()?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+            .map_err(JournalError::from)?;
+        let d = self
+            .gc_disposals(space, max)?
+            .into_iter()
+            .find(|d| d.intent.execution_id == *id)
+            .ok_or(JournalError::Invariant("GC disposal preparation missing"))?;
+        if matches!(
+            d.state,
+            GcDisposalState::Restored | GcDisposalState::Deleted
+        ) {
+            tx.commit().map_err(JournalError::from)?;
+            return Ok((None, d));
+        }
+        if d.state != GcDisposalState::DeletePending {
+            return Err(
+                JournalError::Invariant("GC disposal requires explicit restoration").into(),
+            );
+        }
+        self.audit_gc_owners(space, max)?;
+        let e = self
+            .gc_executions(space, max)?
+            .into_iter()
+            .find(|e| e.intent.execution_id == *id)
+            .ok_or(JournalError::Invariant("GC disposal execution missing"))?;
+        let mut guards = inspect(&e, &d)?;
+        coordination.try_exclusive()?;
+        match apply(&mut guards, &d)? {
+            GcDisposalStep::Deleted => {
+                self.audit_gc_owners(space, max)?;
+                verify_absence(&mut guards, &d)?;
+                tx.execute("INSERT INTO gc_execution_deletions SELECT ?1,observed_at_ms FROM gc_clock WHERE singleton=1",[id.as_str()])
+                    .map_err(JournalError::from)?;
+            }
+            GcDisposalStep::RestorePending => {
+                tx.execute("UPDATE gc_quarantines SET state='restore_pending' WHERE execution_id=?1 AND state='quarantined'",[id.as_str()])
+                    .map_err(JournalError::from)?;
+            }
+            GcDisposalStep::Pending => {}
+        }
+        let audit = self
+            .gc_disposals(space, max)?
+            .into_iter()
+            .find(|d| d.intent.execution_id == *id)
+            .ok_or(JournalError::Invariant("GC disposal disappeared"))?;
+        tx.commit().map_err(JournalError::from)?;
+        Ok((Some((coordination, guards)), audit))
     }
 
     /// Commit a single-use pre-disposition record only; caller performs no deletion.
