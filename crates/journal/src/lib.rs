@@ -64,7 +64,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=10 => {}
+            1..=11 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -124,6 +124,11 @@ impl Journal {
         if version < 10 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-010.sql"))?;
+            tx.commit()?;
+        }
+        if version < 11 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-011.sql"))?;
             tx.commit()?;
         }
         Ok(Self { connection })
@@ -1307,7 +1312,8 @@ fn check_storage_metadata_limit(
             + (SELECT count(*) FROM cleanup_plans) + (SELECT count(*) FROM read_leases)
             + (SELECT count(*) FROM read_lease_objects) + (SELECT count(*) FROM snapshot_prunings)
             + (SELECT 2*count(*) FROM gc_marks) + (SELECT count(*) FROM gc_cancellations)
-            + (SELECT count(*) FROM gc_clock),
+            + (SELECT count(*) FROM gc_clock) + (SELECT count(*) FROM gc_authorizations)
+            + (SELECT count(*) FROM gc_revocations),
             (SELECT coalesce(sum(length(CAST(manifest AS BLOB))),0) FROM snapshots)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))
                 + coalesce(length(CAST(execution AS BLOB)),0)),0) FROM mutations)
@@ -1315,7 +1321,8 @@ fn check_storage_metadata_limit(
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM cleanup_plans)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM read_leases)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM snapshot_prunings)
-            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_marks)",
+            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_marks)
+            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_authorizations)",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1429,3 +1436,8 @@ mod snapshot_pruning;
 pub use snapshot_pruning::{SnapshotAudit, SnapshotPruning};
 mod gc_mark;
 pub use gc_mark::{gc_grace_until, GcCheck, GcMark, GcMarkAudit, GcObservation, GcState};
+mod gc_authorization;
+pub use gc_authorization::{
+    gc_authorization_expiry, GcAuthorization, GcAuthorizationAudit, GcAuthorizationState,
+    GcBoundary,
+};

@@ -79,6 +79,34 @@ enum Command {
         #[arg(long)]
         mark: String,
     },
+    /// Persist one guarded GC intent for a future executor; never delete.
+    AuthorizeGcMark {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        mark: String,
+        #[arg(long, default_value_t=300, value_parser=clap::value_parser!(u64).range(1..=3600))]
+        ttl_secs: u64,
+    },
+    /// Audit GC authorization intents at the durable clock watermark.
+    GcAuthorizations {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Permanently revoke one GC intent without changing any file or pin.
+    RevokeGcAuthorization {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        authorization: String,
+    },
+    /// Recheck a durable GC intent under transient guards; no deletion.
+    CheckGcAuthorization {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        authorization: String,
+    },
     /// List immutable snapshot audit metadata, including explicitly pruned non-restorable history.
     SnapshotAudit {
         #[arg(long)]
@@ -374,6 +402,26 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::PreflightGcMark { data_dir, mark } => {
             print(&open(&data_dir)?.preflight_gc_mark(&mark.parse()?)?)?;
+        }
+        Command::AuthorizeGcMark {
+            data_dir,
+            mark,
+            ttl_secs,
+        } => {
+            print(&open(&data_dir)?.authorize_gc_mark(&mark.parse()?, ttl_secs)?)?;
+        }
+        Command::GcAuthorizations { data_dir } => print(&open(&data_dir)?.gc_authorizations()?)?,
+        Command::RevokeGcAuthorization {
+            data_dir,
+            authorization,
+        } => {
+            print(&open(&data_dir)?.revoke_gc_authorization(&authorization.parse()?)?)?;
+        }
+        Command::CheckGcAuthorization {
+            data_dir,
+            authorization,
+        } => {
+            print(&open(&data_dir)?.check_gc_authorization(&authorization.parse()?)?)?;
         }
         Command::SnapshotAudit { data_dir } => print(&open(&data_dir)?.snapshot_audit()?)?,
         Command::PruneSnapshot {

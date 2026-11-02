@@ -29,7 +29,7 @@ impl LocalSpace {
 }
 
 #[cfg(windows)]
-mod windows {
+pub(crate) mod windows {
     use super::*;
     use crate::{
         fault::checkpoint, filesystem::physical_identity, guarded_mutation::directory_chain,
@@ -41,12 +41,53 @@ mod windows {
         time::UNIX_EPOCH,
     };
     use sync_extend_core_model::ContentId;
-    use sync_extend_journal::GcMark;
+    use sync_extend_journal::{GcBoundary, GcMark};
     use sync_extend_platform_fs::{GuardedReadFile, LockedDirectory};
 
-    struct Guards {
+    pub(crate) struct Guards {
         _file: GuardedReadFile,
         _directories: Vec<LockedDirectory>,
+    }
+
+    pub(crate) fn inspect(
+        local: &LocalSpace,
+        mark: &GcMark,
+        phase: &str,
+    ) -> Result<(Guards, GcBoundary)> {
+        local.storage_report()?;
+        local.verify()?;
+        let path = local.cas.object_path(&mark.content_id);
+        let parent = path
+            .parent()
+            .ok_or(ReconcileError::Invariant("GC parent missing"))?;
+        let cas = local.data_dir.join("cas");
+        let mut directories = directory_chain(&local.worktree)?;
+        directories.extend(directory_chain(parent)?);
+        for directory in &directories {
+            directory.require_case_insensitive()?;
+        }
+        local.verify_root()?;
+        let boundary = GcBoundary {
+            worktree: physical_identity(&local.worktree)?,
+            cas: physical_identity(&cas)?,
+            objects: physical_identity(&cas.join("objects"))?,
+            shard: physical_identity(parent)?,
+        };
+        let file = GuardedReadFile::open(&path)?;
+        verify(&file, &path, mark)?;
+        checkpoint(phase);
+        verify(&file, &path, mark)?;
+        for directory in &directories {
+            directory.require_case_insensitive()?;
+        }
+        local.verify_root()?;
+        Ok((
+            Guards {
+                _file: file,
+                _directories: directories,
+            },
+            boundary,
+        ))
     }
 
     fn verify(file: &GuardedReadFile, path: &Path, mark: &GcMark) -> Result<()> {
@@ -102,9 +143,6 @@ mod windows {
         pub(super) fn preflight_gc_platform(&mut self, id: &EntryId) -> Result<GcPreflight> {
             self.storage_report()?;
             self.verify()?;
-            let worktree = self.worktree.clone();
-            let root_identity = self.root_identity.physical.clone();
-            let cas = &self.cas;
             checkpoint("before_gc_preflight");
             let (guards, checked_at_ms) = self.journal.with_gc_preflight(
                 &self.space_id,
@@ -113,34 +151,7 @@ mod windows {
                 now_ms,
                 |mark| -> Result<Guards> {
                     checkpoint("after_gc_preflight_journal_lock");
-                    self.storage_report()?;
-                    self.verify()?;
-                    let path = cas.object_path(&mark.content_id);
-                    let parent = path
-                        .parent()
-                        .ok_or(ReconcileError::Invariant("GC parent missing"))?;
-                    let mut directories = directory_chain(&worktree)?;
-                    directories.extend(directory_chain(parent)?);
-                    for directory in &directories {
-                        directory.require_case_insensitive()?;
-                    }
-                    if physical_identity(&worktree)? != root_identity {
-                        return Err(ReconcileError::Unstable);
-                    }
-                    let file = GuardedReadFile::open(&path)?;
-                    verify(&file, &path, mark)?;
-                    checkpoint("after_gc_preflight_file_lock");
-                    verify(&file, &path, mark)?;
-                    for directory in &directories {
-                        directory.require_case_insensitive()?;
-                    }
-                    if physical_identity(&worktree)? != root_identity {
-                        return Err(ReconcileError::Unstable);
-                    }
-                    Ok(Guards {
-                        _file: file,
-                        _directories: directories,
-                    })
+                    Ok(inspect(self, mark, "after_gc_preflight_file_lock")?.0)
                 },
             )?;
             // Keep all transient guards alive until the clock transaction is committed.

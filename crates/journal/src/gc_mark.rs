@@ -195,7 +195,7 @@ impl Journal {
         )?)
     }
 
-    fn gc_observe_clock(&self, now: u64, max_entries: usize) -> Result<()> {
+    pub(crate) fn gc_observe_clock(&self, now: u64, max_entries: usize) -> Result<()> {
         let now = sql_integer(now)?;
         let old: Option<i64> = self
             .connection
@@ -370,7 +370,7 @@ impl Journal {
         Ok((guards, checked_at_ms))
     }
 
-    fn require_gc_preflight(
+    pub(crate) fn require_gc_preflight(
         &self,
         space: &SpaceId,
         id: &EntryId,
