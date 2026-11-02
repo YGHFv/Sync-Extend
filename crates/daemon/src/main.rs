@@ -88,6 +88,36 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Persist a file mutation baseline only. No file is replaced, removed or moved.
+    PrepareMutation {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long)]
+        path: String,
+        #[command(subcommand)]
+        action: PrepareAction,
+    },
+    /// List local mutation preparations and cancellations (contains filenames).
+    Mutations {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Revalidate a preparation without executing any worktree mutation.
+    CheckMutation {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        transaction: String,
+    },
+    /// Cancel an unexecuted preparation, releasing only its journal references.
+    CancelMutation {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        transaction: String,
+    },
     /// Validate configuration without starting any listener.
     CheckConfig {
         #[arg(long)]
@@ -99,6 +129,19 @@ enum Command {
         data_dir: PathBuf,
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
         scan_interval_secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum PrepareAction {
+    Replace {
+        #[arg(long)]
+        source: PathBuf,
+    },
+    Delete,
+    Move {
+        #[arg(long)]
+        destination: String,
     },
 }
 
@@ -191,6 +234,43 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Snapshots { data_dir } => {
             print(&open(&data_dir)?.snapshots()?)?;
+        }
+        Command::PrepareMutation {
+            data_dir,
+            snapshot,
+            path,
+            action,
+        } => {
+            let mut local = open(&data_dir)?;
+            let snapshot = snapshot.parse()?;
+            let path = PortablePath::new(path)?;
+            let mutation = match action {
+                PrepareAction::Replace { source } => {
+                    local.prepare_replace(&snapshot, &path, &source)?
+                }
+                PrepareAction::Delete => local.prepare_delete(&snapshot, &path)?,
+                PrepareAction::Move { destination } => {
+                    local.prepare_move(&snapshot, &path, &PortablePath::new(destination)?)?
+                }
+            };
+            print(&serde_json::json!({
+                "mutation": mutation, "executor_available": false,
+                "worktree_modified": false, "remote_backup_complete": false,
+            }))?;
+        }
+        Command::Mutations { data_dir } => print(&open(&data_dir)?.mutations()?)?,
+        Command::CheckMutation {
+            data_dir,
+            transaction,
+        } => {
+            print(&open(&data_dir)?.check_mutation(&transaction.parse()?)?)?;
+        }
+        Command::CancelMutation {
+            data_dir,
+            transaction,
+        } => {
+            open(&data_dir)?.cancel_mutation(&transaction.parse()?)?;
+            print(&serde_json::json!({"cancelled": true, "worktree_modified": false}))?;
         }
         Command::Run {
             data_dir,

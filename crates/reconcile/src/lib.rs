@@ -1,8 +1,10 @@
 mod fault;
 mod filesystem;
 mod identity;
+mod mutation;
 mod publish;
 mod scan;
+pub use mutation::MutationCheck;
 pub use publish::PublishResult;
 
 use fs2::FileExt;
@@ -80,6 +82,8 @@ pub struct Status {
     pub publication_stages: Vec<sync_extend_journal::PublicationState>,
     pub protected_objects: usize,
     pub local_limits: LocalLimits,
+    pub outstanding_mutations: usize,
+    pub destructive_mutation_enabled: bool,
 }
 
 impl LocalSpace {
@@ -237,6 +241,7 @@ impl LocalSpace {
     }
 
     fn scan_without_recovery(&mut self) -> Result<ScanResult> {
+        self.require_no_mutation()?;
         let second = self.stable_scan()?;
         self.commit_scan(&second, None)
     }
@@ -394,6 +399,8 @@ impl LocalSpace {
             publication_stages: publications.iter().map(|p| p.state).collect(),
             protected_objects: self.journal.protected_objects()?.len(),
             local_limits: self.limits.clone(),
+            outstanding_mutations: self.journal.outstanding_mutations(&self.space_id)?.len(),
+            destructive_mutation_enabled: false,
         })
     }
 
@@ -406,6 +413,38 @@ impl LocalSpace {
         }
         let protected: std::collections::BTreeSet<_> =
             self.journal.protected_objects()?.into_iter().collect();
+        for mutation in self.journal.mutations(&self.space_id)? {
+            let intent = &mutation.intent;
+            self.journal
+                .verify_mutation_references(&intent.transaction_id)?;
+            let baseline = self
+                .journal
+                .snapshot(&self.space_id, &intent.baseline_root)?;
+            if baseline.entries.get(&intent.baseline_entry.entry_id) != Some(&intent.baseline_entry)
+            {
+                return Err(ReconcileError::Invariant("mutation baseline mismatch"));
+            }
+            if mutation.state == sync_extend_journal::MutationState::Prepared {
+                for content in std::iter::once(intent.baseline_entry.content.as_ref().ok_or(
+                    ReconcileError::Invariant("mutation baseline content missing"),
+                )?)
+                .chain(match &intent.action {
+                    sync_extend_journal::MutationAction::Replace { content } => Some(content),
+                    _ => None,
+                }) {
+                    if content
+                        .chunks
+                        .iter()
+                        .any(|chunk| !protected.contains(&chunk.content_id))
+                    {
+                        return Err(ReconcileError::Invariant(
+                            "mutation object lacks a protection reference",
+                        ));
+                    }
+                    self.cas.verify(content)?;
+                }
+            }
+        }
         for manifest in self.journal.retained_manifests(&self.space_id)? {
             for entry in manifest.entries.values() {
                 if let Some(content) = &entry.content {

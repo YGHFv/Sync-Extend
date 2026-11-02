@@ -64,7 +64,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1 | 2 => {}
+            1..=3 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -84,6 +84,11 @@ impl Journal {
                 }
                 pin_snapshot(&tx, &root, &manifest)?;
             }
+            tx.commit()?;
+        }
+        if version < 3 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-003.sql"))?;
             tx.commit()?;
         }
         Ok(Self { connection })
@@ -381,9 +386,190 @@ impl Journal {
         Ok(())
     }
 
+    pub fn mutation(&self, id: &EntryId) -> Result<Mutation> {
+        let (space, root, json, hash, state): (String, String, String, String, String) =
+            self.connection.query_row(
+                "SELECT space_id,baseline_root,intent,intent_hash,state FROM mutations WHERE transaction_id=?1",
+                [id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?;
+        if json.len() > MAX_OPERATION_BYTES || ContentId::hash(json.as_bytes()).as_str() != hash {
+            return Err(JournalError::Invariant(
+                "mutation intent integrity mismatch",
+            ));
+        }
+        let intent: MutationIntent = serde_json::from_str(&json)?;
+        intent.validate()?;
+        if intent.transaction_id != *id
+            || intent.space_id.as_str() != space
+            || intent.baseline_root.as_str() != root
+        {
+            return Err(JournalError::Invariant("mutation intent row mismatch"));
+        }
+        let state = match state.as_str() {
+            "prepared" => MutationState::Prepared,
+            "cancelled" => MutationState::Cancelled,
+            _ => return Err(JournalError::Invariant("unsupported mutation state")),
+        };
+        Ok(Mutation { intent, state })
+    }
+
+    pub fn mutations(&self, space: &SpaceId) -> Result<Vec<Mutation>> {
+        let mut statement = self.connection.prepare(
+            "SELECT transaction_id FROM mutations WHERE space_id=?1 ORDER BY transaction_id",
+        )?;
+        let ids: Vec<String> = statement
+            .query_map([space.as_str()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        ids.into_iter()
+            .map(|id| self.mutation(&id.parse()?))
+            .collect()
+    }
+
+    pub fn outstanding_mutations(&self, space: &SpaceId) -> Result<Vec<Mutation>> {
+        let mut statement = self.connection.prepare(
+            "SELECT transaction_id FROM mutations WHERE space_id=?1 AND state='prepared'",
+        )?;
+        let ids: Vec<String> = statement
+            .query_map([space.as_str()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        ids.into_iter()
+            .map(|id| self.mutation(&id.parse()?))
+            .collect()
+    }
+
+    pub fn verify_mutation_references(&self, id: &EntryId) -> Result<()> {
+        let mutation = self.mutation(id)?;
+        let intent = &mutation.intent;
+        let baseline = self.snapshot(&intent.space_id, &intent.baseline_root)?;
+        if baseline.entries.get(&intent.baseline_entry.entry_id) != Some(&intent.baseline_entry) {
+            return Err(JournalError::Invariant(
+                "mutation retained baseline mismatch",
+            ));
+        }
+        let mut expected = std::collections::BTreeSet::new();
+        if mutation.state == MutationState::Prepared {
+            for content in std::iter::once(
+                intent
+                    .baseline_entry
+                    .content
+                    .as_ref()
+                    .ok_or(JournalError::Invariant("mutation baseline content missing"))?,
+            )
+            .chain(match &intent.action {
+                MutationAction::Replace { content } => Some(content),
+                _ => None,
+            }) {
+                expected.extend(content.chunks.iter().map(|chunk| chunk.content_id.clone()));
+            }
+        }
+        let mut statement = self
+            .connection
+            .prepare("SELECT content_id FROM mutation_objects WHERE transaction_id=?1")?;
+        let ids: Vec<String> = statement
+            .query_map([id.as_str()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        let actual = ids
+            .into_iter()
+            .map(|id| id.parse())
+            .collect::<std::result::Result<std::collections::BTreeSet<ContentId>, _>>()?;
+        if actual != expected {
+            return Err(JournalError::Invariant(
+                "mutation object protection mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn begin_mutation(&mut self, intent: &MutationIntent) -> Result<()> {
+        intent.validate()?;
+        let baseline = self.snapshot(&intent.space_id, &intent.baseline_root)?;
+        if baseline.entries.get(&intent.baseline_entry.entry_id) != Some(&intent.baseline_entry) {
+            return Err(JournalError::Invariant("mutation baseline entry mismatch"));
+        }
+        if let MutationAction::Move { destination, .. } = &intent.action {
+            if baseline
+                .entries
+                .values()
+                .any(|entry| entry.path.collision_key() == destination.collision_key())
+            {
+                return Err(JournalError::Invariant(
+                    "mutation move destination occupied",
+                ));
+            }
+        }
+        let json = serde_json::to_string(intent)?;
+        if json.len() > MAX_OPERATION_BYTES {
+            return Err(JournalError::Invariant("mutation resource limit"));
+        }
+        let tx = self.connection.transaction()?;
+        let root: String = tx.query_row(
+            "SELECT snapshot_id FROM current_manifests WHERE space_id=?1",
+            [intent.space_id.as_str()],
+            |r| r.get(0),
+        )?;
+        if root != intent.baseline_root.as_str() {
+            return Err(JournalError::Invariant("mutation baseline changed"));
+        }
+        tx.execute(
+            "INSERT INTO mutations VALUES (?1,?2,?3,?4,?5,'prepared')",
+            params![
+                intent.transaction_id.as_str(),
+                intent.space_id.as_str(),
+                intent.baseline_root.as_str(),
+                json,
+                ContentId::hash(json.as_bytes()).as_str()
+            ],
+        )?;
+        for content in std::iter::once(
+            intent
+                .baseline_entry
+                .content
+                .as_ref()
+                .ok_or(JournalError::Invariant("mutation baseline content missing"))?,
+        )
+        .chain(match &intent.action {
+            MutationAction::Replace { content } => Some(content),
+            _ => None,
+        }) {
+            for chunk in &content.chunks {
+                tx.execute(
+                    "INSERT OR IGNORE INTO mutation_objects VALUES (?1,?2)",
+                    params![intent.transaction_id.as_str(), chunk.content_id.as_str()],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn cancel_mutation(&mut self, space: &SpaceId, id: &EntryId) -> Result<()> {
+        let mutation = self.mutation(id)?;
+        if mutation.intent.space_id != *space {
+            return Err(JournalError::Invariant("mutation belongs to another space"));
+        }
+        if mutation.state == MutationState::Cancelled {
+            return Ok(());
+        }
+        let tx = self.connection.transaction()?;
+        if tx.execute(
+            "UPDATE mutations SET state='cancelled' WHERE transaction_id=?1 AND state='prepared'",
+            [id.as_str()],
+        )? != 1
+        {
+            return Err(JournalError::Invariant("mutation state changed"));
+        }
+        tx.execute(
+            "DELETE FROM mutation_objects WHERE transaction_id=?1",
+            [id.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn protected_objects(&self) -> Result<Vec<ContentId>> {
         let mut statement = self.connection.prepare(
-            "SELECT content_id FROM publication_objects UNION SELECT content_id FROM snapshot_objects ORDER BY content_id",
+            "SELECT content_id FROM publication_objects UNION SELECT content_id FROM snapshot_objects
+             UNION SELECT content_id FROM mutation_objects ORDER BY content_id",
         )?;
         let ids: Vec<String> = statement
             .query_map([], |r| r.get(0))?
@@ -503,6 +689,16 @@ impl Journal {
         manifest.validate()?;
         let root = manifest.root()?;
         let tx = self.connection.transaction()?;
+        let mutation_active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mutations WHERE space_id=?1 AND state='prepared')",
+            [manifest.space_id.as_str()],
+            |r| r.get(0),
+        )?;
+        if mutation_active {
+            return Err(JournalError::Invariant(
+                "prepared mutation must be resolved first",
+            ));
+        }
         let active: Option<String> = tx.query_row(
             "SELECT transaction_id FROM publications WHERE space_id=?1 AND (state!='committed' OR cleaned=0)",
             [manifest.space_id.as_str()], |r| r.get(0),
@@ -694,3 +890,5 @@ fn promote_pending(tx: &Transaction<'_>) -> Result<()> {
 }
 mod publication;
 pub use publication::{Publication, PublicationIntent, PublicationState};
+mod mutation;
+pub use mutation::{Mutation, MutationAction, MutationIntent, MutationState};

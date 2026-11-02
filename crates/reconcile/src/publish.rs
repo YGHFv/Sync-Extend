@@ -31,6 +31,13 @@ impl LocalSpace {
     pub fn publish_file(&mut self, source: &Path, path: PortablePath) -> Result<PublishResult> {
         self.recover()?;
         self.scan_without_recovery()?;
+        let content = self.import_source(source)?;
+        let id = self.begin_content(path, content, None)?;
+        self.recover_transaction(&id)?;
+        self.publication_result(&id)
+    }
+
+    pub(crate) fn import_source(&self, source: &Path) -> Result<FileManifest> {
         check_ancestors(source)?;
         let metadata = fs::symlink_metadata(source)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() || is_reparse(&metadata) {
@@ -75,9 +82,7 @@ impl LocalSpace {
         {
             return Err(ReconcileError::Unstable);
         }
-        let id = self.begin_content(path, content, None)?;
-        self.recover_transaction(&id)?;
-        self.publication_result(&id)
+        Ok(content)
     }
 
     pub fn restore_file(
@@ -151,6 +156,7 @@ impl LocalSpace {
 
     pub fn recover(&mut self) -> Result<Vec<PublishResult>> {
         self.verify_root()?;
+        self.require_no_mutation()?;
         let publications = self.journal.outstanding_publications(&self.space_id)?;
         let mut results = Vec::new();
         for publication in publications {
@@ -320,7 +326,7 @@ impl LocalSpace {
         Ok(())
     }
 
-    fn check_publication_limits(&self, content: &FileManifest) -> Result<()> {
+    pub(crate) fn check_publication_limits(&self, content: &FileManifest) -> Result<()> {
         if content.length > self.limits.max_file_bytes {
             return Err(ReconcileError::ResourceLimit("file bytes"));
         }
@@ -333,7 +339,7 @@ impl LocalSpace {
         Ok(())
     }
 
-    fn parent_for(&self, path: &PortablePath) -> Result<PathBuf> {
+    pub(crate) fn parent_for(&self, path: &PortablePath) -> Result<PathBuf> {
         let parent = path
             .parent()
             .map_or_else(|| self.worktree.clone(), |p| self.worktree.join(p.as_str()));
@@ -347,7 +353,7 @@ impl LocalSpace {
         Ok(parent)
     }
 
-    fn occupied(&self, path: &PortablePath) -> Result<bool> {
+    pub(crate) fn occupied(&self, path: &PortablePath) -> Result<bool> {
         let parent = self.parent_for(path)?;
         let name = path.as_str().rsplit('/').next().unwrap_or("");
         for child in fs::read_dir(parent)? {
@@ -548,7 +554,7 @@ fn verify_directory_identity(path: &Path, identity: &Handle) -> Result<()> {
     Ok(())
 }
 
-fn file_matches(path: &Path, content: &FileManifest) -> Result<bool> {
+pub(crate) fn file_matches(path: &Path, content: &FileManifest) -> Result<bool> {
     check_ancestors(path)?;
     let before = fs::symlink_metadata(path)?;
     if !before.is_file()
