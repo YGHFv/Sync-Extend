@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+. "$(dirname "$0")/source-only.sh"
+git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR | check_paths
