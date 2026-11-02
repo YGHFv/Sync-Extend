@@ -11,11 +11,13 @@ mod publish;
 mod read_lease;
 mod replace_file;
 mod scan;
+mod snapshot_retention;
 mod storage;
 pub use delete::{DeleteResult, MutationResult};
 pub use mutation::MutationCheck;
 pub use publish::PublishResult;
 pub use read_lease::LeasedExportResult;
+pub use snapshot_retention::{RetentionReport, SnapshotLockResult, SnapshotRetention};
 pub use storage::StorageReport;
 
 use fs2::FileExt;
@@ -481,8 +483,11 @@ impl LocalSpace {
                 }
             }
         }
-        for manifest in self.journal.retained_manifests(&self.space_id)? {
-            for entry in manifest.entries.values() {
+        for snapshot in self
+            .journal
+            .retained_snapshots(&self.space_id, self.limits.max_storage_entries)?
+        {
+            for entry in snapshot.manifest.entries.values() {
                 if let Some(content) = &entry.content {
                     if content
                         .chunks

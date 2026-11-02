@@ -1393,3 +1393,5 @@ mod cleanup;
 pub use cleanup::{CleanupIntent, CleanupPlan, CleanupState};
 mod read_lease;
 pub use read_lease::{read_lease_expiry, ReadLease, ReadLeaseIntent, ReadLeaseState};
+mod snapshot_retention;
+pub use snapshot_retention::RetainedSnapshot;

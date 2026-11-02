@@ -1,6 +1,9 @@
 use clap::{Parser, Subcommand};
 use std::{io::Read, path::PathBuf, process::ExitCode, time::Duration};
-use sync_extend_core_model::{config::Config, PortablePath};
+use sync_extend_core_model::{
+    config::{Config, HistoryPolicy},
+    PortablePath,
+};
 use sync_extend_reconcile::LocalSpace;
 
 #[derive(Parser)]
@@ -40,6 +43,29 @@ enum Command {
     StorageReport {
         #[arg(long)]
         data_dir: PathBuf,
+    },
+    /// Protect a retained materialized snapshot after validating its references and content.
+    LockSnapshot {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        snapshot: String,
+    },
+    /// Remove only the explicit user lock, never history or object pins.
+    UnlockSnapshot {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        snapshot: String,
+    },
+    /// Preview count/budget retention and blockers; never prune history or run GC.
+    RetentionReport {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long, default_value_t = HistoryPolicy::default().history_snapshots)]
+        history_snapshots: u32,
+        #[arg(long, default_value_t = HistoryPolicy::default().history_budget_bytes)]
+        history_budget_bytes: u64,
     },
     /// Persist exact retained-file read pins; does not release overdue leases.
     AcquireReadLease {
@@ -282,6 +308,24 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::StorageReport { data_dir } => {
             print(&open(&data_dir)?.storage_report()?)?;
+        }
+        Command::LockSnapshot { data_dir, snapshot } => {
+            print(&open(&data_dir)?.lock_snapshot(&snapshot.parse()?)?)?;
+        }
+        Command::UnlockSnapshot { data_dir, snapshot } => {
+            print(&open(&data_dir)?.unlock_snapshot(&snapshot.parse()?)?)?;
+        }
+        Command::RetentionReport {
+            data_dir,
+            history_snapshots,
+            history_budget_bytes,
+        } => {
+            let policy = HistoryPolicy {
+                history_snapshots,
+                history_budget_bytes,
+                ..Default::default()
+            };
+            print(&open(&data_dir)?.retention_report(policy)?)?;
         }
         Command::AcquireReadLease {
             data_dir,

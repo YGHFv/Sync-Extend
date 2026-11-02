@@ -27,6 +27,8 @@ pub struct StorageReport {
     pub active_read_leases: usize,
     pub read_lease_unique_chunk_bytes: u64,
     pub durable_read_leases_available: bool,
+    pub locked_snapshots: usize,
+    pub durable_snapshot_locks_available: bool,
     pub missing_protected_objects: usize,
     pub mismatched_protected_lengths: usize,
     pub cas_logical_bytes: u64,
@@ -87,8 +89,13 @@ impl LocalSpace {
             }
         }
         let mut retained = current.clone();
-        for manifest in self.journal.retained_manifests(&self.space_id)? {
-            for content in manifest
+        let snapshots = self
+            .journal
+            .retained_snapshots(&self.space_id, self.limits.max_storage_entries)?;
+        let locked_snapshots = snapshots.iter().filter(|s| s.locked).count();
+        for snapshot in snapshots {
+            for content in snapshot
+                .manifest
                 .entries
                 .values()
                 .filter_map(|entry| entry.content.as_ref())
@@ -164,6 +171,8 @@ impl LocalSpace {
             active_read_leases,
             read_lease_unique_chunk_bytes: refs.bytes(leased.iter())?,
             durable_read_leases_available: true,
+            locked_snapshots,
+            durable_snapshot_locks_available: true,
             missing_protected_objects: protected
                 .iter()
                 .filter(|id| !objects.contains_key(*id))
