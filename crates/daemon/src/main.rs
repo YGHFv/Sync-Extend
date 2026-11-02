@@ -41,6 +41,52 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Persist exact retained-file read pins; does not release overdue leases.
+    AcquireReadLease {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long)]
+        path: String,
+        #[arg(long,default_value_t=300,value_parser=clap::value_parser!(u64).range(1..=86400))]
+        ttl_secs: u64,
+    },
+    /// Audit all read lease states without implicitly expiring their pins.
+    ReadLeases {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Extend an active, unexpired lease without changing its fixed version.
+    RenewReadLease {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        lease: String,
+        #[arg(long,default_value_t=300,value_parser=clap::value_parser!(u64).range(1..=86400))]
+        ttl_secs: u64,
+    },
+    /// Release only this lease's pins; never delete content or history.
+    ReleaseReadLease {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        lease: String,
+    },
+    /// Explicitly expire overdue read lease pins; never delete content.
+    RecoverReadLeases {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Export the lease's fixed historical file outside worktree/data, never overwrite.
+    ExportLeased {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        lease: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Prepare exact committed Move marker cleanup without authorizing deletion.
     PrepareCleanup {
         #[arg(long)]
@@ -236,6 +282,37 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::StorageReport { data_dir } => {
             print(&open(&data_dir)?.storage_report()?)?;
+        }
+        Command::AcquireReadLease {
+            data_dir,
+            snapshot,
+            path,
+            ttl_secs,
+        } => {
+            print(&open(&data_dir)?.acquire_read_lease(
+                &snapshot.parse()?,
+                &PortablePath::new(path)?,
+                ttl_secs,
+            )?)?;
+        }
+        Command::ReadLeases { data_dir } => print(&open(&data_dir)?.read_leases()?)?,
+        Command::RenewReadLease {
+            data_dir,
+            lease,
+            ttl_secs,
+        } => {
+            print(&open(&data_dir)?.renew_read_lease(&lease.parse()?, ttl_secs)?)?;
+        }
+        Command::ReleaseReadLease { data_dir, lease } => {
+            print(&open(&data_dir)?.release_read_lease(&lease.parse()?)?)?;
+        }
+        Command::RecoverReadLeases { data_dir } => print(&open(&data_dir)?.recover_read_leases()?)?,
+        Command::ExportLeased {
+            data_dir,
+            lease,
+            output,
+        } => {
+            print(&open(&data_dir)?.export_leased(&lease.parse()?, &output)?)?;
         }
         Command::PrepareCleanup {
             data_dir,

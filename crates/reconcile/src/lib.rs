@@ -8,12 +8,14 @@ mod identity;
 mod move_file;
 mod mutation;
 mod publish;
+mod read_lease;
 mod replace_file;
 mod scan;
 mod storage;
 pub use delete::{DeleteResult, MutationResult};
 pub use mutation::MutationCheck;
 pub use publish::PublishResult;
+pub use read_lease::LeasedExportResult;
 pub use storage::StorageReport;
 
 use fs2::FileExt;
@@ -428,6 +430,18 @@ impl LocalSpace {
     pub fn verify(&self) -> Result<usize> {
         self.journal.integrity_check()?;
         self.cleanup_plans()?;
+        for lease in self.read_leases()? {
+            if lease.state == sync_extend_journal::ReadLeaseState::Active {
+                self.cas.verify(
+                    lease
+                        .intent
+                        .entry
+                        .content
+                        .as_ref()
+                        .ok_or(ReconcileError::Invariant("read lease content missing"))?,
+                )?;
+            }
+        }
         let mut files = 0;
         let mut checked = std::collections::BTreeSet::new();
         for publication in self.journal.outstanding_publications(&self.space_id)? {

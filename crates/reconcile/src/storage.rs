@@ -13,7 +13,7 @@ use std::{
 };
 use sync_extend_cas::is_reparse;
 use sync_extend_core_model::{ChunkRef, ContentId, FileManifest};
-use sync_extend_journal::{MutationAction, PublicationState};
+use sync_extend_journal::{MutationAction, PublicationState, ReadLeaseState};
 
 #[derive(Debug, Serialize)]
 pub struct StorageReport {
@@ -24,6 +24,9 @@ pub struct StorageReport {
     pub transaction_only_chunk_bytes: u64,
     pub protected_chunk_bytes: u64,
     pub protected_objects: usize,
+    pub active_read_leases: usize,
+    pub read_lease_unique_chunk_bytes: u64,
+    pub durable_read_leases_available: bool,
     pub missing_protected_objects: usize,
     pub mismatched_protected_lengths: usize,
     pub cas_logical_bytes: u64,
@@ -94,6 +97,26 @@ impl LocalSpace {
             }
         }
         let mut expected = retained.clone();
+        let mut leased = BTreeSet::new();
+        let mut active_read_leases = 0;
+        for lease in self
+            .journal
+            .read_leases(&self.space_id, self.limits.max_storage_entries)?
+        {
+            if lease.state == ReadLeaseState::Active {
+                active_read_leases += 1;
+                refs.add(
+                    lease
+                        .intent
+                        .entry
+                        .content
+                        .as_ref()
+                        .ok_or(ReconcileError::Invariant("read lease content missing"))?,
+                    &mut leased,
+                )?;
+            }
+        }
+        expected.extend(leased.iter().cloned());
         for mutation in self.journal.mutations(&self.space_id)? {
             self.journal
                 .verify_mutation_references(&mutation.intent.transaction_id)?;
@@ -138,6 +161,9 @@ impl LocalSpace {
             transaction_only_chunk_bytes: refs.bytes(expected.difference(&retained))?,
             protected_chunk_bytes: refs.bytes(expected.iter())?,
             protected_objects: protected.len(),
+            active_read_leases,
+            read_lease_unique_chunk_bytes: refs.bytes(leased.iter())?,
+            durable_read_leases_available: true,
             missing_protected_objects: protected
                 .iter()
                 .filter(|id| !objects.contains_key(*id))
