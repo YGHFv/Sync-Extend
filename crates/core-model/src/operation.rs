@@ -50,7 +50,7 @@ impl FileManifest {
             || self.chunking != "fastcdc-2020-v1"
             || self.hash_algorithm != "blake3"
             || self.compression != "none"
-            || self.chunks.len() > 1_000_000
+            || self.chunks.len() > limits::MAX_CHUNKS
         {
             return Err(ModelError::InvalidData("unsupported content format"));
         }
@@ -194,8 +194,8 @@ impl Manifest {
             || self.policy_version == 0
             || self.version_vector.0.len() > 1024
             || self.version_vector.0.values().any(|seq| *seq == 0)
-            || self.entries.len() > 1_000_000
-            || self.tombstones.len() > 1_000_000
+            || self.entries.len() > limits::MAX_ENTRIES
+            || self.tombstones.len() > limits::MAX_ENTRIES
         {
             return Err(ModelError::InvalidData("unsupported manifest format"));
         }

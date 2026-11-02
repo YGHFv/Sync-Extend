@@ -1,8 +1,14 @@
-use crate::{check_ancestors, now_ms, LocalSpace, ReconcileError, Result};
+use crate::{
+    check_ancestors,
+    fault::checkpoint,
+    filesystem::{physical_identity, ObservedFile},
+    now_ms, LocalSpace, ReconcileError, Result,
+};
 use same_file::Handle;
 use serde::Serialize;
 use std::{
-    fs::{self, File, OpenOptions},
+    collections::BTreeSet,
+    fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
 };
@@ -49,10 +55,22 @@ impl LocalSpace {
                 "cannot publish internal worktree metadata",
             ));
         }
-        let file = File::open(&source)?;
-        let content = self.cas.import(&file)?;
+        let observed = ObservedFile::open(&source)?;
+        if observed.metadata.len() > self.limits.max_file_bytes {
+            return Err(ReconcileError::ResourceLimit("file bytes"));
+        }
+        if observed.metadata.len() > self.limits.max_staging_bytes {
+            return Err(ReconcileError::ResourceLimit("publication staging bytes"));
+        }
+        checkpoint("after_publish_source_open");
+        let content = self.cas.import_bounded(
+            &observed.file,
+            observed.metadata.len(),
+            self.limits.max_scan_chunks,
+        )?;
+        observed.verify(&source)?;
         if content.length != metadata.len()
-            || metadata.modified()? != file.metadata()?.modified()?
+            || metadata.modified()? != observed.file.metadata()?.modified()?
             || !file_matches(&source, &content)?
         {
             return Err(ReconcileError::Unstable);
@@ -91,6 +109,7 @@ impl LocalSpace {
         source: Option<SnapshotId>,
     ) -> Result<EntryId> {
         self.verify_root()?;
+        self.check_publication_limits(&content)?;
         self.parent_for(&path)?;
         self.cas.verify(&content)?;
         let manifest = self
@@ -186,15 +205,24 @@ impl LocalSpace {
                 self.journal.mark_publication_cleaned(id)?;
                 return Ok(());
             }
+            self.check_publication_limits(&intent.content)?;
             self.cas.verify(&intent.content)?;
             ensure_temp_directory(
                 &directory,
                 id,
                 publication.state == PublicationState::Preparing,
+                intent.attempt,
             )?;
+            staging_bytes(&directory, self.limits.max_staging_bytes)?;
             match publication.state {
                 PublicationState::Preparing => {
-                    prepare_payload(&self.cas, &directory, &payload, &intent)?;
+                    prepare_payload(
+                        &self.cas,
+                        &directory,
+                        &payload,
+                        &intent,
+                        self.limits.max_staging_bytes,
+                    )?;
                     checkpoint("after_temp");
                     self.journal.advance_publication(
                         id,
@@ -292,6 +320,19 @@ impl LocalSpace {
         Ok(())
     }
 
+    fn check_publication_limits(&self, content: &FileManifest) -> Result<()> {
+        if content.length > self.limits.max_file_bytes {
+            return Err(ReconcileError::ResourceLimit("file bytes"));
+        }
+        if content.length > self.limits.max_staging_bytes {
+            return Err(ReconcileError::ResourceLimit("publication staging bytes"));
+        }
+        if content.chunks.len() > self.limits.max_scan_chunks {
+            return Err(ReconcileError::ResourceLimit("publication chunks"));
+        }
+        Ok(())
+    }
+
     fn parent_for(&self, path: &PortablePath) -> Result<PathBuf> {
         let parent = path
             .parent()
@@ -360,7 +401,7 @@ impl LocalSpace {
         if !directory.try_exists()? {
             return Ok(());
         }
-        ensure_temp_directory(directory, &intent.transaction_id, false)?;
+        ensure_temp_directory(directory, &intent.transaction_id, false, intent.attempt)?;
         for attempt in 0..=intent.attempt {
             for name in [format!("building-{attempt}"), format!("payload-{attempt}")] {
                 unlink_internal(&directory.join(name))?;
@@ -373,7 +414,7 @@ impl LocalSpace {
     }
 }
 
-fn ensure_temp_directory(directory: &Path, id: &EntryId, create: bool) -> Result<()> {
+fn ensure_temp_directory(directory: &Path, id: &EntryId, create: bool, attempt: u32) -> Result<()> {
     check_ancestors(directory)?;
     let base = directory
         .parent()
@@ -400,12 +441,33 @@ fn ensure_temp_directory(directory: &Path, id: &EntryId, create: bool) -> Result
         sync_directory(directory)?;
         sync_directory(base)?;
     }
-    check_ancestors(&owner)?;
-    let metadata = fs::symlink_metadata(&owner)?;
-    if !metadata.is_file() || metadata.len() != 32 || fs::read_to_string(owner)? != id.as_str() {
+    let observed = ObservedFile::open(&owner)?;
+    let mut marker = Vec::new();
+    (&observed.file).take(33).read_to_end(&mut marker)?;
+    observed.verify(&owner)?;
+    if observed.metadata.len() != 32 || marker != id.as_str().as_bytes() {
         return Err(ReconcileError::Invariant(
             "temporary transaction ownership mismatch",
         ));
+    }
+    for child in fs::read_dir(directory)? {
+        let child = child?;
+        let name = child.file_name();
+        let known = name.to_str().is_some_and(|name| {
+            name == "owner"
+                || (0..=attempt)
+                    .any(|n| name == format!("building-{n}") || name == format!("payload-{n}"))
+        });
+        let metadata = fs::symlink_metadata(child.path())?;
+        if !known
+            || !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || is_reparse(&metadata)
+        {
+            return Err(ReconcileError::Invariant(
+                "unexpected transaction staging path",
+            ));
+        }
     }
     Ok(())
 }
@@ -415,6 +477,7 @@ fn prepare_payload(
     directory: &Path,
     payload: &Path,
     intent: &PublicationIntent,
+    max_staging_bytes: u64,
 ) -> Result<()> {
     if payload.try_exists()? {
         if file_matches(payload, &intent.content)? {
@@ -426,6 +489,12 @@ fn prepare_payload(
     }
     let building = directory.join(format!("building-{}", intent.attempt));
     unlink_internal(&building)?;
+    if staging_bytes(directory, max_staging_bytes)?
+        .checked_add(intent.content.length)
+        .is_none_or(|bytes| bytes > max_staging_bytes)
+    {
+        return Err(ReconcileError::ResourceLimit("publication staging bytes"));
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -469,27 +538,6 @@ fn same_owned_file(
         && file_matches(target, content)?)
 }
 
-fn physical_identity(path: &Path) -> Result<ContentId> {
-    check_ancestors(path)?;
-    let id = file_id::get_file_id(path)?;
-    let text = match id {
-        file_id::FileId::Inode {
-            device_id,
-            inode_number,
-        } => format!("inode:{device_id}:{inode_number}"),
-        file_id::FileId::HighRes {
-            volume_serial_number,
-            file_id,
-        } => format!("windows:{volume_serial_number}:{file_id}"),
-        file_id::FileId::LowRes { .. } => {
-            return Err(ReconcileError::Invariant(
-                "high-resolution Windows file identity is unavailable",
-            ))
-        }
-    };
-    Ok(ContentId::hash(text.as_bytes()))
-}
-
 fn verify_directory_identity(path: &Path, identity: &Handle) -> Result<()> {
     check_ancestors(path)?;
     if identity != &Handle::from_path(path)? {
@@ -510,8 +558,8 @@ fn file_matches(path: &Path, content: &FileManifest) -> Result<bool> {
     {
         return Ok(false);
     }
-    let mut file = File::open(path)?;
-    let identity = Handle::from_file(file.try_clone()?)?;
+    let observed = ObservedFile::open(path)?;
+    let mut file = &observed.file;
     let mut hasher = blake3::Hasher::new();
     let mut remaining = content.length;
     let mut buffer = [0u8; 64 * 1024];
@@ -527,11 +575,32 @@ fn file_matches(path: &Path, content: &FileManifest) -> Result<bool> {
         hasher.update(&buffer[..count]);
     }
     let after = file.metadata()?;
+    observed.verify(path)?;
     Ok(remaining == 0
         && ContentId::from_hasher(&hasher) == content.content_id
         && before.modified()? == after.modified()?
         && after.len() == content.length
-        && identity == Handle::from_path(path)?)
+        && after.len() == observed.metadata.len())
+}
+
+fn staging_bytes(directory: &Path, limit: u64) -> Result<u64> {
+    let mut identities = BTreeSet::new();
+    let mut bytes = 0u64;
+    for child in fs::read_dir(directory)? {
+        let child = child?;
+        if child.file_name() == "owner" {
+            continue;
+        }
+        let observed = ObservedFile::open(&child.path())?;
+        if identities.insert(observed.identity.physical.clone()) {
+            bytes = bytes
+                .checked_add(observed.metadata.len())
+                .filter(|bytes| *bytes <= limit)
+                .ok_or(ReconcileError::ResourceLimit("publication staging bytes"))?;
+        }
+        observed.verify(&child.path())?;
+    }
+    Ok(bytes)
 }
 
 fn unlink_internal(path: &Path) -> Result<()> {
@@ -553,14 +622,4 @@ fn unlink_internal(path: &Path) -> Result<()> {
         Err(e) => return Err(e.into()),
     }
     Ok(())
-}
-
-fn checkpoint(_phase: &str) {
-    #[cfg(feature = "fault-injection")]
-    if std::env::var("SYNCEXTEND_PAUSE_AT").ok().as_deref() == Some(_phase) {
-        eprintln!("SYNCEXTEND_CHECKPOINT:{_phase}");
-        loop {
-            std::thread::park();
-        }
-    }
 }

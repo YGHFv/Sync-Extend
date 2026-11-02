@@ -4,7 +4,9 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
 };
-use sync_extend_core_model::{ChunkRef, ContentId, EntryId, FileManifest, FORMAT_VERSION};
+use sync_extend_core_model::{
+    limits::MAX_CHUNKS, ChunkRef, ContentId, EntryId, FileManifest, FORMAT_VERSION,
+};
 
 pub const MIN_CHUNK: usize = 256 * 1024;
 pub const AVG_CHUNK: usize = 1024 * 1024;
@@ -22,6 +24,8 @@ pub enum CasError {
     Integrity,
     #[error("unsafe CAS directory")]
     UnsafeDirectory,
+    #[error("content resource limit exceeded: {0}")]
+    ResourceLimit(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, CasError>;
@@ -137,11 +141,22 @@ impl Cas {
     }
 
     pub fn import(&self, reader: impl Read) -> Result<FileManifest> {
+        self.import_bounded(reader, MAX_CHUNKS as u64 * MAX_CHUNK as u64, MAX_CHUNKS)
+    }
+
+    pub fn import_bounded(
+        &self,
+        reader: impl Read,
+        max_bytes: u64,
+        max_chunks: usize,
+    ) -> Result<FileManifest> {
+        let max_chunks = max_chunks.min(MAX_CHUNKS);
         let mut hasher = blake3::Hasher::new();
         let mut chunks = Vec::new();
         let mut length = 0u64;
+        // Probe one excess byte without consuming an unbounded, growing source.
         for chunk in StreamCDC::with_level_and_seed(
-            reader,
+            reader.take(max_bytes.saturating_add(1)),
             MIN_CHUNK,
             AVG_CHUNK,
             MAX_CHUNK,
@@ -149,14 +164,17 @@ impl Cas {
             0,
         ) {
             let chunk = chunk.map_err(|e| CasError::Chunking(e.to_string()))?;
-            hasher.update(&chunk.data);
-            chunks.push(self.put(&chunk.data)?);
             length = length
                 .checked_add(chunk.length as u64)
                 .ok_or(CasError::Integrity)?;
-            if chunks.len() > 1_000_000 {
-                return Err(CasError::Integrity);
+            if length > max_bytes {
+                return Err(CasError::ResourceLimit("file bytes"));
             }
+            if chunks.len() >= max_chunks {
+                return Err(CasError::ResourceLimit("file chunks"));
+            }
+            hasher.update(&chunk.data);
+            chunks.push(self.put(&chunk.data)?);
         }
         let manifest = FileManifest {
             format_version: FORMAT_VERSION,

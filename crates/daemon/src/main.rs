@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::{path::PathBuf, process::ExitCode, time::Duration};
+use std::{io::Read, path::PathBuf, process::ExitCode, time::Duration};
 use sync_extend_core_model::{config::Config, PortablePath};
 use sync_extend_reconcile::LocalSpace;
 
@@ -10,6 +10,9 @@ use sync_extend_reconcile::LocalSpace;
     about = "SyncExtend offline local core prototype; network and WebDAV are not yet available"
 )]
 struct Cli {
+    /// Apply a local limits JSON file to this invocation (not a retention/GC policy).
+    #[arg(long, global = true)]
+    limits: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -116,25 +119,38 @@ async fn main() -> ExitCode {
 }
 
 async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let limits: sync_extend_core_model::limits::LocalLimits = if let Some(path) = cli.limits {
+        let file = std::fs::File::open(path)?;
+        let mut bytes = Vec::new();
+        file.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 64 * 1024 {
+            return Err("limits configuration exceeds 64 KiB".into());
+        }
+        serde_json::from_slice(&bytes)?
+    } else {
+        Default::default()
+    };
+    limits.validate()?;
+    let open = |data: &std::path::Path| LocalSpace::open(data)?.with_limits(limits.clone());
     match cli.command {
         Command::Init { data_dir, root } => {
-            let local = LocalSpace::initialize(&data_dir, &root)?;
+            let local = LocalSpace::initialize_with_limits(&data_dir, &root, limits.clone())?;
             print(&local.status()?)?;
         }
         Command::Scan { data_dir } => {
-            print(&LocalSpace::open(&data_dir)?.scan()?)?;
+            print(&open(&data_dir)?.scan()?)?;
         }
         Command::Status { data_dir } => {
-            print(&LocalSpace::open(&data_dir)?.status()?)?;
+            print(&open(&data_dir)?.status()?)?;
         }
         Command::Manifest { data_dir } => {
-            print(&LocalSpace::open(&data_dir)?.manifest()?)?;
+            print(&open(&data_dir)?.manifest()?)?;
         }
         Command::Ops { data_dir } => {
-            print(&LocalSpace::open(&data_dir)?.operations()?)?;
+            print(&open(&data_dir)?.operations()?)?;
         }
         Command::Verify { data_dir } => {
-            let files = LocalSpace::open(&data_dir)?.verify()?;
+            let files = open(&data_dir)?.verify()?;
             print(&serde_json::json!({"verified_file_versions": files, "sqlite_integrity": "ok"}))?;
         }
         Command::Export {
@@ -142,15 +158,17 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             path,
             output,
         } => {
-            LocalSpace::open(&data_dir)?.export_file(&PortablePath::new(path)?, &output)?;
+            open(&data_dir)?.export_file(&PortablePath::new(path)?, &output)?;
             print(&serde_json::json!({"exported": true, "remote_backup_complete": false}))?;
         }
         Command::CheckConfig { config } => {
-            let metadata = std::fs::metadata(&config)?;
-            if metadata.len() > 1024 * 1024 {
+            let file = std::fs::File::open(config)?;
+            let mut bytes = Vec::new();
+            file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > 1024 * 1024 {
                 return Err("configuration exceeds 1 MiB".into());
             }
-            let config: Config = serde_json::from_reader(std::fs::File::open(config)?)?;
+            let config: Config = serde_json::from_slice(&bytes)?;
             config.validate()?;
             print(&serde_json::json!({"valid": true, "listener_started": false}))?;
         }
@@ -159,29 +177,26 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             source,
             path,
         } => {
-            print(&LocalSpace::open(&data_dir)?.publish_file(&source, PortablePath::new(path)?)?)?;
+            print(&open(&data_dir)?.publish_file(&source, PortablePath::new(path)?)?)?;
         }
         Command::Restore {
             data_dir,
             snapshot,
             path,
         } => {
-            print(
-                &LocalSpace::open(&data_dir)?
-                    .restore_file(&snapshot.parse()?, PortablePath::new(path)?)?,
-            )?;
+            print(&open(&data_dir)?.restore_file(&snapshot.parse()?, PortablePath::new(path)?)?)?;
         }
         Command::Recover { data_dir } => {
-            print(&LocalSpace::open(&data_dir)?.recover()?)?;
+            print(&open(&data_dir)?.recover()?)?;
         }
         Command::Snapshots { data_dir } => {
-            print(&LocalSpace::open(&data_dir)?.snapshots()?)?;
+            print(&open(&data_dir)?.snapshots()?)?;
         }
         Command::Run {
             data_dir,
             scan_interval_secs,
         } => {
-            let mut local = LocalSpace::open(&data_dir)?;
+            let mut local = open(&data_dir)?;
             let mut timer = tokio::time::interval(Duration::from_secs(scan_interval_secs));
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let shutdown = tokio::signal::ctrl_c();

@@ -1,3 +1,5 @@
+mod fault;
+mod filesystem;
 mod identity;
 mod publish;
 mod scan;
@@ -13,6 +15,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use sync_extend_cas::{is_reparse, sync_directory, Cas};
+use sync_extend_core_model::limits::LocalLimits;
 use sync_extend_core_model::*;
 use sync_extend_journal::Journal;
 
@@ -32,6 +35,8 @@ pub enum ReconcileError {
     Invariant(&'static str),
     #[error("worktree changed during scanning; retry after writers settle")]
     Unstable,
+    #[error("local resource limit exceeded: {0}; existing state is preserved")]
+    ResourceLimit(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, ReconcileError>;
@@ -43,6 +48,8 @@ pub struct LocalSpace {
     data_dir: PathBuf,
     cas: Cas,
     journal: Journal,
+    limits: LocalLimits,
+    root_identity: filesystem::PathIdentity,
     _lock: File,
     _worktree_lock: File,
 }
@@ -72,10 +79,20 @@ pub struct Status {
     pub outstanding_publications: usize,
     pub publication_stages: Vec<sync_extend_journal::PublicationState>,
     pub protected_objects: usize,
+    pub local_limits: LocalLimits,
 }
 
 impl LocalSpace {
     pub fn initialize(data_dir: &Path, worktree: &Path) -> Result<Self> {
+        Self::initialize_with_limits(data_dir, worktree, LocalLimits::default())
+    }
+
+    pub fn initialize_with_limits(
+        data_dir: &Path,
+        worktree: &Path,
+        limits: LocalLimits,
+    ) -> Result<Self> {
+        limits.validate()?;
         check_ancestors(worktree)?;
         check_ancestors(data_dir)?;
         let worktree = fs::canonicalize(worktree)?;
@@ -125,6 +142,7 @@ impl LocalSpace {
         )?;
         let cas = Cas::open(&data_dir.join("cas"))?;
         let worktree_lock = acquire_lock(&marker_directory)?;
+        let root_identity = filesystem::PathIdentity::capture(&worktree)?;
         Ok(Self {
             space_id,
             device_id,
@@ -132,6 +150,8 @@ impl LocalSpace {
             data_dir,
             cas,
             journal,
+            limits,
+            root_identity,
             _lock: lock,
             _worktree_lock: worktree_lock,
         })
@@ -159,6 +179,7 @@ impl LocalSpace {
         validate_roots(&data_dir, &worktree)?;
         let cas = Cas::open(&data_dir.join("cas"))?;
         let worktree_lock = acquire_lock(&worktree.join(".sync-extend"))?;
+        let root_identity = filesystem::PathIdentity::capture(&worktree)?;
         let local = Self {
             space_id,
             device_id,
@@ -166,6 +187,8 @@ impl LocalSpace {
             data_dir,
             cas,
             journal,
+            limits: LocalLimits::default(),
+            root_identity,
             _lock: lock,
             _worktree_lock: worktree_lock,
         };
@@ -173,7 +196,14 @@ impl LocalSpace {
         Ok(local)
     }
 
+    pub fn with_limits(mut self, limits: LocalLimits) -> Result<Self> {
+        limits.validate()?;
+        self.limits = limits;
+        Ok(self)
+    }
+
     fn verify_root(&self) -> Result<()> {
+        self.root_identity.verify(&self.worktree)?;
         check_ancestors(&self.worktree)?;
         let metadata = fs::symlink_metadata(&self.worktree)?;
         if !metadata.is_dir()
@@ -195,9 +225,10 @@ impl LocalSpace {
 
     fn stable_scan(&self) -> Result<scan::Scan> {
         self.verify_root()?;
-        let first = scan::scan(&self.worktree, &self.cas)?;
+        let first = scan::scan(&self.worktree, &self.cas, &self.limits)?;
+        fault::checkpoint("after_first_scan");
         self.verify_root()?;
-        let second = scan::scan(&self.worktree, &self.cas)?;
+        let second = scan::scan(&self.worktree, &self.cas, &self.limits)?;
         if first != second {
             return Err(ReconcileError::Unstable);
         }
@@ -362,6 +393,7 @@ impl LocalSpace {
             outstanding_publications: publications.len(),
             publication_stages: publications.iter().map(|p| p.state).collect(),
             protected_objects: self.journal.protected_objects()?.len(),
+            local_limits: self.limits.clone(),
         })
     }
 

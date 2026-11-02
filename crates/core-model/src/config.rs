@@ -1,4 +1,4 @@
-use crate::{ModelError, Result, FORMAT_VERSION};
+use crate::{limits::LocalLimits, ModelError, Result, FORMAT_VERSION};
 use serde::{Deserialize, Serialize};
 use std::{net::IpAddr, path::PathBuf};
 
@@ -8,6 +8,8 @@ pub struct Config {
     pub format_version: u32,
     pub data_dir: PathBuf,
     pub worktree: Option<PathBuf>,
+    #[serde(default)]
+    pub local_limits: LocalLimits,
     #[serde(default)]
     pub history: HistoryPolicy,
     #[serde(default)]
@@ -66,6 +68,7 @@ impl Default for WebDavConfig {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        self.local_limits.validate()?;
         if self.format_version != FORMAT_VERSION
             || !self.data_dir.is_absolute()
             || self
