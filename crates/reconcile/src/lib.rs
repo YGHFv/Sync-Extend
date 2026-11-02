@@ -1,3 +1,4 @@
+mod cleanup;
 mod delete;
 mod fault;
 mod filesystem;
@@ -426,6 +427,7 @@ impl LocalSpace {
 
     pub fn verify(&self) -> Result<usize> {
         self.journal.integrity_check()?;
+        self.cleanup_plans()?;
         let mut files = 0;
         let mut checked = std::collections::BTreeSet::new();
         for publication in self.journal.outstanding_publications(&self.space_id)? {

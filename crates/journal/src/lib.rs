@@ -64,7 +64,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=6 => {}
+            1..=7 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -104,6 +104,11 @@ impl Journal {
         if version < 6 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-006.sql"))?;
+            tx.commit()?;
+        }
+        if version < 7 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-007.sql"))?;
             tx.commit()?;
         }
         Ok(Self { connection })
@@ -852,11 +857,13 @@ impl Journal {
             "SELECT
                 (SELECT count(*) FROM snapshots) + (SELECT count(*) FROM mutations)
                 + (SELECT count(*) FROM publications) + (SELECT count(*) FROM snapshot_objects)
-                + (SELECT count(*) FROM mutation_objects) + (SELECT count(*) FROM publication_objects),
+                + (SELECT count(*) FROM mutation_objects) + (SELECT count(*) FROM publication_objects)
+                + (SELECT count(*) FROM cleanup_plans),
                 (SELECT coalesce(sum(length(CAST(manifest AS BLOB))),0) FROM snapshots)
                 + (SELECT coalesce(sum(length(CAST(intent AS BLOB))
                     + coalesce(length(CAST(execution AS BLOB)),0)),0) FROM mutations)
-                + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM publications)",
+                + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM publications)
+                + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM cleanup_plans)",
             [], |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let max_bytes = (max_entries as u64)
@@ -1356,3 +1363,5 @@ mod mutation;
 pub use mutation::{
     DeleteExecution, Mutation, MutationAction, MutationExecution, MutationIntent, MutationState,
 };
+mod cleanup;
+pub use cleanup::{CleanupIntent, CleanupPlan, CleanupState};

@@ -10,12 +10,12 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{GENERIC_READ, HANDLE},
     Storage::FileSystem::{
-        FileCaseSensitiveInfo, FileIdInfo, FileRenameInfo, GetDriveTypeW,
+        FileCaseSensitiveInfo, FileDispositionInfo, FileIdInfo, FileRenameInfo, GetDriveTypeW,
         GetFileInformationByHandle, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
         GetVolumePathNameW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_CASE_SENSITIVE_INFO, FILE_DISPOSITION_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_RENAME_INFO,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     },
     System::WindowsProgramming::DRIVE_FIXED,
 };
@@ -181,6 +181,26 @@ impl LockedFile {
 
     pub fn reader(&self) -> &File {
         &self.file
+    }
+
+    /// Mark this protected single-link file for deletion when all handles close.
+    pub fn delete_on_close(&self) -> io::Result<()> {
+        regular(&self.file, false)?;
+        let mut info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: file owns a live DELETE-capable handle; info is correctly
+        // aligned and sized for FileDispositionInfo. No pathname is retargeted.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                self.file.as_raw_handle() as HANDLE,
+                FileDispositionInfo,
+                ptr::from_mut(&mut info).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     pub fn rename_no_replace(&self, destination: &Path) -> io::Result<()> {

@@ -41,6 +41,37 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Prepare exact committed Move marker cleanup without authorizing deletion.
+    PrepareCleanup {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        transaction: String,
+    },
+    /// List persistent marker cleanup plans and authorization/completion states.
+    CleanupPlans {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Cancel a prepared marker cleanup; no file or history is removed.
+    CancelCleanup {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        transaction: String,
+    },
+    /// Explicitly remove only the protected owner marker of a committed Move.
+    ExecuteCleanup {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        transaction: String,
+    },
+    /// Resume authorized marker cleanups only; never authorize preparations.
+    RecoverCleanups {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Print the immutable current manifest (contains local filenames).
     Manifest {
         #[arg(long)]
@@ -206,6 +237,27 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::StorageReport { data_dir } => {
             print(&open(&data_dir)?.storage_report()?)?;
         }
+        Command::PrepareCleanup {
+            data_dir,
+            transaction,
+        } => {
+            print(&open(&data_dir)?.prepare_cleanup(&transaction.parse()?)?)?;
+        }
+        Command::CleanupPlans { data_dir } => print(&open(&data_dir)?.cleanup_plans()?)?,
+        Command::CancelCleanup {
+            data_dir,
+            transaction,
+        } => {
+            open(&data_dir)?.cancel_cleanup(&transaction.parse()?)?;
+            print(&serde_json::json!({"cancelled": true, "worktree_modified": false}))?;
+        }
+        Command::ExecuteCleanup {
+            data_dir,
+            transaction,
+        } => {
+            print(&open(&data_dir)?.execute_cleanup(&transaction.parse()?)?)?;
+        }
+        Command::RecoverCleanups { data_dir } => print(&open(&data_dir)?.recover_cleanups()?)?,
         Command::Manifest { data_dir } => {
             print(&open(&data_dir)?.manifest()?)?;
         }

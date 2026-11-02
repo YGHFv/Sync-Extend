@@ -37,6 +37,7 @@ pub struct StorageReport {
     pub internal_worktree_limit_exceeded: bool,
     pub history_pruning_enabled: bool,
     pub cleanup_enabled: bool,
+    pub explicit_move_marker_cleanup_available: bool,
     pub gc_enabled: bool,
     pub remote_backup_complete: bool,
 }
@@ -66,6 +67,7 @@ impl LocalSpace {
         self.journal.integrity_check()?;
         self.journal
             .check_storage_metadata_limit(self.limits.max_storage_entries)?;
+        self.journal.cleanup_plans(&self.space_id)?;
         let mut refs = References {
             lengths: BTreeMap::new(),
             seen: 0,
@@ -170,6 +172,7 @@ impl LocalSpace {
             internal_worktree_limit_exceeded: internal > self.limits.max_internal_worktree_bytes,
             history_pruning_enabled: false,
             cleanup_enabled: false,
+            explicit_move_marker_cleanup_available: cfg!(windows),
             gc_enabled: false,
             remote_backup_complete: false,
         })
