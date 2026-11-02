@@ -30,6 +30,7 @@ pub enum ReceiveOutcome {
 
 pub struct Journal {
     connection: Connection,
+    database_path: std::path::PathBuf,
 }
 
 impl Journal {
@@ -136,7 +137,10 @@ impl Journal {
             tx.execute_batch(include_str!("migration-012.sql"))?;
             tx.commit()?;
         }
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            database_path: std::fs::canonicalize(path)?,
+        })
     }
 
     pub fn state(&self, key: &str) -> Result<Option<String>> {
@@ -1449,3 +1453,5 @@ pub use gc_authorization::{
 };
 mod gc_execution;
 pub use gc_execution::{GcExecutionAudit, GcExecutionIntent, GcExecutionState};
+mod cas_access;
+pub use cas_access::CasAccessGuard;

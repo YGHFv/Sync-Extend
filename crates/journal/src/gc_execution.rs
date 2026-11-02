@@ -1,5 +1,6 @@
 use crate::{
-    check_storage_metadata_limit, sql_integer, GcAuthorization, Journal, JournalError, Result,
+    check_storage_metadata_limit, sql_integer, CasAccessGuard, GcAuthorization, Journal,
+    JournalError, Result,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -150,10 +151,23 @@ impl Journal {
         max_entries: usize,
         now: impl Fn() -> std::result::Result<u64, E>,
         inspect: impl FnOnce(&GcAuthorization) -> std::result::Result<T, E>,
-    ) -> std::result::Result<(Option<T>, GcExecutionAudit), E>
+    ) -> std::result::Result<(Option<(CasAccessGuard, T)>, GcExecutionAudit), E>
     where
         E: From<JournalError>,
     {
+        {
+            let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+                .map_err(JournalError::from)?;
+            if let Some(old) = self
+                .gc_executions(space, max_entries)?
+                .into_iter()
+                .find(|e| e.intent.authorization.authorization_id == *authorization_id)
+            {
+                tx.commit().map_err(JournalError::from)?;
+                return Ok((None, old));
+            }
+        }
+        let mut coordination = self.acquire_cas_coordination()?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
             .map_err(JournalError::from)?;
         if let Some(old) = self
@@ -172,6 +186,16 @@ impl Journal {
             != authorization
         {
             return Err(JournalError::Invariant("GC admission authorization changed").into());
+        }
+        coordination.try_exclusive()?;
+        let time = now()?;
+        if self.require_gc_authorization(space, authorization_id, time, max_entries)?
+            != authorization
+        {
+            return Err(JournalError::Invariant(
+                "GC admission authorization changed after CAS exclusion",
+            )
+            .into());
         }
         let intent = GcExecutionIntent {
             format_version: FORMAT_VERSION,
@@ -205,7 +229,7 @@ impl Journal {
             .find(|e| e.intent.execution_id == intent.execution_id)
             .ok_or(JournalError::Invariant("GC execution disappeared"))?;
         tx.commit().map_err(JournalError::from)?;
-        Ok((Some(guards), audit))
+        Ok((Some((coordination, guards)), audit))
     }
 
     /// Only the currently non-displacing Fenced family is cancellable.

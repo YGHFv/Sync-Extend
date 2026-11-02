@@ -611,6 +611,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sync-extend-core-model",
+ "sync-extend-platform-fs",
  "thiserror",
 ]
 

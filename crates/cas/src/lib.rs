@@ -35,9 +35,11 @@ pub type Result<T> = std::result::Result<T, CasError>;
 pub struct Cas {
     root: PathBuf,
     access: Option<Box<CasAccess>>,
+    coordinated_access: Option<Box<CoordinatedAccess>>,
 }
 
 type CasAccess = dyn Fn(&ContentId) -> std::result::Result<(), String> + Send;
+type CoordinatedAccess = dyn Fn(&ContentId) -> std::result::Result<Box<dyn Send>, String> + Send;
 
 impl Cas {
     pub fn open(root: &Path) -> Result<Self> {
@@ -62,6 +64,7 @@ impl Cas {
         Ok(Self {
             root: root.to_owned(),
             access: None,
+            coordinated_access: None,
         })
     }
 
@@ -75,11 +78,27 @@ impl Cas {
         Ok(cas)
     }
 
-    fn require_access(&self, id: &ContentId) -> Result<()> {
+    /// The callback must acquire coordination BEFORE checking the durable fence.
+    /// Its returned guard survives the complete chunk operation, including errors.
+    pub fn open_coordinated(
+        root: &Path,
+        access: impl Fn(&ContentId) -> std::result::Result<Box<dyn Send>, String> + Send + 'static,
+    ) -> Result<Self> {
+        let mut cas = Self::open(root)?;
+        cas.coordinated_access = Some(Box::new(access));
+        Ok(cas)
+    }
+
+    fn require_access(&self, id: &ContentId) -> Result<Option<Box<dyn Send>>> {
+        let guard = self
+            .coordinated_access
+            .as_ref()
+            .map(|access| access(id).map_err(CasError::AccessDeferred))
+            .transpose()?;
         if let Some(access) = &self.access {
             access(id).map_err(CasError::AccessDeferred)?;
         }
-        Ok(())
+        Ok(guard)
     }
 
     pub fn object_path(&self, id: &ContentId) -> PathBuf {
@@ -94,14 +113,14 @@ impl Cas {
             return Err(CasError::Integrity);
         }
         let id = ContentId::hash(data);
-        self.require_access(&id)?;
+        let _access = self.require_access(&id)?;
         let reference = ChunkRef {
             content_id: id.clone(),
             length: data.len() as u32,
         };
         let target = self.object_path(&id);
         if target.try_exists()? {
-            self.read(&reference)?;
+            self.read_under_access(&reference)?;
             return Ok(reference);
         }
         let parent = target.parent().ok_or(CasError::UnsafeDirectory)?;
@@ -123,11 +142,11 @@ impl Cas {
             Ok(()) => {
                 sync_directory(parent)?;
                 fs::remove_file(&temporary)?;
-                self.read(&reference)?;
+                self.read_under_access(&reference)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 fs::remove_file(&temporary)?;
-                self.read(&reference)?;
+                self.read_under_access(&reference)?;
             }
             Err(error) => {
                 let _ = fs::remove_file(&temporary);
@@ -138,7 +157,11 @@ impl Cas {
     }
 
     pub fn read(&self, reference: &ChunkRef) -> Result<Vec<u8>> {
-        self.require_access(&reference.content_id)?;
+        let _access = self.require_access(&reference.content_id)?;
+        self.read_under_access(reference)
+    }
+
+    fn read_under_access(&self, reference: &ChunkRef) -> Result<Vec<u8>> {
         if reference.length == 0 || reference.length as usize > MAX_CHUNK {
             return Err(CasError::Integrity);
         }

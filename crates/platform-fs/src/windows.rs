@@ -74,6 +74,11 @@ fn regular(file: &File, directory: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// Validate an already retained handle as a regular non-reparse single-link file.
+pub fn verify_regular_file(file: &File) -> io::Result<()> {
+    regular(file, false)
+}
+
 fn wide(path: &Path) -> io::Result<Vec<u16>> {
     let mut name: Vec<_> = path.as_os_str().encode_wide().collect();
     if !path.is_absolute() || name.contains(&0) {

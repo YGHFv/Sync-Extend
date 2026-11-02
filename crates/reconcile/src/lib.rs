@@ -66,9 +66,13 @@ pub type Result<T> = std::result::Result<T, ReconcileError>;
 
 fn managed_cas(data_dir: &Path) -> Result<Cas> {
     let access_journal = Journal::open(&data_dir.join("journal.sqlite"))?;
-    Ok(Cas::open_managed(&data_dir.join("cas"), move |id| {
+    Ok(Cas::open_coordinated(&data_dir.join("cas"), move |id| {
         access_journal
-            .require_cas_access(id)
+            .acquire_cas_access(id)
+            .map(|guard| -> Box<dyn Send> {
+                fault::checkpoint("after_cas_access_lock");
+                Box::new(guard)
+            })
             .map_err(|e| e.to_string())
     })?)
 }
