@@ -64,8 +64,27 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1 => {}
+            1 | 2 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
+        }
+        if version < 2 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-002.sql"))?;
+            let retained: Vec<(String, String)> = {
+                let mut statement = tx.prepare("SELECT snapshot_id,manifest FROM snapshots")?;
+                let rows = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            for (root, json) in retained {
+                let manifest: Manifest = serde_json::from_str(&json)?;
+                if manifest.root()?.as_str() != root {
+                    return Err(JournalError::Invariant(
+                        "snapshot integrity failed during migration",
+                    ));
+                }
+                pin_snapshot(&tx, &root, &manifest)?;
+            }
+            tx.commit()?;
         }
         Ok(Self { connection })
     }
@@ -179,6 +198,193 @@ impl Journal {
         Ok(manifests)
     }
 
+    pub fn snapshot(&self, space: &SpaceId, root: &SnapshotId) -> Result<Manifest> {
+        let json: String = self.connection.query_row(
+            "SELECT manifest FROM snapshots WHERE space_id=?1 AND snapshot_id=?2",
+            params![space.as_str(), root.as_str()],
+            |r| r.get(0),
+        )?;
+        let manifest: Manifest = serde_json::from_str(&json)?;
+        if manifest.space_id != *space || manifest.root()? != *root {
+            return Err(JournalError::Invariant("snapshot integrity mismatch"));
+        }
+        Ok(manifest)
+    }
+
+    pub fn publication(&self, id: &EntryId) -> Result<Publication> {
+        let (json, hash, state, root, cleaned): (String, String, String, Option<String>, bool) =
+            self.connection.query_row(
+                "SELECT intent,intent_hash,state,committed_snapshot,cleaned FROM publications WHERE transaction_id=?1",
+                [id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?;
+        let intent: PublicationIntent = serde_json::from_str(&json)?;
+        intent.validate()?;
+        if ContentId::hash(json.as_bytes()).as_str() != hash || intent.transaction_id != *id {
+            return Err(JournalError::Invariant(
+                "publication intent integrity mismatch",
+            ));
+        }
+        let state = match state.as_str() {
+            "preparing" => PublicationState::Preparing,
+            "ready" => PublicationState::Ready,
+            "published" => PublicationState::Published,
+            "committed" => PublicationState::Committed,
+            _ => return Err(JournalError::Invariant("unsupported publication state")),
+        };
+        Ok(Publication {
+            intent,
+            state,
+            committed_snapshot: root.map(|root| root.parse()).transpose()?,
+            cleaned,
+        })
+    }
+
+    pub fn outstanding_publications(&self, space: &SpaceId) -> Result<Vec<Publication>> {
+        let mut statement = self.connection.prepare(
+            "SELECT transaction_id FROM publications WHERE space_id=?1 AND (state!='committed' OR cleaned=0)",
+        )?;
+        let ids: Vec<String> = statement
+            .query_map([space.as_str()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        ids.into_iter()
+            .map(|id| self.publication(&id.parse()?))
+            .collect()
+    }
+
+    pub fn begin_publication(&mut self, intent: &PublicationIntent) -> Result<()> {
+        intent.validate()?;
+        let baseline = self.snapshot(&intent.space_id, &intent.baseline_root)?;
+        let expected = baseline
+            .entries
+            .values()
+            .find(|entry| entry.path == intent.requested_path);
+        if expected != intent.requested_baseline.as_ref()
+            || baseline.entries.contains_key(&intent.entry_id)
+        {
+            return Err(JournalError::Invariant(
+                "publication baseline/identity mismatch",
+            ));
+        }
+        if let Some(root) = &intent.source_snapshot {
+            let source = self.snapshot(&intent.space_id, root)?;
+            if !source
+                .entries
+                .values()
+                .any(|entry| entry.content.as_ref() == Some(&intent.content))
+            {
+                return Err(JournalError::Invariant(
+                    "restore content is not in source snapshot",
+                ));
+            }
+        }
+        let json = serde_json::to_string(intent)?;
+        if json.len() > MAX_OPERATION_BYTES {
+            return Err(JournalError::Invariant("publication resource limit"));
+        }
+        let tx = self.connection.transaction()?;
+        let root: String = tx.query_row(
+            "SELECT snapshot_id FROM current_manifests WHERE space_id=?1",
+            [intent.space_id.as_str()],
+            |r| r.get(0),
+        )?;
+        if root != intent.baseline_root.as_str() {
+            return Err(JournalError::Invariant("publication baseline changed"));
+        }
+        tx.execute(
+            "INSERT INTO publications VALUES (?1,?2,?3,?4,'preparing',NULL,0)",
+            params![
+                intent.transaction_id.as_str(),
+                intent.space_id.as_str(),
+                json,
+                ContentId::hash(json.as_bytes()).as_str()
+            ],
+        )?;
+        for chunk in &intent.content.chunks {
+            tx.execute(
+                "INSERT OR IGNORE INTO publication_objects VALUES (?1,?2)",
+                params![intent.transaction_id.as_str(), chunk.content_id.as_str()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn advance_publication(
+        &mut self,
+        id: &EntryId,
+        expected: PublicationState,
+        next: PublicationState,
+    ) -> Result<()> {
+        if !matches!(
+            (expected, next),
+            (PublicationState::Preparing, PublicationState::Ready)
+                | (PublicationState::Ready, PublicationState::Published)
+        ) {
+            return Err(JournalError::Invariant("illegal publication transition"));
+        }
+        if self.connection.execute(
+            "UPDATE publications SET state=?1 WHERE transaction_id=?2 AND state=?3",
+            params![next.as_str(), id.as_str(), expected.as_str()],
+        )? != 1
+        {
+            return Err(JournalError::Invariant("publication stage changed"));
+        }
+        Ok(())
+    }
+
+    pub fn retarget_publication(&mut self, id: &EntryId, path: PortablePath) -> Result<()> {
+        let publication = self.publication(id)?;
+        if publication.state == PublicationState::Committed
+            || path == publication.intent.target_path
+        {
+            return Err(JournalError::Invariant(
+                "cannot retarget committed or unchanged publication",
+            ));
+        }
+        let mut intent = publication.intent;
+        intent.target_path = path;
+        intent.attempt += 1;
+        intent.validate()?;
+        let json = serde_json::to_string(&intent)?;
+        if self.connection.execute(
+            "UPDATE publications SET intent=?1,intent_hash=?2,state='preparing'
+             WHERE transaction_id=?3 AND state=?4",
+            params![
+                json,
+                ContentId::hash(json.as_bytes()).as_str(),
+                id.as_str(),
+                publication.state.as_str()
+            ],
+        )? != 1
+        {
+            return Err(JournalError::Invariant("publication stage changed"));
+        }
+        Ok(())
+    }
+
+    pub fn mark_publication_cleaned(&mut self, id: &EntryId) -> Result<()> {
+        if self.connection.execute(
+            "UPDATE publications SET cleaned=1 WHERE transaction_id=?1 AND state='committed'",
+            [id.as_str()],
+        )? != 1
+        {
+            return Err(JournalError::Invariant(
+                "cannot clean uncommitted publication",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn protected_objects(&self) -> Result<Vec<ContentId>> {
+        let mut statement = self.connection.prepare(
+            "SELECT content_id FROM publication_objects UNION SELECT content_id FROM snapshot_objects ORDER BY content_id",
+        )?;
+        let ids: Vec<String> = statement
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        ids.into_iter().map(|id| Ok(id.parse()?)).collect()
+    }
+
     pub fn cursor(&self, space: &SpaceId, device: &DeviceId) -> Result<u64> {
         cursor(&self.connection, space, device)
     }
@@ -243,9 +449,63 @@ impl Journal {
         operations: &[Operation],
         timestamp: u64,
     ) -> Result<SnapshotId> {
+        self.commit_local_inner(expected_root, manifest, operations, timestamp, None)
+    }
+
+    pub fn commit_publication(
+        &mut self,
+        id: &EntryId,
+        expected_root: &SnapshotId,
+        manifest: &Manifest,
+        operations: &[Operation],
+        timestamp: u64,
+    ) -> Result<SnapshotId> {
+        let publication = self.publication(id)?;
+        let intent = &publication.intent;
+        if publication.state != PublicationState::Published
+            || intent.space_id != manifest.space_id
+            || manifest.entries.get(&intent.entry_id).is_none_or(|entry| {
+                entry.path != intent.target_path || entry.content.as_ref() != Some(&intent.content)
+            })
+            || !operations.iter().any(|op| {
+                matches!(&op.payload.change, Change::Put { entry }
+                if entry.entry_id == intent.entry_id && entry.path == intent.target_path
+                    && entry.content.as_ref() == Some(&intent.content))
+            })
+        {
+            return Err(JournalError::Invariant(
+                "publication completion does not contain intended content",
+            ));
+        }
+        self.commit_local_inner(
+            Some(expected_root),
+            manifest,
+            operations,
+            timestamp,
+            Some(id),
+        )
+    }
+
+    fn commit_local_inner(
+        &mut self,
+        expected_root: Option<&SnapshotId>,
+        manifest: &Manifest,
+        operations: &[Operation],
+        timestamp: u64,
+        publication: Option<&EntryId>,
+    ) -> Result<SnapshotId> {
         manifest.validate()?;
         let root = manifest.root()?;
         let tx = self.connection.transaction()?;
+        let active: Option<String> = tx.query_row(
+            "SELECT transaction_id FROM publications WHERE space_id=?1 AND (state!='committed' OR cleaned=0)",
+            [manifest.space_id.as_str()], |r| r.get(0),
+        ).optional()?;
+        if active.as_deref() != publication.map(EntryId::as_str) {
+            return Err(JournalError::Invariant(
+                "outstanding publication must be recovered first",
+            ));
+        }
         let existing: Option<String> = tx
             .query_row(
                 "SELECT snapshot_id FROM current_manifests WHERE space_id=?1",
@@ -313,6 +573,23 @@ impl Journal {
              ON CONFLICT(space_id) DO UPDATE SET snapshot_id=excluded.snapshot_id",
             params![manifest.space_id.as_str(), root.as_str()],
         )?;
+        pin_snapshot(&tx, root.as_str(), manifest)?;
+        if let Some(id) = publication {
+            if tx.execute(
+                "UPDATE publications SET state='committed',committed_snapshot=?1
+                 WHERE transaction_id=?2 AND state='published'",
+                params![root.as_str(), id.as_str()],
+            )? != 1
+            {
+                return Err(JournalError::Invariant(
+                    "publication changed before completion",
+                ));
+            }
+            tx.execute(
+                "DELETE FROM publication_objects WHERE transaction_id=?1",
+                [id.as_str()],
+            )?;
+        }
         tx.commit()?;
         Ok(root)
     }
@@ -326,6 +603,20 @@ impl Journal {
         }
         Ok(())
     }
+}
+
+fn pin_snapshot(tx: &Transaction<'_>, root: &str, manifest: &Manifest) -> Result<()> {
+    for entry in manifest.entries.values() {
+        if let Some(content) = &entry.content {
+            for chunk in &content.chunks {
+                tx.execute(
+                    "INSERT OR IGNORE INTO snapshot_objects VALUES (?1,?2)",
+                    params![root, chunk.content_id.as_str()],
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cursor(connection: &Connection, space: &SpaceId, device: &DeviceId) -> Result<u64> {
@@ -391,3 +682,5 @@ fn promote_pending(tx: &Transaction<'_>) -> Result<()> {
     }
     Ok(())
 }
+mod publication;
+pub use publication::{Publication, PublicationIntent, PublicationState};
