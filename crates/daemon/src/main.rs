@@ -72,6 +72,13 @@ enum Command {
         #[arg(long)]
         mark: String,
     },
+    /// Inspect one mark under transient database/file guards; never authorize deletion.
+    PreflightGcMark {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        mark: String,
+    },
     /// List immutable snapshot audit metadata, including explicitly pruned non-restorable history.
     SnapshotAudit {
         #[arg(long)]
@@ -364,6 +371,9 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::RevalidateGcMark { data_dir, mark } => {
             print(&open(&data_dir)?.revalidate_gc_mark(&mark.parse()?)?)?;
+        }
+        Command::PreflightGcMark { data_dir, mark } => {
+            print(&open(&data_dir)?.preflight_gc_mark(&mark.parse()?)?)?;
         }
         Command::SnapshotAudit { data_dir } => print(&open(&data_dir)?.snapshot_audit()?)?,
         Command::PruneSnapshot {

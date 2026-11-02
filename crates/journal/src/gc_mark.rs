@@ -343,4 +343,55 @@ impl Journal {
         self.cleanup_plans(space)?;
         Ok(())
     }
+
+    /// Observe under SQLite writer exclusion. Returned guards survive clock commit;
+    /// neither the callback nor this method grants permission to delete content.
+    pub fn with_gc_preflight<T, E>(
+        &self,
+        space: &SpaceId,
+        id: &EntryId,
+        max_entries: usize,
+        now: impl Fn() -> std::result::Result<u64, E>,
+        inspect: impl FnOnce(&GcMark) -> std::result::Result<T, E>,
+    ) -> std::result::Result<(T, u64), E>
+    where
+        E: From<JournalError>,
+    {
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+            .map_err(JournalError::from)?;
+        let mark = self.require_gc_preflight(space, id, now()?, max_entries)?;
+        let guards = inspect(&mark)?;
+        let checked_at_ms = now()?;
+        let final_mark = self.require_gc_preflight(space, id, checked_at_ms, max_entries)?;
+        if final_mark != mark {
+            return Err(JournalError::Invariant("GC preflight mark changed").into());
+        }
+        tx.commit().map_err(JournalError::from)?;
+        Ok((guards, checked_at_ms))
+    }
+
+    fn require_gc_preflight(
+        &self,
+        space: &SpaceId,
+        id: &EntryId,
+        now: u64,
+        max_entries: usize,
+    ) -> Result<GcMark> {
+        self.audit_gc_owners(space, max_entries)?;
+        let audit = self
+            .gc_marks(space, max_entries)?
+            .into_iter()
+            .find(|m| m.intent.mark_id == *id)
+            .ok_or(JournalError::Invariant("unknown GC mark"))?;
+        if audit.state != GcState::Marked || self.gc_protected(&audit.intent.content_id)? {
+            return Err(JournalError::Invariant(
+                "GC preflight mark is terminal or referenced",
+            ));
+        }
+        if now < audit.intent.grace_until_ms {
+            return Err(JournalError::Invariant("GC preflight grace pending"));
+        }
+        self.gc_observe_clock(now, max_entries)?;
+        Ok(audit.intent)
+    }
 }

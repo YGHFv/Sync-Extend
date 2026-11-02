@@ -3,7 +3,7 @@
 #[allow(unsafe_code)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{LockedDirectory, LockedFile};
+pub use windows::{GuardedReadFile, LockedDirectory, LockedFile};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileKey {

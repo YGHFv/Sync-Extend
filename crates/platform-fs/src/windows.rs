@@ -163,6 +163,36 @@ pub struct LockedFile {
     file: File,
 }
 
+/// A single-link local NTFS read handle that excludes concurrent write/delete opens.
+pub struct GuardedReadFile {
+    file: File,
+}
+
+impl GuardedReadFile {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .access_mode(GENERIC_READ)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        regular(&file, false)?;
+        local_ntfs(&file, path)?;
+        Ok(Self { file })
+    }
+
+    pub fn key(&self) -> io::Result<FileKey> {
+        key(&self.file)
+    }
+
+    pub fn reader(&self) -> &File {
+        &self.file
+    }
+
+    pub fn verify_single_link(&self) -> io::Result<()> {
+        regular(&self.file, false)
+    }
+}
+
 impl LockedFile {
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()

@@ -3,6 +3,7 @@ mod delete;
 mod fault;
 mod filesystem;
 mod gc_mark;
+mod gc_preflight;
 #[cfg(windows)]
 mod guarded_mutation;
 mod identity;
@@ -17,6 +18,7 @@ mod snapshot_retention;
 mod storage;
 pub use delete::{DeleteResult, MutationResult};
 pub use gc_mark::GcRevalidation;
+pub use gc_preflight::GcPreflight;
 pub use mutation::MutationCheck;
 pub use publish::PublishResult;
 pub use read_lease::LeasedExportResult;
