@@ -36,10 +36,17 @@ pub struct Cas {
     root: PathBuf,
     access: Option<Box<CasAccess>>,
     coordinated_access: Option<Box<CoordinatedAccess>>,
+    session_access: Option<Box<SessionAccess>>,
 }
 
 type CasAccess = dyn Fn(&ContentId) -> std::result::Result<(), String> + Send;
 type CoordinatedAccess = dyn Fn(&ContentId) -> std::result::Result<Box<dyn Send>, String> + Send;
+type SessionAccess = dyn Fn() -> std::result::Result<Box<dyn Send>, String> + Send;
+
+/// Cooperative process-lifetime exclusion, not a durable reference or authorization.
+pub struct CasSessionGuard {
+    _guard: Box<dyn Send>,
+}
 
 impl Cas {
     pub fn open(root: &Path) -> Result<Self> {
@@ -65,6 +72,7 @@ impl Cas {
             root: root.to_owned(),
             access: None,
             coordinated_access: None,
+            session_access: None,
         })
     }
 
@@ -87,6 +95,36 @@ impl Cas {
         let mut cas = Self::open(root)?;
         cas.coordinated_access = Some(Box::new(access));
         Ok(cas)
+    }
+
+    /// Retain a shared session for complete import/write/verify operations.
+    /// Both callbacks acquire coordination before any journal/fence access.
+    pub fn open_session_coordinated(
+        root: &Path,
+        access: impl Fn(&ContentId) -> std::result::Result<Box<dyn Send>, String> + Send + 'static,
+        session: impl Fn() -> std::result::Result<Box<dyn Send>, String> + Send + 'static,
+    ) -> Result<Self> {
+        let mut cas = Self::open_coordinated(root, access)?;
+        cas.session_access = Some(Box::new(session));
+        Ok(cas)
+    }
+
+    /// Keep this guard through a caller's reference commit when operation return
+    /// alone is too short. Existing fences still refuse individual chunk access.
+    pub fn acquire_session(&self) -> Result<CasSessionGuard> {
+        let access = self.session_access.as_ref().ok_or_else(|| {
+            CasError::AccessDeferred("CAS session coordination is not configured".to_owned())
+        })?;
+        Ok(CasSessionGuard {
+            _guard: access().map_err(CasError::AccessDeferred)?,
+        })
+    }
+
+    fn operation_session(&self) -> Result<Option<CasSessionGuard>> {
+        self.session_access
+            .as_ref()
+            .map(|_| self.acquire_session())
+            .transpose()
     }
 
     fn require_access(&self, id: &ContentId) -> Result<Option<Box<dyn Send>>> {
@@ -198,6 +236,7 @@ impl Cas {
         max_bytes: u64,
         max_chunks: usize,
     ) -> Result<FileManifest> {
+        let _session = self.operation_session()?;
         let max_chunks = max_chunks.min(MAX_CHUNKS);
         let mut hasher = blake3::Hasher::new();
         let mut chunks = Vec::new();
@@ -238,6 +277,7 @@ impl Cas {
     }
 
     pub fn write_file(&self, manifest: &FileManifest, mut writer: impl Write) -> Result<()> {
+        let _session = self.operation_session()?;
         manifest.validate()?;
         let mut hasher = blake3::Hasher::new();
         for reference in &manifest.chunks {

@@ -70,15 +70,38 @@ pub type Result<T> = std::result::Result<T, ReconcileError>;
 
 fn managed_cas(data_dir: &Path) -> Result<Cas> {
     let access_journal = Journal::open(&data_dir.join("journal.sqlite"))?;
-    Ok(Cas::open_coordinated(&data_dir.join("cas"), move |id| {
-        access_journal
-            .acquire_cas_access(id)
-            .map(|guard| -> Box<dyn Send> {
-                fault::checkpoint("after_cas_access_lock");
-                Box::new(guard)
-            })
-            .map_err(|e| e.to_string())
-    })?)
+    let session_journal = Journal::open(&data_dir.join("journal.sqlite"))?;
+    Ok(Cas::open_session_coordinated(
+        &data_dir.join("cas"),
+        move |id| {
+            access_journal
+                .acquire_cas_access(id)
+                .map(|guard| -> Box<dyn Send> {
+                    fault::checkpoint("after_cas_access_lock");
+                    Box::new(guard)
+                })
+                .map_err(|e| e.to_string())
+        },
+        move || {
+            session_journal
+                .acquire_cas_session()
+                .map(|guard| -> Box<dyn Send> {
+                    fault::checkpoint("after_cas_session_lock");
+                    Box::new(SessionGuard { _guard: guard })
+                })
+                .map_err(|e| e.to_string())
+        },
+    )?)
+}
+
+struct SessionGuard {
+    _guard: sync_extend_journal::CasAccessGuard,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        fault::checkpoint("before_cas_session_release");
+    }
 }
 
 pub struct LocalSpace {
@@ -578,12 +601,14 @@ impl LocalSpace {
             .content
             .as_ref()
             .ok_or(ReconcileError::Invariant("path is a directory"))?;
+        let _session = self.cas.acquire_session()?;
         self.cas.verify(content)?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(output)?;
         self.cas.write_file(content, &mut file)?;
+        fault::checkpoint("after_export_cas_write");
         file.sync_all()?;
         sync_directory(&parent)?;
         Ok(())

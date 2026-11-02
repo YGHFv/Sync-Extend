@@ -115,6 +115,12 @@ fn unsafe_metadata(metadata: &fs::Metadata) -> bool {
 }
 
 impl Journal {
+    /// Acquire cooperative session exclusion before any per-content fence checks.
+    /// This is not a persistent owner and cannot override an existing fence.
+    pub fn acquire_cas_session(&self) -> Result<CasAccessGuard> {
+        self.acquire_cas_coordination()
+    }
+
     pub fn acquire_cas_access(&self, content: &ContentId) -> Result<CasAccessGuard> {
         let guard = self.acquire_cas_coordination()?;
         self.require_cas_access(content)?;
