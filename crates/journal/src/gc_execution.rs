@@ -143,7 +143,7 @@ impl Journal {
         Ok(audits)
     }
 
-    /// Consume one explicit intent into a durable fence. No filesystem executor exists.
+    /// Consume one explicit intent into a durable fence without moving CAS content.
     pub fn with_gc_execution_admission<T, E>(
         &self,
         space: &SpaceId,
@@ -232,8 +232,8 @@ impl Journal {
         Ok((Some((coordination, guards)), audit))
     }
 
-    /// Only the currently non-displacing Fenced family is cancellable.
-    /// A future physical executor must replace this with guarded recovery phases.
+    /// Abort only a non-displacing execution or replay an already restored terminal.
+    /// SQL rejects active physical plans until guarded restoration completes.
     pub fn abort_gc_execution(
         &self,
         space: &SpaceId,
@@ -241,6 +241,7 @@ impl Journal {
         max_entries: usize,
     ) -> Result<GcExecutionAudit> {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        self.gc_quarantines(space, max_entries)?;
         let old = self
             .gc_executions(space, max_entries)?
             .into_iter()

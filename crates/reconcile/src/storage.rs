@@ -53,6 +53,10 @@ pub struct StorageReport {
     pub gc_execution_records: usize,
     pub active_gc_execution_fences: usize,
     pub sweep_available: bool,
+    pub gc_quarantine_records: usize,
+    pub quarantined_gc_objects: usize,
+    pub quarantined_gc_logical_bytes: u64,
+    pub explicit_gc_quarantine_available: bool,
     pub pruned_snapshots: usize,
     pub explicit_snapshot_pruning_available: bool,
     pub remote_backup_complete: bool,
@@ -83,6 +87,7 @@ impl LocalSpace {
         self.journal.integrity_check()?;
         let gc_authorization_records = self.gc_authorizations()?.len();
         let executions = self.gc_executions()?;
+        let quarantines = self.gc_quarantines()?;
         let active_gc_execution_fences = executions.iter().filter(|e| e.content_fenced).count();
         let gc_mark_records = self
             .journal
@@ -183,6 +188,25 @@ impl LocalSpace {
             }
         }
         let internal = inventory_bytes(&worktree)?;
+        let quarantine_files: BTreeSet<_> = quarantines
+            .iter()
+            .map(|q| {
+                self.data_dir
+                    .join("cas/tmp")
+                    .join(format!("gc-{}.object", q.intent.plan_id))
+            })
+            .collect();
+        let quarantined_gc_objects = cas
+            .iter()
+            .filter(|(path, e)| quarantine_files.contains(*path) && !e.directory)
+            .count();
+        let quarantine_identities: BTreeSet<_> = cas
+            .iter()
+            .filter(|(path, _)| quarantine_files.contains(*path))
+            .map(|(_, e)| e.identity.clone())
+            .collect();
+        let quarantined_gc_logical_bytes =
+            selected_inventory_bytes(&cas, |e| quarantine_identities.contains(&e.identity))?;
         Ok(StorageReport {
             accounting: "physical_identity_deduplicated_logical_lengths_not_allocated_blocks",
             content_hashes_verified: false,
@@ -241,6 +265,10 @@ impl LocalSpace {
             gc_execution_records: executions.len(),
             active_gc_execution_fences,
             sweep_available: false,
+            gc_quarantine_records: quarantines.len(),
+            quarantined_gc_objects,
+            quarantined_gc_logical_bytes,
+            explicit_gc_quarantine_available: cfg!(windows),
             pruned_snapshots,
             explicit_snapshot_pruning_available: true,
             remote_backup_complete: false,

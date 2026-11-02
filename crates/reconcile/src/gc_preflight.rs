@@ -92,8 +92,25 @@ pub(crate) mod windows {
 
     fn verify(file: &GuardedReadFile, path: &Path, mark: &GcMark) -> Result<()> {
         file.verify_single_link()?;
-        let metadata = file.reader().metadata()?;
-        if ContentId::hash(file.key()?.to_string().as_bytes()) != mark.observation.physical_identity
+        verify_reader(
+            file.reader(),
+            ContentId::hash(file.key()?.to_string().as_bytes()),
+            path,
+            mark,
+        )?;
+        file.verify_single_link()?;
+        Ok(())
+    }
+
+    pub(crate) fn verify_reader(
+        file: &std::fs::File,
+        identity: ContentId,
+        path: &Path,
+        mark: &GcMark,
+    ) -> Result<()> {
+        sync_extend_platform_fs::verify_regular_file(file)?;
+        let metadata = file.metadata()?;
+        if identity != mark.observation.physical_identity
             || physical_identity(path)? != mark.observation.physical_identity
             || metadata.len() != u64::from(mark.observation.length)
             || metadata
@@ -107,7 +124,7 @@ pub(crate) mod windows {
                 "GC preflight physical observation changed",
             ));
         }
-        let mut reader = file.reader();
+        let mut reader = file;
         reader.seek(SeekFrom::Start(0))?;
         let mut hash = blake3::Hasher::new();
         let mut bytes = 0u64;
@@ -132,8 +149,8 @@ pub(crate) mod windows {
                 "GC preflight content hash mismatch",
             ));
         }
-        file.verify_single_link()?;
-        if file.reader().metadata()?.modified()? != metadata.modified()? {
+        sync_extend_platform_fs::verify_regular_file(file)?;
+        if file.metadata()?.modified()? != metadata.modified()? {
             return Err(ReconcileError::Unstable);
         }
         Ok(())

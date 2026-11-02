@@ -159,6 +159,7 @@ impl LocalSpace {
         self.gc_marks()?;
         self.gc_authorizations()?;
         self.gc_executions()?;
+        self.gc_quarantines()?;
         self.verify_root()?;
         self.journal
             .check_snapshot_prunings(&self.space_id, self.limits.max_storage_entries)?;

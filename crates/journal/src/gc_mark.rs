@@ -332,7 +332,7 @@ impl Journal {
         Ok(check)
     }
 
-    fn audit_gc_owners(&self, space: &SpaceId, max_entries: usize) -> Result<()> {
+    pub(crate) fn audit_gc_owners(&self, space: &SpaceId, max_entries: usize) -> Result<()> {
         self.snapshot_audit(space, max_entries)?;
         self.current(space)?;
         self.read_leases(space, max_entries)?;

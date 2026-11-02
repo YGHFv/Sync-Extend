@@ -6,6 +6,7 @@ mod gc_authorization;
 mod gc_execution;
 mod gc_mark;
 mod gc_preflight;
+mod gc_quarantine;
 #[cfg(windows)]
 mod guarded_mutation;
 mod identity;
@@ -456,6 +457,7 @@ impl LocalSpace {
         self.gc_marks()?;
         self.gc_authorizations()?;
         self.gc_executions()?;
+        self.gc_quarantines()?;
         self.snapshot_audit()?;
         self.cleanup_plans()?;
         for lease in self.read_leases()? {

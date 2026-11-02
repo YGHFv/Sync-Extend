@@ -105,6 +105,25 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Explicitly quarantine one admitted CAS object; preserve bytes, never sweep.
+    QuarantineGcExecution {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        execution: String,
+    },
+    /// Audit bounded durable GC quarantine plans without physical recovery.
+    GcQuarantines {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Restore only the exact admitted quarantine object, without overwrite.
+    RestoreGcQuarantine {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        execution: String,
+    },
     /// Abort a non-displacing execution fence; never restore/delete or reuse its intent.
     AbortGcExecution {
         #[arg(long)]
@@ -435,6 +454,15 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             authorization,
         } => print(&open(&data_dir)?.admit_gc_execution(&authorization.parse()?)?)?,
         Command::GcExecutions { data_dir } => print(&open(&data_dir)?.gc_executions()?)?,
+        Command::QuarantineGcExecution {
+            data_dir,
+            execution,
+        } => print(&open(&data_dir)?.quarantine_gc_execution(&execution.parse()?)?)?,
+        Command::GcQuarantines { data_dir } => print(&open(&data_dir)?.gc_quarantines()?)?,
+        Command::RestoreGcQuarantine {
+            data_dir,
+            execution,
+        } => print(&open(&data_dir)?.restore_gc_quarantine(&execution.parse()?)?)?,
         Command::AbortGcExecution {
             data_dir,
             execution,

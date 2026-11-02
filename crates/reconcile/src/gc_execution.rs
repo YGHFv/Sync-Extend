@@ -24,6 +24,7 @@ impl LocalSpace {
 
     pub fn abort_gc_execution(&mut self, id: &EntryId) -> Result<GcExecutionAudit> {
         self.verify_root()?;
+        self.gc_quarantines()?;
         let old = self
             .gc_executions()?
             .into_iter()
