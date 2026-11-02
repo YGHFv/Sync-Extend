@@ -40,6 +40,12 @@ fn key(file: &File) -> io::Result<FileKey> {
     })
 }
 
+impl FileKey {
+    pub fn from_file(file: &File) -> io::Result<Self> {
+        key(file)
+    }
+}
+
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, message)
 }

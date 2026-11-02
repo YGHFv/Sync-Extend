@@ -7,6 +7,7 @@ mod identity;
 mod move_file;
 mod mutation;
 mod publish;
+mod replace_file;
 mod scan;
 pub use delete::{DeleteResult, MutationResult};
 pub use mutation::MutationCheck;
@@ -91,6 +92,7 @@ pub struct Status {
     pub destructive_mutation_enabled: bool,
     pub windows_delete_executor_available: bool,
     pub windows_move_executor_available: bool,
+    pub windows_replace_executor_available: bool,
     pub mutation_executor_actions: Vec<&'static str>,
 }
 
@@ -411,8 +413,9 @@ impl LocalSpace {
             destructive_mutation_enabled: cfg!(windows),
             windows_delete_executor_available: cfg!(windows),
             windows_move_executor_available: cfg!(windows),
+            windows_replace_executor_available: cfg!(windows),
             mutation_executor_actions: if cfg!(windows) {
-                vec!["delete", "move"]
+                vec!["delete", "move", "replace"]
             } else {
                 vec![]
             },

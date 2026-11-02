@@ -21,11 +21,9 @@ impl LocalSpace {
     pub fn execute_mutation(&mut self, id: &EntryId) -> Result<MutationResult> {
         self.verify_root()?;
         let mutation = self.journal.mutation(id)?;
-        if mutation.intent.space_id != self.space_id
-            || matches!(mutation.intent.action, MutationAction::Replace { .. })
-        {
+        if mutation.intent.space_id != self.space_id {
             return Err(ReconcileError::Invariant(
-                "only this space's single-file Delete/Move has an executor",
+                "mutation belongs to another space",
             ));
         }
         if mutation.state == MutationState::Cancelled {
@@ -37,7 +35,7 @@ impl LocalSpace {
             match mutation.intent.action {
                 MutationAction::Delete => self.execute_delete_platform(id)?,
                 MutationAction::Move { .. } => self.execute_move_platform(id)?,
-                MutationAction::Replace { .. } => unreachable!(),
+                MutationAction::Replace { .. } => self.execute_replace_platform(id)?,
             }
         }
         let mutation = self.journal.mutation(id)?;
@@ -47,13 +45,16 @@ impl LocalSpace {
             snapshot_id: mutation
                 .committed_snapshot
                 .ok_or(ReconcileError::Invariant("mutation is not committed"))?,
-            original_retained_at_commit: mutation.intent.action == MutationAction::Delete,
+            original_retained_at_commit: !matches!(
+                mutation.intent.action,
+                MutationAction::Move { .. }
+            ),
             local_committed: true,
             remote_backup_complete: false,
-            action: if mutation.intent.action == MutationAction::Delete {
-                "delete"
-            } else {
-                "move"
+            action: match mutation.intent.action {
+                MutationAction::Delete => "delete",
+                MutationAction::Move { .. } => "move",
+                MutationAction::Replace { .. } => "replace",
             },
             source_path: mutation.intent.baseline_entry.path,
             moved_path: match mutation.intent.action {

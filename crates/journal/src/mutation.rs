@@ -61,6 +61,7 @@ pub enum MutationState {
     Executing,
     Quarantined,
     Moved,
+    Replaced,
     Committed,
 }
 
@@ -68,7 +69,7 @@ impl MutationState {
     pub fn active(self) -> bool {
         matches!(
             self,
-            Self::Prepared | Self::Executing | Self::Quarantined | Self::Moved
+            Self::Prepared | Self::Executing | Self::Quarantined | Self::Moved | Self::Replaced
         )
     }
 }
@@ -79,6 +80,8 @@ pub struct MutationExecution {
     pub execution_id: EntryId,
     pub directory_identity: ContentId,
     pub owner_identity: ContentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_identity: Option<ContentId>,
 }
 
 pub type DeleteExecution = MutationExecution;

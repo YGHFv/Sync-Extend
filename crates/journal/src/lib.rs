@@ -64,7 +64,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=5 => {}
+            1..=6 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -99,6 +99,11 @@ impl Journal {
         if version < 5 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-005.sql"))?;
+            tx.commit()?;
+        }
+        if version < 6 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-006.sql"))?;
             tx.commit()?;
         }
         Ok(Self { connection })
@@ -421,6 +426,7 @@ impl Journal {
             "executing" => MutationState::Executing,
             "quarantined" => MutationState::Quarantined,
             "moved" => MutationState::Moved,
+            "replaced" => MutationState::Replaced,
             "committed" => MutationState::Committed,
             _ => return Err(JournalError::Invariant("unsupported mutation state")),
         };
@@ -443,6 +449,12 @@ impl Journal {
                     ) | (
                         MutationAction::Move { .. },
                         MutationState::Executing | MutationState::Moved | MutationState::Committed
+                    ) | (
+                        MutationAction::Replace { .. },
+                        MutationState::Executing
+                            | MutationState::Quarantined
+                            | MutationState::Replaced
+                            | MutationState::Committed
                     )
                 ) && json.len() <= MAX_OPERATION_BYTES
                     && ContentId::hash(json.as_bytes()).as_str() == hash =>
@@ -455,6 +467,15 @@ impl Journal {
                 ))
             }
         };
+        if let Some(execution) = &execution {
+            if execution.payload_identity.is_some()
+                != matches!(intent.action, MutationAction::Replace { .. })
+            {
+                return Err(JournalError::Invariant(
+                    "mutation payload identity mismatch",
+                ));
+            }
+        }
         let committed_snapshot = root.map(|root| root.parse()).transpose()?;
         if (state == MutationState::Committed) != committed_snapshot.is_some() {
             return Err(JournalError::Invariant("mutation completion row mismatch"));
@@ -481,7 +502,7 @@ impl Journal {
 
     pub fn outstanding_mutations(&self, space: &SpaceId) -> Result<Vec<Mutation>> {
         let mut statement = self.connection.prepare(
-            "SELECT transaction_id FROM mutations WHERE space_id=?1 AND state IN ('prepared','executing','quarantined','moved')",
+            "SELECT transaction_id FROM mutations WHERE space_id=?1 AND state IN ('prepared','executing','quarantined','moved','replaced')",
         )?;
         let ids: Vec<String> = statement
             .query_map([space.as_str()], |r| r.get(0))?
@@ -548,7 +569,12 @@ impl Journal {
                     completed.entries.get(&entry.entry_id) == Some(&entry)
                         && !completed.tombstones.contains_key(&entry.entry_id)
                 }
-                _ => false,
+                MutationAction::Replace { content } => {
+                    let mut entry = intent.baseline_entry.clone();
+                    entry.content = Some(content.clone());
+                    completed.entries.get(&entry.entry_id) == Some(&entry)
+                        && !completed.tombstones.contains_key(&entry.entry_id)
+                }
             };
             if !valid {
                 return Err(JournalError::Invariant(
@@ -659,7 +685,7 @@ impl Journal {
         id: &EntryId,
         execution: &DeleteExecution,
     ) -> Result<()> {
-        self.start_file_mutation(space, id, execution, false)
+        self.start_file_mutation(space, id, execution, "delete")
     }
 
     pub fn start_move(
@@ -668,7 +694,16 @@ impl Journal {
         id: &EntryId,
         execution: &MutationExecution,
     ) -> Result<()> {
-        self.start_file_mutation(space, id, execution, true)
+        self.start_file_mutation(space, id, execution, "move")
+    }
+
+    pub fn start_replace(
+        &mut self,
+        space: &SpaceId,
+        id: &EntryId,
+        execution: &MutationExecution,
+    ) -> Result<()> {
+        self.start_file_mutation(space, id, execution, "replace")
     }
 
     fn start_file_mutation(
@@ -676,17 +711,19 @@ impl Journal {
         space: &SpaceId,
         id: &EntryId,
         execution: &MutationExecution,
-        moving: bool,
+        action: &str,
     ) -> Result<()> {
         let mutation = self.mutation(id)?;
         self.verify_mutation_references(id)?;
         if mutation.intent.space_id != *space
             || mutation.state != MutationState::Prepared
-            || if moving {
-                !matches!(mutation.intent.action, MutationAction::Move { .. })
-            } else {
-                mutation.intent.action != MutationAction::Delete
-            }
+            || !matches!(
+                (action, &mutation.intent.action),
+                ("delete", MutationAction::Delete)
+                    | ("move", MutationAction::Move { .. })
+                    | ("replace", MutationAction::Replace { .. })
+            )
+            || execution.payload_identity.is_some() != (action == "replace")
         {
             return Err(JournalError::Invariant(
                 "only a matching prepared file mutation can execute",
@@ -727,6 +764,52 @@ impl Journal {
 
     pub fn mark_move_moved(&mut self, space: &SpaceId, id: &EntryId) -> Result<()> {
         self.mark_file_mutated(space, id, true)
+    }
+
+    pub fn mark_replace_quarantined(&mut self, space: &SpaceId, id: &EntryId) -> Result<()> {
+        self.mark_replace_phase(
+            space,
+            id,
+            MutationState::Executing,
+            "executing",
+            "quarantined",
+        )
+    }
+
+    pub fn mark_replace_replaced(&mut self, space: &SpaceId, id: &EntryId) -> Result<()> {
+        self.mark_replace_phase(
+            space,
+            id,
+            MutationState::Quarantined,
+            "quarantined",
+            "replaced",
+        )
+    }
+
+    fn mark_replace_phase(
+        &mut self,
+        space: &SpaceId,
+        id: &EntryId,
+        expected: MutationState,
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
+        let mutation = self.mutation(id)?;
+        self.verify_mutation_references(id)?;
+        if mutation.intent.space_id != *space
+            || mutation.state != expected
+            || !matches!(mutation.intent.action, MutationAction::Replace { .. })
+        {
+            return Err(JournalError::Invariant("invalid Replace transition"));
+        }
+        if self.connection.execute(
+            "UPDATE mutations SET state=?1 WHERE transaction_id=?2 AND state=?3",
+            params![to, id.as_str(), from],
+        )? != 1
+        {
+            return Err(JournalError::Invariant("mutation state changed"));
+        }
+        Ok(())
     }
 
     fn mark_file_mutated(&mut self, space: &SpaceId, id: &EntryId, moving: bool) -> Result<()> {
@@ -964,6 +1047,52 @@ impl Journal {
         )
     }
 
+    pub fn commit_replace(
+        &mut self,
+        id: &EntryId,
+        manifest: &Manifest,
+        operation: &Operation,
+        timestamp: u64,
+    ) -> Result<SnapshotId> {
+        let mutation = self.mutation(id)?;
+        self.verify_mutation_references(id)?;
+        let intent = &mutation.intent;
+        let MutationAction::Replace { content } = &intent.action else {
+            return Err(JournalError::Invariant(
+                "replace completion requires Replace action",
+            ));
+        };
+        let mut entry = intent.baseline_entry.clone();
+        entry.content = Some(content.clone());
+        if mutation.state != MutationState::Replaced
+            || operation.payload.space_id != intent.space_id
+            || operation.payload.change
+                != (Change::Put {
+                    entry: entry.clone(),
+                })
+        {
+            return Err(JournalError::Invariant("invalid replace completion"));
+        }
+        let mut expected = self.snapshot(&intent.space_id, &intent.baseline_root)?;
+        expected.entries.insert(entry.entry_id.clone(), entry);
+        expected.version_vector.observe(
+            operation.payload.origin_device_id.clone(),
+            operation.payload.origin_seq,
+        );
+        if &expected != manifest {
+            return Err(JournalError::Invariant(
+                "replace completion changed unrelated baseline entries",
+            ));
+        }
+        self.commit_local_inner(
+            Some(&intent.baseline_root),
+            manifest,
+            std::slice::from_ref(operation),
+            timestamp,
+            Completion::Mutation(id),
+        )
+    }
+
     fn commit_local_inner(
         &mut self,
         expected_root: Option<&SnapshotId>,
@@ -976,7 +1105,7 @@ impl Journal {
         let root = manifest.root()?;
         let tx = self.connection.transaction()?;
         let mutation_active: Option<String> = tx.query_row(
-            "SELECT transaction_id FROM mutations WHERE space_id=?1 AND state IN ('prepared','executing','quarantined','moved')",
+            "SELECT transaction_id FROM mutations WHERE space_id=?1 AND state IN ('prepared','executing','quarantined','moved','replaced')",
             [manifest.space_id.as_str()], |r| r.get(0),
         ).optional()?;
         let mutation = match completion {
@@ -1087,7 +1216,7 @@ impl Journal {
         }
         if let Some(id) = mutation {
             if tx.execute(
-                "UPDATE mutations SET state='committed',committed_snapshot=?1 WHERE transaction_id=?2 AND state IN ('quarantined','moved')",
+                "UPDATE mutations SET state='committed',committed_snapshot=?1 WHERE transaction_id=?2 AND state IN ('quarantined','moved','replaced')",
                 params![root.as_str(), id.as_str()],
             )? != 1 {
                 return Err(JournalError::Invariant("mutation changed before completion"));

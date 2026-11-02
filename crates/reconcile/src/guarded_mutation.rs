@@ -63,8 +63,12 @@ pub(crate) fn validate_directory(directory: &Path, mutation: &Mutation) -> Resul
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         if entry.file_name() != "owner"
-            && !(mutation.intent.action == MutationAction::Delete
-                && entry.file_name() == "original")
+            && !(matches!(
+                mutation.intent.action,
+                MutationAction::Delete | MutationAction::Replace { .. }
+            ) && entry.file_name() == "original")
+            && !(matches!(mutation.intent.action, MutationAction::Replace { .. })
+                && entry.file_name() == "payload")
         {
             return Err(ReconcileError::Invariant(
                 "unexpected mutation transaction path",
@@ -126,6 +130,7 @@ pub(crate) struct TransactionDirectory {
     pub(crate) execution: MutationExecution,
     pub(crate) _guards: Vec<LockedDirectory>,
     pub(crate) _owner: LockedFile,
+    pub(crate) directory: std::path::PathBuf,
 }
 
 pub(crate) fn allocate_directory(
@@ -155,6 +160,7 @@ pub(crate) fn allocate_directory(
         execution_id,
         directory_identity: physical_identity(&directory)?,
         owner_identity: physical_identity(&owner_path)?,
+        payload_identity: None,
     };
     let mut admitted = mutation.clone();
     admitted.execution = Some(execution.clone());
@@ -163,5 +169,6 @@ pub(crate) fn allocate_directory(
         execution,
         _guards: guards,
         _owner: owner,
+        directory,
     })
 }
