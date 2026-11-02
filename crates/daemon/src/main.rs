@@ -118,14 +118,14 @@ enum Command {
         #[arg(long)]
         transaction: String,
     },
-    /// Explicitly execute a prepared Windows local NTFS single-file delete; retain original.
+    /// Explicitly execute a prepared Windows local NTFS single-file Delete or non-overwriting Move.
     ExecuteMutation {
         #[arg(long)]
         data_dir: PathBuf,
         #[arg(long)]
         transaction: String,
     },
-    /// Resume authorized delete executions, never automatically authorize preparations.
+    /// Resume authorized file mutations, never automatically authorize preparations.
     RecoverMutations {
         #[arg(long)]
         data_dir: PathBuf,
@@ -256,7 +256,8 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut local = open(&data_dir)?;
             let snapshot = snapshot.parse()?;
             let path = PortablePath::new(path)?;
-            let executor_available = cfg!(windows) && matches!(&action, PrepareAction::Delete);
+            let executor_available =
+                cfg!(windows) && !matches!(&action, PrepareAction::Replace { .. });
             let mutation = match action {
                 PrepareAction::Replace { source } => {
                     local.prepare_replace(&snapshot, &path, &source)?

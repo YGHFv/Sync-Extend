@@ -60,27 +60,33 @@ pub enum MutationState {
     Cancelled,
     Executing,
     Quarantined,
+    Moved,
     Committed,
 }
 
 impl MutationState {
     pub fn active(self) -> bool {
-        matches!(self, Self::Prepared | Self::Executing | Self::Quarantined)
+        matches!(
+            self,
+            Self::Prepared | Self::Executing | Self::Quarantined | Self::Moved
+        )
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DeleteExecution {
+pub struct MutationExecution {
     pub execution_id: EntryId,
     pub directory_identity: ContentId,
     pub owner_identity: ContentId,
 }
 
+pub type DeleteExecution = MutationExecution;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Mutation {
     pub intent: MutationIntent,
     pub state: MutationState,
-    pub execution: Option<DeleteExecution>,
+    pub execution: Option<MutationExecution>,
     pub committed_snapshot: Option<SnapshotId>,
 }

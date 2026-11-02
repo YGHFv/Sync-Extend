@@ -1,11 +1,14 @@
 mod delete;
 mod fault;
 mod filesystem;
+#[cfg(windows)]
+mod guarded_mutation;
 mod identity;
+mod move_file;
 mod mutation;
 mod publish;
 mod scan;
-pub use delete::DeleteResult;
+pub use delete::{DeleteResult, MutationResult};
 pub use mutation::MutationCheck;
 pub use publish::PublishResult;
 
@@ -87,6 +90,7 @@ pub struct Status {
     pub outstanding_mutations: usize,
     pub destructive_mutation_enabled: bool,
     pub windows_delete_executor_available: bool,
+    pub windows_move_executor_available: bool,
     pub mutation_executor_actions: Vec<&'static str>,
 }
 
@@ -406,8 +410,9 @@ impl LocalSpace {
             outstanding_mutations: self.journal.outstanding_mutations(&self.space_id)?.len(),
             destructive_mutation_enabled: cfg!(windows),
             windows_delete_executor_available: cfg!(windows),
+            windows_move_executor_available: cfg!(windows),
             mutation_executor_actions: if cfg!(windows) {
-                vec!["delete"]
+                vec!["delete", "move"]
             } else {
                 vec![]
             },

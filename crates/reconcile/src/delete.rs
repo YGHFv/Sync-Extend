@@ -4,23 +4,28 @@ use sync_extend_core_model::*;
 use sync_extend_journal::{MutationAction, MutationState};
 
 #[derive(Serialize)]
-pub struct DeleteResult {
+pub struct MutationResult {
     pub transaction_id: EntryId,
     pub snapshot_id: SnapshotId,
     pub original_retained_at_commit: bool,
     pub local_committed: bool,
     pub remote_backup_complete: bool,
+    pub action: &'static str,
+    pub source_path: PortablePath,
+    pub moved_path: Option<PortablePath>,
 }
 
+pub type DeleteResult = MutationResult;
+
 impl LocalSpace {
-    pub fn execute_mutation(&mut self, id: &EntryId) -> Result<DeleteResult> {
+    pub fn execute_mutation(&mut self, id: &EntryId) -> Result<MutationResult> {
         self.verify_root()?;
         let mutation = self.journal.mutation(id)?;
         if mutation.intent.space_id != self.space_id
-            || mutation.intent.action != MutationAction::Delete
+            || matches!(mutation.intent.action, MutationAction::Replace { .. })
         {
             return Err(ReconcileError::Invariant(
-                "only this space's single-file delete has an executor",
+                "only this space's single-file Delete/Move has an executor",
             ));
         }
         if mutation.state == MutationState::Cancelled {
@@ -29,22 +34,36 @@ impl LocalSpace {
             ));
         }
         if mutation.state != MutationState::Committed {
-            self.execute_delete_platform(id)?;
+            match mutation.intent.action {
+                MutationAction::Delete => self.execute_delete_platform(id)?,
+                MutationAction::Move { .. } => self.execute_move_platform(id)?,
+                MutationAction::Replace { .. } => unreachable!(),
+            }
         }
         let mutation = self.journal.mutation(id)?;
         self.journal.verify_mutation_references(id)?;
-        Ok(DeleteResult {
+        Ok(MutationResult {
             transaction_id: id.clone(),
             snapshot_id: mutation
                 .committed_snapshot
-                .ok_or(ReconcileError::Invariant("delete is not committed"))?,
-            original_retained_at_commit: true,
+                .ok_or(ReconcileError::Invariant("mutation is not committed"))?,
+            original_retained_at_commit: mutation.intent.action == MutationAction::Delete,
             local_committed: true,
             remote_backup_complete: false,
+            action: if mutation.intent.action == MutationAction::Delete {
+                "delete"
+            } else {
+                "move"
+            },
+            source_path: mutation.intent.baseline_entry.path,
+            moved_path: match mutation.intent.action {
+                MutationAction::Move { destination, .. } => Some(destination),
+                _ => None,
+            },
         })
     }
 
-    pub fn recover_mutations(&mut self) -> Result<Vec<DeleteResult>> {
+    pub fn recover_mutations(&mut self) -> Result<Vec<MutationResult>> {
         self.verify_root()?;
         let mutations = self.journal.outstanding_mutations(&self.space_id)?;
         if mutations
@@ -72,126 +91,14 @@ impl LocalSpace {
 #[cfg(windows)]
 mod windows {
     use super::*;
-    use crate::{check_ancestors, fault::checkpoint, filesystem::physical_identity, now_ms};
-    use std::{
-        fs,
-        io::{Read, Seek, SeekFrom, Write},
-        path::Path,
+    use crate::guarded_mutation::{
+        allocate_directory, content_matches, directory_chain, identity, validate_directory,
     };
+    use crate::{fault::checkpoint, filesystem::physical_identity, now_ms};
     use sync_extend_cas::sync_directory;
-    use sync_extend_journal::{DeleteExecution, Mutation};
-    use sync_extend_platform_fs::{LockedDirectory, LockedFile};
-
-    fn directory_chain(path: &Path) -> Result<Vec<LockedDirectory>> {
-        let mut paths: Vec<_> = path.ancestors().take_while(|p| p.is_absolute()).collect();
-        paths.reverse();
-        let mut guards = Vec::new();
-        for path in paths {
-            check_ancestors(path)?;
-            let guard = LockedDirectory::open(path)?;
-            if ContentId::hash(guard.key()?.to_string().as_bytes()) != physical_identity(path)? {
-                return Err(ReconcileError::Unstable);
-            }
-            guards.push(guard);
-        }
-        Ok(guards)
-    }
-
-    fn identity(file: &LockedFile) -> Result<ContentId> {
-        Ok(ContentId::hash(file.key()?.to_string().as_bytes()))
-    }
-
-    fn content_matches(file: &LockedFile, content: &FileManifest) -> Result<bool> {
-        if file.reader().metadata()?.len() != content.length {
-            return Ok(false);
-        }
-        let mut reader = file.reader();
-        reader.seek(SeekFrom::Start(0))?;
-        let mut hash = blake3::Hasher::new();
-        let mut left = content.length;
-        let mut buffer = [0u8; 65536];
-        loop {
-            let n = reader.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            if n as u64 > left {
-                return Ok(false);
-            }
-            left -= n as u64;
-            hash.update(&buffer[..n]);
-        }
-        Ok(left == 0 && ContentId::from_hasher(&hash) == content.content_id)
-    }
-
-    fn validate_directory(directory: &Path, mutation: &Mutation) -> Result<LockedFile> {
-        let execution = mutation
-            .execution
-            .as_ref()
-            .ok_or(ReconcileError::Invariant("missing delete execution"))?;
-        if physical_identity(directory)? != execution.directory_identity {
-            return Err(ReconcileError::Invariant(
-                "delete quarantine directory identity changed",
-            ));
-        }
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            if entry.file_name() != "owner" && entry.file_name() != "original" {
-                return Err(ReconcileError::Invariant(
-                    "unexpected delete quarantine path",
-                ));
-            }
-            check_ancestors(&entry.path())?;
-        }
-        let owner_path = directory.join("owner");
-        let owner = LockedFile::open(&owner_path)?;
-        let marker = format!(
-            "{}:{}",
-            mutation.intent.transaction_id, execution.execution_id
-        );
-        let mut bytes = Vec::new();
-        owner
-            .reader()
-            .take(marker.len() as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        if identity(&owner)? != execution.owner_identity || bytes != marker.as_bytes() {
-            return Err(ReconcileError::Invariant(
-                "delete quarantine ownership changed",
-            ));
-        }
-        Ok(owner)
-    }
+    use sync_extend_platform_fs::LockedFile;
 
     impl LocalSpace {
-        fn validate_delete_baseline(&self, mutation: &Mutation) -> Result<()> {
-            let intent = &mutation.intent;
-            let baseline = self
-                .journal
-                .snapshot(&self.space_id, &intent.baseline_root)?;
-            let scan = self.stable_scan()?;
-            if self
-                .manifest()?
-                .as_ref()
-                .map(Manifest::root)
-                .transpose()?
-                .as_ref()
-                != Some(&intent.baseline_root)
-                || baseline.entries.len() != scan.len()
-                || baseline.entries.values().any(|entry| {
-                    scan.get(&entry.path)
-                        .is_none_or(|s| s.kind != entry.kind || s.content != entry.content)
-                })
-                || scan
-                    .get(&intent.baseline_entry.path)
-                    .is_none_or(|s| s.physical_identity != intent.file_identity)
-            {
-                return Err(ReconcileError::Invariant(
-                    "delete baseline changed; all files and pins preserved",
-                ));
-            }
-            Ok(())
-        }
-
         pub(super) fn execute_delete_platform(&mut self, id: &EntryId) -> Result<()> {
             let mut mutation = self.journal.mutation(id)?;
             self.journal.verify_mutation_references(id)?;
@@ -215,8 +122,7 @@ mod windows {
             let source = self.worktree.join(intent.baseline_entry.path.as_str());
             checkpoint("before_delete_lock");
             let mut held = None;
-            let mut admission_guards = Vec::new();
-            let mut admission_owner = None;
+            let mut admission = None;
             if mutation.state == MutationState::Prepared {
                 let file = LockedFile::open(&source)?;
                 if identity(&file)? != intent.file_identity || !content_matches(&file, content)? {
@@ -225,35 +131,12 @@ mod windows {
                     ));
                 }
                 checkpoint("after_delete_lock");
-                self.validate_delete_baseline(&mutation)?;
-                let base = parent.join(".sync-tmp");
-                if !base.try_exists()? {
-                    fs::create_dir(&base)?;
-                }
-                admission_guards.extend(directory_chain(&base)?);
-                let execution_id = EntryId::random()?;
-                let directory = base.join(execution_id.as_str());
-                fs::create_dir(&directory)?;
-                admission_guards.extend(directory_chain(&directory)?);
-                let owner_path = directory.join("owner");
-                let mut owner = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&owner_path)?;
-                write!(owner, "{}:{}", id, execution_id)?;
-                owner.sync_all()?;
-                drop(owner);
-                sync_directory(&directory)?;
-                sync_directory(&base)?;
-                let execution = DeleteExecution {
-                    execution_id,
-                    directory_identity: physical_identity(&directory)?,
-                    owner_identity: physical_identity(&owner_path)?,
-                };
-                mutation.execution = Some(execution.clone());
-                admission_owner = Some(validate_directory(&directory, &mutation)?);
+                self.validate_mutation_baseline(&mutation)?;
+                let transaction = allocate_directory(&parent, &mutation)?;
                 checkpoint("before_delete_execution");
-                self.journal.start_delete(&self.space_id, id, &execution)?;
+                self.journal
+                    .start_delete(&self.space_id, id, &transaction.execution)?;
+                admission = Some(transaction);
                 mutation = self.journal.mutation(id)?;
                 held = Some(file);
                 checkpoint("after_delete_execution");
@@ -266,9 +149,10 @@ mod windows {
                 .join(".sync-tmp")
                 .join(execution.execution_id.as_str());
             let quarantine_guards = directory_chain(&directory)?;
-            let _owner = match admission_owner {
-                Some(owner) => owner,
-                None => validate_directory(&directory, &mutation)?,
+            let _owner = if admission.is_none() {
+                Some(validate_directory(&directory, &mutation)?)
+            } else {
+                None
             };
             let quarantine = directory.join("original");
             let file = if quarantine.try_exists()? {
@@ -287,7 +171,7 @@ mod windows {
                 if identity(&file)? != intent.file_identity || !content_matches(&file, content)? {
                     return Err(ReconcileError::Invariant("executing delete source changed"));
                 }
-                self.validate_delete_baseline(&mutation)?;
+                self.validate_mutation_baseline(&mutation)?;
                 if file.key()?.volume
                     != quarantine_guards
                         .last()

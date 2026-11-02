@@ -252,11 +252,15 @@ impl LocalSpace {
             transaction_id: id.clone(),
             state: mutation.state,
             baseline_valid: valid,
-            executor_available: cfg!(windows) && intent.action == MutationAction::Delete && active,
+            executor_available: cfg!(windows)
+                && !matches!(intent.action, MutationAction::Replace { .. })
+                && active,
             worktree_modified: match mutation.state {
                 MutationState::Executing => None,
                 MutationState::Prepared | MutationState::Cancelled => Some(false),
-                MutationState::Quarantined | MutationState::Committed => Some(true),
+                MutationState::Quarantined | MutationState::Moved | MutationState::Committed => {
+                    Some(true)
+                }
             },
             remote_backup_complete: false,
         })

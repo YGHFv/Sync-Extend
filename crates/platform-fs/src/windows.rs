@@ -10,11 +10,12 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{GENERIC_READ, HANDLE},
     Storage::FileSystem::{
-        FileIdInfo, FileRenameInfo, GetDriveTypeW, GetFileInformationByHandle,
-        GetFileInformationByHandleEx, GetVolumeInformationByHandleW, GetVolumePathNameW,
-        SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileCaseSensitiveInfo, FileIdInfo, FileRenameInfo, GetDriveTypeW,
+        GetFileInformationByHandle, GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
+        GetVolumePathNameW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_RENAME_INFO, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
     },
     System::WindowsProgramming::DRIVE_FIXED,
 };
@@ -61,7 +62,7 @@ fn regular(file: &File, directory: bool) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
         if info.nNumberOfLinks != 1 {
-            return Err(invalid("delete executor requires a single-link file"));
+            return Err(invalid("file mutation requires a single-link file"));
         }
     }
     Ok(())
@@ -85,7 +86,7 @@ fn local_ntfs(file: &File, path: &Path) -> io::Result<()> {
     }
     // SAFETY: successful GetVolumePathNameW returned a terminated volume path.
     if unsafe { GetDriveTypeW(root.as_ptr()) } != DRIVE_FIXED {
-        return Err(invalid("delete executor requires a fixed local volume"));
+        return Err(invalid("file mutation requires a fixed local volume"));
     }
     let mut filesystem = [0u16; 32];
     // SAFETY: handle is live; optional outputs are null and filesystem is sized.
@@ -105,7 +106,7 @@ fn local_ntfs(file: &File, path: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     if filesystem[..5] != [b'N' as u16, b'T' as u16, b'F' as u16, b'S' as u16, 0] {
-        return Err(invalid("delete executor requires NTFS"));
+        return Err(invalid("file mutation requires NTFS"));
     }
     Ok(())
 }
@@ -117,7 +118,8 @@ pub struct LockedDirectory {
 impl LockedDirectory {
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
-            .access_mode(0)
+            // Metadata-only opens do not enforce Windows sharing exclusion.
+            .access_mode(GENERIC_READ)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
@@ -127,6 +129,27 @@ impl LockedDirectory {
 
     pub fn key(&self) -> io::Result<FileKey> {
         key(&self.file)
+    }
+
+    pub fn require_case_insensitive(&self) -> io::Result<()> {
+        let mut info = FILE_CASE_SENSITIVE_INFO::default();
+        // SAFETY: directory owns a live handle; info is aligned writable output
+        // sized for the requested information class.
+        let result = unsafe {
+            GetFileInformationByHandleEx(
+                self.file.as_raw_handle() as HANDLE,
+                FileCaseSensitiveInfo,
+                ptr::from_mut(&mut info).cast(),
+                size_of::<FILE_CASE_SENSITIVE_INFO>() as u32,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if info.Flags != 0 {
+            return Err(invalid("mutation requires case-insensitive parents"));
+        }
+        Ok(())
     }
 }
 

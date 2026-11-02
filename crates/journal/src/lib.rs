@@ -64,7 +64,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=4 => {}
+            1..=5 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -94,6 +94,11 @@ impl Journal {
         if version < 4 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-004.sql"))?;
+            tx.commit()?;
+        }
+        if version < 5 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-005.sql"))?;
             tx.commit()?;
         }
         Ok(Self { connection })
@@ -415,6 +420,7 @@ impl Journal {
             "cancelled" => MutationState::Cancelled,
             "executing" => MutationState::Executing,
             "quarantined" => MutationState::Quarantined,
+            "moved" => MutationState::Moved,
             "committed" => MutationState::Committed,
             _ => return Err(JournalError::Invariant("unsupported mutation state")),
         };
@@ -427,12 +433,21 @@ impl Journal {
                 None
             }
             (Some(json), Some(hash))
-                if matches!(intent.action, MutationAction::Delete)
-                    && !matches!(state, MutationState::Prepared | MutationState::Cancelled)
-                    && json.len() <= MAX_OPERATION_BYTES
+                if matches!(
+                    (&intent.action, state),
+                    (
+                        MutationAction::Delete,
+                        MutationState::Executing
+                            | MutationState::Quarantined
+                            | MutationState::Committed
+                    ) | (
+                        MutationAction::Move { .. },
+                        MutationState::Executing | MutationState::Moved | MutationState::Committed
+                    )
+                ) && json.len() <= MAX_OPERATION_BYTES
                     && ContentId::hash(json.as_bytes()).as_str() == hash =>
             {
-                Some(serde_json::from_str::<DeleteExecution>(&json)?)
+                Some(serde_json::from_str::<MutationExecution>(&json)?)
             }
             _ => {
                 return Err(JournalError::Invariant(
@@ -466,7 +481,7 @@ impl Journal {
 
     pub fn outstanding_mutations(&self, space: &SpaceId) -> Result<Vec<Mutation>> {
         let mut statement = self.connection.prepare(
-            "SELECT transaction_id FROM mutations WHERE space_id=?1 AND state IN ('prepared','executing','quarantined')",
+            "SELECT transaction_id FROM mutations WHERE space_id=?1 AND state IN ('prepared','executing','quarantined','moved')",
         )?;
         let ids: Vec<String> = statement
             .query_map([space.as_str()], |r| r.get(0))?
@@ -518,13 +533,24 @@ impl Journal {
         }
         if let Some(root) = &mutation.committed_snapshot {
             let completed = self.snapshot(&intent.space_id, root)?;
-            if completed
-                .entries
-                .contains_key(&intent.baseline_entry.entry_id)
-                || !completed
-                    .tombstones
-                    .contains_key(&intent.baseline_entry.entry_id)
-            {
+            let valid = match &intent.action {
+                MutationAction::Delete => {
+                    !completed
+                        .entries
+                        .contains_key(&intent.baseline_entry.entry_id)
+                        && completed
+                            .tombstones
+                            .contains_key(&intent.baseline_entry.entry_id)
+                }
+                MutationAction::Move { destination, .. } => {
+                    let mut entry = intent.baseline_entry.clone();
+                    entry.path = destination.clone();
+                    completed.entries.get(&entry.entry_id) == Some(&entry)
+                        && !completed.tombstones.contains_key(&entry.entry_id)
+                }
+                _ => false,
+            };
+            if !valid {
                 return Err(JournalError::Invariant(
                     "mutation completion snapshot mismatch",
                 ));
@@ -549,6 +575,14 @@ impl Journal {
                     "mutation move destination occupied",
                 ));
             }
+            // Reject noncanonical/missing indexed parents before any OS rename.
+            let mut moved = baseline.clone();
+            moved
+                .entries
+                .get_mut(&intent.baseline_entry.entry_id)
+                .ok_or(JournalError::Invariant("missing move baseline entry"))?
+                .path = destination.clone();
+            moved.validate()?;
         }
         let json = serde_json::to_string(intent)?;
         if json.len() > MAX_OPERATION_BYTES {
@@ -625,15 +659,47 @@ impl Journal {
         id: &EntryId,
         execution: &DeleteExecution,
     ) -> Result<()> {
+        self.start_file_mutation(space, id, execution, false)
+    }
+
+    pub fn start_move(
+        &mut self,
+        space: &SpaceId,
+        id: &EntryId,
+        execution: &MutationExecution,
+    ) -> Result<()> {
+        self.start_file_mutation(space, id, execution, true)
+    }
+
+    fn start_file_mutation(
+        &mut self,
+        space: &SpaceId,
+        id: &EntryId,
+        execution: &MutationExecution,
+        moving: bool,
+    ) -> Result<()> {
         let mutation = self.mutation(id)?;
         self.verify_mutation_references(id)?;
         if mutation.intent.space_id != *space
             || mutation.state != MutationState::Prepared
-            || mutation.intent.action != MutationAction::Delete
+            || if moving {
+                !matches!(mutation.intent.action, MutationAction::Move { .. })
+            } else {
+                mutation.intent.action != MutationAction::Delete
+            }
         {
             return Err(JournalError::Invariant(
-                "only a prepared delete can execute",
+                "only a matching prepared file mutation can execute",
             ));
+        }
+        if let MutationAction::Move { destination, .. } = &mutation.intent.action {
+            let mut baseline = self.snapshot(space, &mutation.intent.baseline_root)?;
+            baseline
+                .entries
+                .get_mut(&mutation.intent.baseline_entry.entry_id)
+                .ok_or(JournalError::Invariant("missing move baseline entry"))?
+                .path = destination.clone();
+            baseline.validate()?;
         }
         let json = serde_json::to_string(execution)?;
         let tx = self.connection.transaction()?;
@@ -656,17 +722,32 @@ impl Journal {
     }
 
     pub fn mark_delete_quarantined(&mut self, space: &SpaceId, id: &EntryId) -> Result<()> {
+        self.mark_file_mutated(space, id, false)
+    }
+
+    pub fn mark_move_moved(&mut self, space: &SpaceId, id: &EntryId) -> Result<()> {
+        self.mark_file_mutated(space, id, true)
+    }
+
+    fn mark_file_mutated(&mut self, space: &SpaceId, id: &EntryId, moving: bool) -> Result<()> {
         let mutation = self.mutation(id)?;
         if mutation.intent.space_id != *space
             || mutation.state != MutationState::Executing
-            || mutation.intent.action != MutationAction::Delete
+            || if moving {
+                !matches!(mutation.intent.action, MutationAction::Move { .. })
+            } else {
+                mutation.intent.action != MutationAction::Delete
+            }
         {
-            return Err(JournalError::Invariant("delete is not executing"));
+            return Err(JournalError::Invariant(
+                "matching file mutation is not executing",
+            ));
         }
         if self.connection.execute(
-            "UPDATE mutations SET state='quarantined' WHERE transaction_id=?1 AND state='executing'",
-            [id.as_str()],
-        )? != 1 {
+            "UPDATE mutations SET state=?1 WHERE transaction_id=?2 AND state='executing'",
+            params![if moving { "moved" } else { "quarantined" }, id.as_str()],
+        )? != 1
+        {
             return Err(JournalError::Invariant("mutation state changed"));
         }
         Ok(())
@@ -834,6 +915,55 @@ impl Journal {
         )
     }
 
+    pub fn commit_move(
+        &mut self,
+        id: &EntryId,
+        manifest: &Manifest,
+        operation: &Operation,
+        timestamp: u64,
+    ) -> Result<SnapshotId> {
+        let mutation = self.mutation(id)?;
+        self.verify_mutation_references(id)?;
+        let intent = &mutation.intent;
+        let MutationAction::Move { destination, .. } = &intent.action else {
+            return Err(JournalError::Invariant(
+                "move completion requires Move action",
+            ));
+        };
+        if mutation.state != MutationState::Moved
+            || operation.payload.space_id != intent.space_id
+            || operation.payload.change
+                != (Change::Rename {
+                    entry_id: intent.baseline_entry.entry_id.clone(),
+                    path: destination.clone(),
+                })
+        {
+            return Err(JournalError::Invariant("invalid move completion"));
+        }
+        let mut expected = self.snapshot(&intent.space_id, &intent.baseline_root)?;
+        expected
+            .entries
+            .get_mut(&intent.baseline_entry.entry_id)
+            .ok_or(JournalError::Invariant("missing move baseline entry"))?
+            .path = destination.clone();
+        expected.version_vector.observe(
+            operation.payload.origin_device_id.clone(),
+            operation.payload.origin_seq,
+        );
+        if &expected != manifest {
+            return Err(JournalError::Invariant(
+                "move completion changed unrelated baseline entries",
+            ));
+        }
+        self.commit_local_inner(
+            Some(&intent.baseline_root),
+            manifest,
+            std::slice::from_ref(operation),
+            timestamp,
+            Completion::Mutation(id),
+        )
+    }
+
     fn commit_local_inner(
         &mut self,
         expected_root: Option<&SnapshotId>,
@@ -846,7 +976,7 @@ impl Journal {
         let root = manifest.root()?;
         let tx = self.connection.transaction()?;
         let mutation_active: Option<String> = tx.query_row(
-            "SELECT transaction_id FROM mutations WHERE space_id=?1 AND state IN ('prepared','executing','quarantined')",
+            "SELECT transaction_id FROM mutations WHERE space_id=?1 AND state IN ('prepared','executing','quarantined','moved')",
             [manifest.space_id.as_str()], |r| r.get(0),
         ).optional()?;
         let mutation = match completion {
@@ -957,7 +1087,7 @@ impl Journal {
         }
         if let Some(id) = mutation {
             if tx.execute(
-                "UPDATE mutations SET state='committed',committed_snapshot=?1 WHERE transaction_id=?2 AND state='quarantined'",
+                "UPDATE mutations SET state='committed',committed_snapshot=?1 WHERE transaction_id=?2 AND state IN ('quarantined','moved')",
                 params![root.as_str(), id.as_str()],
             )? != 1 {
                 return Err(JournalError::Invariant("mutation changed before completion"));
@@ -1073,4 +1203,6 @@ fn promote_pending(tx: &Transaction<'_>) -> Result<()> {
 mod publication;
 pub use publication::{Publication, PublicationIntent, PublicationState};
 mod mutation;
-pub use mutation::{DeleteExecution, Mutation, MutationAction, MutationIntent, MutationState};
+pub use mutation::{
+    DeleteExecution, Mutation, MutationAction, MutationExecution, MutationIntent, MutationState,
+};
