@@ -87,13 +87,18 @@ mod windows {
                 }
                 checkpoint("after_replace_lock");
                 self.validate_mutation_baseline(&mutation)?;
-                let mut transaction = allocate_directory(&parent, &mutation)?;
+                let mut transaction = allocate_directory(self, &parent, &mutation)?;
                 transaction
                     ._guards
                     .last()
                     .ok_or(ReconcileError::Invariant("missing Replace staging guard"))?
                     .require_case_insensitive()?;
                 let payload_path = transaction.directory.join("payload");
+                self.reserve_internal_worktree(
+                    original_content.length.checked_add(content.length).ok_or(
+                        ReconcileError::ResourceLimit("Replace internal byte overflow"),
+                    )?,
+                )?;
                 let mut writer = OpenOptions::new()
                     .write(true)
                     .create_new(true)
@@ -202,6 +207,7 @@ mod windows {
                 self.validate_mutation_baseline(&mutation)?;
                 parent_guard.require_case_insensitive()?;
                 checkpoint("before_replace_quarantine");
+                self.reserve_internal_worktree(original_content.length)?;
                 file.rename_no_replace(&quarantine)?;
                 sync_directory(&parent)?;
                 sync_directory(&directory)?;

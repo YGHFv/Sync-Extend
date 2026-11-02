@@ -133,7 +133,7 @@ mod windows {
                 }
                 checkpoint("after_delete_lock");
                 self.validate_mutation_baseline(&mutation)?;
-                let transaction = allocate_directory(&parent, &mutation)?;
+                let transaction = allocate_directory(self, &parent, &mutation)?;
                 checkpoint("before_delete_execution");
                 self.journal
                     .start_delete(&self.space_id, id, &transaction.execution)?;
@@ -185,6 +185,7 @@ mod windows {
                     ));
                 }
                 checkpoint("before_delete_rename");
+                self.reserve_internal_worktree(content.length)?;
                 file.rename_no_replace(&quarantine)?;
                 sync_directory(&parent)?;
                 sync_directory(&directory)?;

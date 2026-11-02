@@ -36,6 +36,11 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Audit local storage and references without importing, recovering or deleting.
+    StorageReport {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Print the immutable current manifest (contains local filenames).
     Manifest {
         #[arg(long)]
@@ -118,7 +123,7 @@ enum Command {
         #[arg(long)]
         transaction: String,
     },
-    /// Explicitly execute a prepared Windows local NTFS single-file Delete or non-overwriting Move.
+    /// Explicitly execute a prepared Windows local NTFS single-file Delete, Move or Replace.
     ExecuteMutation {
         #[arg(long)]
         data_dir: PathBuf,
@@ -198,6 +203,9 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Status { data_dir } => {
             print(&open(&data_dir)?.status()?)?;
         }
+        Command::StorageReport { data_dir } => {
+            print(&open(&data_dir)?.storage_report()?)?;
+        }
         Command::Manifest { data_dir } => {
             print(&open(&data_dir)?.manifest()?)?;
         }
@@ -256,8 +264,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut local = open(&data_dir)?;
             let snapshot = snapshot.parse()?;
             let path = PortablePath::new(path)?;
-            let executor_available =
-                cfg!(windows) && !matches!(&action, PrepareAction::Replace { .. });
+            let executor_available = cfg!(windows);
             let mutation = match action {
                 PrepareAction::Replace { source } => {
                     local.prepare_replace(&snapshot, &path, &source)?

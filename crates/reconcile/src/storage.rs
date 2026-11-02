@@ -1,0 +1,422 @@
+use crate::{
+    check_ancestors,
+    fault::checkpoint,
+    filesystem::{ObservedFile, PathIdentity},
+    LocalSpace, ReconcileError, Result,
+};
+use serde::Serialize;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
+use sync_extend_cas::is_reparse;
+use sync_extend_core_model::{ChunkRef, ContentId, FileManifest};
+use sync_extend_journal::{MutationAction, PublicationState};
+
+#[derive(Debug, Serialize)]
+pub struct StorageReport {
+    pub accounting: &'static str,
+    pub content_hashes_verified: bool,
+    pub current_unique_chunk_bytes: u64,
+    pub historical_additional_chunk_bytes: u64,
+    pub transaction_only_chunk_bytes: u64,
+    pub protected_chunk_bytes: u64,
+    pub protected_objects: usize,
+    pub missing_protected_objects: usize,
+    pub mismatched_protected_lengths: usize,
+    pub cas_logical_bytes: u64,
+    pub cas_object_paths: usize,
+    pub cas_temporary_paths: usize,
+    pub unreferenced_cas_objects: usize,
+    pub unreferenced_cas_logical_bytes: u64,
+    pub internal_worktree_logical_bytes: u64,
+    pub internal_worktree_file_paths: usize,
+    pub internal_worktree_limit_bytes: u64,
+    pub internal_worktree_limit_exceeded: bool,
+    pub history_pruning_enabled: bool,
+    pub cleanup_enabled: bool,
+    pub gc_enabled: bool,
+    pub remote_backup_complete: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Observation {
+    identity: ContentId,
+    length: u64,
+    modified: SystemTime,
+    directory: bool,
+    counted: bool,
+    object: Option<ContentId>,
+    temporary: bool,
+}
+
+type Inventory = BTreeMap<PathBuf, Observation>;
+
+#[derive(Clone, Copy)]
+enum Region {
+    Worktree,
+    Cas,
+}
+
+impl LocalSpace {
+    pub fn storage_report(&self) -> Result<StorageReport> {
+        self.verify_root()?;
+        self.journal.integrity_check()?;
+        self.journal
+            .check_storage_metadata_limit(self.limits.max_storage_entries)?;
+        let mut refs = References {
+            lengths: BTreeMap::new(),
+            seen: 0,
+            limit: self.limits.max_storage_entries,
+        };
+        let mut current = BTreeSet::new();
+        if let Some(manifest) = self.manifest()? {
+            for content in manifest
+                .entries
+                .values()
+                .filter_map(|entry| entry.content.as_ref())
+            {
+                refs.add(content, &mut current)?;
+            }
+        }
+        let mut retained = current.clone();
+        for manifest in self.journal.retained_manifests(&self.space_id)? {
+            for content in manifest
+                .entries
+                .values()
+                .filter_map(|entry| entry.content.as_ref())
+            {
+                refs.add(content, &mut retained)?;
+            }
+        }
+        let mut expected = retained.clone();
+        for mutation in self.journal.mutations(&self.space_id)? {
+            self.journal
+                .verify_mutation_references(&mutation.intent.transaction_id)?;
+            if mutation.state.active() {
+                if let Some(content) = &mutation.intent.baseline_entry.content {
+                    refs.add(content, &mut expected)?;
+                }
+                if let MutationAction::Replace { content } = &mutation.intent.action {
+                    refs.add(content, &mut expected)?;
+                }
+            }
+        }
+        for publication in self.journal.outstanding_publications(&self.space_id)? {
+            if publication.state != PublicationState::Committed {
+                refs.add(&publication.intent.content, &mut expected)?;
+            }
+        }
+        let protected: BTreeSet<_> = self.journal.protected_objects()?.into_iter().collect();
+        if expected != protected {
+            return Err(ReconcileError::Invariant(
+                "storage reference protection mismatch",
+            ));
+        }
+        let cas = self.storage_inventory(Region::Cas)?;
+        let worktree = self.storage_inventory(Region::Worktree)?;
+        let objects: BTreeMap<_, _> = cas
+            .values()
+            .filter_map(|entry| entry.object.as_ref().map(|id| (id.clone(), entry.length)))
+            .collect();
+        let mut unreferenced = BTreeSet::new();
+        for id in objects.keys() {
+            if !protected.contains(id) {
+                unreferenced.insert(id.clone());
+            }
+        }
+        let internal = inventory_bytes(&worktree)?;
+        Ok(StorageReport {
+            accounting: "physical_identity_deduplicated_logical_lengths_not_allocated_blocks",
+            content_hashes_verified: false,
+            current_unique_chunk_bytes: refs.bytes(current.iter())?,
+            historical_additional_chunk_bytes: refs.bytes(retained.difference(&current))?,
+            transaction_only_chunk_bytes: refs.bytes(expected.difference(&retained))?,
+            protected_chunk_bytes: refs.bytes(expected.iter())?,
+            protected_objects: protected.len(),
+            missing_protected_objects: protected
+                .iter()
+                .filter(|id| !objects.contains_key(*id))
+                .count(),
+            mismatched_protected_lengths: protected
+                .iter()
+                .filter(|id| {
+                    objects
+                        .get(*id)
+                        .is_some_and(|length| Some(length) != refs.lengths.get(*id))
+                })
+                .count(),
+            cas_logical_bytes: inventory_bytes(&cas)?,
+            cas_object_paths: objects.len(),
+            cas_temporary_paths: cas
+                .values()
+                .filter(|entry| !entry.directory && entry.temporary)
+                .count(),
+            unreferenced_cas_objects: unreferenced.len(),
+            unreferenced_cas_logical_bytes: selected_inventory_bytes(&cas, |entry| {
+                entry
+                    .object
+                    .as_ref()
+                    .is_some_and(|id| unreferenced.contains(id))
+            })?,
+            internal_worktree_logical_bytes: internal,
+            internal_worktree_file_paths: worktree
+                .values()
+                .filter(|entry| entry.counted && !entry.directory)
+                .count(),
+            internal_worktree_limit_bytes: self.limits.max_internal_worktree_bytes,
+            internal_worktree_limit_exceeded: internal > self.limits.max_internal_worktree_bytes,
+            history_pruning_enabled: false,
+            cleanup_enabled: false,
+            gc_enabled: false,
+            remote_backup_complete: false,
+        })
+    }
+
+    pub(crate) fn reserve_internal_worktree(&self, additional: u64) -> Result<()> {
+        let inventory = self.storage_inventory(Region::Worktree)?;
+        if inventory_bytes(&inventory)?
+            .checked_add(additional)
+            .is_none_or(|bytes| bytes > self.limits.max_internal_worktree_bytes)
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "aggregate internal worktree bytes",
+            ));
+        }
+        checkpoint("after_internal_storage_admission");
+        Ok(())
+    }
+
+    fn storage_inventory(&self, region: Region) -> Result<Inventory> {
+        let root = match region {
+            Region::Worktree => self.worktree.clone(),
+            Region::Cas => self.data_dir.join("cas"),
+        };
+        let pass = || {
+            self.verify_root()?;
+            let mut inventory = BTreeMap::new();
+            visit(
+                &root,
+                &root,
+                region,
+                false,
+                0,
+                self.limits.max_storage_entries,
+                &mut inventory,
+            )?;
+            self.verify_root()?;
+            Ok::<_, ReconcileError>(inventory)
+        };
+        let first = pass()?;
+        checkpoint(match region {
+            Region::Worktree => "after_internal_storage_inventory",
+            Region::Cas => "after_cas_storage_inventory",
+        });
+        let second = pass()?;
+        if first != second {
+            return Err(ReconcileError::Unstable);
+        }
+        Ok(second)
+    }
+}
+
+struct References {
+    lengths: BTreeMap<ContentId, u64>,
+    seen: usize,
+    limit: usize,
+}
+
+impl References {
+    fn add(&mut self, content: &FileManifest, set: &mut BTreeSet<ContentId>) -> Result<()> {
+        content.validate()?;
+        for ChunkRef { content_id, length } in &content.chunks {
+            self.seen = self
+                .seen
+                .checked_add(1)
+                .filter(|seen| *seen <= self.limit)
+                .ok_or(ReconcileError::ResourceLimit("storage reference count"))?;
+            let length = u64::from(*length);
+            if self
+                .lengths
+                .insert(content_id.clone(), length)
+                .is_some_and(|old| old != length)
+            {
+                return Err(ReconcileError::Invariant(
+                    "conflicting protected chunk lengths",
+                ));
+            }
+            set.insert(content_id.clone());
+        }
+        Ok(())
+    }
+
+    fn bytes<'a>(&self, ids: impl Iterator<Item = &'a ContentId>) -> Result<u64> {
+        sum_lengths(ids, &self.lengths)
+    }
+}
+
+fn sum_lengths<'a>(
+    mut ids: impl Iterator<Item = &'a ContentId>,
+    lengths: &BTreeMap<ContentId, u64>,
+) -> Result<u64> {
+    ids.try_fold(0u64, |sum, id| {
+        sum.checked_add(
+            *lengths
+                .get(id)
+                .ok_or(ReconcileError::Invariant("missing storage length"))?,
+        )
+        .ok_or(ReconcileError::ResourceLimit("storage byte overflow"))
+    })
+}
+
+fn inventory_bytes(inventory: &Inventory) -> Result<u64> {
+    selected_inventory_bytes(inventory, |_| true)
+}
+
+fn selected_inventory_bytes(
+    inventory: &Inventory,
+    select: impl Fn(&Observation) -> bool,
+) -> Result<u64> {
+    let mut lengths = BTreeMap::new();
+    for entry in inventory
+        .values()
+        .filter(|entry| entry.counted && !entry.directory && select(entry))
+    {
+        if lengths
+            .insert(entry.identity.clone(), entry.length)
+            .is_some_and(|old| old != entry.length)
+        {
+            return Err(ReconcileError::Unstable);
+        }
+    }
+    sum_lengths(lengths.keys(), &lengths)
+}
+
+fn visit(
+    root: &Path,
+    path: &Path,
+    region: Region,
+    internal: bool,
+    depth: usize,
+    limit: usize,
+    inventory: &mut Inventory,
+) -> Result<()> {
+    if inventory.len() >= limit || depth > 160 {
+        return Err(ReconcileError::ResourceLimit(
+            "storage inventory entries/depth",
+        ));
+    }
+    check_ancestors(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || is_reparse(&metadata) {
+        return Err(ReconcileError::Invariant("unsafe storage inventory path"));
+    }
+    let identity = PathIdentity::capture(path)?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| ReconcileError::Invariant("storage root escaped"))?;
+    let parts: Vec<_> = relative.iter().collect();
+    let mut object = None;
+    let temporary = matches!(region, Region::Cas) && parts.first().is_some_and(|p| *p == "tmp");
+    if matches!(region, Region::Cas)
+        && (!parts.is_empty()
+            && !parts
+                .first()
+                .is_some_and(|p| *p == "objects" || *p == "tmp")
+            || parts.len() == 1 && !metadata.is_dir()
+            || temporary && (parts.len() > 2 || parts.len() == 2 && !metadata.is_file()))
+    {
+        return Err(ReconcileError::Invariant(
+            "unknown CAS storage directory layout",
+        ));
+    }
+    if matches!(region, Region::Cas) && parts.first().is_some_and(|p| *p == "objects") {
+        if metadata.is_dir() {
+            if parts.len() > 2
+                || (parts.len() == 2
+                    && !parts[1]
+                        .to_str()
+                        .is_some_and(|name| name.len() == 2 && lower_hex(name)))
+            {
+                return Err(ReconcileError::Invariant("unsafe CAS storage layout"));
+            }
+        } else {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or(ReconcileError::Invariant("invalid CAS object name"))?;
+            if parts.len() != 3
+                || name.len() != 64
+                || !lower_hex(name)
+                || parts[1].to_str() != Some(&name[..2])
+            {
+                return Err(ReconcileError::Invariant("invalid CAS object layout"));
+            }
+            object = Some(name.parse()?);
+        }
+    }
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(ReconcileError::Invariant("unsupported storage entry type"));
+    }
+    inventory.insert(
+        path.to_owned(),
+        Observation {
+            identity: identity.physical.clone(),
+            length: if metadata.is_dir() { 0 } else { metadata.len() },
+            modified: metadata.modified()?,
+            directory: metadata.is_dir(),
+            counted: matches!(region, Region::Cas) || internal,
+            object,
+            temporary,
+        },
+    );
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if matches!(region, Region::Worktree)
+                && !internal
+                && name.to_str().is_some_and(|name| {
+                    name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".sync-extend")
+                })
+            {
+                continue;
+            }
+            let internal = internal
+                || (matches!(region, Region::Worktree)
+                    && name
+                        .to_str()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(".sync-tmp")));
+            visit(
+                root,
+                &entry.path(),
+                region,
+                internal,
+                depth + 1,
+                limit,
+                inventory,
+            )?;
+        }
+    } else {
+        let observed = ObservedFile::open(path)?;
+        if observed.identity.physical != identity.physical
+            || observed.metadata.len() != metadata.len()
+            || observed.metadata.modified()? != metadata.modified()?
+        {
+            return Err(ReconcileError::Unstable);
+        }
+        observed.verify(path)?;
+    }
+    identity.verify(path)?;
+    if metadata.modified()? != fs::symlink_metadata(path)?.modified()? {
+        return Err(ReconcileError::Unstable);
+    }
+    Ok(())
+}
+
+fn lower_hex(name: &str) -> bool {
+    name.bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}

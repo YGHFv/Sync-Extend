@@ -9,9 +9,11 @@ mod mutation;
 mod publish;
 mod replace_file;
 mod scan;
+mod storage;
 pub use delete::{DeleteResult, MutationResult};
 pub use mutation::MutationCheck;
 pub use publish::PublishResult;
+pub use storage::StorageReport;
 
 use fs2::FileExt;
 use serde::Serialize;

@@ -134,9 +134,35 @@ pub(crate) struct TransactionDirectory {
 }
 
 pub(crate) fn allocate_directory(
+    local: &LocalSpace,
     parent: &Path,
     mutation: &Mutation,
 ) -> Result<TransactionDirectory> {
+    let original = mutation
+        .intent
+        .baseline_entry
+        .content
+        .as_ref()
+        .ok_or(ReconcileError::Invariant(
+            "missing mutation baseline content",
+        ))?
+        .length;
+    // Owner is two 32-byte IDs separated by ':'; original quarantine stays charged.
+    let additional = match &mutation.intent.action {
+        MutationAction::Move { .. } => 65,
+        MutationAction::Delete => original
+            .checked_add(65)
+            .ok_or(ReconcileError::ResourceLimit(
+                "mutation internal byte overflow",
+            ))?,
+        MutationAction::Replace { content } => original
+            .checked_add(content.length)
+            .and_then(|bytes| bytes.checked_add(65))
+            .ok_or(ReconcileError::ResourceLimit(
+                "mutation internal byte overflow",
+            ))?,
+    };
+    local.reserve_internal_worktree(additional)?;
     let base = parent.join(".sync-tmp");
     if !base.try_exists()? {
         fs::create_dir(&base)?;

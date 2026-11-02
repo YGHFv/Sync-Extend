@@ -105,7 +105,7 @@ mod windows {
                         "Move destination occupied before admission",
                     ));
                 }
-                let transaction = allocate_directory(&parent, &mutation)?;
+                let transaction = allocate_directory(self, &parent, &mutation)?;
                 checkpoint("before_move_execution");
                 self.journal
                     .start_move(&self.space_id, id, &transaction.execution)?;

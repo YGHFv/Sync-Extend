@@ -12,6 +12,8 @@ pub struct LocalLimits {
     pub max_scan_chunks: usize,
     pub max_file_bytes: u64,
     pub max_staging_bytes: u64,
+    pub max_internal_worktree_bytes: u64,
+    pub max_storage_entries: usize,
 }
 
 impl Default for LocalLimits {
@@ -22,6 +24,8 @@ impl Default for LocalLimits {
             max_scan_chunks: MAX_CHUNKS,
             max_file_bytes: 64 * 1024 * 1024 * 1024,
             max_staging_bytes: 10 * 1024 * 1024 * 1024,
+            max_internal_worktree_bytes: 10 * 1024 * 1024 * 1024,
+            max_storage_entries: MAX_ENTRIES,
         }
     }
 }
@@ -36,6 +40,9 @@ impl LocalLimits {
             || self.max_file_bytes == 0
             || self.max_file_bytes > MAX_CHUNKS as u64 * 4 * 1024 * 1024
             || self.max_staging_bytes == 0
+            || self.max_internal_worktree_bytes == 0
+            || self.max_storage_entries == 0
+            || self.max_storage_entries > MAX_ENTRIES
         {
             return Err(ModelError::InvalidConfig("invalid local resource limits"));
         }

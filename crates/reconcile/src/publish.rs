@@ -214,6 +214,11 @@ impl LocalSpace {
             }
             self.check_publication_limits(&intent.content)?;
             self.cas.verify(&intent.content)?;
+            if publication.state == PublicationState::Preparing
+                && !directory.join("owner").try_exists()?
+            {
+                self.reserve_internal_worktree(32)?;
+            }
             ensure_temp_directory(
                 &directory,
                 id,
@@ -224,7 +229,7 @@ impl LocalSpace {
             match publication.state {
                 PublicationState::Preparing => {
                     prepare_payload(
-                        &self.cas,
+                        self,
                         &directory,
                         &payload,
                         &intent,
@@ -480,7 +485,7 @@ fn ensure_temp_directory(directory: &Path, id: &EntryId, create: bool, attempt: 
 }
 
 fn prepare_payload(
-    cas: &sync_extend_cas::Cas,
+    local: &LocalSpace,
     directory: &Path,
     payload: &Path,
     intent: &PublicationIntent,
@@ -502,12 +507,13 @@ fn prepare_payload(
     {
         return Err(ReconcileError::ResourceLimit("publication staging bytes"));
     }
+    local.reserve_internal_worktree(intent.content.length)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&building)?;
     checkpoint("after_temp_created");
-    cas.write_file(&intent.content, &mut file)?;
+    local.cas.write_file(&intent.content, &mut file)?;
     file.sync_all()?;
     drop(file);
     checkpoint("after_temp_flushed");
