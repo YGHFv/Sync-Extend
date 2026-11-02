@@ -1,4 +1,5 @@
 pub mod config;
+pub mod gc_recovery;
 pub mod ids;
 pub mod limits;
 pub mod operation;
