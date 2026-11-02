@@ -49,6 +49,10 @@ pub struct StorageReport {
     pub guarded_gc_preflight_available: bool,
     pub durable_gc_authorizations_available: bool,
     pub gc_authorization_records: usize,
+    pub durable_gc_execution_fences_available: bool,
+    pub gc_execution_records: usize,
+    pub active_gc_execution_fences: usize,
+    pub sweep_available: bool,
     pub pruned_snapshots: usize,
     pub explicit_snapshot_pruning_available: bool,
     pub remote_backup_complete: bool,
@@ -78,6 +82,8 @@ impl LocalSpace {
         self.verify_root()?;
         self.journal.integrity_check()?;
         let gc_authorization_records = self.gc_authorizations()?.len();
+        let executions = self.gc_executions()?;
+        let active_gc_execution_fences = executions.iter().filter(|e| e.content_fenced).count();
         let gc_mark_records = self
             .journal
             .gc_marks(&self.space_id, self.limits.max_storage_entries)?
@@ -231,6 +237,10 @@ impl LocalSpace {
             guarded_gc_preflight_available: cfg!(windows),
             durable_gc_authorizations_available: cfg!(windows),
             gc_authorization_records,
+            durable_gc_execution_fences_available: cfg!(windows),
+            gc_execution_records: executions.len(),
+            active_gc_execution_fences,
+            sweep_available: false,
             pruned_snapshots,
             explicit_snapshot_pruning_available: true,
             remote_backup_complete: false,

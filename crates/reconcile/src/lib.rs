@@ -3,6 +3,7 @@ mod delete;
 mod fault;
 mod filesystem;
 mod gc_authorization;
+mod gc_execution;
 mod gc_mark;
 mod gc_preflight;
 #[cfg(windows)]
@@ -62,6 +63,15 @@ pub enum ReconcileError {
 }
 
 pub type Result<T> = std::result::Result<T, ReconcileError>;
+
+fn managed_cas(data_dir: &Path) -> Result<Cas> {
+    let access_journal = Journal::open(&data_dir.join("journal.sqlite"))?;
+    Ok(Cas::open_managed(&data_dir.join("cas"), move |id| {
+        access_journal
+            .require_cas_access(id)
+            .map_err(|e| e.to_string())
+    })?)
+}
 
 pub struct LocalSpace {
     pub space_id: SpaceId,
@@ -168,7 +178,7 @@ impl LocalSpace {
                 .to_str()
                 .ok_or(ReconcileError::Invariant("non-UTF8 root"))?,
         )?;
-        let cas = Cas::open(&data_dir.join("cas"))?;
+        let cas = managed_cas(&data_dir)?;
         let worktree_lock = acquire_lock(&marker_directory)?;
         let root_identity = filesystem::PathIdentity::capture(&worktree)?;
         Ok(Self {
@@ -205,7 +215,7 @@ impl LocalSpace {
             return Err(ReconcileError::Invariant("device public key mismatch"));
         }
         validate_roots(&data_dir, &worktree)?;
-        let cas = Cas::open(&data_dir.join("cas"))?;
+        let cas = managed_cas(&data_dir)?;
         let worktree_lock = acquire_lock(&worktree.join(".sync-extend"))?;
         let root_identity = filesystem::PathIdentity::capture(&worktree)?;
         let local = Self {
@@ -441,6 +451,7 @@ impl LocalSpace {
         self.journal.integrity_check()?;
         self.gc_marks()?;
         self.gc_authorizations()?;
+        self.gc_executions()?;
         self.snapshot_audit()?;
         self.cleanup_plans()?;
         for lease in self.read_leases()? {

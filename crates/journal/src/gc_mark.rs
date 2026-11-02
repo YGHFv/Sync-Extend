@@ -184,7 +184,7 @@ impl Journal {
         Ok(audits)
     }
 
-    fn gc_protected(&self, id: &ContentId) -> Result<bool> {
+    pub(crate) fn gc_protected(&self, id: &ContentId) -> Result<bool> {
         Ok(self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM snapshot_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM publication_objects WHERE content_id=?1)

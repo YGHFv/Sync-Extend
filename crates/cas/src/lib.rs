@@ -26,13 +26,18 @@ pub enum CasError {
     UnsafeDirectory,
     #[error("content resource limit exceeded: {0}")]
     ResourceLimit(&'static str),
+    #[error("CAS access deferred: {0}")]
+    AccessDeferred(String),
 }
 
 pub type Result<T> = std::result::Result<T, CasError>;
 
 pub struct Cas {
     root: PathBuf,
+    access: Option<Box<CasAccess>>,
 }
+
+type CasAccess = dyn Fn(&ContentId) -> std::result::Result<(), String> + Send;
 
 impl Cas {
     pub fn open(root: &Path) -> Result<Self> {
@@ -56,7 +61,25 @@ impl Cas {
         }
         Ok(Self {
             root: root.to_owned(),
+            access: None,
         })
+    }
+
+    /// Install the managed journal fence check; not a concurrent access lease.
+    pub fn open_managed(
+        root: &Path,
+        access: impl Fn(&ContentId) -> std::result::Result<(), String> + Send + 'static,
+    ) -> Result<Self> {
+        let mut cas = Self::open(root)?;
+        cas.access = Some(Box::new(access));
+        Ok(cas)
+    }
+
+    fn require_access(&self, id: &ContentId) -> Result<()> {
+        if let Some(access) = &self.access {
+            access(id).map_err(CasError::AccessDeferred)?;
+        }
+        Ok(())
     }
 
     pub fn object_path(&self, id: &ContentId) -> PathBuf {
@@ -71,6 +94,7 @@ impl Cas {
             return Err(CasError::Integrity);
         }
         let id = ContentId::hash(data);
+        self.require_access(&id)?;
         let reference = ChunkRef {
             content_id: id.clone(),
             length: data.len() as u32,
@@ -114,6 +138,7 @@ impl Cas {
     }
 
     pub fn read(&self, reference: &ChunkRef) -> Result<Vec<u8>> {
+        self.require_access(&reference.content_id)?;
         if reference.length == 0 || reference.length as usize > MAX_CHUNK {
             return Err(CasError::Integrity);
         }

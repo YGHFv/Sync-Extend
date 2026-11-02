@@ -93,6 +93,25 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Consume one explicit GC intent into a durable reference fence; never move/delete.
+    AdmitGcExecution {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        authorization: String,
+    },
+    /// Audit durable single-use execution admissions; executor remains unavailable.
+    GcExecutions {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Abort a non-displacing execution fence; never restore/delete or reuse its intent.
+    AbortGcExecution {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        execution: String,
+    },
     /// Permanently revoke one GC intent without changing any file or pin.
     RevokeGcAuthorization {
         #[arg(long)]
@@ -411,6 +430,15 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             print(&open(&data_dir)?.authorize_gc_mark(&mark.parse()?, ttl_secs)?)?;
         }
         Command::GcAuthorizations { data_dir } => print(&open(&data_dir)?.gc_authorizations()?)?,
+        Command::AdmitGcExecution {
+            data_dir,
+            authorization,
+        } => print(&open(&data_dir)?.admit_gc_execution(&authorization.parse()?)?)?,
+        Command::GcExecutions { data_dir } => print(&open(&data_dir)?.gc_executions()?)?,
+        Command::AbortGcExecution {
+            data_dir,
+            execution,
+        } => print(&open(&data_dir)?.abort_gc_execution(&execution.parse()?)?)?,
         Command::RevokeGcAuthorization {
             data_dir,
             authorization,

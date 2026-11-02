@@ -30,6 +30,7 @@ pub struct GcAuthorization {
 #[serde(rename_all = "snake_case")]
 pub enum GcAuthorizationState {
     ActiveIntent,
+    Consumed,
     Revoked,
     MarkCancelled,
     Invalidated,
@@ -42,6 +43,7 @@ pub struct GcAuthorizationAudit {
     pub state: GcAuthorizationState,
     pub revoked_at_ms: Option<u64>,
     pub evaluated_at_watermark_ms: u64,
+    pub execution_id: Option<EntryId>,
     pub deletion_authorized: bool,
     pub sweep_available: bool,
     pub gc_enabled: bool,
@@ -139,6 +141,14 @@ impl Journal {
                 return Err(JournalError::Invariant("GC revocation time mismatch"));
             }
             let watermark = watermark.ok_or(JournalError::Invariant("GC clock missing"))? as u64;
+            let execution: Option<String> = self
+                .connection
+                .query_row(
+                    "SELECT execution_id FROM gc_executions WHERE authorization_id=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .optional()?;
             let state = if revoked.is_some() {
                 GcAuthorizationState::Revoked
             } else if mark.state == GcState::Cancelled {
@@ -147,6 +157,8 @@ impl Journal {
                 GcAuthorizationState::Invalidated
             } else if watermark >= intent.expires_at_ms {
                 GcAuthorizationState::Expired
+            } else if execution.is_some() {
+                GcAuthorizationState::Consumed
             } else {
                 GcAuthorizationState::ActiveIntent
             };
@@ -155,6 +167,7 @@ impl Journal {
                 state,
                 revoked_at_ms: revoked.map(|t| t as u64),
                 evaluated_at_watermark_ms: watermark,
+                execution_id: execution.map(|id| id.parse()).transpose()?,
                 deletion_authorized: false,
                 sweep_available: false,
                 gc_enabled: false,
@@ -284,7 +297,7 @@ impl Journal {
         Ok((guards, time))
     }
 
-    fn require_gc_authorization(
+    pub(crate) fn require_gc_authorization(
         &self,
         space: &SpaceId,
         id: &EntryId,
