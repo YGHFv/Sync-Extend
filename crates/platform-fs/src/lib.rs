@@ -4,7 +4,8 @@
 mod windows;
 #[cfg(windows)]
 pub use windows::{
-    regular_file_link_count, verify_regular_file, GuardedReadFile, LockedDirectory, LockedFile,
+    regular_file_link_count, verify_regular_file, GuardedReadFile, LockedDirectory,
+    LockedDirectoryMutation, LockedFile,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
