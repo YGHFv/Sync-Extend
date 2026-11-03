@@ -20,6 +20,9 @@ use windows_sys::Win32::{
     System::WindowsProgramming::DRIVE_FIXED,
 };
 
+#[path = "directory_create.rs"]
+mod directory_create;
+
 fn key(file: &File) -> io::Result<FileKey> {
     let mut info = FILE_ID_INFO::default();
     // SAFETY: file owns a live handle; info is an aligned, sized writable output.
@@ -110,6 +113,10 @@ fn local_ntfs(file: &File, path: &Path) -> io::Result<()> {
     if unsafe { GetDriveTypeW(root.as_ptr()) } != DRIVE_FIXED {
         return Err(invalid("file mutation requires a fixed local volume"));
     }
+    require_ntfs(file)
+}
+
+fn require_ntfs(file: &File) -> io::Result<()> {
     let mut filesystem = [0u16; 32];
     // SAFETY: handle is live; optional outputs are null and filesystem is sized.
     let result = unsafe {
