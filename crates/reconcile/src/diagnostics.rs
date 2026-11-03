@@ -32,6 +32,7 @@ impl LocalSpace {
                 "outstanding_publications",
                 "outstanding_mutations",
                 "active_local_read_leases",
+                "durable_worker_content_reservations",
             ],
             unavailable_reference_owners: vec!["offline_queue", "conflicts", "transfers"],
             implementation_gaps: vec![

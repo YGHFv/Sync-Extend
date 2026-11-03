@@ -49,6 +49,18 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Reserve immutable expected content locally; no import, release or worker.
+    ReserveContent {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        intent: PathBuf,
+    },
+    /// Audit durable worker content reservations without reading CAS or releasing pins.
+    ReferenceReservations {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Persist one verified unreferenced CAS observation; never authorize deletion.
     MarkGcObject {
         #[arg(long)]
@@ -450,6 +462,21 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::StorageReport { data_dir } => {
             print(&open(&data_dir)?.storage_report()?)?;
+        }
+        Command::ReserveContent { data_dir, intent } => {
+            let mut bytes = Vec::new();
+            std::fs::File::open(intent)?
+                .take(16 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 16 * 1024 * 1024 {
+                return Err("reservation intent exceeds 16 MiB".into());
+            }
+            let intent: sync_extend_reconcile::ReferenceReservationIntent =
+                serde_json::from_slice(&bytes)?;
+            print(&open(&data_dir)?.reserve_content(&intent)?)?;
+        }
+        Command::ReferenceReservations { data_dir } => {
+            print(&open(&data_dir)?.reference_reservations()?)?;
         }
         Command::MarkGcObject {
             data_dir,

@@ -16,6 +16,7 @@ mod move_file;
 mod mutation;
 mod publish;
 mod read_lease;
+mod reference_reservation;
 mod replace_file;
 mod scan;
 mod snapshot_pruning;
@@ -31,6 +32,7 @@ pub use publish::PublishResult;
 pub use read_lease::LeasedExportResult;
 pub use snapshot_retention::{RetentionReport, SnapshotLockResult, SnapshotRetention};
 pub use storage::StorageReport;
+pub use sync_extend_journal::{ReferenceReservation, ReferenceReservationIntent};
 
 use fs2::FileExt;
 use serde::Serialize;
@@ -511,6 +513,11 @@ impl LocalSpace {
                         .as_ref()
                         .ok_or(ReconcileError::Invariant("read lease content missing"))?,
                 )?;
+            }
+        }
+        for owner in self.reference_reservations()? {
+            for file in &owner.intent.scope.files {
+                self.cas.verify(file)?;
             }
         }
         let mut files = 0;

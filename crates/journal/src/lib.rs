@@ -65,7 +65,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=15 => {}
+            1..=16 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -150,6 +150,11 @@ impl Journal {
         if version < 15 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-015.sql"))?;
+            tx.commit()?;
+        }
+        if version < 16 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-016.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -904,7 +909,8 @@ impl Journal {
         let mut statement = self.connection.prepare(
             "SELECT content_id FROM publication_objects UNION SELECT content_id FROM snapshot_objects
              UNION SELECT content_id FROM mutation_objects
-             UNION SELECT content_id FROM read_lease_objects ORDER BY content_id",
+             UNION SELECT content_id FROM read_lease_objects
+             UNION SELECT content_id FROM reference_reservation_objects ORDER BY content_id",
         )?;
         let ids: Vec<String> = statement
             .query_map([], |r| r.get(0))?
@@ -1338,7 +1344,9 @@ fn check_storage_metadata_limit(
             + (SELECT 2*count(*) FROM gc_marks) + (SELECT count(*) FROM gc_cancellations)
             + (SELECT count(*) FROM gc_clock) + (SELECT count(*) FROM gc_authorizations)
             + (SELECT count(*) FROM gc_revocations) + (SELECT 2*count(*) FROM gc_executions)
-            + (SELECT count(*) FROM gc_quarantines) + (SELECT 2*count(*) FROM gc_disposals),
+            + (SELECT count(*) FROM gc_quarantines) + (SELECT 2*count(*) FROM gc_disposals)
+            + (SELECT 2*count(*) FROM reference_reservations)
+            + (SELECT count(*) FROM reference_reservation_objects),
             (SELECT coalesce(sum(length(CAST(manifest AS BLOB))),0) FROM snapshots)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))
                 + coalesce(length(CAST(execution AS BLOB)),0)),0) FROM mutations)
@@ -1350,7 +1358,9 @@ fn check_storage_metadata_limit(
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_authorizations)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_executions)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_quarantines)
-            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_disposals)",
+            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_disposals)
+            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))+4096),0)
+                FROM reference_reservations)",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1479,3 +1489,5 @@ mod gc_disposal;
 pub use gc_disposal::{GcDisposalAudit, GcDisposalIntent, GcDisposalState, GcDisposalStep};
 mod diagnostics;
 pub use diagnostics::GcDiagnostics;
+mod reference_reservation;
+pub use reference_reservation::{ReferenceReservation, ReferenceReservationIntent};

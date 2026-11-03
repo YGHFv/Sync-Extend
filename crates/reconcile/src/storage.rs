@@ -27,6 +27,10 @@ pub struct StorageReport {
     pub active_read_leases: usize,
     pub read_lease_unique_chunk_bytes: u64,
     pub durable_read_leases_available: bool,
+    pub durable_worker_reservations_available: bool,
+    pub worker_reservation_records: usize,
+    pub worker_reservation_unique_chunk_bytes: u64,
+    pub worker_reservation_release_available: bool,
     pub locked_snapshots: usize,
     pub durable_snapshot_locks_available: bool,
     pub missing_protected_objects: usize,
@@ -157,6 +161,15 @@ impl LocalSpace {
             }
         }
         expected.extend(leased.iter().cloned());
+        let owners = self.reference_reservations()?;
+        let worker_reservation_records = owners.len();
+        let mut reserved = BTreeSet::new();
+        for owner in owners {
+            for file in &owner.intent.scope.files {
+                refs.add(file, &mut reserved)?;
+            }
+        }
+        expected.extend(reserved.iter().cloned());
         for mutation in self.journal.mutations(&self.space_id)? {
             self.journal
                 .verify_mutation_references(&mutation.intent.transaction_id)?;
@@ -220,6 +233,10 @@ impl LocalSpace {
             transaction_only_chunk_bytes: refs.bytes(expected.difference(&retained))?,
             protected_chunk_bytes: refs.bytes(expected.iter())?,
             protected_objects: protected.len(),
+            durable_worker_reservations_available: true,
+            worker_reservation_records,
+            worker_reservation_unique_chunk_bytes: refs.bytes(reserved.iter())?,
+            worker_reservation_release_available: false,
             active_read_leases,
             read_lease_unique_chunk_bytes: refs.bytes(leased.iter())?,
             durable_read_leases_available: true,

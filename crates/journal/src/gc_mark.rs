@@ -189,7 +189,8 @@ impl Journal {
             "SELECT EXISTS(SELECT 1 FROM snapshot_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM publication_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM mutation_objects WHERE content_id=?1)
-             OR EXISTS(SELECT 1 FROM read_lease_objects WHERE content_id=?1)",
+             OR EXISTS(SELECT 1 FROM read_lease_objects WHERE content_id=?1)
+             OR EXISTS(SELECT 1 FROM reference_reservation_objects WHERE content_id=?1)",
             [id.as_str()],
             |r| r.get(0),
         )?)
@@ -341,6 +342,7 @@ impl Journal {
         }
         self.publications(space, max_entries)?;
         self.cleanup_plans(space)?;
+        self.reference_reservations(space, max_entries)?;
         Ok(())
     }
 
