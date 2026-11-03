@@ -65,7 +65,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=18 => {}
+            1..=19 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -165,6 +165,11 @@ impl Journal {
         if version < 18 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-018.sql"))?;
+            tx.commit()?;
+        }
+        if version < 19 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-019.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -1409,7 +1414,8 @@ fn check_storage_metadata_limit(
             + max((SELECT count(*) FROM reference_reservations),
                 (SELECT count(*) FROM reference_snapshot_handoffs))
             + (SELECT count(*) FROM reference_reservation_objects)
-            + (SELECT count(*) FROM rename_observations),
+            + (SELECT count(*) FROM rename_observations)
+            + (SELECT 2*count(*) FROM original_disposals),
             (SELECT coalesce(sum(length(CAST(manifest AS BLOB))),0) FROM snapshots)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))
                 + coalesce(length(CAST(execution AS BLOB)),0)),0) FROM mutations)
@@ -1425,7 +1431,9 @@ fn check_storage_metadata_limit(
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))+4096),0)
                 FROM reference_reservations)
             + (SELECT coalesce(sum(length(CAST(observation AS BLOB))),0)
-                FROM rename_observations)",
+                FROM rename_observations)
+            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))+4096),0)
+                FROM original_disposals)",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1554,8 +1562,10 @@ mod gc_disposal;
 pub use gc_disposal::{GcDisposalAudit, GcDisposalIntent, GcDisposalState, GcDisposalStep};
 mod diagnostics;
 pub use diagnostics::GcDiagnostics;
+mod original_retention;
 mod reference_reservation;
 mod rename_observation;
+pub use original_retention::{OriginalDisposalAudit, OriginalDisposalIntent};
 pub use reference_reservation::{
     ReferenceReservation, ReferenceReservationIntent, ReferenceSnapshotHandoff,
 };

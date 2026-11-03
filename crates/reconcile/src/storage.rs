@@ -50,6 +50,8 @@ pub struct StorageReport {
     pub history_pruning_enabled: bool,
     pub cleanup_enabled: bool,
     pub explicit_move_marker_cleanup_available: bool,
+    pub original_disposal_preparation_records: usize,
+    pub original_disposition_executor_available: bool,
     pub gc_enabled: bool,
     pub persistent_gc_marks_available: bool,
     pub gc_mark_records: usize,
@@ -115,6 +117,10 @@ impl LocalSpace {
         self.journal
             .check_storage_metadata_limit(self.limits.max_storage_entries)?;
         self.journal.cleanup_plans(&self.space_id)?;
+        let original_disposal_preparation_records = self
+            .journal
+            .original_disposals(&self.space_id, self.limits.max_storage_entries)?
+            .len();
         let mut refs = References {
             lengths: BTreeMap::new(),
             seen: 0,
@@ -239,6 +245,8 @@ impl LocalSpace {
         let quarantined_gc_logical_bytes =
             selected_inventory_bytes(&cas, |e| quarantine_identities.contains(&e.identity))?;
         Ok(StorageReport {
+            original_disposal_preparation_records,
+            original_disposition_executor_available: false,
             accounting: "physical_identity_deduplicated_logical_lengths_not_allocated_blocks",
             content_hashes_verified: false,
             current_unique_chunk_bytes: refs.bytes(current.iter())?,

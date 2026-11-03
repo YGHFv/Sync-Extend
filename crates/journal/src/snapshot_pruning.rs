@@ -226,6 +226,7 @@ impl Journal {
         }
         self.publications(&intent.space_id, max_entries)?;
         self.cleanup_plans(&intent.space_id)?;
+        self.original_disposals(&intent.space_id, max_entries)?;
         validate_pruned_snapshot(
             &tx,
             &intent.space_id,

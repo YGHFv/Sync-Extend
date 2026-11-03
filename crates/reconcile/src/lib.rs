@@ -516,6 +516,8 @@ impl LocalSpace {
         self.gc_quarantines()?;
         self.snapshot_audit()?;
         self.cleanup_plans()?;
+        self.journal
+            .original_disposals(&self.space_id, self.limits.max_storage_entries)?;
         for lease in self.read_leases()? {
             if lease.state == sync_extend_journal::ReadLeaseState::Active {
                 self.cas.verify(

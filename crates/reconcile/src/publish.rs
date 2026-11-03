@@ -156,6 +156,8 @@ impl LocalSpace {
     }
 
     pub fn recover(&mut self) -> Result<Vec<PublishResult>> {
+        self.journal
+            .original_disposals(&self.space_id, self.limits.max_storage_entries)?;
         self.gc_marks()?;
         self.gc_authorizations()?;
         self.gc_executions()?;

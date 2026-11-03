@@ -343,6 +343,7 @@ impl Journal {
         self.publications(space, max_entries)?;
         self.cleanup_plans(space)?;
         self.reference_reservations(space, max_entries)?;
+        self.original_disposals(space, max_entries)?;
         Ok(())
     }
 
