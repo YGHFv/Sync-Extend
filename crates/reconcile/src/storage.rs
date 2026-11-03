@@ -51,6 +51,7 @@ pub struct StorageReport {
     pub cleanup_enabled: bool,
     pub explicit_move_marker_cleanup_available: bool,
     pub original_disposal_preparation_records: usize,
+    pub disposed_original_records: usize,
     pub explicit_original_preparation_available: bool,
     pub original_disposition_executor_available: bool,
     pub gc_enabled: bool,
@@ -118,10 +119,14 @@ impl LocalSpace {
         self.journal
             .check_storage_metadata_limit(self.limits.max_storage_entries)?;
         self.journal.cleanup_plans(&self.space_id)?;
-        let original_disposal_preparation_records = self
+        let original_disposals = self
             .journal
-            .original_disposals(&self.space_id, self.limits.max_storage_entries)?
-            .len();
+            .original_disposals(&self.space_id, self.limits.max_storage_entries)?;
+        let original_disposal_preparation_records = original_disposals.len();
+        let disposed_original_records = original_disposals
+            .iter()
+            .filter(|a| a.completed_at_ms.is_some())
+            .count();
         let mut refs = References {
             lengths: BTreeMap::new(),
             seen: 0,
@@ -247,6 +252,7 @@ impl LocalSpace {
             selected_inventory_bytes(&cas, |e| quarantine_identities.contains(&e.identity))?;
         Ok(StorageReport {
             original_disposal_preparation_records,
+            disposed_original_records,
             explicit_original_preparation_available: cfg!(windows),
             original_disposition_executor_available: false,
             accounting: "physical_identity_deduplicated_logical_lengths_not_allocated_blocks",

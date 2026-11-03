@@ -65,7 +65,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=19 => {}
+            1..=20 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -170,6 +170,11 @@ impl Journal {
         if version < 19 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-019.sql"))?;
+            tx.commit()?;
+        }
+        if version < 20 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-020.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -1415,7 +1420,9 @@ fn check_storage_metadata_limit(
                 (SELECT count(*) FROM reference_snapshot_handoffs))
             + (SELECT count(*) FROM reference_reservation_objects)
             + (SELECT count(*) FROM rename_observations)
-            + (SELECT 2*count(*) FROM original_disposals),
+            + (SELECT count(*) FROM original_disposals)
+            + max((SELECT count(*) FROM original_disposals),
+                (SELECT count(*) FROM original_disposal_completions)),
             (SELECT coalesce(sum(length(CAST(manifest AS BLOB))),0) FROM snapshots)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))
                 + coalesce(length(CAST(execution AS BLOB)),0)),0) FROM mutations)
@@ -1565,7 +1572,7 @@ pub use diagnostics::GcDiagnostics;
 mod original_retention;
 mod reference_reservation;
 mod rename_observation;
-pub use original_retention::{OriginalDisposalAudit, OriginalDisposalIntent};
+pub use original_retention::{OriginalDisposalAudit, OriginalDisposalIntent, OriginalDisposalStep};
 pub use reference_reservation::{
     ReferenceReservation, ReferenceReservationIntent, ReferenceSnapshotHandoff,
 };
