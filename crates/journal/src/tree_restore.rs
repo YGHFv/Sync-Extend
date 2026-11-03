@@ -46,6 +46,7 @@ pub struct TreeRestorePreparation {
     pub remote_backup_complete: bool,
     pub history_reservation: Option<crate::TreeRestoreHistoryReservation>,
     pub native_reservation: Option<crate::TreeRestoreNativeReservation>,
+    pub execution_description: Option<crate::TreeExecutionDescriptionAudit>,
 }
 
 struct PreparedPlan {
@@ -229,13 +230,22 @@ impl Journal {
              OR EXISTS(SELECT 1 FROM tree_restore_native_reservations n
                 LEFT JOIN tree_restore_preparations p USING(transaction_id)
                 LEFT JOIN tree_restore_histories h USING(transaction_id)
-                WHERE p.transaction_id IS NULL OR h.transaction_id IS NULL)",
+                WHERE p.transaction_id IS NULL OR h.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_execution_intents e
+                LEFT JOIN tree_restore_preparations p USING(transaction_id)
+                LEFT JOIN tree_restore_histories h USING(transaction_id)
+                LEFT JOIN tree_restore_native_reservations n USING(transaction_id)
+                WHERE p.transaction_id IS NULL OR h.transaction_id IS NULL OR n.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_execution_step_intents s
+                LEFT JOIN tree_restore_execution_intents e USING(transaction_id)
+                WHERE e.transaction_id IS NULL)",
             [],
             |r| r.get(0),
         )?;
         if orphan {
             return Err(JournalError::Invariant("orphan tree restore metadata"));
         }
+        crate::tree_restore_execution_intent::audit_generation_inventory(&self.connection, max)?;
         let (native_rows, native_bindings): (i64, i64) = self.connection.query_row(
             "SELECT count(*),coalesce(sum(binding_count),0) FROM tree_restore_native_reservations",
             [],
@@ -380,13 +390,27 @@ impl Journal {
                 cancelled_at_ms,
                 max,
             )?;
-            let baseline = self.snapshot(space, &intent.scope.baseline_snapshot)?;
+            // Cancelled descriptions depend on immutable metadata, not retained content.
+            let baseline =
+                audit_snapshot(&self.connection, space, &intent.scope.baseline_snapshot)?.manifest;
             let native_reservation = crate::tree_restore_native_identity::audit_native(
                 &self.connection,
                 &intent,
                 history_reservation.as_ref(),
                 &prepared.plan,
                 &baseline,
+                cancelled_at_ms,
+                max,
+            )?;
+            let target =
+                audit_snapshot(&self.connection, space, &intent.scope.target_snapshot)?.manifest;
+            let execution_description = crate::tree_restore_execution_intent::audit_description(
+                &self.connection,
+                &intent,
+                history_reservation.as_ref(),
+                native_reservation.as_ref(),
+                &baseline,
+                &target,
                 cancelled_at_ms,
                 max,
             )?;
@@ -418,6 +442,7 @@ impl Journal {
                 remote_backup_complete: false,
                 history_reservation,
                 native_reservation,
+                execution_description,
             });
         }
         if actual_native_bindings as u64 != native_bindings as u64 {
@@ -441,7 +466,9 @@ impl Journal {
              OR EXISTS(SELECT 1 FROM tree_restore_objects)
              OR EXISTS(SELECT 1 FROM tree_restore_cancellations)
              OR EXISTS(SELECT 1 FROM tree_restore_histories)
-             OR EXISTS(SELECT 1 FROM tree_restore_native_reservations)",
+             OR EXISTS(SELECT 1 FROM tree_restore_native_reservations)
+             OR EXISTS(SELECT 1 FROM tree_restore_execution_intents)
+             OR EXISTS(SELECT 1 FROM tree_restore_execution_step_intents)",
             [],
             |r| r.get(0),
         )?;

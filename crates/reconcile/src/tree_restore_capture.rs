@@ -32,6 +32,20 @@ impl<T> TreeRestoreCapture<'_, T> {
 }
 
 impl LocalSpace {
+    /// Persist exact metadata descriptions; never recapture or authorize native actions.
+    pub fn describe_tree_restore_execution(
+        &self,
+        input: &sync_extend_core_model::tree_restore_execution_intent::TreeExecutionIntentInput,
+    ) -> Result<sync_extend_journal::TreeExecutionDescriptionAudit> {
+        let (held, audit) = self.journal.with_tree_execution_description(
+            input,
+            self.limits.max_storage_entries,
+            |_| Ok::<_, crate::ReconcileError>(()),
+        )?;
+        drop(held);
+        Ok(audit)
+    }
+
     /// Always recapture under shared CAS and SQLite writer exclusion.
     /// Callback errors and native recheck failures preserve all durable state.
     pub fn with_tree_restore_capture<T>(
