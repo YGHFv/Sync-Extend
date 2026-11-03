@@ -107,7 +107,10 @@ pub(crate) fn validate_pruned_snapshot(
             OR EXISTS(SELECT 1 FROM read_leases WHERE snapshot_id=?1)
             OR EXISTS(SELECT 1 FROM mutations WHERE baseline_root=?1 OR committed_snapshot=?1)
             OR EXISTS(SELECT 1 FROM publications WHERE committed_snapshot=?1
-                OR json_extract(intent,'$.baseline_root')=?1 OR json_extract(intent,'$.source_snapshot')=?1)",
+                OR json_extract(intent,'$.baseline_root')=?1 OR json_extract(intent,'$.source_snapshot')=?1)
+            OR EXISTS(SELECT 1 FROM tree_restore_preparations p
+                WHERE ?1 IN (p.baseline_root,p.target_root)
+                AND NOT EXISTS(SELECT 1 FROM tree_restore_cancellations WHERE transaction_id=p.transaction_id))",
         [id.as_str()], |r| r.get(0),
     )?;
     if locked != 0 || state != "materialized" || dependent {
@@ -227,6 +230,7 @@ impl Journal {
         self.publications(&intent.space_id, max_entries)?;
         self.cleanup_plans(&intent.space_id)?;
         self.original_disposals(&intent.space_id, max_entries)?;
+        self.tree_restore_preparations(&intent.space_id, max_entries)?;
         validate_pruned_snapshot(
             &tx,
             &intent.space_id,

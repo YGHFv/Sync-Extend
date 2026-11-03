@@ -33,11 +33,12 @@ impl LocalSpace {
                 "outstanding_mutations",
                 "active_local_read_leases",
                 "durable_worker_content_reservations",
+                "prepared_tree_restore_inputs",
             ],
             unavailable_reference_owners: vec!["offline_queue", "conflicts", "transfers"],
             implementation_gaps: vec![
                 "persistent_identity_rename_inference",
-                "whole_tree_restore_transaction",
+                "whole_tree_restore_native_admission_execution_and_final_handoff",
                 "non_move_transaction_marker_cleanup",
                 "automatic_retention_and_bulk_gc",
                 "authenticated_network_sync",

@@ -156,6 +156,11 @@ impl LocalSpace {
     }
 
     pub fn recover(&mut self) -> Result<Vec<PublishResult>> {
+        let prepared_tree = self
+            .journal
+            .tree_restore_preparations(&self.space_id, self.limits.max_storage_entries)?
+            .iter()
+            .any(|p| p.writer_gate_held);
         self.journal
             .original_disposals(&self.space_id, self.limits.max_storage_entries)?;
         self.gc_marks()?;
@@ -165,6 +170,9 @@ impl LocalSpace {
         self.verify_root()?;
         self.journal
             .check_snapshot_prunings(&self.space_id, self.limits.max_storage_entries)?;
+        if prepared_tree {
+            return Ok(Vec::new());
+        }
         self.recover_mutations()?;
         self.require_no_mutation()?;
         let publications = self.journal.outstanding_publications(&self.space_id)?;

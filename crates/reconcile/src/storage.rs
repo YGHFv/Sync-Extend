@@ -34,6 +34,13 @@ pub struct StorageReport {
     pub explicit_local_snapshot_handoff_available: bool,
     pub worker_reservation_unique_chunk_bytes: u64,
     pub worker_reservation_release_available: bool,
+    pub tree_restore_preparation_records: usize,
+    pub tree_restore_writer_gate_held: bool,
+    pub tree_restore_reserved_metadata_bytes: u64,
+    pub tree_restore_reserved_worktree_logical_bytes: u64,
+    pub tree_restore_input_unique_chunk_bytes: u64,
+    pub tree_restore_execution_available: bool,
+    pub tree_atomic: bool,
     pub locked_snapshots: usize,
     pub durable_snapshot_locks_available: bool,
     pub missing_protected_objects: usize,
@@ -127,6 +134,16 @@ impl LocalSpace {
             .iter()
             .filter(|a| a.completed_at_ms.is_some())
             .count();
+        let trees = self
+            .journal
+            .tree_restore_preparations(&self.space_id, self.limits.max_storage_entries)?;
+        let tree_restore_reserved_metadata_bytes = trees.iter().try_fold(0u64, |total, p| {
+            total
+                .checked_add(p.reserved_metadata_bytes)
+                .ok_or(ReconcileError::ResourceLimit("tree restore metadata bytes"))
+        })?;
+        let mut tree_inputs = BTreeSet::new();
+        let mut tree_restore_reserved_worktree_logical_bytes = 0;
         let mut refs = References {
             lengths: BTreeMap::new(),
             seen: 0,
@@ -155,6 +172,23 @@ impl LocalSpace {
                 .filter_map(|entry| entry.content.as_ref())
             {
                 refs.add(content, &mut retained)?;
+            }
+        }
+        for preparation in trees.iter().filter(|p| p.writer_gate_held) {
+            tree_restore_reserved_worktree_logical_bytes = preparation.retained_and_staging_bytes;
+            for root in [
+                &preparation.intent.scope.baseline_snapshot,
+                &preparation.intent.scope.target_snapshot,
+            ] {
+                let snapshot = self.journal.retained_snapshot(&self.space_id, root)?;
+                for content in snapshot
+                    .manifest
+                    .entries
+                    .values()
+                    .filter_map(|e| e.content.as_ref())
+                {
+                    refs.add(content, &mut tree_inputs)?;
+                }
             }
         }
         let mut expected = retained.clone();
@@ -251,6 +285,13 @@ impl LocalSpace {
         let quarantined_gc_logical_bytes =
             selected_inventory_bytes(&cas, |e| quarantine_identities.contains(&e.identity))?;
         Ok(StorageReport {
+            tree_restore_preparation_records: trees.len(),
+            tree_restore_writer_gate_held: trees.iter().any(|p| p.writer_gate_held),
+            tree_restore_reserved_metadata_bytes,
+            tree_restore_reserved_worktree_logical_bytes,
+            tree_restore_input_unique_chunk_bytes: refs.bytes(tree_inputs.iter())?,
+            tree_restore_execution_available: false,
+            tree_atomic: false,
             original_disposal_preparation_records,
             disposed_original_records,
             explicit_original_preparation_available: cfg!(windows),

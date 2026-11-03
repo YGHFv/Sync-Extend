@@ -32,6 +32,7 @@ impl LocalSpace {
             ));
         }
         if mutation.state != MutationState::Committed {
+            self.require_no_tree_restore()?;
             match mutation.intent.action {
                 MutationAction::Delete => self.execute_delete_platform(id)?,
                 MutationAction::Move { .. } => self.execute_move_platform(id)?,

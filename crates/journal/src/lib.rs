@@ -65,7 +65,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=20 => {}
+            1..=21 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -175,6 +175,11 @@ impl Journal {
         if version < 20 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-020.sql"))?;
+            tx.commit()?;
+        }
+        if version < 21 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-021.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -361,6 +366,7 @@ impl Journal {
     }
 
     pub fn begin_publication(&mut self, intent: &PublicationIntent) -> Result<()> {
+        self.require_no_tree_restore(&intent.space_id, limits::MAX_ENTRIES)?;
         intent.validate()?;
         let baseline = self.snapshot(&intent.space_id, &intent.baseline_root)?;
         let expected = baseline
@@ -675,6 +681,7 @@ impl Journal {
     }
 
     pub fn begin_mutation(&mut self, intent: &MutationIntent) -> Result<()> {
+        self.require_no_tree_restore(&intent.space_id, limits::MAX_ENTRIES)?;
         intent.validate()?;
         let baseline = self.snapshot(&intent.space_id, &intent.baseline_root)?;
         if baseline.entries.get(&intent.baseline_entry.entry_id) != Some(&intent.baseline_entry) {
@@ -930,7 +937,8 @@ impl Journal {
             "SELECT content_id FROM publication_objects UNION SELECT content_id FROM snapshot_objects
              UNION SELECT content_id FROM mutation_objects
              UNION SELECT content_id FROM read_lease_objects
-             UNION SELECT content_id FROM reference_reservation_objects ORDER BY content_id",
+             UNION SELECT content_id FROM reference_reservation_objects
+             UNION SELECT content_id FROM tree_restore_objects ORDER BY content_id",
         )?;
         let ids: Vec<String> = statement
             .query_map([], |r| r.get(0))?
@@ -948,6 +956,7 @@ impl Journal {
 
     // Trusted local transport only. Authentication must precede this API in M2.
     pub fn receive(&mut self, op: &Operation) -> Result<ReceiveOutcome> {
+        self.require_no_tree_restore(&op.payload.space_id, limits::MAX_ENTRIES)?;
         op.validate()?;
         let json = serde_json::to_string(op)?;
         if json.len() > MAX_OPERATION_BYTES || op.payload.origin_seq > i64::MAX as u64 {
@@ -1216,6 +1225,8 @@ impl Journal {
         timestamp: u64,
         completion: Completion<'_>,
     ) -> Result<SnapshotId> {
+        self.require_no_tree_restore(&manifest.space_id, limits::MAX_ENTRIES)?;
+        sql_integer(timestamp)?;
         manifest.validate()?;
         let root = manifest.root()?;
         self.require_unpruned_root(&root)?;
@@ -1313,15 +1324,33 @@ impl Journal {
                 "manifest vector does not match committed operations",
             ));
         }
-        tx.execute(
-            "INSERT OR IGNORE INTO snapshots VALUES (?1,?2,?3,?4,'materialized',0)",
-            params![
-                root.as_str(),
-                manifest.space_id.as_str(),
-                serde_json::to_string(manifest)?,
-                sql_integer(timestamp)?
-            ],
-        )?;
+        let json = serde_json::to_string(manifest)?;
+        let stored: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT space_id,
+                    CASE WHEN length(CAST(manifest AS BLOB))<=16777216 THEN manifest ELSE '' END,
+                    state FROM snapshots WHERE snapshot_id=?1",
+                [root.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((space, old, state)) = stored {
+            if space != manifest.space_id.as_str() || old != json || state != "materialized" {
+                return Err(JournalError::Invariant(
+                    "existing snapshot differs from local commit",
+                ));
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO snapshots VALUES (?1,?2,?3,?4,'materialized',0)",
+                params![
+                    root.as_str(),
+                    manifest.space_id.as_str(),
+                    json,
+                    sql_integer(timestamp)?
+                ],
+            )?;
+        }
         tx.execute(
             "INSERT INTO current_manifests VALUES (?1,?2)
              ON CONFLICT(space_id) DO UPDATE SET snapshot_id=excluded.snapshot_id",
@@ -1422,7 +1451,12 @@ fn check_storage_metadata_limit(
             + (SELECT count(*) FROM rename_observations)
             + (SELECT count(*) FROM original_disposals)
             + max((SELECT count(*) FROM original_disposals),
-                (SELECT count(*) FROM original_disposal_completions)),
+                (SELECT count(*) FROM original_disposal_completions))
+            + max((SELECT coalesce(sum(reserved_rows),0) FROM tree_restore_preparations),
+                (SELECT count(*) FROM tree_restore_preparations)
+                + (SELECT 3*count(*) FROM tree_restore_steps)
+                + (SELECT count(*) FROM tree_restore_objects)
+                + (SELECT count(*) FROM tree_restore_cancellations)),
             (SELECT coalesce(sum(length(CAST(manifest AS BLOB))),0) FROM snapshots)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))
                 + coalesce(length(CAST(execution AS BLOB)),0)),0) FROM mutations)
@@ -1440,7 +1474,15 @@ fn check_storage_metadata_limit(
             + (SELECT coalesce(sum(length(CAST(observation AS BLOB))),0)
                 FROM rename_observations)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))+4096),0)
-                FROM original_disposals)",
+                FROM original_disposals)
+            + max((SELECT coalesce(sum(reserved_bytes),0) FROM tree_restore_preparations),
+                (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0)
+                    FROM tree_restore_preparations)
+                + max((SELECT 4096*count(*) FROM tree_restore_preparations),
+                    (SELECT coalesce(sum(length(CAST(intent_hash AS BLOB))),0)
+                        FROM tree_restore_cancellations))
+                + (SELECT coalesce(sum(length(CAST(step AS BLOB))+4096),0) FROM tree_restore_steps)
+                + (SELECT coalesce(sum(length(CAST(content_id AS BLOB))+64),0) FROM tree_restore_objects))",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1572,7 +1614,9 @@ pub use diagnostics::GcDiagnostics;
 mod original_retention;
 mod reference_reservation;
 mod rename_observation;
+mod tree_restore;
 pub use original_retention::{OriginalDisposalAudit, OriginalDisposalIntent, OriginalDisposalStep};
 pub use reference_reservation::{
     ReferenceReservation, ReferenceReservationIntent, ReferenceSnapshotHandoff,
 };
+pub use tree_restore::{TreeRestorePreparation, TreeRestorePreparationIntent};

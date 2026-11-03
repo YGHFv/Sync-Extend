@@ -147,6 +147,19 @@ impl LocalSpace {
             })
             .collect();
         self.journal.cleanup_plans(&self.space_id)?;
+        for tree in self
+            .journal
+            .tree_restore_preparations(&self.space_id, self.limits.max_storage_entries)?
+        {
+            if tree.writer_gate_held {
+                for root in [
+                    &tree.intent.scope.baseline_snapshot,
+                    &tree.intent.scope.target_snapshot,
+                ] {
+                    protect(&mut reasons, root, "prepared_tree_restore_input")?;
+                }
+            }
+        }
         for lease in self
             .journal
             .read_leases(&self.space_id, self.limits.max_storage_entries)?

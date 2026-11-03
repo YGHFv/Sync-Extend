@@ -22,6 +22,7 @@ impl LocalSpace {
             }
             return Ok(plan);
         }
+        self.require_no_tree_restore()?;
         self.prepare_cleanup_platform(id)
     }
 
@@ -47,6 +48,7 @@ impl LocalSpace {
             ));
         }
         if plan.state != CleanupState::Cleaned {
+            self.require_no_tree_restore()?;
             self.execute_cleanup_platform(&plan)?;
         }
         self.journal

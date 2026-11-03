@@ -1,4 +1,4 @@
-//! Prospective non-atomic tree coordination. No native executor or durable owner.
+//! Pure non-atomic planning, not certification of a durable owner or native executor.
 //! Historical entry IDs identify inputs, not permission to resurrect those IDs.
 
 use crate::{
@@ -17,7 +17,8 @@ pub struct TreeRestoreScope {
     pub target_snapshot: SnapshotId,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TreeRestoreLimits {
     pub max_entries: usize,
     pub max_steps: usize,
@@ -27,7 +28,8 @@ pub struct TreeRestoreLimits {
     pub max_plan_bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TreeRestoreAction {
     CreateDirectory,
     PublishNewFile,
@@ -36,7 +38,8 @@ pub enum TreeRestoreAction {
     RemoveEmptyDirectory,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TreeRestoreStep {
     pub index: usize,
     pub action: TreeRestoreAction,

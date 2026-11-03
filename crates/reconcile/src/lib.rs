@@ -154,6 +154,10 @@ pub struct Status {
     pub windows_move_executor_available: bool,
     pub windows_replace_executor_available: bool,
     pub mutation_executor_actions: Vec<&'static str>,
+    pub tree_restore_preparation_records: usize,
+    pub tree_restore_writer_gate_held: bool,
+    pub tree_restore_execution_available: bool,
+    pub tree_atomic: bool,
     pub gc: sync_extend_journal::GcDiagnostics,
 }
 
@@ -477,6 +481,9 @@ impl LocalSpace {
     fn status_in_snapshot(&self, gc: &sync_extend_journal::GcDiagnostics) -> Result<Status> {
         let manifest = self.manifest()?;
         let publications = self.journal.outstanding_publications(&self.space_id)?;
+        let trees = self
+            .journal
+            .tree_restore_preparations(&self.space_id, self.limits.max_storage_entries)?;
         Ok(Status {
             space_id: self.space_id.clone(),
             device_id: self.device_id.clone(),
@@ -503,12 +510,18 @@ impl LocalSpace {
             } else {
                 vec![]
             },
+            tree_restore_preparation_records: trees.len(),
+            tree_restore_writer_gate_held: trees.iter().any(|p| p.writer_gate_held),
+            tree_restore_execution_available: false,
+            tree_atomic: false,
             gc: gc.clone(),
         })
     }
 
     pub fn verify(&self) -> Result<usize> {
         self.journal.integrity_check()?;
+        self.journal
+            .tree_restore_preparations(&self.space_id, self.limits.max_storage_entries)?;
         self.journal
             .rename_observation(&self.space_id, self.limits.max_storage_entries)?;
         self.gc_marks()?;

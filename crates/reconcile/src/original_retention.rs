@@ -20,6 +20,7 @@ impl LocalSpace {
         {
             return Ok(old);
         }
+        self.require_no_tree_restore()?;
         self.prepare_original_disposal_platform(id)
     }
 
@@ -35,6 +36,7 @@ impl LocalSpace {
         if pending.completed_at_ms.is_some() {
             return Ok(pending);
         }
+        self.require_no_tree_restore()?;
         self.execute_original_disposal_platform(&pending)
     }
 

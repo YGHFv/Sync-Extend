@@ -234,6 +234,7 @@ impl Journal {
         let coordination = self.acquire_cas_coordination()?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
             .map_err(JournalError::from)?;
+        self.require_no_tree_restore(space, max)?;
         self.audit_gc_owners(space, max)?;
         self.validate_original_disposal(intent)?;
         if intent.scope.content.chunks.len() > max {
@@ -311,6 +312,7 @@ impl Journal {
         let coordination = self.acquire_cas_coordination()?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
             .map_err(JournalError::from)?;
+        self.require_no_tree_restore(space, max)?;
         self.audit_gc_owners(space, max)?;
         let pending = selected(self.original_disposals(space, max)?)?;
         // Another writer can finish between the optimistic read and write admission.

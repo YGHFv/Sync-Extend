@@ -21,7 +21,14 @@ pub struct MutationCheck {
 }
 
 impl LocalSpace {
+    pub(crate) fn require_no_tree_restore(&self) -> Result<()> {
+        Ok(self
+            .journal
+            .require_no_tree_restore(&self.space_id, self.limits.max_storage_entries)?)
+    }
+
     pub(crate) fn require_no_mutation(&self) -> Result<()> {
+        self.require_no_tree_restore()?;
         if !self
             .journal
             .outstanding_mutations(&self.space_id)?
