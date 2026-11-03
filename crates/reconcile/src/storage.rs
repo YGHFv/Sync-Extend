@@ -51,6 +51,7 @@ pub struct StorageReport {
     pub cleanup_enabled: bool,
     pub explicit_move_marker_cleanup_available: bool,
     pub original_disposal_preparation_records: usize,
+    pub explicit_original_preparation_available: bool,
     pub original_disposition_executor_available: bool,
     pub gc_enabled: bool,
     pub persistent_gc_marks_available: bool,
@@ -246,6 +247,7 @@ impl LocalSpace {
             selected_inventory_bytes(&cas, |e| quarantine_identities.contains(&e.identity))?;
         Ok(StorageReport {
             original_disposal_preparation_records,
+            explicit_original_preparation_available: cfg!(windows),
             original_disposition_executor_available: false,
             accounting: "physical_identity_deduplicated_logical_lengths_not_allocated_blocks",
             content_hashes_verified: false,

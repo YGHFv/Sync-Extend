@@ -284,6 +284,18 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Prepare one committed Delete/Replace original; no native deletion occurs.
+    PrepareOriginalDisposal {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        transaction: String,
+    },
+    /// Audit immutable original preparations without inspecting native bytes.
+    OriginalDisposals {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Prepare exact committed Move marker cleanup without authorizing deletion.
     PrepareCleanup {
         #[arg(long)]
@@ -637,6 +649,15 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             output,
         } => {
             print(&open(&data_dir)?.export_leased(&lease.parse()?, &output)?)?;
+        }
+        Command::PrepareOriginalDisposal {
+            data_dir,
+            transaction,
+        } => {
+            print(&open(&data_dir)?.prepare_original_disposal(&transaction.parse()?)?)?;
+        }
+        Command::OriginalDisposals { data_dir } => {
+            print(&open(&data_dir)?.original_disposals()?)?;
         }
         Command::PrepareCleanup {
             data_dir,
