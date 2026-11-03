@@ -22,6 +22,9 @@ use windows_sys::Win32::{
 
 #[path = "directory_create.rs"]
 mod directory_create;
+#[path = "owned_file.rs"]
+mod owned_file;
+pub use owned_file::OwnedFileCreation;
 
 fn key(file: &File) -> io::Result<FileKey> {
     let mut info = FILE_ID_INFO::default();

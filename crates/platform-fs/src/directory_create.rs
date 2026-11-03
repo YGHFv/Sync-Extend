@@ -4,7 +4,7 @@ use super::{
 };
 use std::{fs::File, io, mem::size_of, os::windows::io::AsRawHandle, ptr};
 use windows_sys::Win32::{
-    Foundation::{GENERIC_READ, HANDLE},
+    Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE},
     Storage::FileSystem::{GetDriveTypeW, DELETE, FILE_SHARE_READ},
     System::WindowsProgramming::DRIVE_FIXED,
 };
@@ -61,14 +61,25 @@ fn local_ntfs_from_handle(file: &File) -> io::Result<()> {
     require_ntfs(file)
 }
 
+pub(super) enum NewChildKind {
+    Directory,
+    File,
+}
+
 fn create_new_directory_child(file: &File, name: &str) -> io::Result<LockedDirectoryMutation> {
+    Ok(LockedDirectoryMutation {
+        file: create_new_child(file, name, NewChildKind::Directory)?,
+    })
+}
+
+pub(super) fn create_new_child(file: &File, name: &str, kind: NewChildKind) -> io::Result<File> {
     use std::os::windows::io::FromRawHandle;
     use windows_sys::{
         Wdk::{
             Foundation::OBJECT_ATTRIBUTES,
             Storage::FileSystem::{
-                NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
-                FILE_SYNCHRONOUS_IO_NONALERT,
+                NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE,
+                FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
             },
         },
         Win32::{
@@ -85,6 +96,20 @@ fn create_new_directory_child(file: &File, name: &str) -> io::Result<LockedDirec
     require_case_insensitive(file)?;
     local_ntfs_from_handle(file)?;
     let parent_key = key(file)?;
+    let (access, share, options, directory) = match kind {
+        NewChildKind::Directory => (
+            GENERIC_READ | DELETE | SYNCHRONIZE,
+            FILE_SHARE_READ,
+            FILE_DIRECTORY_FILE,
+            true,
+        ),
+        NewChildKind::File => (
+            GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE,
+            0,
+            FILE_NON_DIRECTORY_FILE,
+            false,
+        ),
+    };
     let mut encoded: Vec<u16> = name.encode_utf16().collect();
     let bytes = u16::try_from(
         encoded
@@ -110,18 +135,19 @@ fn create_new_directory_child(file: &File, name: &str) -> io::Result<LockedDirec
     let mut handle = ptr::null_mut();
     // SAFETY: parent owns a live real-directory handle. The single-component
     // UTF-16 buffer, counted string and attributes remain live and aligned
-    // throughout synchronous creation; handle/status are sized writable outputs.
+    // throughout synchronous creation; fixed internal kind flags select only
+    // new file/directory creation and handle/status are sized writable outputs.
     let status = unsafe {
         NtCreateFile(
             &mut handle,
-            GENERIC_READ | DELETE | SYNCHRONIZE,
+            access,
             &attributes,
             &mut status_block,
             ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
-            FILE_SHARE_READ,
+            share,
             FILE_CREATE,
-            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
             ptr::null(),
             0,
         )
@@ -133,7 +159,7 @@ fn create_new_directory_child(file: &File, name: &str) -> io::Result<LockedDirec
         ));
     }
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return Err(invalid("directory create returned no owned handle"));
+        return Err(invalid("native create returned no owned handle"));
     }
     // SAFETY: successful synchronous creation returned one owned native handle.
     // File assumes ownership once and closes it on every later error path.
@@ -144,14 +170,16 @@ fn create_new_directory_child(file: &File, name: &str) -> io::Result<LockedDirec
         || completion != STATUS_SUCCESS
         || status_block.Information != FILE_CREATED as usize
     {
-        return Err(invalid("new directory creation ownership unavailable"));
+        return Err(invalid("new native creation ownership unavailable"));
     }
-    regular(&created, true)?;
-    require_case_insensitive(&created)?;
+    regular(&created, directory)?;
+    if directory {
+        require_case_insensitive(&created)?;
+    }
     if key(&created)?.volume != parent_key.volume {
-        return Err(invalid("created directory volume changed"));
+        return Err(invalid("created native volume changed"));
     }
-    Ok(LockedDirectoryMutation { file: created })
+    Ok(created)
 }
 
 fn validate_directory_component(name: &str) -> io::Result<()> {
