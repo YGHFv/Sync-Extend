@@ -61,6 +61,15 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Transfer download/restore pins to an exact retained local snapshot; no remote receipt.
+    HandoffContent {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        snapshot: String,
+    },
     /// Persist one verified unreferenced CAS observation; never authorize deletion.
     MarkGcObject {
         #[arg(long)]
@@ -477,6 +486,13 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::ReferenceReservations { data_dir } => {
             print(&open(&data_dir)?.reference_reservations()?)?;
+        }
+        Command::HandoffContent {
+            data_dir,
+            owner,
+            snapshot,
+        } => {
+            print(&open(&data_dir)?.handoff_content(&owner.parse()?, &snapshot.parse()?)?)?;
         }
         Command::MarkGcObject {
             data_dir,

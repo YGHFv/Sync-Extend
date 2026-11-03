@@ -65,7 +65,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=16 => {}
+            1..=17 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -155,6 +155,11 @@ impl Journal {
         if version < 16 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-016.sql"))?;
+            tx.commit()?;
+        }
+        if version < 17 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-017.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -1345,7 +1350,9 @@ fn check_storage_metadata_limit(
             + (SELECT count(*) FROM gc_clock) + (SELECT count(*) FROM gc_authorizations)
             + (SELECT count(*) FROM gc_revocations) + (SELECT 2*count(*) FROM gc_executions)
             + (SELECT count(*) FROM gc_quarantines) + (SELECT 2*count(*) FROM gc_disposals)
-            + (SELECT 2*count(*) FROM reference_reservations)
+            + (SELECT count(*) FROM reference_reservations)
+            + max((SELECT count(*) FROM reference_reservations),
+                (SELECT count(*) FROM reference_snapshot_handoffs))
             + (SELECT count(*) FROM reference_reservation_objects),
             (SELECT coalesce(sum(length(CAST(manifest AS BLOB))),0) FROM snapshots)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))
@@ -1490,4 +1497,6 @@ pub use gc_disposal::{GcDisposalAudit, GcDisposalIntent, GcDisposalState, GcDisp
 mod diagnostics;
 pub use diagnostics::GcDiagnostics;
 mod reference_reservation;
-pub use reference_reservation::{ReferenceReservation, ReferenceReservationIntent};
+pub use reference_reservation::{
+    ReferenceReservation, ReferenceReservationIntent, ReferenceSnapshotHandoff,
+};

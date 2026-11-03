@@ -1,10 +1,13 @@
 use crate::{
     check_storage_metadata_limit, sql_integer, CasAccessGuard, Journal, JournalError, Result,
 };
-use rusqlite::{params, Transaction, TransactionBehavior};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use sync_extend_core_model::{reference_owner::ReferenceOwnerScope, ContentId, EntryId, SpaceId};
+use sync_extend_core_model::{
+    reference_owner::{ReferenceOwnerKind, ReferenceOwnerScope},
+    ContentId, EntryId, SnapshotId, SpaceId,
+};
 
 const MAX_RESERVATION_BYTES: usize = 16 * 1024 * 1024;
 const TERMINAL_RESERVATION_BYTES: u64 = 4096;
@@ -25,6 +28,13 @@ pub struct ReferenceReservation {
     pub release_available: bool,
     pub worker_available: bool,
     pub remote_backup_complete: bool,
+    pub snapshot_handoff: Option<ReferenceSnapshotHandoff>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ReferenceSnapshotHandoff {
+    pub snapshot_id: SnapshotId,
+    pub owner_intent_hash: ContentId,
 }
 
 impl ReferenceReservationIntent {
@@ -62,6 +72,8 @@ impl Journal {
         }
         let orphan: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM reference_reservation_objects p
+                LEFT JOIN reference_reservations o USING(owner_id) WHERE o.owner_id IS NULL)
+             OR EXISTS(SELECT 1 FROM reference_snapshot_handoffs h
                 LEFT JOIN reference_reservations o USING(owner_id) WHERE o.owner_id IS NULL)",
             [],
             |r| r.get(0),
@@ -100,7 +112,7 @@ impl Journal {
                     "reservation intent integrity mismatch",
                 ));
             }
-            let expected = intent.chunks(max)?;
+            let mut expected = intent.chunks(max)?;
             all_files = all_files
                 .checked_add(intent.scope.files.len())
                 .filter(|n| *n <= max)
@@ -111,6 +123,35 @@ impl Journal {
                     .filter(|n| *n <= max)
                     .ok_or(JournalError::Invariant("reservation aggregate chunk limit"))?;
             }
+            let handoff: Option<(String, String)> = self
+                .connection
+                .query_row(
+                    "SELECT CASE WHEN length(CAST(snapshot_id AS BLOB))=64 THEN snapshot_id ELSE '' END,
+                        CASE WHEN length(CAST(owner_intent_hash AS BLOB))=64 THEN owner_intent_hash ELSE '' END
+                     FROM reference_snapshot_handoffs WHERE owner_id=?1",
+                    [&id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let snapshot_handoff = if let Some((snapshot_id, owner_hash)) = handoff {
+                if owner_hash != hash {
+                    return Err(JournalError::Invariant("snapshot handoff hash mismatch"));
+                }
+                let snapshot_id = snapshot_id.parse()?;
+                let snapshot = crate::snapshot_retention::audit_snapshot(
+                    &self.connection,
+                    space,
+                    &snapshot_id,
+                )?;
+                require_snapshot_scope(&intent, &snapshot.manifest, &snapshot.state)?;
+                expected.clear();
+                Some(ReferenceSnapshotHandoff {
+                    snapshot_id,
+                    owner_intent_hash: owner_hash.parse()?,
+                })
+            } else {
+                None
+            };
             let mut pins = self.connection.prepare(
                 "SELECT content_id FROM reference_reservation_objects WHERE owner_id=?1",
             )?;
@@ -136,11 +177,16 @@ impl Journal {
             }
             owners.push(ReferenceReservation {
                 intent,
-                state: "reserved",
+                state: if snapshot_handoff.is_some() {
+                    "transferred_to_snapshot"
+                } else {
+                    "reserved"
+                },
                 content_hashes_verified: false,
                 release_available: false,
                 worker_available: false,
                 remote_backup_complete: false,
+                snapshot_handoff,
             });
         }
         Ok(owners)
@@ -230,4 +276,103 @@ impl Journal {
         tx.commit().map_err(JournalError::from)?;
         Ok((Some((coordination, held)), owner))
     }
+
+    /// Transfer only download/restore pins to an exact already retained snapshot.
+    /// The caller verifies content under the returned CAS guard before commit.
+    pub fn with_reference_snapshot_handoff<T, E>(
+        &self,
+        space: &SpaceId,
+        owner_id: &EntryId,
+        snapshot_id: &SnapshotId,
+        max: usize,
+        inspect: impl FnOnce(&ReferenceReservationIntent) -> std::result::Result<T, E>,
+    ) -> std::result::Result<(Option<(CasAccessGuard, T)>, ReferenceReservation), E>
+    where
+        E: From<JournalError>,
+    {
+        let find = || {
+            self.reference_reservations(space, max)?
+                .into_iter()
+                .find(|o| o.intent.owner_id == *owner_id)
+                .ok_or(JournalError::Invariant("unknown reference reservation"))
+        };
+        let replay = |owner: &ReferenceReservation| -> Result<bool> {
+            if let Some(handoff) = &owner.snapshot_handoff {
+                if handoff.snapshot_id != *snapshot_id {
+                    return Err(JournalError::Invariant("snapshot handoff target collision"));
+                }
+                return Ok(true);
+            }
+            Ok(false)
+        };
+        {
+            let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)
+                .map_err(JournalError::from)?;
+            let owner = find()?;
+            if replay(&owner)? {
+                tx.commit().map_err(JournalError::from)?;
+                return Ok((None, owner));
+            }
+        }
+        let coordination = self.acquire_cas_coordination()?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+            .map_err(JournalError::from)?;
+        self.audit_gc_owners(space, max)?;
+        let owner = find()?;
+        if replay(&owner)? {
+            tx.commit().map_err(JournalError::from)?;
+            return Ok((None, owner));
+        }
+        let snapshot = self.retained_snapshot(space, snapshot_id)?;
+        require_snapshot_scope(&owner.intent, &snapshot.manifest, &snapshot.state)?;
+        // The terminal row/bytes were reserved at admission, even under tighter limits.
+        self.check_storage_metadata_limit(max)?;
+        let held = inspect(&owner.intent)?;
+        self.audit_gc_owners(space, max)?;
+        let snapshot = self.retained_snapshot(space, snapshot_id)?;
+        require_snapshot_scope(&owner.intent, &snapshot.manifest, &snapshot.state)?;
+        let json = serde_json::to_string(&owner.intent).map_err(JournalError::from)?;
+        self.connection
+            .execute(
+                "INSERT INTO reference_snapshot_handoffs VALUES (?1,?2,?3)",
+                params![
+                    owner_id.as_str(),
+                    snapshot_id.as_str(),
+                    ContentId::hash(json.as_bytes()).as_str(),
+                ],
+            )
+            .map_err(JournalError::from)?;
+        self.connection
+            .execute(
+                "DELETE FROM reference_reservation_objects WHERE owner_id=?1",
+                [owner_id.as_str()],
+            )
+            .map_err(JournalError::from)?;
+        self.audit_gc_owners(space, max)?;
+        let owner = find()?;
+        tx.commit().map_err(JournalError::from)?;
+        Ok((Some((coordination, held)), owner))
+    }
+}
+
+fn require_snapshot_scope(
+    owner: &ReferenceReservationIntent,
+    snapshot: &sync_extend_core_model::Manifest,
+    state: &str,
+) -> Result<()> {
+    if !matches!(
+        owner.scope.kind,
+        ReferenceOwnerKind::Download | ReferenceOwnerKind::Restore
+    ) || snapshot.space_id != owner.scope.space_id
+        || state != "materialized"
+        || owner.scope.files.iter().any(|file| {
+            !snapshot
+                .entries
+                .values()
+                .any(|e| e.content.as_ref() == Some(file))
+        })
+    {
+        return Err(JournalError::Invariant("snapshot handoff scope mismatch"));
+    }
+    Ok(())
 }

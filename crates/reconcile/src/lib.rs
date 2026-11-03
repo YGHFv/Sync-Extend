@@ -516,8 +516,10 @@ impl LocalSpace {
             }
         }
         for owner in self.reference_reservations()? {
-            for file in &owner.intent.scope.files {
-                self.cas.verify(file)?;
+            if owner.snapshot_handoff.is_none() {
+                for file in &owner.intent.scope.files {
+                    self.cas.verify(file)?;
+                }
             }
         }
         let mut files = 0;

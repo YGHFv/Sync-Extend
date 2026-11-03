@@ -29,6 +29,9 @@ pub struct StorageReport {
     pub durable_read_leases_available: bool,
     pub durable_worker_reservations_available: bool,
     pub worker_reservation_records: usize,
+    pub active_worker_reservations: usize,
+    pub worker_snapshot_handoff_records: usize,
+    pub explicit_local_snapshot_handoff_available: bool,
     pub worker_reservation_unique_chunk_bytes: u64,
     pub worker_reservation_release_available: bool,
     pub locked_snapshots: usize,
@@ -163,10 +166,18 @@ impl LocalSpace {
         expected.extend(leased.iter().cloned());
         let owners = self.reference_reservations()?;
         let worker_reservation_records = owners.len();
+        let worker_snapshot_handoff_records = owners
+            .iter()
+            .filter(|o| o.snapshot_handoff.is_some())
+            .count();
+        let active_worker_reservations =
+            worker_reservation_records - worker_snapshot_handoff_records;
         let mut reserved = BTreeSet::new();
         for owner in owners {
-            for file in &owner.intent.scope.files {
-                refs.add(file, &mut reserved)?;
+            if owner.snapshot_handoff.is_none() {
+                for file in &owner.intent.scope.files {
+                    refs.add(file, &mut reserved)?;
+                }
             }
         }
         expected.extend(reserved.iter().cloned());
@@ -235,6 +246,9 @@ impl LocalSpace {
             protected_objects: protected.len(),
             durable_worker_reservations_available: true,
             worker_reservation_records,
+            active_worker_reservations,
+            worker_snapshot_handoff_records,
+            explicit_local_snapshot_handoff_available: true,
             worker_reservation_unique_chunk_bytes: refs.bytes(reserved.iter())?,
             worker_reservation_release_available: false,
             active_read_leases,

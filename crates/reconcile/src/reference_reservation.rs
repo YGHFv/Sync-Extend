@@ -1,5 +1,6 @@
 use crate::{fault::checkpoint, LocalSpace, ReconcileError, Result};
 use sync_extend_core_model::limits::LocalLimits;
+use sync_extend_core_model::{EntryId, SnapshotId};
 use sync_extend_journal::{ReferenceReservation, ReferenceReservationIntent};
 
 impl LocalSpace {
@@ -35,6 +36,35 @@ impl LocalSpace {
             },
         )?;
         checkpoint("after_reference_reservation_commit");
+        drop(guards);
+        self.verify_root()?;
+        Ok(owner)
+    }
+
+    pub fn handoff_content(
+        &mut self,
+        owner_id: &EntryId,
+        snapshot_id: &SnapshotId,
+    ) -> Result<ReferenceReservation> {
+        self.verify_root()?;
+        checkpoint("before_reference_snapshot_handoff");
+        let (guards, owner) = self.journal.with_reference_snapshot_handoff(
+            &self.space_id,
+            owner_id,
+            snapshot_id,
+            self.limits.max_storage_entries,
+            |intent| -> Result<()> {
+                checkpoint("after_reference_snapshot_handoff_lock");
+                check_limits(intent, &self.limits)?;
+                for file in &intent.scope.files {
+                    self.cas.verify(file)?;
+                }
+                checkpoint("after_reference_snapshot_handoff_verify");
+                self.verify_root()?;
+                Ok(())
+            },
+        )?;
+        checkpoint("after_reference_snapshot_handoff_commit");
         drop(guards);
         self.verify_root()?;
         Ok(owner)
