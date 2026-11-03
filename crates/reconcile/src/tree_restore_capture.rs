@@ -55,6 +55,24 @@ impl LocalSpace {
             "guarded tree observation requires Windows fixed local NTFS",
         ))
     }
+
+    /// Bind an immutable native description, not executable admission.
+    pub fn reserve_tree_restore_native_identity(
+        &self,
+        request: &sync_extend_journal::TreeRestoreNativeRequest,
+    ) -> Result<sync_extend_journal::TreeRestoreNativeReservation> {
+        self.reserve_tree_native_platform(request)
+    }
+
+    #[cfg(not(windows))]
+    fn reserve_tree_native_platform(
+        &self,
+        _request: &sync_extend_journal::TreeRestoreNativeRequest,
+    ) -> Result<sync_extend_journal::TreeRestoreNativeReservation> {
+        Err(crate::ReconcileError::Invariant(
+            "native tree identity capture requires Windows fixed local NTFS",
+        ))
+    }
 }
 
 #[cfg(windows)]
@@ -440,6 +458,37 @@ mod windows {
     }
 
     impl LocalSpace {
+        pub(super) fn reserve_tree_native_platform(
+            &self,
+            request: &sync_extend_journal::TreeRestoreNativeRequest,
+        ) -> Result<sync_extend_journal::TreeRestoreNativeReservation> {
+            let (held, audit) = self.journal.with_tree_restore_native_identity(
+                request,
+                self.limits.max_storage_entries,
+                |preparation, tree, baseline, target| {
+                    self.verify_root()?;
+                    let (guards, plan) =
+                        capture(self, preparation, tree, baseline, target, request.limits)?;
+                    let inventory = plan.inventory().clone();
+                    checkpoint("after_tree_native_binding_capture");
+                    Ok::<_, ReconcileError>(((guards, baseline.clone(), target.clone()), inventory))
+                },
+                |(guards, baseline, target), plan| {
+                    for snapshot in [baseline, target] {
+                        for file in snapshot.entries.values().filter_map(|e| e.content.as_ref()) {
+                            self.cas.verify(file)?;
+                        }
+                    }
+                    checkpoint("before_tree_native_binding_recheck");
+                    guards.verify(self, plan)?;
+                    Ok::<_, ReconcileError>(())
+                },
+            )?;
+            checkpoint("after_tree_native_binding_commit");
+            drop(held);
+            Ok(audit)
+        }
+
         pub(super) fn capture_tree_platform<T>(
             &self,
             intent: &TreeRestoreHistoryIntent,

@@ -45,6 +45,7 @@ pub struct TreeRestorePreparation {
     pub tree_atomic: bool,
     pub remote_backup_complete: bool,
     pub history_reservation: Option<crate::TreeRestoreHistoryReservation>,
+    pub native_reservation: Option<crate::TreeRestoreNativeReservation>,
 }
 
 struct PreparedPlan {
@@ -224,12 +225,30 @@ impl Journal {
              OR EXISTS(SELECT 1 FROM tree_restore_cancellations c
                 LEFT JOIN tree_restore_preparations p USING(transaction_id) WHERE p.transaction_id IS NULL)
              OR EXISTS(SELECT 1 FROM tree_restore_histories h
-                LEFT JOIN tree_restore_preparations p USING(transaction_id) WHERE p.transaction_id IS NULL)",
+                LEFT JOIN tree_restore_preparations p USING(transaction_id) WHERE p.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_native_reservations n
+                LEFT JOIN tree_restore_preparations p USING(transaction_id)
+                LEFT JOIN tree_restore_histories h USING(transaction_id)
+                WHERE p.transaction_id IS NULL OR h.transaction_id IS NULL)",
             [],
             |r| r.get(0),
         )?;
         if orphan {
             return Err(JournalError::Invariant("orphan tree restore metadata"));
+        }
+        let (native_rows, native_bindings): (i64, i64) = self.connection.query_row(
+            "SELECT count(*),coalesce(sum(binding_count),0) FROM tree_restore_native_reservations",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if native_rows < 0
+            || native_bindings < 0
+            || native_rows as u64 > max as u64
+            || native_bindings as u64 > max as u64
+        {
+            return Err(JournalError::Invariant(
+                "tree native aggregate inventory limit",
+            ));
         }
         let mut statement = self.connection.prepare(
             "SELECT CASE WHEN length(CAST(transaction_id AS BLOB))=32 THEN transaction_id ELSE '' END,
@@ -246,6 +265,7 @@ impl Journal {
         let mut active_count = 0;
         let mut inventory = 0usize;
         let mut lengths = BTreeMap::new();
+        let mut actual_native_bindings = 0usize;
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
             let json: String = row.get(4)?;
@@ -360,6 +380,24 @@ impl Journal {
                 cancelled_at_ms,
                 max,
             )?;
+            let baseline = self.snapshot(space, &intent.scope.baseline_snapshot)?;
+            let native_reservation = crate::tree_restore_native_identity::audit_native(
+                &self.connection,
+                &intent,
+                history_reservation.as_ref(),
+                &prepared.plan,
+                &baseline,
+                cancelled_at_ms,
+                max,
+            )?;
+            if let Some(native) = &native_reservation {
+                actual_native_bindings = actual_native_bindings
+                    .checked_add(native.binding_count)
+                    .filter(|n| *n <= max)
+                    .ok_or(JournalError::Invariant(
+                        "tree native actual aggregate limit",
+                    ))?;
+            }
             audits.push(TreeRestorePreparation {
                 intent,
                 steps: prepared.plan.steps().to_vec(),
@@ -379,7 +417,13 @@ impl Journal {
                 tree_atomic: false,
                 remote_backup_complete: false,
                 history_reservation,
+                native_reservation,
             });
+        }
+        if actual_native_bindings as u64 != native_bindings as u64 {
+            return Err(JournalError::Invariant(
+                "tree native aggregate counter mismatch",
+            ));
         }
         if active_count > 1 {
             return Err(JournalError::Invariant("multiple tree restore writers"));
@@ -396,7 +440,8 @@ impl Journal {
              OR EXISTS(SELECT 1 FROM tree_restore_steps)
              OR EXISTS(SELECT 1 FROM tree_restore_objects)
              OR EXISTS(SELECT 1 FROM tree_restore_cancellations)
-             OR EXISTS(SELECT 1 FROM tree_restore_histories)",
+             OR EXISTS(SELECT 1 FROM tree_restore_histories)
+             OR EXISTS(SELECT 1 FROM tree_restore_native_reservations)",
             [],
             |r| r.get(0),
         )?;
