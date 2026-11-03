@@ -44,6 +44,7 @@ pub struct TreeRestorePreparation {
     pub final_handoff_capacity_verified: bool,
     pub tree_atomic: bool,
     pub remote_backup_complete: bool,
+    pub history_reservation: Option<crate::TreeRestoreHistoryReservation>,
 }
 
 struct PreparedPlan {
@@ -221,6 +222,8 @@ impl Journal {
              OR EXISTS(SELECT 1 FROM tree_restore_objects o
                 LEFT JOIN tree_restore_preparations p USING(transaction_id) WHERE p.transaction_id IS NULL)
              OR EXISTS(SELECT 1 FROM tree_restore_cancellations c
+                LEFT JOIN tree_restore_preparations p USING(transaction_id) WHERE p.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_histories h
                 LEFT JOIN tree_restore_preparations p USING(transaction_id) WHERE p.transaction_id IS NULL)",
             [],
             |r| r.get(0),
@@ -350,6 +353,13 @@ impl Journal {
             if pins.next()?.is_some() {
                 return Err(JournalError::Invariant("extra tree restore pin"));
             }
+            let history_reservation = crate::tree_restore_history::audit_history(
+                &self.connection,
+                &intent,
+                &prepared.plan,
+                cancelled_at_ms,
+                max,
+            )?;
             audits.push(TreeRestorePreparation {
                 intent,
                 steps: prepared.plan.steps().to_vec(),
@@ -368,6 +378,7 @@ impl Journal {
                 final_handoff_capacity_verified: false,
                 tree_atomic: false,
                 remote_backup_complete: false,
+                history_reservation,
             });
         }
         if active_count > 1 {
@@ -384,7 +395,8 @@ impl Journal {
             "SELECT EXISTS(SELECT 1 FROM tree_restore_preparations)
              OR EXISTS(SELECT 1 FROM tree_restore_steps)
              OR EXISTS(SELECT 1 FROM tree_restore_objects)
-             OR EXISTS(SELECT 1 FROM tree_restore_cancellations)",
+             OR EXISTS(SELECT 1 FROM tree_restore_cancellations)
+             OR EXISTS(SELECT 1 FROM tree_restore_histories)",
             [],
             |r| r.get(0),
         )?;

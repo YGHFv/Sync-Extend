@@ -39,6 +39,7 @@ impl LocalSpace {
             implementation_gaps: vec![
                 "persistent_identity_rename_inference",
                 "whole_tree_restore_native_admission_execution_and_final_handoff",
+                "whole_tree_restore_native_and_terminal_capacity_beyond_reserved_history",
                 "non_move_transaction_marker_cleanup",
                 "automatic_retention_and_bulk_gc",
                 "authenticated_network_sync",

@@ -155,6 +155,7 @@ pub struct Status {
     pub windows_replace_executor_available: bool,
     pub mutation_executor_actions: Vec<&'static str>,
     pub tree_restore_preparation_records: usize,
+    pub tree_restore_history_reservations: usize,
     pub tree_restore_writer_gate_held: bool,
     pub tree_restore_execution_available: bool,
     pub tree_atomic: bool,
@@ -511,6 +512,10 @@ impl LocalSpace {
                 vec![]
             },
             tree_restore_preparation_records: trees.len(),
+            tree_restore_history_reservations: trees
+                .iter()
+                .filter(|p| p.history_reservation.is_some())
+                .count(),
             tree_restore_writer_gate_held: trees.iter().any(|p| p.writer_gate_held),
             tree_restore_execution_available: false,
             tree_atomic: false,

@@ -37,6 +37,7 @@ pub struct StorageReport {
     pub tree_restore_preparation_records: usize,
     pub tree_restore_writer_gate_held: bool,
     pub tree_restore_reserved_metadata_bytes: u64,
+    pub tree_restore_history_reserved_metadata_bytes: u64,
     pub tree_restore_reserved_worktree_logical_bytes: u64,
     pub tree_restore_input_unique_chunk_bytes: u64,
     pub tree_restore_execution_available: bool,
@@ -142,6 +143,14 @@ impl LocalSpace {
                 .checked_add(p.reserved_metadata_bytes)
                 .ok_or(ReconcileError::ResourceLimit("tree restore metadata bytes"))
         })?;
+        let tree_restore_history_reserved_metadata_bytes = trees
+            .iter()
+            .filter_map(|p| p.history_reservation.as_ref())
+            .try_fold(0u64, |total, h| {
+                total
+                    .checked_add(h.reserved_metadata_bytes)
+                    .ok_or(ReconcileError::ResourceLimit("tree restore history bytes"))
+            })?;
         let mut tree_inputs = BTreeSet::new();
         let mut tree_restore_reserved_worktree_logical_bytes = 0;
         let mut refs = References {
@@ -288,6 +297,7 @@ impl LocalSpace {
             tree_restore_preparation_records: trees.len(),
             tree_restore_writer_gate_held: trees.iter().any(|p| p.writer_gate_held),
             tree_restore_reserved_metadata_bytes,
+            tree_restore_history_reserved_metadata_bytes,
             tree_restore_reserved_worktree_logical_bytes,
             tree_restore_input_unique_chunk_bytes: refs.bytes(tree_inputs.iter())?,
             tree_restore_execution_available: false,

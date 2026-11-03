@@ -65,7 +65,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=21 => {}
+            1..=22 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -180,6 +180,11 @@ impl Journal {
         if version < 21 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-021.sql"))?;
+            tx.commit()?;
+        }
+        if version < 22 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-022.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -1452,6 +1457,10 @@ fn check_storage_metadata_limit(
             + (SELECT count(*) FROM original_disposals)
             + max((SELECT count(*) FROM original_disposals),
                 (SELECT count(*) FROM original_disposal_completions))
+            + (SELECT count(*) FROM operations) + (SELECT count(*) FROM receive_cursors)
+            + (SELECT count(*) FROM current_manifests)
+            + max((SELECT coalesce(sum(reserved_rows),0) FROM tree_restore_histories),
+                (SELECT count(*) FROM tree_restore_histories))
             + max((SELECT coalesce(sum(reserved_rows),0) FROM tree_restore_preparations),
                 (SELECT count(*) FROM tree_restore_preparations)
                 + (SELECT 3*count(*) FROM tree_restore_steps)
@@ -1475,6 +1484,13 @@ fn check_storage_metadata_limit(
                 FROM rename_observations)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))+4096),0)
                 FROM original_disposals)
+            + (SELECT coalesce(sum(length(CAST(payload AS BLOB))+180),0) FROM operations)
+            + (SELECT 104*count(*) FROM receive_cursors)
+            + (SELECT 96*count(*) FROM current_manifests)
+            + (SELECT 124*count(*) FROM snapshots)
+            + (SELECT 128*count(*) FROM snapshot_objects)
+            + max((SELECT coalesce(sum(reserved_bytes),0) FROM tree_restore_histories),
+                (SELECT coalesce(sum(length(CAST(intent AS BLOB))+392),0) FROM tree_restore_histories))
             + max((SELECT coalesce(sum(reserved_bytes),0) FROM tree_restore_preparations),
                 (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0)
                     FROM tree_restore_preparations)
@@ -1615,8 +1631,10 @@ mod original_retention;
 mod reference_reservation;
 mod rename_observation;
 mod tree_restore;
+mod tree_restore_history;
 pub use original_retention::{OriginalDisposalAudit, OriginalDisposalIntent, OriginalDisposalStep};
 pub use reference_reservation::{
     ReferenceReservation, ReferenceReservationIntent, ReferenceSnapshotHandoff,
 };
 pub use tree_restore::{TreeRestorePreparation, TreeRestorePreparationIntent};
+pub use tree_restore_history::{TreeRestoreHistoryIntent, TreeRestoreHistoryReservation};
