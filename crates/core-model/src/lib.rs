@@ -4,6 +4,7 @@ pub mod ids;
 pub mod limits;
 pub mod operation;
 pub mod path;
+pub mod persisted_rename;
 pub mod reference_owner;
 
 pub use ids::*;
