@@ -385,3 +385,66 @@ impl Journal {
         Ok((Some((coordination, held)), audit))
     }
 }
+
+impl Journal {
+    /// Fresh read-only inspection of an existing exact history reservation.
+    /// This never reserves native identities or grants executable authority.
+    pub fn with_tree_restore_history_observation<T, E>(
+        &self,
+        intent: &TreeRestoreHistoryIntent,
+        max: usize,
+        inspect: impl FnOnce(
+            &TreeRestorePreparationIntent,
+            &TreeRestorePlan,
+            &Manifest,
+            &Manifest,
+        ) -> std::result::Result<T, E>,
+    ) -> std::result::Result<(CasAccessGuard, T), E>
+    where
+        E: From<JournalError>,
+    {
+        let space = self
+            .state("space_id")?
+            .ok_or(JournalError::Invariant("tree observation space missing"))?
+            .parse()
+            .map_err(JournalError::from)?;
+        let coordination = self.acquire_cas_coordination()?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+            .map_err(JournalError::from)?;
+        self.audit_gc_owners(&space, max)?;
+        let find = || {
+            let p = self
+                .tree_restore_preparations(&space, max)?
+                .into_iter()
+                .find(|p| p.intent.transaction_id == intent.transaction_id)
+                .ok_or(JournalError::Invariant("unknown tree observation owner"))?;
+            if !p.writer_gate_held
+                || p.history_reservation.as_ref().map(|h| &h.intent) != Some(intent)
+            {
+                return Err(JournalError::Invariant(
+                    "tree observation exact active history mismatch",
+                ));
+            }
+            Ok(p)
+        };
+        let preparation = find()?;
+        let baseline = self.snapshot(&space, &preparation.intent.scope.baseline_snapshot)?;
+        let target = self.snapshot(&space, &preparation.intent.scope.target_snapshot)?;
+        let tree = plan_tree_restore(
+            &preparation.intent.scope,
+            &baseline,
+            &target,
+            preparation.intent.limits,
+        )
+        .map_err(JournalError::from)?;
+        let held = inspect(&preparation.intent, &tree, &baseline, &target)?;
+        self.audit_gc_owners(&space, max)?;
+        if find()? != preparation {
+            return Err(
+                JournalError::Invariant("tree observation changed during inspection").into(),
+            );
+        }
+        tx.commit().map_err(JournalError::from)?;
+        Ok((coordination, held))
+    }
+}

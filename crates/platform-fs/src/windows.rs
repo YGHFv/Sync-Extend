@@ -153,6 +153,11 @@ impl LockedDirectory {
         key(&self.file)
     }
 
+    /// Require the retained directory to live on a fixed local NTFS volume.
+    pub fn require_local_ntfs(&self, path: &Path) -> io::Result<()> {
+        local_ntfs(&self.file, path)
+    }
+
     pub fn require_case_insensitive(&self) -> io::Result<()> {
         let mut info = FILE_CASE_SENSITIVE_INFO::default();
         // SAFETY: directory owns a live handle; info is aligned writable output
