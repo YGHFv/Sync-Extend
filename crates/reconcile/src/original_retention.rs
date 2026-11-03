@@ -23,10 +23,35 @@ impl LocalSpace {
         self.prepare_original_disposal_platform(id)
     }
 
+    pub fn execute_original_disposal(&self, id: &EntryId) -> Result<OriginalDisposalAudit> {
+        self.verify_root()?;
+        let pending = self
+            .original_disposals()?
+            .into_iter()
+            .find(|a| a.intent.scope.transaction_id == *id)
+            .ok_or(crate::ReconcileError::Invariant(
+                "original preparation missing",
+            ))?;
+        if pending.completed_at_ms.is_some() {
+            return Ok(pending);
+        }
+        self.execute_original_disposal_platform(&pending)
+    }
+
     #[cfg(not(windows))]
     fn prepare_original_disposal_platform(&self, _id: &EntryId) -> Result<OriginalDisposalAudit> {
         Err(crate::ReconcileError::Invariant(
             "original preparation requires Windows fixed local NTFS",
+        ))
+    }
+
+    #[cfg(not(windows))]
+    fn execute_original_disposal_platform(
+        &self,
+        _pending: &OriginalDisposalAudit,
+    ) -> Result<OriginalDisposalAudit> {
+        Err(crate::ReconcileError::Invariant(
+            "original disposition requires Windows fixed local NTFS",
         ))
     }
 }
@@ -46,7 +71,9 @@ mod windows {
         original_retention::{OriginalRetentionScope, RetainedOriginalAction},
         ContentId, FORMAT_VERSION,
     };
-    use sync_extend_journal::{Mutation, MutationAction, MutationState, OriginalDisposalIntent};
+    use sync_extend_journal::{
+        Mutation, MutationAction, MutationState, OriginalDisposalIntent, OriginalDisposalStep,
+    };
     use sync_extend_platform_fs::{
         verify_regular_file, GuardedReadFile, LockedDirectory, LockedFile,
     };
@@ -54,7 +81,7 @@ mod windows {
     struct Guards {
         _directories: Vec<LockedDirectory>,
         owner: GuardedReadFile,
-        original: LockedFile,
+        original: Option<LockedFile>,
         parent: PathBuf,
         base: PathBuf,
         directory: PathBuf,
@@ -73,6 +100,12 @@ mod windows {
     }
 
     impl Guards {
+        fn file(&self) -> Result<&LockedFile> {
+            self.original
+                .as_ref()
+                .ok_or(ReconcileError::Invariant("original handle missing"))
+        }
+
         fn verify(
             &self,
             local: &LocalSpace,
@@ -116,9 +149,7 @@ mod windows {
             owner_reader.take(66).read_to_end(&mut marker)?;
             let owner_identity = ContentId::hash(self.owner.key()?.to_string().as_bytes());
             verify_regular_file(self.owner.reader())?;
-            verify_regular_file(self.original.reader())?;
             if !owner_found
-                || !original_found
                 || owner_identity != execution.owner_identity
                 || physical_identity(&self.directory.join("owner"))? != owner_identity
                 || marker
@@ -127,16 +158,33 @@ mod windows {
                         mutation.intent.transaction_id, execution.execution_id
                     )
                     .as_bytes()
-                || identity(&self.original)? != intent.scope.original_identity
-                || physical_identity(&self.directory.join("original"))?
-                    != intent.scope.original_identity
-                || self.original.reader().metadata()?.len() != intent.original_length
-                || modified_ns(&self.original)? != intent.modified_at_ns
-                || !content_matches(&self.original, &intent.scope.content)?
             {
                 return Err(ReconcileError::Invariant("exact original or owner changed"));
             }
+            if let Some(original) = &self.original {
+                verify_regular_file(original.reader())?;
+                if !original_found
+                    || identity(original)? != intent.scope.original_identity
+                    || physical_identity(&self.directory.join("original"))?
+                        != intent.scope.original_identity
+                    || original.reader().metadata()?.len() != intent.original_length
+                    || modified_ns(original)? != intent.modified_at_ns
+                    || !content_matches(original, &intent.scope.content)?
+                {
+                    return Err(ReconcileError::Invariant("exact original changed"));
+                }
+            } else if original_found || slot_present(&self.directory.join("original"))? {
+                return Err(ReconcileError::Invariant("original absence changed"));
+            }
             Ok(())
+        }
+    }
+
+    fn slot_present(path: &std::path::Path) -> Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -186,7 +234,7 @@ mod windows {
             let guards = Guards {
                 _directories: directories,
                 owner: GuardedReadFile::open(&directory.join("owner"))?,
-                original: LockedFile::open(&directory.join("original"))?,
+                original: Some(LockedFile::open(&directory.join("original"))?),
                 parent,
                 base,
                 directory,
@@ -216,8 +264,8 @@ mod windows {
                     content: content.clone(),
                 },
                 base_identity: physical_identity(&guards.base)?,
-                original_length: guards.original.reader().metadata()?.len(),
-                modified_at_ns: modified_ns(&guards.original)?,
+                original_length: guards.file()?.reader().metadata()?.len(),
+                modified_at_ns: modified_ns(guards.file()?)?,
                 prepared_at_ms: now_ms()?,
             };
             guards.verify(self, &mutation, &intent)?;
@@ -243,6 +291,90 @@ mod windows {
                 },
             )?;
             checkpoint("after_original_preparation_commit");
+            drop(retained);
+            Ok(audit)
+        }
+
+        pub(super) fn execute_original_disposal_platform(
+            &self,
+            pending: &OriginalDisposalAudit,
+        ) -> Result<OriginalDisposalAudit> {
+            let _session = self.cas.acquire_session()?;
+            let mutation = self
+                .journal
+                .mutation(&pending.intent.scope.transaction_id)?;
+            let execution = mutation
+                .execution
+                .as_ref()
+                .ok_or(ReconcileError::Invariant("original execution missing"))?;
+            if pending.intent.scope.content.length > self.limits.max_file_bytes {
+                return Err(ReconcileError::ResourceLimit(
+                    "original disposition content budget",
+                ));
+            }
+            checkpoint("before_original_disposition_lock");
+            let (retained, audit) = self.journal.with_original_disposition(
+                &self.space_id,
+                &pending.intent.scope.transaction_id,
+                self.limits.max_storage_entries,
+                now_ms()?,
+                |pending| {
+                    let parent = self.parent_for(&mutation.intent.baseline_entry.path)?;
+                    let base = parent.join(".sync-tmp");
+                    let directory = base.join(execution.execution_id.as_str());
+                    let mut directories = directory_chain(&self.worktree)?;
+                    directories.extend(directory_chain(&directory)?);
+                    let original_path = directory.join("original");
+                    let original = if slot_present(&original_path)? {
+                        Some(LockedFile::open(&original_path)?)
+                    } else {
+                        None
+                    };
+                    let guards = Guards {
+                        _directories: directories,
+                        owner: GuardedReadFile::open(&directory.join("owner"))?,
+                        original,
+                        parent,
+                        base,
+                        directory,
+                    };
+                    self.cas.verify(&pending.intent.scope.content)?;
+                    guards.verify(self, &mutation, &pending.intent)?;
+                    checkpoint("after_original_disposition_lock");
+                    Ok::<_, ReconcileError>(guards)
+                },
+                (
+                    |guards: &mut Guards, pending: &OriginalDisposalAudit| {
+                        self.cas.verify(&pending.intent.scope.content)?;
+                        guards.verify(self, &mutation, &pending.intent)?;
+                        if let Some(original) = &guards.original {
+                            checkpoint("before_original_disposition_request");
+                            self.cas.verify(&pending.intent.scope.content)?;
+                            guards.verify(self, &mutation, &pending.intent)?;
+                            original.delete_on_close()?;
+                            checkpoint("after_original_disposition_request");
+                            drop(guards.original.take());
+                            checkpoint("after_original_disposition_close");
+                        }
+                        // Compatible readers can keep the namespace pending. An
+                        // access/sharing/delete-pending error is never absence.
+                        if slot_present(&guards.directory.join("original"))? {
+                            return Ok(OriginalDisposalStep::Pending);
+                        }
+                        checkpoint("after_original_disposition_absence");
+                        Ok(OriginalDisposalStep::ActualAbsence)
+                    },
+                    |guards: &mut Guards, pending: &OriginalDisposalAudit| {
+                        self.cas.verify(&pending.intent.scope.content)?;
+                        guards.verify(self, &mutation, &pending.intent)?;
+                        checkpoint("before_original_disposition_terminal");
+                        self.cas.verify(&pending.intent.scope.content)?;
+                        guards.verify(self, &mutation, &pending.intent)?;
+                        Ok(())
+                    },
+                ),
+            )?;
+            checkpoint("after_original_disposition_terminal");
             drop(retained);
             Ok(audit)
         }

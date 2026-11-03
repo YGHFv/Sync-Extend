@@ -254,7 +254,7 @@ impl LocalSpace {
             original_disposal_preparation_records,
             disposed_original_records,
             explicit_original_preparation_available: cfg!(windows),
-            original_disposition_executor_available: false,
+            original_disposition_executor_available: cfg!(windows),
             accounting: "physical_identity_deduplicated_logical_lengths_not_allocated_blocks",
             content_hashes_verified: false,
             current_unique_chunk_bytes: refs.bytes(current.iter())?,

@@ -296,6 +296,13 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Explicitly dispose ONE precommitted original; recovery never selects this.
+    ExecuteOriginalDisposal {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        transaction: String,
+    },
     /// Prepare exact committed Move marker cleanup without authorizing deletion.
     PrepareCleanup {
         #[arg(long)]
@@ -658,6 +665,12 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::OriginalDisposals { data_dir } => {
             print(&open(&data_dir)?.original_disposals()?)?;
+        }
+        Command::ExecuteOriginalDisposal {
+            data_dir,
+            transaction,
+        } => {
+            print(&open(&data_dir)?.execute_original_disposal(&transaction.parse()?)?)?;
         }
         Command::PrepareCleanup {
             data_dir,

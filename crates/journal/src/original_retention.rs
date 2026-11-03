@@ -198,7 +198,7 @@ impl Journal {
                 completed_at_ms,
                 historical_snapshot_pins_verified: true,
                 content_hashes_verified: false,
-                disposition_executor_available: false,
+                disposition_executor_available: cfg!(windows),
                 automatic_cleanup_available: false,
                 physical_space_reclaimed: false,
                 remote_backup_complete: false,
