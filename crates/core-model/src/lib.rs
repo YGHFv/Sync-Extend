@@ -3,6 +3,7 @@ pub mod gc_recovery;
 pub mod ids;
 pub mod limits;
 pub mod operation;
+pub mod original_retention;
 pub mod path;
 pub mod persisted_rename;
 pub mod reference_owner;
