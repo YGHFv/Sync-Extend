@@ -96,6 +96,8 @@ impl LocalSpace {
     pub fn storage_report(&self) -> Result<StorageReport> {
         self.verify_root()?;
         self.journal.integrity_check()?;
+        self.journal
+            .rename_observation(&self.space_id, self.limits.max_storage_entries)?;
         let gc_authorization_records = self.gc_authorizations()?.len();
         let executions = self.gc_executions()?;
         let quarantines = self.gc_quarantines()?;

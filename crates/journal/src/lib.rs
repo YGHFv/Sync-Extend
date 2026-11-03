@@ -65,7 +65,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=17 => {}
+            1..=18 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -160,6 +160,11 @@ impl Journal {
         if version < 17 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-017.sql"))?;
+            tx.commit()?;
+        }
+        if version < 18 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-018.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -1000,6 +1005,26 @@ impl Journal {
         )
     }
 
+    /// Commit optional local observations atomically with the exact visible tree.
+    /// The caller establishes native evidence; this does not enable scan inference.
+    pub fn commit_local_with_observations(
+        &mut self,
+        expected_root: Option<&SnapshotId>,
+        manifest: &Manifest,
+        operations: &[Operation],
+        timestamp: u64,
+        observations: &persisted_rename::RenameObservationMap,
+        max_entries: usize,
+    ) -> Result<SnapshotId> {
+        self.commit_local_inner(
+            expected_root,
+            manifest,
+            operations,
+            timestamp,
+            Completion::ObservedScan(observations, max_entries),
+        )
+    }
+
     pub fn commit_publication(
         &mut self,
         id: &EntryId,
@@ -1184,7 +1209,21 @@ impl Journal {
         manifest.validate()?;
         let root = manifest.root()?;
         self.require_unpruned_root(&root)?;
+        let observations = match completion {
+            Completion::ObservedScan(map, max) => {
+                map.validate(manifest, max)?;
+                Some((map, max, rename_observation::serialize_observation(map)?))
+            }
+            _ => None,
+        };
         let tx = self.connection.transaction()?;
+        rename_observation::audit_observation(
+            &tx,
+            &manifest.space_id,
+            observations
+                .as_ref()
+                .map_or(limits::MAX_ENTRIES, |(_, max, _)| *max),
+        )?;
         let mutation_active: Option<String> = tx.query_row(
             "SELECT transaction_id FROM mutations WHERE space_id=?1 AND state IN ('prepared','executing','quarantined','moved','replaced')",
             [manifest.space_id.as_str()], |r| r.get(0),
@@ -1307,6 +1346,21 @@ impl Journal {
                 [id.as_str()],
             )?;
         }
+        if let Some((map, max, bytes)) = observations {
+            let json = std::str::from_utf8(&bytes)
+                .map_err(|_| JournalError::Invariant("rename observation serialization"))?;
+            check_storage_metadata_limit(&tx, max, 1, bytes.len() as u64)?;
+            tx.execute(
+                "INSERT INTO rename_observations VALUES (?1,?2,?3,?4)",
+                params![
+                    map.scope.space_id.as_str(),
+                    root.as_str(),
+                    json,
+                    ContentId::hash(&bytes).as_str(),
+                ],
+            )?;
+            rename_observation::audit_observation(&tx, &manifest.space_id, max)?;
+        }
         tx.commit()?;
         Ok(root)
     }
@@ -1329,6 +1383,7 @@ impl Journal {
 #[derive(Clone, Copy)]
 enum Completion<'a> {
     None,
+    ObservedScan(&'a persisted_rename::RenameObservationMap, usize),
     Publication(&'a EntryId),
     Mutation(&'a EntryId),
 }
@@ -1353,7 +1408,8 @@ fn check_storage_metadata_limit(
             + (SELECT count(*) FROM reference_reservations)
             + max((SELECT count(*) FROM reference_reservations),
                 (SELECT count(*) FROM reference_snapshot_handoffs))
-            + (SELECT count(*) FROM reference_reservation_objects),
+            + (SELECT count(*) FROM reference_reservation_objects)
+            + (SELECT count(*) FROM rename_observations),
             (SELECT coalesce(sum(length(CAST(manifest AS BLOB))),0) FROM snapshots)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))
                 + coalesce(length(CAST(execution AS BLOB)),0)),0) FROM mutations)
@@ -1367,7 +1423,9 @@ fn check_storage_metadata_limit(
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_quarantines)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))),0) FROM gc_disposals)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))+4096),0)
-                FROM reference_reservations)",
+                FROM reference_reservations)
+            + (SELECT coalesce(sum(length(CAST(observation AS BLOB))),0)
+                FROM rename_observations)",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1497,6 +1555,7 @@ pub use gc_disposal::{GcDisposalAudit, GcDisposalIntent, GcDisposalState, GcDisp
 mod diagnostics;
 pub use diagnostics::GcDiagnostics;
 mod reference_reservation;
+mod rename_observation;
 pub use reference_reservation::{
     ReferenceReservation, ReferenceReservationIntent, ReferenceSnapshotHandoff,
 };

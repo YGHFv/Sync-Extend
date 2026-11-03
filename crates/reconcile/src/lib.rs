@@ -498,6 +498,8 @@ impl LocalSpace {
 
     pub fn verify(&self) -> Result<usize> {
         self.journal.integrity_check()?;
+        self.journal
+            .rename_observation(&self.space_id, self.limits.max_storage_entries)?;
         self.gc_marks()?;
         self.gc_authorizations()?;
         self.gc_executions()?;

@@ -94,6 +94,7 @@ impl Journal {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)
             .map_err(JournalError::from)?;
         self.check_storage_metadata_limit(max)?;
+        crate::rename_observation::audit_observation(&tx, space, max)?;
         self.audit_gc_owners(space, max)?;
         let marks = self.gc_marks(space, max)?;
         let authorizations = self.gc_authorizations(space, max)?;
