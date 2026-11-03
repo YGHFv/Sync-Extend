@@ -30,6 +30,7 @@ pub use gc_preflight::GcPreflight;
 pub use mutation::MutationCheck;
 pub use publish::PublishResult;
 pub use read_lease::LeasedExportResult;
+pub use reference_reservation::ReservedChunkImport;
 pub use snapshot_retention::{RetentionReport, SnapshotLockResult, SnapshotRetention};
 pub use storage::StorageReport;
 pub use sync_extend_journal::{ReferenceReservation, ReferenceReservationIntent};

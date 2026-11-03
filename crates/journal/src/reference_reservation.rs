@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use sync_extend_core_model::{
     reference_owner::{ReferenceOwnerKind, ReferenceOwnerScope},
-    ContentId, EntryId, SnapshotId, SpaceId,
+    ChunkRef, ContentId, EntryId, SnapshotId, SpaceId,
 };
 
 const MAX_RESERVATION_BYTES: usize = 16 * 1024 * 1024;
@@ -60,6 +60,51 @@ impl ReferenceReservationIntent {
 }
 
 impl Journal {
+    /// Serialize bounded chunk ingestion against owner handoff, not just GC.
+    /// No journal state/pin/clock changes; valid immutable CAS output may survive errors.
+    pub fn with_reserved_chunk<T, E>(
+        &self,
+        space: &SpaceId,
+        owner_id: &EntryId,
+        content_id: &ContentId,
+        max: usize,
+        ingest: impl FnOnce(&ChunkRef) -> std::result::Result<T, E>,
+    ) -> std::result::Result<(CasAccessGuard, T), E>
+    where
+        E: From<JournalError>,
+    {
+        let coordination = self.acquire_cas_coordination()?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+            .map_err(JournalError::from)?;
+        self.audit_gc_owners(space, max)?;
+        let owner = self
+            .reference_reservations(space, max)?
+            .into_iter()
+            .find(|o| o.intent.owner_id == *owner_id)
+            .ok_or(JournalError::Invariant("unknown reference reservation"))?;
+        if owner.snapshot_handoff.is_some() {
+            return Err(JournalError::Invariant("reference reservation is terminal").into());
+        }
+        let length =
+            owner
+                .intent
+                .chunks(max)?
+                .get(content_id)
+                .copied()
+                .ok_or(JournalError::Invariant(
+                    "chunk is outside reservation scope",
+                ))?;
+        self.require_cas_access(content_id)?;
+        let result = ingest(&ChunkRef {
+            content_id: content_id.clone(),
+            length,
+        })?;
+        self.audit_gc_owners(space, max)?;
+        self.require_cas_access(content_id)?;
+        tx.commit().map_err(JournalError::from)?;
+        Ok((coordination, result))
+    }
+
     /// Audit durable missing-or-present content reservations, without reading CAS.
     pub fn reference_reservations(
         &self,

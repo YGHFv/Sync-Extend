@@ -1,9 +1,111 @@
-use crate::{fault::checkpoint, LocalSpace, ReconcileError, Result};
+use crate::{
+    check_ancestors, fault::checkpoint, filesystem::ObservedFile, LocalSpace, ReconcileError,
+    Result,
+};
+use serde::Serialize;
+use std::{fs, io::Read, path::Path};
+use sync_extend_cas::is_reparse;
 use sync_extend_core_model::limits::LocalLimits;
-use sync_extend_core_model::{EntryId, SnapshotId};
+use sync_extend_core_model::{ContentId, EntryId, SnapshotId};
 use sync_extend_journal::{ReferenceReservation, ReferenceReservationIntent};
 
+#[derive(Serialize)]
+pub struct ReservedChunkImport {
+    pub owner_id: EntryId,
+    pub content_id: ContentId,
+    pub bytes: u32,
+    pub imported_chunk_verified: bool,
+    pub whole_file_verified: bool,
+    pub worktree_materialized: bool,
+    pub owner_released: bool,
+    pub remote_backup_complete: bool,
+}
+
 impl LocalSpace {
+    pub fn ingest_reserved_chunk(
+        &mut self,
+        owner_id: &EntryId,
+        content_id: &ContentId,
+        source: &Path,
+    ) -> Result<ReservedChunkImport> {
+        self.verify_root()?;
+        checkpoint("before_reserved_chunk_ingest");
+        let (guard, result) = self.journal.with_reserved_chunk(
+            &self.space_id,
+            owner_id,
+            content_id,
+            self.limits.max_storage_entries,
+            |chunk| -> Result<ReservedChunkImport> {
+                checkpoint("after_reserved_chunk_lock");
+                if u64::from(chunk.length) > self.limits.max_file_bytes
+                    || u64::from(chunk.length) > self.limits.max_staging_bytes
+                {
+                    return Err(ReconcileError::ResourceLimit("reserved chunk bytes"));
+                }
+                check_ancestors(source)?;
+                let metadata = fs::symlink_metadata(source)?;
+                if !metadata.is_file() || metadata.file_type().is_symlink() || is_reparse(&metadata)
+                {
+                    return Err(ReconcileError::Invariant("chunk source must be regular"));
+                }
+                let source = fs::canonicalize(source)?;
+                if source.starts_with(&self.data_dir)
+                    || source.components().any(|component| {
+                        component.as_os_str().to_str().is_some_and(|part| {
+                            [".sync-extend", ".sync-tmp", ".git"]
+                                .iter()
+                                .any(|reserved| part.eq_ignore_ascii_case(reserved))
+                        })
+                    })
+                {
+                    return Err(ReconcileError::Invariant("chunk source is internal data"));
+                }
+                let observed = ObservedFile::open(&source)?;
+                if observed.metadata.len() != u64::from(chunk.length) {
+                    return Err(ReconcileError::Invariant("reserved chunk source length"));
+                }
+                require_single_link(&observed)?;
+                checkpoint("after_reserved_chunk_source_open");
+                let mut bytes = Vec::with_capacity(chunk.length as usize);
+                (&observed.file)
+                    .take(u64::from(chunk.length) + 1)
+                    .read_to_end(&mut bytes)?;
+                observed.verify(&source)?;
+                if bytes.len() != chunk.length as usize || ContentId::hash(&bytes) != *content_id {
+                    return Err(ReconcileError::Invariant("reserved chunk hash mismatch"));
+                }
+                checkpoint("before_reserved_chunk_put");
+                observed.verify(&source)?;
+                require_single_link(&observed)?;
+                let actual = self.cas.put(&bytes)?;
+                if actual != *chunk {
+                    return Err(ReconcileError::Invariant(
+                        "reserved chunk publication mismatch",
+                    ));
+                }
+                checkpoint("after_reserved_chunk_put");
+                observed.verify(&source)?;
+                require_single_link(&observed)?;
+                self.cas.read(chunk)?;
+                self.verify_root()?;
+                Ok(ReservedChunkImport {
+                    owner_id: owner_id.clone(),
+                    content_id: content_id.clone(),
+                    bytes: chunk.length,
+                    imported_chunk_verified: true,
+                    whole_file_verified: false,
+                    worktree_materialized: false,
+                    owner_released: false,
+                    remote_backup_complete: false,
+                })
+            },
+        )?;
+        checkpoint("after_reserved_chunk_commit");
+        drop(guard);
+        self.verify_root()?;
+        Ok(result)
+    }
+
     pub fn reference_reservations(&self) -> Result<Vec<ReferenceReservation>> {
         self.verify_root()?;
         let owners = self
@@ -69,6 +171,23 @@ impl LocalSpace {
         self.verify_root()?;
         Ok(owner)
     }
+}
+
+fn require_single_link(source: &ObservedFile) -> Result<()> {
+    #[cfg(windows)]
+    {
+        sync_extend_platform_fs::verify_regular_file(&source.file)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if source.file.metadata()?.nlink() != 1 {
+            return Err(ReconcileError::Invariant(
+                "chunk source is a hardlink alias",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn check_limits(intent: &ReferenceReservationIntent, limits: &LocalLimits) -> Result<()> {

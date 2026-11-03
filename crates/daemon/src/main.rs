@@ -70,6 +70,17 @@ enum Command {
         #[arg(long)]
         snapshot: String,
     },
+    /// Verify and ingest one exact reserved chunk; no snapshot/worker/remote completion.
+    IngestReservedChunk {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        chunk: String,
+        #[arg(long)]
+        source: PathBuf,
+    },
     /// Persist one verified unreferenced CAS observation; never authorize deletion.
     MarkGcObject {
         #[arg(long)]
@@ -493,6 +504,18 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             snapshot,
         } => {
             print(&open(&data_dir)?.handoff_content(&owner.parse()?, &snapshot.parse()?)?)?;
+        }
+        Command::IngestReservedChunk {
+            data_dir,
+            owner,
+            chunk,
+            source,
+        } => {
+            print(&open(&data_dir)?.ingest_reserved_chunk(
+                &owner.parse()?,
+                &chunk.parse()?,
+                &source,
+            )?)?;
         }
         Command::MarkGcObject {
             data_dir,
