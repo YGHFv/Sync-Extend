@@ -14,6 +14,7 @@ mod guarded_mutation;
 mod identity;
 mod move_file;
 mod mutation;
+mod persisted_rename;
 mod publish;
 mod read_lease;
 mod reference_reservation;
@@ -323,7 +324,8 @@ impl LocalSpace {
         let old = self.journal.current(&self.space_id)?;
         let baseline = old.as_ref().map(Manifest::root).transpose()?;
         let previous = old.unwrap_or_else(|| Manifest::empty(self.space_id.clone()));
-        let mut manifest = build_manifest(&previous, second)?;
+        let candidates = self.persisted_rename_candidates(&previous, second)?;
+        let mut manifest = build_manifest(&previous, second, &candidates)?;
         if let Some(intent) = publication {
             let observed = second
                 .get(&intent.target_path)
@@ -413,11 +415,19 @@ impl LocalSpace {
                 &operations,
                 timestamp,
             )?
-        } else if operations.is_empty() && baseline.is_some() {
-            manifest.root()?
         } else {
-            self.journal
-                .commit_local(baseline.as_ref(), &manifest, &operations, timestamp)?
+            let observations = self.scan_observations(&manifest, second)?;
+            fault::checkpoint("before_scan_observation_commit");
+            let root = self.journal.commit_local_with_observations(
+                baseline.as_ref(),
+                &manifest,
+                &operations,
+                timestamp,
+                &observations,
+                self.limits.max_storage_entries,
+            )?;
+            fault::checkpoint("after_scan_observation_commit");
+            root
         };
         Ok(ScanResult {
             space_id: self.space_id.clone(),
@@ -627,7 +637,11 @@ impl LocalSpace {
     }
 }
 
-fn build_manifest(old: &Manifest, scanned: &scan::Scan) -> Result<Manifest> {
+fn build_manifest(
+    old: &Manifest,
+    scanned: &scan::Scan,
+    candidates: &BTreeMap<PortablePath, EntryId>,
+) -> Result<Manifest> {
     let mut result = old.clone();
     result.entries.clear();
     let by_path: BTreeMap<_, _> = old.entries.values().map(|e| (e.path.clone(), e)).collect();
@@ -653,9 +667,9 @@ fn build_manifest(old: &Manifest, scanned: &scan::Scan) -> Result<Manifest> {
         }
     }
     let mut renames = BTreeMap::new();
-    for (fingerprint, paths) in unmatched_new {
+    for (fingerprint, paths) in &unmatched_new {
         if paths.len() == 1 {
-            if let Some(ids) = unmatched_old.get(&fingerprint).filter(|ids| ids.len() == 1) {
+            if let Some(ids) = unmatched_old.get(fingerprint).filter(|ids| ids.len() == 1) {
                 renames.insert(paths[0].clone(), ids[0].clone());
             }
         }
@@ -688,6 +702,26 @@ fn build_manifest(old: &Manifest, scanned: &scan::Scan) -> Result<Manifest> {
                     break;
                 }
             }
+        }
+    }
+    let mut used: std::collections::BTreeSet<_> = renames.values().cloned().collect();
+    for (path, id) in candidates {
+        let old_entry = old
+            .entries
+            .get(id)
+            .ok_or(ReconcileError::Invariant("rename candidate missing"))?;
+        let key = fingerprint_old(old_entry, old)?;
+        if !renames.contains_key(path)
+            && !used.contains(id)
+            && unmatched_old
+                .get(&key)
+                .is_some_and(|ids| ids.len() > 1 && ids.contains(id))
+            && unmatched_new
+                .get(&key)
+                .is_some_and(|paths| paths.len() > 1 && paths.contains(path))
+        {
+            renames.insert(path.clone(), id.clone());
+            used.insert(id.clone());
         }
     }
     for (path, scanned) in scanned {

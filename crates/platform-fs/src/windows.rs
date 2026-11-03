@@ -61,15 +61,8 @@ fn regular(file: &File, directory: bool) -> io::Result<()> {
             "expected a real directory or regular non-reparse file",
         ));
     }
-    if !directory {
-        let mut info = BY_HANDLE_FILE_INFORMATION::default();
-        // SAFETY: the handle is live and info is valid writable output storage.
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if info.nNumberOfLinks != 1 {
-            return Err(invalid("file mutation requires a single-link file"));
-        }
+    if !directory && regular_file_link_count(file)? != 1 {
+        return Err(invalid("file mutation requires a single-link file"));
     }
     Ok(())
 }
@@ -77,6 +70,24 @@ fn regular(file: &File, directory: bool) -> io::Result<()> {
 /// Validate an already retained handle as a regular non-reparse single-link file.
 pub fn verify_regular_file(file: &File) -> io::Result<()> {
     regular(file, false)
+}
+
+/// Read alias multiplicity from the retained regular-file handle, not its path.
+pub fn regular_file_link_count(file: &File) -> io::Result<u32> {
+    use std::os::windows::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(invalid("expected a regular non-reparse file"));
+    }
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: file owns a live handle and info is sized, aligned writable output.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info.nNumberOfLinks == 0 {
+        return Err(invalid("regular file link count is unavailable"));
+    }
+    Ok(info.nNumberOfLinks)
 }
 
 fn wide(path: &Path) -> io::Result<Vec<u16>> {

@@ -19,6 +19,7 @@ pub struct ScannedEntry {
     pub content: Option<FileManifest>,
     // Local observation only: identity is not part of the portable manifest.
     pub physical_identity: ContentId,
+    pub single_link: bool,
 }
 
 pub type Scan = BTreeMap<PortablePath, ScannedEntry>;
@@ -95,9 +96,11 @@ fn visit(
                 kind: EntryKind::Directory,
                 content: None,
                 physical_identity: identity.physical,
+                single_link: false,
             }
         } else if metadata.is_file() {
             let observed = ObservedFile::open(&full_path)?;
+            let single_link = single_link(&observed.file)?;
             if !same_metadata(&metadata, &observed.metadata) {
                 return Err(ReconcileError::Unstable);
             }
@@ -110,6 +113,9 @@ fn visit(
             )?;
             checkpoint("after_scan_file_import");
             observed.verify(&full_path)?;
+            if single_link != self::single_link(&observed.file)? {
+                return Err(ReconcileError::Unstable);
+            }
             if content.length != metadata.len() {
                 return Err(ReconcileError::Unstable);
             }
@@ -118,6 +124,7 @@ fn visit(
                 kind: EntryKind::File,
                 content: Some(content),
                 physical_identity: observed.identity.physical,
+                single_link,
             }
         } else {
             return Err(ReconcileError::Invariant("unsupported special file"));
@@ -130,6 +137,23 @@ fn visit(
     }
     directory_identity.verify(directory)?;
     Ok(())
+}
+
+fn single_link(file: &fs::File) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        Ok(sync_extend_platform_fs::regular_file_link_count(file)? == 1)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(file.metadata()?.nlink() == 1)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = file;
+        Ok(false)
+    }
 }
 
 fn is_internal(name: &str) -> bool {
