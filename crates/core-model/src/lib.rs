@@ -7,6 +7,7 @@ pub mod original_retention;
 pub mod path;
 pub mod persisted_rename;
 pub mod reference_owner;
+pub mod tree_restore;
 
 pub use ids::*;
 pub use operation::*;
