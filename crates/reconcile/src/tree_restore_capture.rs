@@ -32,6 +32,20 @@ impl<T> TreeRestoreCapture<'_, T> {
 }
 
 impl LocalSpace {
+    /// Persist a candidate description, never final history or native execution.
+    pub fn describe_tree_restore_final(
+        &self,
+        request: &sync_extend_journal::TreeFinalDescriptionRequest,
+    ) -> Result<sync_extend_journal::TreeFinalDescriptionAudit> {
+        let (held, audit) = self.journal.with_tree_final_description(
+            request,
+            self.limits.max_storage_entries,
+            |_| Ok::<_, crate::ReconcileError>(()),
+        )?;
+        drop(held);
+        Ok(audit)
+    }
+
     /// Persist metadata only; a ready description is not native directory ownership.
     pub fn describe_tree_restore_owner(
         &self,

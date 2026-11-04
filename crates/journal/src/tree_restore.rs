@@ -50,6 +50,7 @@ pub struct TreeRestorePreparation {
     pub execution_records: Option<crate::TreeExecutionRecordsAudit>,
     pub original_pins: Option<crate::TreeOriginalPinsAudit>,
     pub owner_description: Option<crate::TreeOwnerDescriptionAudit>,
+    pub final_description: Option<crate::TreeFinalDescriptionAudit>,
 }
 
 struct PreparedPlan {
@@ -263,7 +264,15 @@ impl Journal {
                 WHERE h.transaction_id IS NULL)
              OR EXISTS(SELECT 1 FROM tree_restore_owner_records r
                 LEFT JOIN tree_restore_owner_intents o USING(transaction_id)
-                WHERE o.transaction_id IS NULL)",
+                WHERE o.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_final_descriptions f
+                LEFT JOIN tree_restore_owner_intents o USING(transaction_id)
+                WHERE o.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_retained_descriptions r
+                LEFT JOIN tree_restore_final_descriptions f USING(transaction_id)
+                LEFT JOIN tree_restore_original_owners o
+                    ON o.transaction_id=r.transaction_id AND o.step_index=r.step_index
+                WHERE f.transaction_id IS NULL OR o.transaction_id IS NULL)",
             [],
             |r| r.get(0),
         )?;
@@ -481,7 +490,7 @@ impl Journal {
                         "tree native actual aggregate limit",
                     ))?;
             }
-            audits.push(TreeRestorePreparation {
+            let mut preparation = TreeRestorePreparation {
                 intent,
                 steps: prepared.plan.steps().to_vec(),
                 state: if active { "prepared" } else { "cancelled" },
@@ -505,7 +514,11 @@ impl Journal {
                 execution_records,
                 original_pins,
                 owner_description,
-            });
+                final_description: None,
+            };
+            preparation.final_description =
+                crate::tree_final_description::audit_final(&self.connection, &preparation, max)?;
+            audits.push(preparation);
         }
         if actual_native_bindings as u64 != native_bindings as u64 {
             return Err(JournalError::Invariant(
@@ -536,7 +549,9 @@ impl Journal {
              OR EXISTS(SELECT 1 FROM tree_restore_original_owners)
              OR EXISTS(SELECT 1 FROM tree_restore_original_objects)
              OR EXISTS(SELECT 1 FROM tree_restore_owner_intents)
-             OR EXISTS(SELECT 1 FROM tree_restore_owner_records)",
+             OR EXISTS(SELECT 1 FROM tree_restore_owner_records)
+             OR EXISTS(SELECT 1 FROM tree_restore_final_descriptions)
+             OR EXISTS(SELECT 1 FROM tree_restore_retained_descriptions)",
             [],
             |r| r.get(0),
         )?;

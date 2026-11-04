@@ -165,6 +165,8 @@ pub struct Status {
     pub tree_restore_original_reference_rows: usize,
     pub tree_restore_owner_descriptions: usize,
     pub tree_restore_owner_description_records: usize,
+    pub tree_restore_final_descriptions: usize,
+    pub tree_restore_retained_original_descriptions: usize,
     pub tree_restore_writer_gate_held: bool,
     pub tree_restore_execution_available: bool,
     pub tree_atomic: bool,
@@ -535,6 +537,15 @@ impl LocalSpace {
                 .iter()
                 .filter(|p| p.owner_description.is_some())
                 .count(),
+            tree_restore_final_descriptions: trees
+                .iter()
+                .filter(|p| p.final_description.is_some())
+                .count(),
+            tree_restore_retained_original_descriptions: trees
+                .iter()
+                .filter_map(|p| p.final_description.as_ref())
+                .map(|p| p.intent.retained_originals.len())
+                .sum(),
             tree_restore_owner_description_records: trees
                 .iter()
                 .filter_map(|p| p.owner_description.as_ref())
