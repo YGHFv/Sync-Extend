@@ -9,6 +9,7 @@ pub mod persisted_rename;
 pub mod reference_owner;
 pub mod tree_execution_records;
 pub mod tree_final_description;
+pub mod tree_original_disposition;
 pub mod tree_original_reference;
 pub mod tree_owner_marker;
 pub mod tree_restore;
