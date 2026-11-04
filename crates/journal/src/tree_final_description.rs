@@ -43,7 +43,7 @@ pub struct TreeFinalDescriptionAudit {
     pub tree_atomic: bool,
 }
 
-fn project(
+pub(crate) fn project(
     connection: &Connection,
     p: &TreeRestorePreparation,
     request: &TreeFinalDescriptionRequest,

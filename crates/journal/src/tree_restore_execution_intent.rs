@@ -245,7 +245,8 @@ fn audit_generations(
     let mut statement = connection.prepare(
         "SELECT execution_id FROM tree_restore_execution_intents
          UNION ALL SELECT execution_id FROM tree_restore_execution_step_intents
-         UNION ALL SELECT transaction_id FROM tree_restore_preparations",
+         UNION ALL SELECT transaction_id FROM tree_restore_preparations
+         UNION ALL SELECT disposition_id FROM tree_restore_disposition_intents",
     )?;
     let mut rows = statement.query([])?;
     let mut count = 0;
@@ -261,7 +262,7 @@ fn audit_generations(
     audit_logical_generations(connection, &ids, max)
 }
 
-fn audit_logical_generations(
+pub(crate) fn audit_logical_generations(
     connection: &Connection,
     ids: &BTreeSet<&EntryId>,
     max: usize,

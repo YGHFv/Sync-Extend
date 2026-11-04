@@ -47,6 +47,7 @@ pub struct StorageReport {
     pub tree_restore_original_unique_chunk_bytes: u64,
     pub tree_restore_owner_description_metadata_bytes: u64,
     pub tree_restore_final_description_metadata_bytes: u64,
+    pub tree_restore_disposition_description_metadata_bytes: u64,
     pub tree_restore_reserved_worktree_logical_bytes: u64,
     pub tree_restore_input_unique_chunk_bytes: u64,
     pub tree_restore_execution_available: bool,
@@ -199,6 +200,16 @@ impl LocalSpace {
                     )
                 })?;
         let mut tree_restore_original_reference_rows = 0usize;
+        let tree_restore_disposition_description_metadata_bytes = trees
+            .iter()
+            .filter_map(|p| p.disposition_description.as_ref())
+            .try_fold(0u64, |total, p| {
+                total
+                    .checked_add(p.metadata_bytes)
+                    .ok_or(ReconcileError::ResourceLimit(
+                        "tree disposition description metadata bytes",
+                    ))
+            })?;
         let tree_restore_final_description_metadata_bytes = trees
             .iter()
             .filter_map(|p| p.final_description.as_ref())
@@ -392,6 +403,7 @@ impl LocalSpace {
             tree_restore_original_unique_chunk_bytes: refs.bytes(tree_originals.iter())?,
             tree_restore_owner_description_metadata_bytes,
             tree_restore_final_description_metadata_bytes,
+            tree_restore_disposition_description_metadata_bytes,
             tree_restore_reserved_worktree_logical_bytes,
             tree_restore_input_unique_chunk_bytes: refs.bytes(tree_inputs.iter())?,
             tree_restore_execution_available: false,

@@ -167,6 +167,8 @@ pub struct Status {
     pub tree_restore_owner_description_records: usize,
     pub tree_restore_final_descriptions: usize,
     pub tree_restore_retained_original_descriptions: usize,
+    pub tree_restore_disposition_descriptions: usize,
+    pub tree_restore_disposition_description_records: usize,
     pub tree_restore_writer_gate_held: bool,
     pub tree_restore_execution_available: bool,
     pub tree_atomic: bool,
@@ -545,6 +547,16 @@ impl LocalSpace {
                 .iter()
                 .filter_map(|p| p.final_description.as_ref())
                 .map(|p| p.intent.retained_originals.len())
+                .sum(),
+            tree_restore_disposition_descriptions: trees
+                .iter()
+                .filter(|p| p.disposition_description.is_some())
+                .count(),
+            tree_restore_disposition_description_records: trees
+                .iter()
+                .filter_map(|p| p.disposition_description.as_ref())
+                .flat_map(|p| p.records.values())
+                .map(Vec::len)
                 .sum(),
             tree_restore_owner_description_records: trees
                 .iter()
