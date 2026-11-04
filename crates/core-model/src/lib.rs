@@ -8,6 +8,7 @@ pub mod path;
 pub mod persisted_rename;
 pub mod reference_owner;
 pub mod tree_execution_records;
+pub mod tree_original_reference;
 pub mod tree_restore;
 pub mod tree_restore_execution_intent;
 pub mod tree_restore_history;
