@@ -169,6 +169,7 @@ pub struct Status {
     pub tree_restore_retained_original_descriptions: usize,
     pub tree_restore_disposition_descriptions: usize,
     pub tree_restore_disposition_description_records: usize,
+    pub tree_restore_irreversible_admissions: usize,
     pub tree_restore_writer_gate_held: bool,
     pub tree_restore_execution_available: bool,
     pub tree_atomic: bool,
@@ -551,6 +552,10 @@ impl LocalSpace {
             tree_restore_disposition_descriptions: trees
                 .iter()
                 .filter(|p| p.disposition_description.is_some())
+                .count(),
+            tree_restore_irreversible_admissions: trees
+                .iter()
+                .filter(|p| p.coordinator_admission.is_some())
                 .count(),
             tree_restore_disposition_description_records: trees
                 .iter()

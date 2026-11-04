@@ -32,6 +32,24 @@ impl<T> TreeRestoreCapture<'_, T> {
 }
 
 impl LocalSpace {
+    /// Irreversibly fence cancellation under fresh read guards, never execute a step.
+    pub fn admit_tree_restore_coordinator(
+        &self,
+        request: &sync_extend_journal::TreeCoordinatorAdmissionRequest,
+    ) -> Result<sync_extend_journal::TreeCoordinatorAdmissionAudit> {
+        self.admit_tree_coordinator_platform(request)
+    }
+
+    #[cfg(not(windows))]
+    fn admit_tree_coordinator_platform(
+        &self,
+        _request: &sync_extend_journal::TreeCoordinatorAdmissionRequest,
+    ) -> Result<sync_extend_journal::TreeCoordinatorAdmissionAudit> {
+        Err(crate::ReconcileError::Invariant(
+            "tree admission requires guarded Windows capture",
+        ))
+    }
+
     /// Persist metadata only, never actual disposal or original reference release.
     pub fn describe_tree_restore_dispositions(
         &self,
@@ -567,6 +585,46 @@ mod windows {
     }
 
     impl LocalSpace {
+        pub(super) fn admit_tree_coordinator_platform(
+            &self,
+            request: &sync_extend_journal::TreeCoordinatorAdmissionRequest,
+        ) -> Result<sync_extend_journal::TreeCoordinatorAdmissionAudit> {
+            let (held, audit) = self.journal.with_tree_coordinator_admission(
+                request,
+                self.limits.max_storage_entries,
+                |projection| {
+                    self.verify_root()?;
+                    let (guards, identity) = capture(
+                        self,
+                        projection.preparation(),
+                        projection.tree(),
+                        projection.baseline(),
+                        projection.target(),
+                        TreeIdentityLimits {
+                            max_bindings: self.limits.max_storage_entries,
+                            max_metadata_bytes: request.limits.max_input_bytes,
+                        },
+                    )?;
+                    if identity.inventory() != projection.identity().inventory() {
+                        return Err(ReconcileError::Invariant(
+                            "tree admission fresh native binding changed",
+                        ));
+                    }
+                    checkpoint("after_tree_coordinator_admission_capture");
+                    for manifest in [projection.baseline(), projection.target()] {
+                        for file in manifest.entries.values().filter_map(|e| e.content.as_ref()) {
+                            self.cas.verify(file)?;
+                        }
+                    }
+                    guards.verify(self, &identity)?;
+                    Ok::<_, ReconcileError>(guards)
+                },
+            )?;
+            checkpoint("after_tree_coordinator_admission_commit");
+            drop(held);
+            Ok(audit)
+        }
+
         pub(super) fn reserve_tree_native_platform(
             &self,
             request: &sync_extend_journal::TreeRestoreNativeRequest,

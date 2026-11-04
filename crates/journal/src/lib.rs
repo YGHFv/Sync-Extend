@@ -65,7 +65,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=29 => {}
+            1..=30 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -220,6 +220,11 @@ impl Journal {
         if version < 29 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-029.sql"))?;
+            tx.commit()?;
+        }
+        if version < 30 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-030.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -1504,6 +1509,7 @@ fn check_storage_metadata_limit(
             + (SELECT count(*) FROM tree_restore_disposition_reservations)
             + (SELECT count(*) FROM tree_restore_disposition_intents)
             + (SELECT count(*) FROM tree_restore_disposition_records)
+            + (SELECT count(*) FROM tree_restore_coordinator_admissions)
             + (SELECT count(*) FROM tree_restore_final_descriptions)
             + (SELECT count(*) FROM tree_restore_retained_descriptions)
             + max((SELECT coalesce(sum(reserved_rows),0) FROM tree_restore_original_reservations),
@@ -1558,6 +1564,8 @@ fn check_storage_metadata_limit(
                 FROM tree_restore_disposition_intents)
             + (SELECT coalesce(sum(length(CAST(record AS BLOB))+312),0)
                 FROM tree_restore_disposition_records)
+            + (SELECT coalesce(sum(length(CAST(request AS BLOB))+552),0)
+                FROM tree_restore_coordinator_admissions)
             + (SELECT coalesce(sum(length(CAST(request AS BLOB))+length(CAST(intent AS BLOB))+696),0)
                 FROM tree_restore_final_descriptions)
             + (SELECT coalesce(sum(length(CAST(description AS BLOB))+488),0)
@@ -1709,6 +1717,7 @@ pub use diagnostics::GcDiagnostics;
 mod original_retention;
 mod reference_reservation;
 mod rename_observation;
+mod tree_coordinator_admission;
 mod tree_disposition_description;
 mod tree_disposition_generations;
 mod tree_execution_records;
@@ -1722,6 +1731,10 @@ mod tree_restore_native_identity;
 pub use original_retention::{OriginalDisposalAudit, OriginalDisposalIntent, OriginalDisposalStep};
 pub use reference_reservation::{
     ReferenceReservation, ReferenceReservationIntent, ReferenceSnapshotHandoff,
+};
+pub use tree_coordinator_admission::{
+    TreeCoordinatorAdmissionAudit, TreeCoordinatorAdmissionInspection,
+    TreeCoordinatorAdmissionRequest,
 };
 pub use tree_disposition_description::{
     TreeDispositionDescriptionAudit, TreeDispositionDescriptionRequest,

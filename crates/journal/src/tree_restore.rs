@@ -52,6 +52,7 @@ pub struct TreeRestorePreparation {
     pub owner_description: Option<crate::TreeOwnerDescriptionAudit>,
     pub final_description: Option<crate::TreeFinalDescriptionAudit>,
     pub disposition_description: Option<crate::TreeDispositionDescriptionAudit>,
+    pub coordinator_admission: Option<crate::TreeCoordinatorAdmissionAudit>,
 }
 
 struct PreparedPlan {
@@ -285,7 +286,10 @@ impl Journal {
              OR EXISTS(SELECT 1 FROM tree_restore_disposition_records r
                 LEFT JOIN tree_restore_disposition_intents i
                     ON i.transaction_id=r.transaction_id AND i.step_index=r.step_index
-                WHERE i.transaction_id IS NULL)",
+                WHERE i.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_coordinator_admissions a
+                LEFT JOIN tree_restore_owner_intents o USING(transaction_id)
+                WHERE o.transaction_id IS NULL)",
             [],
             |r| r.get(0),
         )?;
@@ -530,6 +534,7 @@ impl Journal {
                 owner_description,
                 final_description: None,
                 disposition_description: None,
+                coordinator_admission: None,
             };
             preparation.final_description =
                 crate::tree_final_description::audit_final(&self.connection, &preparation, max)?;
@@ -539,6 +544,8 @@ impl Journal {
                     &preparation,
                     max,
                 )?;
+            preparation.coordinator_admission =
+                crate::tree_coordinator_admission::audit(&self.connection, &preparation, max)?;
             audits.push(preparation);
         }
         if actual_native_bindings as u64 != native_bindings as u64 {
@@ -549,6 +556,7 @@ impl Journal {
         if active_count > 1 {
             return Err(JournalError::Invariant("multiple tree restore writers"));
         }
+        crate::tree_coordinator_admission::audit_generations(&self.connection, max)?;
         if active_count != 0 {
             require_no_ordinary_writer(&self.connection, space)?;
         }
@@ -575,7 +583,8 @@ impl Journal {
              OR EXISTS(SELECT 1 FROM tree_restore_retained_descriptions)
              OR EXISTS(SELECT 1 FROM tree_restore_disposition_reservations)
              OR EXISTS(SELECT 1 FROM tree_restore_disposition_intents)
-             OR EXISTS(SELECT 1 FROM tree_restore_disposition_records)",
+             OR EXISTS(SELECT 1 FROM tree_restore_disposition_records)
+             OR EXISTS(SELECT 1 FROM tree_restore_coordinator_admissions)",
             [],
             |r| r.get(0),
         )?;
@@ -710,6 +719,9 @@ impl Journal {
         if old.cancelled_at_ms.is_some() {
             return Ok(old);
         }
+        if old.coordinator_admission.is_some() {
+            return Err(JournalError::Invariant("admitted tree cannot cancel"));
+        }
         sql_integer(cancelled_at_ms)?;
         if cancelled_at_ms < old.intent.prepared_at_ms {
             return Err(JournalError::Invariant(
@@ -723,6 +735,9 @@ impl Journal {
         if old.cancelled_at_ms.is_some() {
             tx.commit()?;
             return Ok(old);
+        }
+        if old.coordinator_admission.is_some() {
+            return Err(JournalError::Invariant("admitted tree cannot cancel"));
         }
         let json = serde_json::to_string(&old.intent)?;
         tx.execute(

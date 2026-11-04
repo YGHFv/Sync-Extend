@@ -20,7 +20,11 @@ fn existing(connection: &Connection, max: usize) -> Result<BTreeSet<EntryId>> {
     Ok(ids)
 }
 
-fn audit_names(connection: &Connection, ids: &BTreeSet<&EntryId>, max: usize) -> Result<()> {
+pub(crate) fn audit_names(
+    connection: &Connection,
+    ids: &BTreeSet<&EntryId>,
+    max: usize,
+) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
@@ -63,7 +67,19 @@ fn audit_names(connection: &Connection, ids: &BTreeSet<&EntryId>, max: usize) ->
 
 pub(crate) fn audit_inventory(connection: &Connection, max: usize) -> Result<()> {
     let ids = existing(connection, max)?;
-    audit_names(connection, &ids.iter().collect(), max)
+    audit_names(connection, &ids.iter().collect(), max)?;
+    for id in &ids {
+        let collision: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tree_restore_coordinator_admissions WHERE admission_id=?1)",
+            [id.as_str()], |r|r.get(0),
+        )?;
+        if collision {
+            return Err(JournalError::Invariant(
+                "tree disposition/admission generation collision",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn admit(
