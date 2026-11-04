@@ -161,6 +161,8 @@ pub struct Status {
     pub tree_restore_native_reservations: usize,
     pub tree_restore_execution_descriptions: usize,
     pub tree_restore_execution_description_records: usize,
+    pub tree_restore_original_reservations: usize,
+    pub tree_restore_original_reference_rows: usize,
     pub tree_restore_writer_gate_held: bool,
     pub tree_restore_execution_available: bool,
     pub tree_atomic: bool,
@@ -527,6 +529,15 @@ impl LocalSpace {
                 .filter(|p| p.native_reservation.is_some())
                 .count(),
             tree_restore_execution_available: false,
+            tree_restore_original_reservations: trees
+                .iter()
+                .filter(|p| p.original_pins.is_some())
+                .count(),
+            tree_restore_original_reference_rows: trees
+                .iter()
+                .filter_map(|p| p.original_pins.as_ref())
+                .map(|p| p.active_reference_count)
+                .sum(),
             tree_restore_execution_descriptions: trees
                 .iter()
                 .filter(|p| p.execution_description.is_some())

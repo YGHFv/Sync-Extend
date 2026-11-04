@@ -41,6 +41,10 @@ pub struct StorageReport {
     pub tree_restore_native_reserved_metadata_bytes: u64,
     pub tree_restore_execution_description_metadata_bytes: u64,
     pub tree_restore_execution_record_description_metadata_bytes: u64,
+    pub tree_restore_original_reserved_metadata_bytes: u64,
+    pub tree_restore_original_reference_rows: usize,
+    pub tree_restore_original_owned_logical_bytes: u64,
+    pub tree_restore_original_unique_chunk_bytes: u64,
     pub tree_restore_reserved_worktree_logical_bytes: u64,
     pub tree_restore_input_unique_chunk_bytes: u64,
     pub tree_restore_execution_available: bool,
@@ -183,6 +187,18 @@ impl LocalSpace {
                         "tree execution record description bytes",
                     ))
             })?;
+        let tree_restore_original_reserved_metadata_bytes =
+            trees
+                .iter()
+                .filter_map(|p| p.original_pins.as_ref())
+                .try_fold(0u64, |total, p| {
+                    total.checked_add(p.reserved_metadata_bytes).ok_or(
+                        ReconcileError::ResourceLimit("tree original metadata bytes"),
+                    )
+                })?;
+        let mut tree_restore_original_reference_rows = 0usize;
+        let mut tree_restore_original_owned_logical_bytes = 0u64;
+        let mut tree_originals = BTreeSet::new();
         let mut refs = References {
             lengths: BTreeMap::new(),
             seen: 0,
@@ -231,6 +247,23 @@ impl LocalSpace {
             }
         }
         let mut expected = retained.clone();
+        for original in trees.iter().filter_map(|p| p.original_pins.as_ref()) {
+            if original.exact_original_pins_verified {
+                tree_restore_original_reference_rows = tree_restore_original_reference_rows
+                    .checked_add(original.active_reference_count)
+                    .ok_or(ReconcileError::ResourceLimit(
+                        "tree original reference rows",
+                    ))?;
+                tree_restore_original_owned_logical_bytes =
+                    tree_restore_original_owned_logical_bytes
+                        .checked_add(original.original_logical_bytes)
+                        .ok_or(ReconcileError::ResourceLimit("tree original owned bytes"))?;
+                for intent in original.originals.values() {
+                    refs.add(&intent.original_content, &mut tree_originals)?;
+                }
+            }
+        }
+        expected.extend(tree_originals.iter().cloned());
         let mut leased = BTreeSet::new();
         let mut active_read_leases = 0;
         for lease in self
@@ -331,6 +364,10 @@ impl LocalSpace {
             tree_restore_native_reserved_metadata_bytes,
             tree_restore_execution_description_metadata_bytes,
             tree_restore_execution_record_description_metadata_bytes,
+            tree_restore_original_reserved_metadata_bytes,
+            tree_restore_original_reference_rows,
+            tree_restore_original_owned_logical_bytes,
+            tree_restore_original_unique_chunk_bytes: refs.bytes(tree_originals.iter())?,
             tree_restore_reserved_worktree_logical_bytes,
             tree_restore_input_unique_chunk_bytes: refs.bytes(tree_inputs.iter())?,
             tree_restore_execution_available: false,

@@ -65,7 +65,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=25 => {}
+            1..=26 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -200,6 +200,11 @@ impl Journal {
         if version < 25 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-025.sql"))?;
+            tx.commit()?;
+        }
+        if version < 26 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-026.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -958,7 +963,8 @@ impl Journal {
              UNION SELECT content_id FROM mutation_objects
              UNION SELECT content_id FROM read_lease_objects
              UNION SELECT content_id FROM reference_reservation_objects
-             UNION SELECT content_id FROM tree_restore_objects ORDER BY content_id",
+             UNION SELECT content_id FROM tree_restore_objects
+             UNION SELECT content_id FROM tree_restore_original_objects ORDER BY content_id",
         )?;
         let ids: Vec<String> = statement
             .query_map([], |r| r.get(0))?
@@ -1478,6 +1484,10 @@ fn check_storage_metadata_limit(
             + (SELECT count(*) FROM tree_restore_execution_intents)
             + (SELECT count(*) FROM tree_restore_execution_step_intents)
             + (SELECT count(*) FROM tree_restore_execution_records)
+            + max((SELECT coalesce(sum(reserved_rows),0) FROM tree_restore_original_reservations),
+                (SELECT count(*) FROM tree_restore_original_reservations)
+                + (SELECT count(*) FROM tree_restore_original_owners)
+                + (SELECT count(*) FROM tree_restore_original_objects))
             + max((SELECT coalesce(sum(reserved_rows),0) FROM tree_restore_histories),
                 (SELECT count(*) FROM tree_restore_histories))
             + max((SELECT coalesce(sum(reserved_rows),0) FROM tree_restore_preparations),
@@ -1516,6 +1526,12 @@ fn check_storage_metadata_limit(
                 FROM tree_restore_execution_step_intents)
             + (SELECT coalesce(sum(length(CAST(record AS BLOB))+312),0)
                 FROM tree_restore_execution_records)
+            + max((SELECT coalesce(sum(reserved_bytes),0) FROM tree_restore_original_reservations),
+                (SELECT coalesce(sum(length(CAST(request AS BLOB))+304),0)
+                    FROM tree_restore_original_reservations)
+                + (SELECT coalesce(sum(length(CAST(intent AS BLOB))+264),0)
+                    FROM tree_restore_original_owners)
+                + (SELECT 144*count(*) FROM tree_restore_original_objects))
             + max((SELECT coalesce(sum(reserved_bytes),0) FROM tree_restore_histories),
                 (SELECT coalesce(sum(length(CAST(intent AS BLOB))+392),0) FROM tree_restore_histories))
             + max((SELECT coalesce(sum(reserved_bytes),0) FROM tree_restore_preparations),
@@ -1658,6 +1674,7 @@ mod original_retention;
 mod reference_reservation;
 mod rename_observation;
 mod tree_execution_records;
+mod tree_original_pins;
 mod tree_restore;
 mod tree_restore_execution_intent;
 mod tree_restore_history;
@@ -1667,6 +1684,7 @@ pub use reference_reservation::{
     ReferenceReservation, ReferenceReservationIntent, ReferenceSnapshotHandoff,
 };
 pub use tree_execution_records::TreeExecutionRecordsAudit;
+pub use tree_original_pins::{TreeOriginalPinRequest, TreeOriginalPinsAudit};
 pub use tree_restore::{TreeRestorePreparation, TreeRestorePreparationIntent};
 pub use tree_restore_execution_intent::TreeExecutionDescriptionAudit;
 pub use tree_restore_history::{TreeRestoreHistoryIntent, TreeRestoreHistoryReservation};

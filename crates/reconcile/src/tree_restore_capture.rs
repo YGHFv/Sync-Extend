@@ -32,6 +32,20 @@ impl<T> TreeRestoreCapture<'_, T> {
 }
 
 impl LocalSpace {
+    /// Persist separate original closures without certifying native move authority.
+    pub fn reserve_tree_restore_original_pins(
+        &self,
+        request: &sync_extend_journal::TreeOriginalPinRequest,
+    ) -> Result<sync_extend_journal::TreeOriginalPinsAudit> {
+        let (held, audit) = self.journal.with_tree_original_pins(
+            request,
+            self.limits.max_storage_entries,
+            |_| Ok::<_, crate::ReconcileError>(()),
+        )?;
+        drop(held);
+        Ok(audit)
+    }
+
     /// Append a metadata transcript record only; this never authorizes an action.
     pub fn describe_tree_restore_execution_record(
         &self,

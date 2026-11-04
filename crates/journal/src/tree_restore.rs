@@ -48,6 +48,7 @@ pub struct TreeRestorePreparation {
     pub native_reservation: Option<crate::TreeRestoreNativeReservation>,
     pub execution_description: Option<crate::TreeExecutionDescriptionAudit>,
     pub execution_records: Option<crate::TreeExecutionRecordsAudit>,
+    pub original_pins: Option<crate::TreeOriginalPinsAudit>,
 }
 
 struct PreparedPlan {
@@ -243,7 +244,19 @@ impl Journal {
              OR EXISTS(SELECT 1 FROM tree_restore_execution_records r
                 LEFT JOIN tree_restore_execution_step_intents s
                     ON s.transaction_id=r.transaction_id AND s.step_index=r.step_index
-                WHERE s.transaction_id IS NULL)",
+                WHERE s.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_original_reservations h
+                LEFT JOIN tree_restore_execution_intents c USING(transaction_id)
+                WHERE c.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_original_owners o
+                LEFT JOIN tree_restore_original_reservations h USING(transaction_id)
+                LEFT JOIN tree_restore_execution_step_intents s
+                    ON s.transaction_id=o.transaction_id AND s.step_index=o.step_index
+                WHERE h.transaction_id IS NULL OR s.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_original_objects p
+                LEFT JOIN tree_restore_original_owners o
+                    ON o.transaction_id=p.transaction_id AND o.step_index=p.step_index
+                WHERE o.transaction_id IS NULL)",
             [],
             |r| r.get(0),
         )?;
@@ -430,6 +443,17 @@ impl Journal {
                 cancelled_at_ms,
                 max,
             )?;
+            let original_pins = crate::tree_original_pins::audit_originals(
+                self,
+                &intent,
+                history_reservation.as_ref(),
+                native_reservation.as_ref(),
+                execution_description.as_ref(),
+                &baseline,
+                &target,
+                cancelled_at_ms,
+                max,
+            )?;
             if let Some(native) = &native_reservation {
                 actual_native_bindings = actual_native_bindings
                     .checked_add(native.binding_count)
@@ -460,6 +484,7 @@ impl Journal {
                 native_reservation,
                 execution_description,
                 execution_records,
+                original_pins,
             });
         }
         if actual_native_bindings as u64 != native_bindings as u64 {
@@ -486,7 +511,10 @@ impl Journal {
              OR EXISTS(SELECT 1 FROM tree_restore_native_reservations)
              OR EXISTS(SELECT 1 FROM tree_restore_execution_intents)
              OR EXISTS(SELECT 1 FROM tree_restore_execution_step_intents)
-             OR EXISTS(SELECT 1 FROM tree_restore_execution_records)",
+             OR EXISTS(SELECT 1 FROM tree_restore_execution_records)
+             OR EXISTS(SELECT 1 FROM tree_restore_original_reservations)
+             OR EXISTS(SELECT 1 FROM tree_restore_original_owners)
+             OR EXISTS(SELECT 1 FROM tree_restore_original_objects)",
             [],
             |r| r.get(0),
         )?;
@@ -643,6 +671,10 @@ impl Journal {
                 ContentId::hash(json.as_bytes()).as_str(),
                 sql_integer(cancelled_at_ms)?
             ],
+        )?;
+        tx.execute(
+            "DELETE FROM tree_restore_original_objects WHERE transaction_id=?1",
+            [id.as_str()],
         )?;
         tx.execute(
             "DELETE FROM tree_restore_objects WHERE transaction_id=?1",
