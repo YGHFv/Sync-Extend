@@ -65,7 +65,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=26 => {}
+            1..=27 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -205,6 +205,11 @@ impl Journal {
         if version < 26 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-026.sql"))?;
+            tx.commit()?;
+        }
+        if version < 27 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-027.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -1484,6 +1489,8 @@ fn check_storage_metadata_limit(
             + (SELECT count(*) FROM tree_restore_execution_intents)
             + (SELECT count(*) FROM tree_restore_execution_step_intents)
             + (SELECT count(*) FROM tree_restore_execution_records)
+            + (SELECT count(*) FROM tree_restore_owner_intents)
+            + (SELECT count(*) FROM tree_restore_owner_records)
             + max((SELECT coalesce(sum(reserved_rows),0) FROM tree_restore_original_reservations),
                 (SELECT count(*) FROM tree_restore_original_reservations)
                 + (SELECT count(*) FROM tree_restore_original_owners)
@@ -1526,6 +1533,10 @@ fn check_storage_metadata_limit(
                 FROM tree_restore_execution_step_intents)
             + (SELECT coalesce(sum(length(CAST(record AS BLOB))+312),0)
                 FROM tree_restore_execution_records)
+            + (SELECT coalesce(sum(length(CAST(intent AS BLOB))+400),0)
+                FROM tree_restore_owner_intents)
+            + (SELECT coalesce(sum(length(CAST(record AS BLOB))+272),0)
+                FROM tree_restore_owner_records)
             + max((SELECT coalesce(sum(reserved_bytes),0) FROM tree_restore_original_reservations),
                 (SELECT coalesce(sum(length(CAST(request AS BLOB))+304),0)
                     FROM tree_restore_original_reservations)
@@ -1675,6 +1686,7 @@ mod reference_reservation;
 mod rename_observation;
 mod tree_execution_records;
 mod tree_original_pins;
+mod tree_owner_description;
 mod tree_restore;
 mod tree_restore_execution_intent;
 mod tree_restore_history;
@@ -1685,6 +1697,7 @@ pub use reference_reservation::{
 };
 pub use tree_execution_records::TreeExecutionRecordsAudit;
 pub use tree_original_pins::{TreeOriginalPinRequest, TreeOriginalPinsAudit};
+pub use tree_owner_description::TreeOwnerDescriptionAudit;
 pub use tree_restore::{TreeRestorePreparation, TreeRestorePreparationIntent};
 pub use tree_restore_execution_intent::TreeExecutionDescriptionAudit;
 pub use tree_restore_history::{TreeRestoreHistoryIntent, TreeRestoreHistoryReservation};

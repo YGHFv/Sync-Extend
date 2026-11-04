@@ -49,6 +49,7 @@ pub struct TreeRestorePreparation {
     pub execution_description: Option<crate::TreeExecutionDescriptionAudit>,
     pub execution_records: Option<crate::TreeExecutionRecordsAudit>,
     pub original_pins: Option<crate::TreeOriginalPinsAudit>,
+    pub owner_description: Option<crate::TreeOwnerDescriptionAudit>,
 }
 
 struct PreparedPlan {
@@ -256,6 +257,12 @@ impl Journal {
              OR EXISTS(SELECT 1 FROM tree_restore_original_objects p
                 LEFT JOIN tree_restore_original_owners o
                     ON o.transaction_id=p.transaction_id AND o.step_index=p.step_index
+                WHERE o.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_owner_intents o
+                LEFT JOIN tree_restore_original_reservations h USING(transaction_id)
+                WHERE h.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_owner_records r
+                LEFT JOIN tree_restore_owner_intents o USING(transaction_id)
                 WHERE o.transaction_id IS NULL)",
             [],
             |r| r.get(0),
@@ -454,6 +461,18 @@ impl Journal {
                 cancelled_at_ms,
                 max,
             )?;
+            let owner_description = crate::tree_owner_description::audit_owner(
+                &self.connection,
+                &intent,
+                history_reservation.as_ref(),
+                native_reservation.as_ref(),
+                execution_description.as_ref(),
+                original_pins.as_ref(),
+                &baseline,
+                &target,
+                cancelled_at_ms,
+                max,
+            )?;
             if let Some(native) = &native_reservation {
                 actual_native_bindings = actual_native_bindings
                     .checked_add(native.binding_count)
@@ -485,6 +504,7 @@ impl Journal {
                 execution_description,
                 execution_records,
                 original_pins,
+                owner_description,
             });
         }
         if actual_native_bindings as u64 != native_bindings as u64 {
@@ -514,7 +534,9 @@ impl Journal {
              OR EXISTS(SELECT 1 FROM tree_restore_execution_records)
              OR EXISTS(SELECT 1 FROM tree_restore_original_reservations)
              OR EXISTS(SELECT 1 FROM tree_restore_original_owners)
-             OR EXISTS(SELECT 1 FROM tree_restore_original_objects)",
+             OR EXISTS(SELECT 1 FROM tree_restore_original_objects)
+             OR EXISTS(SELECT 1 FROM tree_restore_owner_intents)
+             OR EXISTS(SELECT 1 FROM tree_restore_owner_records)",
             [],
             |r| r.get(0),
         )?;

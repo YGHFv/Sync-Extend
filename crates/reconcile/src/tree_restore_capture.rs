@@ -32,6 +32,33 @@ impl<T> TreeRestoreCapture<'_, T> {
 }
 
 impl LocalSpace {
+    /// Persist metadata only; a ready description is not native directory ownership.
+    pub fn describe_tree_restore_owner(
+        &self,
+        input: &sync_extend_core_model::tree_owner_marker::TreeOwnerInput,
+    ) -> Result<sync_extend_journal::TreeOwnerDescriptionAudit> {
+        let (held, audit) = self.journal.with_tree_owner_description(
+            input,
+            self.limits.max_storage_entries,
+            |_| Ok::<_, crate::ReconcileError>(()),
+        )?;
+        drop(held);
+        Ok(audit)
+    }
+
+    pub fn describe_tree_restore_owner_record(
+        &self,
+        record: &sync_extend_core_model::tree_owner_marker::TreeOwnerRecord,
+    ) -> Result<sync_extend_journal::TreeOwnerDescriptionAudit> {
+        let (held, audit) = self.journal.with_tree_owner_record_description(
+            record,
+            self.limits.max_storage_entries,
+            |_| Ok::<_, crate::ReconcileError>(()),
+        )?;
+        drop(held);
+        Ok(audit)
+    }
+
     /// Persist separate original closures without certifying native move authority.
     pub fn reserve_tree_restore_original_pins(
         &self,
