@@ -34,15 +34,16 @@ pub struct TreeExecutionDescriptionAudit {
     pub tree_atomic: bool,
 }
 
-struct Projection {
-    plan: TreeExecutionIntentPlan,
+pub(crate) struct Projection {
+    pub(crate) plan: TreeExecutionIntentPlan,
+    pub(crate) identity: sync_extend_core_model::tree_restore_identity::TreeIdentityPlan,
     json: String,
     steps: Vec<String>,
     audit: TreeExecutionDescriptionAudit,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn project(
+pub(crate) fn project(
     preparation: &TreeRestorePreparationIntent,
     history: &TreeRestoreHistoryReservation,
     native: &TreeRestoreNativeReservation,
@@ -133,6 +134,7 @@ fn project(
     };
     Ok(Projection {
         plan,
+        identity,
         json,
         steps,
         audit,

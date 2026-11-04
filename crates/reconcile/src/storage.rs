@@ -40,6 +40,7 @@ pub struct StorageReport {
     pub tree_restore_history_reserved_metadata_bytes: u64,
     pub tree_restore_native_reserved_metadata_bytes: u64,
     pub tree_restore_execution_description_metadata_bytes: u64,
+    pub tree_restore_execution_record_description_metadata_bytes: u64,
     pub tree_restore_reserved_worktree_logical_bytes: u64,
     pub tree_restore_input_unique_chunk_bytes: u64,
     pub tree_restore_execution_available: bool,
@@ -172,6 +173,16 @@ impl LocalSpace {
                         ReconcileError::ResourceLimit("tree execution description bytes"),
                     )
                 })?;
+        let tree_restore_execution_record_description_metadata_bytes = trees
+            .iter()
+            .filter_map(|p| p.execution_records.as_ref())
+            .try_fold(0u64, |total, records| {
+                total
+                    .checked_add(records.metadata_bytes)
+                    .ok_or(ReconcileError::ResourceLimit(
+                        "tree execution record description bytes",
+                    ))
+            })?;
         let mut refs = References {
             lengths: BTreeMap::new(),
             seen: 0,
@@ -319,6 +330,7 @@ impl LocalSpace {
             tree_restore_history_reserved_metadata_bytes,
             tree_restore_native_reserved_metadata_bytes,
             tree_restore_execution_description_metadata_bytes,
+            tree_restore_execution_record_description_metadata_bytes,
             tree_restore_reserved_worktree_logical_bytes,
             tree_restore_input_unique_chunk_bytes: refs.bytes(tree_inputs.iter())?,
             tree_restore_execution_available: false,

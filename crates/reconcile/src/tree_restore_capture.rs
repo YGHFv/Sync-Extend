@@ -32,6 +32,20 @@ impl<T> TreeRestoreCapture<'_, T> {
 }
 
 impl LocalSpace {
+    /// Append a metadata transcript record only; this never authorizes an action.
+    pub fn describe_tree_restore_execution_record(
+        &self,
+        record: &sync_extend_core_model::tree_execution_records::TreeExecutionRecord,
+    ) -> Result<sync_extend_journal::TreeExecutionRecordsAudit> {
+        let (held, audit) = self.journal.with_tree_execution_record_description(
+            record,
+            self.limits.max_storage_entries,
+            |_| Ok::<_, crate::ReconcileError>(()),
+        )?;
+        drop(held);
+        Ok(audit)
+    }
+
     /// Persist exact metadata descriptions; never recapture or authorize native actions.
     pub fn describe_tree_restore_execution(
         &self,

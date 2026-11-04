@@ -65,7 +65,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=24 => {}
+            1..=25 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -195,6 +195,11 @@ impl Journal {
         if version < 24 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-024.sql"))?;
+            tx.commit()?;
+        }
+        if version < 25 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-025.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -1472,6 +1477,7 @@ fn check_storage_metadata_limit(
             + (SELECT count(*) FROM tree_restore_native_reservations)
             + (SELECT count(*) FROM tree_restore_execution_intents)
             + (SELECT count(*) FROM tree_restore_execution_step_intents)
+            + (SELECT count(*) FROM tree_restore_execution_records)
             + max((SELECT coalesce(sum(reserved_rows),0) FROM tree_restore_histories),
                 (SELECT count(*) FROM tree_restore_histories))
             + max((SELECT coalesce(sum(reserved_rows),0) FROM tree_restore_preparations),
@@ -1508,6 +1514,8 @@ fn check_storage_metadata_limit(
                 FROM tree_restore_execution_intents)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))+168),0)
                 FROM tree_restore_execution_step_intents)
+            + (SELECT coalesce(sum(length(CAST(record AS BLOB))+312),0)
+                FROM tree_restore_execution_records)
             + max((SELECT coalesce(sum(reserved_bytes),0) FROM tree_restore_histories),
                 (SELECT coalesce(sum(length(CAST(intent AS BLOB))+392),0) FROM tree_restore_histories))
             + max((SELECT coalesce(sum(reserved_bytes),0) FROM tree_restore_preparations),
@@ -1649,6 +1657,7 @@ pub use diagnostics::GcDiagnostics;
 mod original_retention;
 mod reference_reservation;
 mod rename_observation;
+mod tree_execution_records;
 mod tree_restore;
 mod tree_restore_execution_intent;
 mod tree_restore_history;
@@ -1657,6 +1666,7 @@ pub use original_retention::{OriginalDisposalAudit, OriginalDisposalIntent, Orig
 pub use reference_reservation::{
     ReferenceReservation, ReferenceReservationIntent, ReferenceSnapshotHandoff,
 };
+pub use tree_execution_records::TreeExecutionRecordsAudit;
 pub use tree_restore::{TreeRestorePreparation, TreeRestorePreparationIntent};
 pub use tree_restore_execution_intent::TreeExecutionDescriptionAudit;
 pub use tree_restore_history::{TreeRestoreHistoryIntent, TreeRestoreHistoryReservation};
