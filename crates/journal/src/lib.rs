@@ -1484,6 +1484,24 @@ fn check_storage_metadata_limit(
     additional_rows: u64,
     additional_bytes: u64,
 ) -> Result<()> {
+    let (rows, bytes) = storage_metadata_budget_usage(connection)?;
+    let max_bytes = (max_entries as u64)
+        .checked_mul(1024)
+        .ok_or(JournalError::Invariant("storage metadata budget overflow"))?;
+    if rows
+        .checked_add(additional_rows)
+        .is_none_or(|n| n > max_entries as u64)
+        || bytes
+            .checked_add(additional_bytes)
+            .is_none_or(|n| n > max_bytes)
+    {
+        return Err(JournalError::Invariant("storage metadata inventory limit"));
+    }
+    Ok(())
+}
+
+// Legacy admission accounting includes reservations, not just persisted values.
+fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> {
     let (rows, bytes): (i64, i64) = connection.query_row(
         "SELECT
             (SELECT count(*) FROM snapshots) + (SELECT count(*) FROM mutations)
@@ -1600,21 +1618,10 @@ fn check_storage_metadata_limit(
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let max_bytes = (max_entries as u64)
-        .checked_mul(1024)
-        .ok_or(JournalError::Invariant("storage metadata budget overflow"))?;
-    if rows < 0
-        || bytes < 0
-        || (rows as u64)
-            .checked_add(additional_rows)
-            .is_none_or(|n| n > max_entries as u64)
-        || (bytes as u64)
-            .checked_add(additional_bytes)
-            .is_none_or(|n| n > max_bytes)
-    {
+    if rows < 0 || bytes < 0 {
         return Err(JournalError::Invariant("storage metadata inventory limit"));
     }
-    Ok(())
+    Ok((rows as u64, bytes as u64))
 }
 
 fn pin_snapshot(tx: &Transaction<'_>, root: &str, manifest: &Manifest) -> Result<()> {
@@ -1741,6 +1748,7 @@ mod tree_restore;
 mod tree_restore_execution_intent;
 mod tree_restore_history;
 mod tree_restore_native_identity;
+mod tree_storage_inventory;
 pub use original_retention::{OriginalDisposalAudit, OriginalDisposalIntent, OriginalDisposalStep};
 pub use reference_reservation::{
     ReferenceReservation, ReferenceReservationIntent, ReferenceSnapshotHandoff,
@@ -1765,4 +1773,9 @@ pub use tree_restore_execution_intent::TreeExecutionDescriptionAudit;
 pub use tree_restore_history::{TreeRestoreHistoryIntent, TreeRestoreHistoryReservation};
 pub use tree_restore_native_identity::{
     TreeRestoreNativeIntent, TreeRestoreNativeRequest, TreeRestoreNativeReservation,
+};
+pub use tree_storage_inventory::{
+    TreeRestoreInventoryLimits, TreeRestoreLegacyBudget, TreeRestoreStorageInventory,
+    TreeRestoreStoredOwner, TreeRestoreStoredReservation, TreeRestoreStoredRow,
+    TreeRestoreStoredTable,
 };
