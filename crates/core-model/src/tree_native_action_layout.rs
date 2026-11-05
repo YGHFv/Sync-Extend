@@ -7,7 +7,7 @@ use crate::{
     },
     tree_restore::TreeRestoreAction,
     tree_restore_history::{encode_history_record, MAX_TREE_HISTORY_BYTES},
-    tree_restore_identity::{TreeNativeIdentity, TreeParentBinding},
+    tree_restore_identity::{TreeNativeEntry, TreeNativeIdentity, TreeParentBinding},
     ContentId, EntryId, EntryKind, FileManifest, ModelError, PortablePath, Result, SpaceId,
 };
 use serde::{Deserialize, Serialize};
@@ -178,6 +178,17 @@ pub struct TreeNativeActionLayoutPlan {
     action_count: usize,
     next_intent: Option<TreeNativeActionIntent>,
     awaiting_observation: bool,
+    completed_native_layout: Option<TreeNativeActionCompletedLayout>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TreeNativeActionCompletedLayout {
+    pub owner_directory: TreeNativeIdentity,
+    pub owner_marker: TreeNativeIdentity,
+    pub entries: BTreeMap<PortablePath, TreeNativeEntry>,
+    pub retained_originals: BTreeMap<usize, TreeNativeIdentity>,
+    pub last_record_hash: ContentId,
+    pub last_recorded_at_ms: u64,
 }
 impl TreeNativeActionLayoutPlan {
     pub fn scope(&self) -> &TreeNativeActionScope {
@@ -209,6 +220,9 @@ impl TreeNativeActionLayoutPlan {
     }
     pub fn complete_layout(&self) -> bool {
         self.next_intent.is_none()
+    }
+    pub fn completed_native_layout(&self) -> Option<&TreeNativeActionCompletedLayout> {
+        self.completed_native_layout.as_ref()
     }
     pub fn durable_native_action_evidence(&self) -> bool {
         false
@@ -675,7 +689,61 @@ pub fn plan_tree_native_action_layout(
         .get(records.len() / 2)
         .map(|p| intent(context, &state, *p))
         .transpose()?;
-    let bytes = encode_history_record(&(&scope, records, &next_intent), bounds.max_encoded_bytes)?;
+    let completed_native_layout = if next_intent.is_none() {
+        let mut entries = inventory.entries.clone();
+        let mut retained_originals = BTreeMap::new();
+        for step in &context.execution.intent().steps {
+            let path = &step.step.path;
+            match step.step.action {
+                TreeRestoreAction::DeleteFile | TreeRestoreAction::ReplaceFile => {
+                    retained_originals.insert(
+                        step.step.index,
+                        context.originals.intents()[&step.step.index]
+                            .original_identity
+                            .clone(),
+                    );
+                    entries.remove(path);
+                }
+                TreeRestoreAction::RemoveEmptyDirectory => {
+                    entries.remove(path);
+                }
+                _ => {}
+            }
+            if let Some(identity) = state.creators.get(&step.step.index) {
+                let logical = context
+                    .history
+                    .manifest()
+                    .entries
+                    .values()
+                    .find(|e| &e.path == path)
+                    .ok_or(ModelError::InvalidData(
+                        "native action final logical entry missing",
+                    ))?;
+                entries.insert(
+                    path.clone(),
+                    TreeNativeEntry {
+                        entry_id: logical.entry_id.clone(),
+                        kind: logical.kind,
+                        identity: identity.clone(),
+                    },
+                );
+            }
+        }
+        Some(TreeNativeActionCompletedLayout {
+            owner_directory: known(&state.directory)?,
+            owner_marker: known(&state.marker)?,
+            entries,
+            retained_originals,
+            last_record_hash: previous,
+            last_recorded_at_ms: time,
+        })
+    } else {
+        None
+    };
+    let bytes = encode_history_record(
+        &(&scope, records, &next_intent, &completed_native_layout),
+        bounds.max_encoded_bytes,
+    )?;
     Ok(TreeNativeActionLayoutPlan {
         scope,
         layout_hash,
@@ -688,5 +756,6 @@ pub fn plan_tree_native_action_layout(
         action_count: phases.len(),
         next_intent,
         awaiting_observation: records.len() % 2 == 1,
+        completed_native_layout,
     })
 }

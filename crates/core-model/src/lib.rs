@@ -10,6 +10,7 @@ pub mod reference_owner;
 pub mod tree_coordinator_lifecycle;
 pub mod tree_execution_records;
 pub mod tree_final_description;
+pub mod tree_final_terminal_layout;
 pub mod tree_final_transaction;
 pub mod tree_native_action_layout;
 pub mod tree_native_protocol;
