@@ -24,6 +24,7 @@ mod scan;
 mod snapshot_pruning;
 mod snapshot_retention;
 mod storage;
+mod tree_final_observation;
 mod tree_restore_capture;
 pub use delete::{DeleteResult, MutationResult};
 pub use diagnostics::Diagnostics;
@@ -37,6 +38,7 @@ pub use reference_reservation::ReservedChunkImport;
 pub use snapshot_retention::{RetentionReport, SnapshotLockResult, SnapshotRetention};
 pub use storage::StorageReport;
 pub use sync_extend_journal::{ReferenceReservation, ReferenceReservationIntent};
+pub use tree_final_observation::{TreeFinalObservation, TreeFinalObservationReport};
 pub use tree_restore_capture::TreeRestoreCapture;
 
 use fs2::FileExt;

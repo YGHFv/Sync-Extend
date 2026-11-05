@@ -1733,6 +1733,7 @@ mod tree_disposition_description;
 mod tree_disposition_generations;
 mod tree_execution_records;
 mod tree_final_description;
+mod tree_final_observation;
 mod tree_native_protocol;
 mod tree_original_pins;
 mod tree_owner_description;
@@ -1753,6 +1754,7 @@ pub use tree_disposition_description::{
 };
 pub use tree_execution_records::TreeExecutionRecordsAudit;
 pub use tree_final_description::{TreeFinalDescriptionAudit, TreeFinalDescriptionRequest};
+pub use tree_final_observation::{TreeFinalObservationInspection, TreeFinalObservationRequest};
 pub use tree_native_protocol::{
     TreeNativeProtocolDescriptionAudit, TreeNativeProtocolDescriptionRequest,
 };
