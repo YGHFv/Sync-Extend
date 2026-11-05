@@ -1,7 +1,7 @@
 //! Owner-attributed selected row accounting, never a Journal admission token.
 use crate::{
     limits,
-    tree_final_terminal_layout::TreeFinalTerminalLayoutPlan,
+    tree_final_layout_source::TreeFinalLayoutSource,
     tree_restore_history::MAX_TREE_HISTORY_BYTES,
     tree_storage_footprint::{
         tree_final_history_row_values, TreeStorageRowKey, TreeStorageRowValues, TreeStorageTable,
@@ -65,7 +65,7 @@ impl TreeStorageOwnerInput {
     /// Ownership comes from the exact typed final projection, not an arbitrary
     /// attribution of another owner's row. Supplied keys select persisted values.
     pub fn from_final_layout(
-        plan: &TreeFinalTerminalLayoutPlan,
+        plan: &impl TreeFinalLayoutSource,
         immutable_metadata: Vec<TreeStorageRowValues>,
         future_metadata: Vec<TreeStorageMetadataObligation>,
         reserved_new: TreeStorageCharge,
@@ -89,7 +89,7 @@ impl TreeStorageOwnerInput {
             actual_new.push(row.clone());
         }
         Ok(Self {
-            owner_id: plan.rows().intent.scope.transaction_id.clone(),
+            owner_id: plan.terminal_rows().intent.scope.transaction_id.clone(),
             immutable_metadata,
             future_metadata,
             reserved_new,

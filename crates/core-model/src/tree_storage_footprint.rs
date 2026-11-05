@@ -1,6 +1,6 @@
 //! Selected physical row VALUES, not SQLite allocation or durable provenance.
 use crate::{
-    tree_final_terminal_layout::TreeFinalTerminalLayoutPlan,
+    tree_final_layout_source::TreeFinalLayoutSource,
     tree_native_action_layout::{TreeNativeActionLayoutRecord, TreeNativeActionScope},
     tree_original_terminal_layout::{
         plan_tree_original_release_layout, TreeOriginalTerminalLayoutLimits,
@@ -30,6 +30,8 @@ pub enum TreeStorageTable {
     CurrentSnapshot,
     Cursor,
     OriginalReference,
+    OwnerCleanupIntent,
+    OwnerCleanupRecord,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -93,26 +95,26 @@ pub struct TreeNativeStorageHeaderRequest {
     pub created_at_ms: u64,
 }
 
-fn text(name: &str, value: impl ToString) -> TreeStorageColumn {
+pub(crate) fn text(name: &str, value: impl ToString) -> TreeStorageColumn {
     TreeStorageColumn {
         name: name.into(),
         value: TreeStorageColumnValue::Text(value.to_string()),
     }
 }
-fn integer(name: &str, value: u64) -> TreeStorageColumn {
+pub(crate) fn integer(name: &str, value: u64) -> TreeStorageColumn {
     TreeStorageColumn {
         name: name.into(),
         value: TreeStorageColumnValue::Integer(value),
     }
 }
-fn json<T: Serialize>(value: &T) -> Result<String> {
+pub(crate) fn json<T: Serialize>(value: &T) -> Result<String> {
     String::from_utf8(encode_history_record(value, MAX_TREE_HISTORY_BYTES)?)
         .map_err(|_| ModelError::InvalidData("tree storage encoding"))
 }
-fn hash<T: Serialize>(value: &T) -> Result<ContentId> {
+pub(crate) fn hash<T: Serialize>(value: &T) -> Result<ContentId> {
     Ok(ContentId::hash(json(value)?.as_bytes()))
 }
-fn scope_columns(s: &TreeNativeActionScope) -> Vec<TreeStorageColumn> {
+pub(crate) fn scope_columns(s: &TreeNativeActionScope) -> Vec<TreeStorageColumn> {
     vec![
         text("space_id", &s.space_id),
         text("transaction_id", &s.transaction_id),
@@ -130,7 +132,7 @@ fn final_scope(s: &TreeNativeActionScope, id: &EntryId) -> Vec<TreeStorageColumn
         text("finalization_id", id),
     ]
 }
-fn row(
+pub(crate) fn row(
     table: TreeStorageTable,
     key: Vec<String>,
     columns: Vec<TreeStorageColumn>,
@@ -207,9 +209,9 @@ pub fn tree_native_action_row_values(
 }
 
 pub fn tree_final_terminal_row_values(
-    plan: &TreeFinalTerminalLayoutPlan,
+    plan: &impl TreeFinalLayoutSource,
 ) -> Result<Vec<TreeStorageRowValues>> {
-    let r = plan.rows();
+    let r = plan.terminal_rows();
     let i = &r.intent;
     let key = vec![i.scope.transaction_id.to_string()];
     let mut result = Vec::new();
@@ -272,9 +274,9 @@ pub fn tree_final_terminal_row_values(
 
 /// Deletion predicates are intentionally NOT persisted row values.
 pub fn tree_final_history_row_values(
-    plan: &TreeFinalTerminalLayoutPlan,
+    plan: &impl TreeFinalLayoutSource,
 ) -> Result<Vec<TreeStorageRowValues>> {
-    let r = plan.transaction().rows();
+    let r = plan.history_rows();
     let mut result = Vec::new();
     for op in &r.operations {
         result.push(row(
@@ -340,7 +342,7 @@ pub fn tree_final_history_row_values(
         sum.checked_add(row.logical_bytes())
             .ok_or(ModelError::InvalidData("tree history byte overflow"))
     })?;
-    let expected = plan.transaction().footprint();
+    let expected = plan.history_footprint();
     if bytes != expected.history_logical_bytes || result.len() as u64 != expected.history_value_rows
     {
         return Err(ModelError::InvalidData(

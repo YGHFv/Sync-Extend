@@ -202,14 +202,6 @@ impl TreeFinalTransactionPlan {
     }
 }
 
-fn checked_sum(values: impl IntoIterator<Item = u64>) -> Result<u64> {
-    values.into_iter().try_fold(0u64, |total, n| {
-        total
-            .checked_add(n)
-            .ok_or(ModelError::InvalidData("tree final row byte overflow"))
-    })
-}
-
 #[derive(Serialize)]
 struct BorrowedFinalIntent<'a> {
     input: &'a TreeFinalTransactionInput,
@@ -351,129 +343,16 @@ pub fn plan_tree_final_transaction(
         },
         coordinator_limits,
     )?;
-    let h = context.history;
-    let prior_seq = context
-        .baseline
-        .version_vector
-        .get(&context.history_input.origin_device_id);
-    let mut operations = Vec::new();
-    for op in h.operations() {
-        let p = &op.payload;
-        operations.push(TreeFinalOperationRow {
-            op_id: op.op_id.clone(),
-            space_id: p.space_id.clone(),
-            origin_device_id: p.origin_device_id.clone(),
-            origin_seq: p.origin_seq,
-            payload: String::from_utf8(encode_history_record(op, bounds.max_encoded_bytes)?)
-                .map_err(|_| ModelError::InvalidData("tree final canonical encoding"))?,
-            state: "materialized".into(),
-        });
-    }
-    let observation_invalidation = input
-        .prior_observation
-        .as_ref()
-        .map(|map| {
-            map.validate(context.baseline, limits::MAX_ENTRIES)?;
-            let json = encode_history_record(map, bounds.max_input_bytes)?;
-            Ok::<_, ModelError>(TreeFinalObservationInvalidation {
-                space_id: map.scope.space_id.clone(),
-                snapshot_id: map.scope.prior_snapshot.clone(),
-                observation_hash: ContentId::hash(&json),
-                observation: String::from_utf8(json)
-                    .map_err(|_| ModelError::InvalidData("tree final observation encoding"))?,
-            })
-        })
-        .transpose()?;
-    let mut retained_references = Vec::new();
-    for (&index, original) in &completion.intent().retained_originals {
-        for (content, &length) in &original.references {
-            retained_references.push(TreeFinalRetainedReferenceRow {
-                transaction_id: input.transaction_id.clone(),
-                step_index: index,
-                step_execution_id: original.original.step_execution_id.clone(),
-                content_id: content.clone(),
-                length,
-            });
-        }
-    }
-    let rows = TreeFinalTransactionRows {
-        operations,
-        snapshot: TreeFinalSnapshotRow {
-            snapshot_id: h.snapshot_id().clone(),
-            space_id: h.manifest().space_id.clone(),
-            manifest: String::from_utf8(encode_history_record(
-                h.manifest(),
-                bounds.max_encoded_bytes,
-            )?)
-            .map_err(|_| ModelError::InvalidData("tree final snapshot encoding"))?,
-            created_at_ms: context.history_input.created_at_ms,
-            state: "materialized".into(),
-            locked: 0,
-        },
-        snapshot_objects: h
-            .chunks()
-            .keys()
-            .map(|id| TreeFinalSnapshotObjectRow {
-                snapshot_id: h.snapshot_id().clone(),
-                content_id: id.clone(),
-            })
-            .collect(),
-        cursor: TreeFinalCursorWrite {
-            space_id: h.manifest().space_id.clone(),
-            device_id: context.history_input.origin_device_id.clone(),
-            prior_seq,
-            contiguous_seq: h
-                .operations()
-                .last()
-                .ok_or(ModelError::InvalidData("tree final no NEW operations"))?
-                .payload
-                .origin_seq,
-        },
-        current: TreeFinalCurrentWrite {
-            space_id: h.manifest().space_id.clone(),
-            prior_snapshot_id: context.execution.intent().scope.baseline_snapshot.clone(),
-            snapshot_id: h.snapshot_id().clone(),
-        },
-        input_release: completion
-            .intent()
-            .input_references
-            .iter()
-            .map(|(id, &length)| TreeFinalInputReleaseRow {
-                transaction_id: input.transaction_id.clone(),
-                content_id: id.clone(),
-                length,
-            })
-            .collect(),
-        retained_references,
-        observation_invalidation,
-    };
-    let history_bytes = checked_sum(
-        rows.operations
-            .iter()
-            .map(|r| r.payload.len() as u64 + 180)
-            .chain([
-                rows.snapshot.manifest.len() as u64 + 124,
-                104,
-                96,
-                rows.snapshot_objects.len() as u64 * 128,
-            ]),
-    )?;
-    let history_rows = rows.operations.len() as u64 + rows.snapshot_objects.len() as u64 + 3;
-    if history_bytes != h.footprint().metadata_bytes || history_rows != h.footprint().row_writes {
-        return Err(ModelError::InvalidData(
-            "tree final exact history footprint",
-        ));
-    }
-    let sql_row_writes = checked_sum([
-        history_rows,
-        rows.input_release.len() as u64,
-        u64::from(rows.observation_invalidation.is_some()),
-    ])?;
-    let retained_bytes = rows.retained_references.len() as u64 * 144;
-    if sql_row_writes > bounds.max_rows
-        || checked_sum([history_bytes, retained_bytes])? > bounds.max_logical_bytes
-    {
-        return Err(ModelError::InvalidData("tree final prospective row budget"));
+    let projected =
+        crate::tree_final_rows::project(context, input.prior_observation.as_ref(), bounds)?;
+    let rows = projected.rows().clone();
+    let input_closure: BTreeMap<_, _> = rows
+        .input_release
+        .iter()
+        .map(|r| (r.content_id.clone(), r.length))
+        .collect();
+    if input_closure != completion.intent().input_references {
+        return Err(ModelError::InvalidData("tree final shared input closure"));
     }
     let row_json = encode_history_record(&rows, bounds.max_encoded_bytes)?;
     let borrowed_intent = BorrowedFinalIntent {
@@ -504,19 +383,8 @@ pub fn plan_tree_final_transaction(
         intent,
         intent_hash: ContentId::hash(&envelope),
         footprint: TreeFinalTransactionFootprint {
-            history_value_rows: history_rows,
-            history_logical_bytes: history_bytes,
-            input_release_rows: rows.input_release.len() as u64,
-            input_release_logical_bytes: rows.input_release.len() as u64 * 104,
-            retained_reference_rows: rows.retained_references.len() as u64,
-            retained_reference_logical_bytes: retained_bytes,
-            observation_delete_rows: u64::from(rows.observation_invalidation.is_some()),
-            observation_delete_logical_bytes: rows
-                .observation_invalidation
-                .as_ref()
-                .map_or(0, |row| row.observation.len() as u64 + 160),
-            sql_row_writes,
             encoded_bytes: envelope.len() as u64,
+            ..projected.footprint().clone()
         },
         rows,
     })

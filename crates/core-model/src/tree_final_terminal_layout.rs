@@ -3,6 +3,7 @@ use crate::{
     limits,
     tree_coordinator_lifecycle::TreeCoordinatorContext,
     tree_execution_records::TreeExecutionTerminal,
+    tree_final_terminal_rows::{self, TreeFinalTerminalAssembly},
     tree_final_transaction::{
         plan_tree_final_transaction, TreeFinalTransactionInput, TreeFinalTransactionLimits,
         TreeFinalTransactionPlan,
@@ -132,6 +133,7 @@ pub struct TreeFinalTerminalLayoutPlan {
     encoded_bytes: u64,
     peak_encoded_bytes: u64,
     forbidden_generations: BTreeSet<EntryId>,
+    owner_intent_hash: ContentId,
 }
 impl TreeFinalTerminalLayoutPlan {
     pub fn rows(&self) -> &TreeFinalTerminalRowsLayout {
@@ -151,6 +153,9 @@ impl TreeFinalTerminalLayoutPlan {
     }
     pub fn forbidden_generations(&self) -> &BTreeSet<EntryId> {
         &self.forbidden_generations
+    }
+    pub fn owner_intent_hash(&self) -> &ContentId {
+        &self.owner_intent_hash
     }
     pub fn durable_native_action_evidence(&self) -> bool {
         false
@@ -278,26 +283,7 @@ pub fn plan_tree_final_terminal_layout(
             max_logical_bytes: bounds.max_logical_bytes,
         },
     )?;
-    if completed.entries.len() != context.history.manifest().entries.len()
-        || completed.retained_originals.len() != context.originals.intents().len()
-    {
-        return Err(ModelError::InvalidData(
-            "final terminal native owner inventory",
-        ));
-    }
-    for entry in context.history.manifest().entries.values() {
-        if completed
-            .entries
-            .get(&entry.path)
-            .is_none_or(|native| native.entry_id != entry.entry_id || native.kind != entry.kind)
-        {
-            return Err(ModelError::InvalidData(
-                "final terminal logical native mismatch",
-            ));
-        }
-    }
-    let mut input_references = BTreeMap::new();
-    // Bound duplicated prospective terminal payloads before materializing handoffs.
+    // Preserve the old envelope bound while the common constructor derives values.
     let borrowed_bytes = encode_history_record(
         &(
             input,
@@ -309,155 +295,42 @@ pub fn plan_tree_final_terminal_layout(
         ),
         bounds.max_encoded_bytes,
     )?;
-    for row in &transaction.rows().input_release {
-        input_references.insert(row.content_id.clone(), row.length);
-    }
-    let mut original_handoffs = BTreeMap::new();
     for (&index, original) in context.originals.intents() {
         let described = &transaction.intent().retained_originals[&index];
         if completed.retained_originals.get(&index) != Some(&original.original_identity)
             || described.owner_directory != completed.owner_directory
             || described.owner_marker != completed.owner_marker
+            || described.new_operation_id
+                != context.execution.intent().steps[index].new_operation_id
         {
             return Err(ModelError::InvalidData(
                 "final terminal independent original owner mismatch",
             ));
         }
-        original_handoffs.insert(
-            index,
-            TreeFinalOriginalHandoffLayout {
-                original: original.clone(),
-                references: context.originals.closures()[&index].clone(),
-                retained_component: context.owner.intent().steps[&index]
-                    .original_component
-                    .clone()
-                    .ok_or(ModelError::InvalidData(
-                        "final original retained component missing",
-                    ))?,
-                owner_directory: completed.owner_directory.clone(),
-                owner_marker: completed.owner_marker.clone(),
-                operation_id: described.new_operation_id.clone(),
-                snapshot_id: context.history.snapshot_id().clone(),
-                action_layout_hash: action.fingerprint().clone(),
-            },
-        );
     }
-    let original_handoffs_hash = ContentId::hash(&encode_history_record(
-        &original_handoffs,
+    let rows = tree_final_terminal_rows::assemble(
+        context,
+        &action,
+        transaction.rows(),
+        TreeFinalTerminalAssembly {
+            finalization_id: &input.final_transaction.finalization_id,
+            fresh_observation_hash: &input.fresh_observation_hash,
+            intended_at_ms: input.final_transaction.described_at_ms,
+            committed_at_ms: input.committed_at_ms,
+        },
         bounds.max_encoded_bytes,
-    )?);
-    let intent = TreeFinalTerminalIntentLayout {
-        format_version: 1,
-        scope: action.scope().clone(),
-        finalization_id: input.final_transaction.finalization_id.clone(),
-        action_layout_hash: action.fingerprint().clone(),
-        action_last_record_hash: completed.last_record_hash.clone(),
-        action_record_count: actions.len(),
-        fresh_observation_hash: input.fresh_observation_hash.clone(),
-        exact_history_rows_hash: transaction.intent().rows_hash.clone(),
-        final_snapshot_id: context.history.snapshot_id().clone(),
-        operation_ids: transaction
-            .rows()
-            .operations
-            .iter()
-            .map(|r| r.op_id.clone())
-            .collect(),
-        final_native_entries: completed.entries.clone(),
-        owner_directory: completed.owner_directory.clone(),
-        owner_marker: completed.owner_marker.clone(),
-        input_references,
-        input_closure_hash: transaction.intent().input_closure_hash.clone(),
-        original_handoffs,
-        original_handoffs_hash,
-        intended_at_ms: input.final_transaction.described_at_ms,
-    };
-    let intent_hash = ContentId::hash(&encode_history_record(&intent, bounds.max_encoded_bytes)?);
-    let committed = TreeFinalCommittedLayout {
-        format_version: 1,
-        scope: intent.scope.clone(),
-        finalization_id: intent.finalization_id.clone(),
-        terminal_intent_hash: intent_hash,
-        action_layout_hash: intent.action_layout_hash.clone(),
-        fresh_observation_hash: intent.fresh_observation_hash.clone(),
-        exact_history_rows_hash: intent.exact_history_rows_hash.clone(),
-        final_snapshot_id: intent.final_snapshot_id.clone(),
-        operation_ids: intent.operation_ids.clone(),
-        input_closure_hash: intent.input_closure_hash.clone(),
-        input_reference_count: intent.input_references.len(),
-        original_handoffs_hash: intent.original_handoffs_hash.clone(),
-        original_owner_count: intent.original_handoffs.len(),
-        committed_at_ms: input.committed_at_ms,
-    };
-    let committed_hash = ContentId::hash(&encode_history_record(
-        &committed,
-        bounds.max_encoded_bytes,
-    )?);
-    let input_release = TreeFinalInputReleaseLayout {
-        format_version: 1,
-        scope: intent.scope.clone(),
-        finalization_id: intent.finalization_id.clone(),
-        committed_record_hash: committed_hash.clone(),
-        input_closure_hash: intent.input_closure_hash.clone(),
-        released_reference_count: intent.input_references.len(),
-        released_at_ms: input.committed_at_ms,
-    };
-    let mut retained_owners = BTreeMap::new();
-    for (&index, handoff) in &intent.original_handoffs {
-        retained_owners.insert(
-            index,
-            TreeFinalRetainedOwnerLayout {
-                format_version: 1,
-                scope: intent.scope.clone(),
-                finalization_id: intent.finalization_id.clone(),
-                committed_record_hash: committed_hash.clone(),
-                step_index: index,
-                step_execution_id: handoff.original.step_execution_id.clone(),
-                handoff_hash: ContentId::hash(&encode_history_record(
-                    handoff,
-                    bounds.max_encoded_bytes,
-                )?),
-                handoff: handoff.clone(),
-            },
-        );
-    }
-    let rows = TreeFinalTerminalRowsLayout {
-        intent,
-        committed,
-        input_release,
-        retained_owners,
-    };
+    )?;
     let bytes = encode_history_record(&rows, bounds.max_encoded_bytes)?;
     let peak_encoded_bytes = (bytes.len() as u64)
         .max(borrowed_bytes.len() as u64)
         .max(action.peak_encoded_bytes())
         .max(transaction.footprint().encoded_bytes)
         .max(descriptive.encoded_bytes());
-    let mut forbidden_generations: BTreeSet<_> = [
-        &input.final_transaction.transaction_id,
-        &input.final_transaction.coordinator_execution_id,
-        &input.final_transaction.admission_id,
+    let forbidden_generations = tree_final_terminal_rows::generations(
+        context,
+        action.scope(),
         &input.final_transaction.finalization_id,
-    ]
-    .into_iter()
-    .cloned()
-    .collect();
-    forbidden_generations.extend(
-        context
-            .execution
-            .intent()
-            .steps
-            .iter()
-            .map(|s| s.step_execution_id.clone()),
-    );
-    for manifest in [context.baseline, context.target, context.history.manifest()] {
-        forbidden_generations.extend(
-            manifest
-                .entries
-                .keys()
-                .chain(manifest.tombstones.keys())
-                .cloned(),
-        );
-    }
+    )?;
     Ok(TreeFinalTerminalLayoutPlan {
         rows,
         transaction,
@@ -465,6 +338,7 @@ pub fn plan_tree_final_terminal_layout(
         encoded_bytes: bytes.len() as u64,
         peak_encoded_bytes,
         forbidden_generations,
+        owner_intent_hash: context.owner.intent_hash().clone(),
     })
 }
 

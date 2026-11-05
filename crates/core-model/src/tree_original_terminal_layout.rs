@@ -1,7 +1,7 @@
 //! Exact original absence/release candidates, never real disposal or NEW proof.
 use crate::{
     limits,
-    tree_final_terminal_layout::TreeFinalTerminalLayoutPlan,
+    tree_final_layout_source::TreeFinalLayoutSource,
     tree_restore_history::{encode_history_record, MAX_TREE_HISTORY_BYTES},
     tree_restore_identity::TreeNativeIdentity,
     ContentId, EntryId, ModelError, Result,
@@ -130,17 +130,17 @@ impl TreeOriginalTerminalLayoutPlan {
 /// This binds only final row candidates. Real Journal final NEW/action evidence
 /// and fresh private absence inspection remain mandatory outside the shape model.
 pub fn plan_tree_original_terminal_layout(
-    final_layout: &TreeFinalTerminalLayoutPlan,
+    final_layout: &impl TreeFinalLayoutSource,
     input: &TreeOriginalTerminalLayoutInput,
     bounds: TreeOriginalTerminalLayoutLimits,
 ) -> Result<TreeOriginalTerminalLayoutPlan> {
-    let final_rows = final_layout.rows();
+    let final_rows = final_layout.terminal_rows();
     if bounds.max_owners > limits::MAX_ENTRIES
         || bounds.max_reference_rows > limits::MAX_CHUNKS
         || bounds.max_input_bytes > MAX_TREE_HISTORY_BYTES
         || bounds.max_encoded_bytes > MAX_TREE_HISTORY_BYTES
         || final_rows.retained_owners.len() > bounds.max_owners
-        || input.final_terminal_layout_hash != *final_layout.fingerprint()
+        || input.final_terminal_layout_hash != *final_layout.layout_fingerprint()
         || input.disposal_ids.len() != final_rows.retained_owners.len()
         || input.intended_at_ms < final_rows.committed.committed_at_ms
         || input.intended_at_ms > i64::MAX as u64
@@ -161,11 +161,10 @@ pub fn plan_tree_original_terminal_layout(
         &scope.admission_id,
         &final_rows.intent.finalization_id,
     ]);
-    forbidden.extend(final_layout.forbidden_generations());
+    forbidden.extend(final_layout.generation_inventory());
     forbidden.extend(
         final_layout
-            .transaction()
-            .rows()
+            .history_rows()
             .retained_references
             .iter()
             .map(|r| &r.step_execution_id),
@@ -275,6 +274,28 @@ pub fn plan_tree_original_release_layout(
         &(plan.intents(), step_index, observed_at_ms),
         bounds.max_input_bytes,
     )?;
+    release_rows(intent, observed_at_ms, bounds)
+}
+
+// A caller with an already bounded, reprojected owner set need not encode that
+// entire set again for every terminal in a cleanup closure.
+pub(crate) fn release_rows(
+    intent: &TreeOriginalDisposalIntentLayout,
+    observed_at_ms: u64,
+    bounds: TreeOriginalTerminalLayoutLimits,
+) -> Result<TreeOriginalTerminalRowsLayout> {
+    if observed_at_ms < intent.intended_at_ms
+        || observed_at_ms > i64::MAX as u64
+        || bounds.max_reference_rows > limits::MAX_CHUNKS
+        || intent.references.len() > bounds.max_reference_rows
+        || bounds.max_input_bytes > MAX_TREE_HISTORY_BYTES
+        || bounds.max_encoded_bytes > MAX_TREE_HISTORY_BYTES
+    {
+        return Err(ModelError::InvalidData(
+            "original release single owner bounds or time",
+        ));
+    }
+    encode_history_record(intent, bounds.max_input_bytes)?;
     let intent_hash = ContentId::hash(&encode_history_record(intent, bounds.max_encoded_bytes)?);
     let absence = TreeOriginalAbsenceLayout {
         format_version: 1,
@@ -304,7 +325,7 @@ pub fn plan_tree_original_release_layout(
         .map(
             |(content_id, &length)| TreeOriginalReleasedReferenceLayout {
                 transaction_id: intent.transaction_id.clone(),
-                step_index,
+                step_index: intent.step_index,
                 step_execution_id: intent.step_execution_id.clone(),
                 content_id: content_id.clone(),
                 length,
