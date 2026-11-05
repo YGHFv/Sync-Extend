@@ -16,6 +16,7 @@ pub mod tree_native_action_layout;
 pub mod tree_native_protocol;
 pub mod tree_original_disposition;
 pub mod tree_original_reference;
+pub mod tree_original_terminal_layout;
 pub mod tree_owner_marker;
 pub mod tree_restore;
 pub mod tree_restore_execution_intent;

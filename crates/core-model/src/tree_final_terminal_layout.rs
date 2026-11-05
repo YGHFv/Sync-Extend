@@ -21,7 +21,7 @@ use crate::{
     ContentId, EntryId, ModelError, OperationId, PortablePath, Result, SnapshotId,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,6 +131,7 @@ pub struct TreeFinalTerminalLayoutPlan {
     fingerprint: ContentId,
     encoded_bytes: u64,
     peak_encoded_bytes: u64,
+    forbidden_generations: BTreeSet<EntryId>,
 }
 impl TreeFinalTerminalLayoutPlan {
     pub fn rows(&self) -> &TreeFinalTerminalRowsLayout {
@@ -147,6 +148,9 @@ impl TreeFinalTerminalLayoutPlan {
     }
     pub fn peak_encoded_bytes(&self) -> u64 {
         self.peak_encoded_bytes
+    }
+    pub fn forbidden_generations(&self) -> &BTreeSet<EntryId> {
+        &self.forbidden_generations
     }
     pub fn durable_native_action_evidence(&self) -> bool {
         false
@@ -428,12 +432,39 @@ pub fn plan_tree_final_terminal_layout(
         .max(action.peak_encoded_bytes())
         .max(transaction.footprint().encoded_bytes)
         .max(descriptive.encoded_bytes());
+    let mut forbidden_generations: BTreeSet<_> = [
+        &input.final_transaction.transaction_id,
+        &input.final_transaction.coordinator_execution_id,
+        &input.final_transaction.admission_id,
+        &input.final_transaction.finalization_id,
+    ]
+    .into_iter()
+    .cloned()
+    .collect();
+    forbidden_generations.extend(
+        context
+            .execution
+            .intent()
+            .steps
+            .iter()
+            .map(|s| s.step_execution_id.clone()),
+    );
+    for manifest in [context.baseline, context.target, context.history.manifest()] {
+        forbidden_generations.extend(
+            manifest
+                .entries
+                .keys()
+                .chain(manifest.tombstones.keys())
+                .cloned(),
+        );
+    }
     Ok(TreeFinalTerminalLayoutPlan {
         rows,
         transaction,
         fingerprint: ContentId::hash(&bytes),
         encoded_bytes: bytes.len() as u64,
         peak_encoded_bytes,
+        forbidden_generations,
     })
 }
 
