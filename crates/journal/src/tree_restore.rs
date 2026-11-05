@@ -54,6 +54,7 @@ pub struct TreeRestorePreparation {
     pub disposition_description: Option<crate::TreeDispositionDescriptionAudit>,
     pub coordinator_admission: Option<crate::TreeCoordinatorAdmissionAudit>,
     pub native_protocol_description: Option<crate::TreeNativeProtocolDescriptionAudit>,
+    pub native_storage: Option<crate::TreeNativePrewriteAudit>,
 }
 
 struct PreparedPlan {
@@ -221,6 +222,7 @@ impl Journal {
                 "tree restore audit inventory limit",
             ));
         }
+        crate::tree_native_storage::preflight_all(&self.connection, max)?;
         self.check_storage_metadata_limit(max)?;
         if self.state("space_id")?.as_deref() != Some(space.as_str()) {
             return Err(JournalError::Invariant("tree restore space mismatch"));
@@ -543,6 +545,7 @@ impl Journal {
                 disposition_description: None,
                 coordinator_admission: None,
                 native_protocol_description: None,
+                native_storage: None,
             };
             preparation.final_description =
                 crate::tree_final_description::audit_final(&self.connection, &preparation, max)?;
@@ -556,6 +559,8 @@ impl Journal {
                 crate::tree_coordinator_admission::audit(&self.connection, &preparation, max)?;
             preparation.native_protocol_description =
                 crate::tree_native_protocol::audit(&self.connection, &preparation, max)?;
+            preparation.native_storage =
+                crate::tree_native_storage::audit(&self.connection, &preparation, max)?;
             audits.push(preparation);
         }
         if actual_native_bindings as u64 != native_bindings as u64 {

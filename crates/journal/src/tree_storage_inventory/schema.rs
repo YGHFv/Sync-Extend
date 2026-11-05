@@ -1,5 +1,8 @@
 // Pinned physical schema21-31, independently checked against the migrations.
-use super::{ColumnKind, ColumnSpec, TableSpec, MAX_OPERATION_BYTES};
+use crate::{
+    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
+    MAX_OPERATION_BYTES,
+};
 
 const fn text(name: &'static str, width: usize, primary_key: usize) -> ColumnSpec {
     ColumnSpec {
@@ -7,6 +10,7 @@ const fn text(name: &'static str, width: usize, primary_key: usize) -> ColumnSpe
         kind: ColumnKind::Text(width),
         primary_key,
         not_null: true,
+        default: None,
     }
 }
 const fn integer(name: &'static str, primary_key: usize) -> ColumnSpec {
@@ -15,10 +19,11 @@ const fn integer(name: &'static str, primary_key: usize) -> ColumnSpec {
         kind: ColumnKind::Integer,
         primary_key,
         not_null: true,
+        default: None,
     }
 }
 
-pub(super) const TABLES: &[TableSpec] = &[
+pub(crate) const TABLES: &[TableSpec] = &[
     TableSpec {
         name: "tree_restore_preparations",
         columns: &[

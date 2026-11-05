@@ -4,6 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
+const SCHEMA_VERSION: u32 = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -65,7 +66,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=31 => {}
+            1..=SCHEMA_VERSION => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -230,6 +231,11 @@ impl Journal {
         if version < 31 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-031.sql"))?;
+            tx.commit()?;
+        }
+        if version < 32 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-032.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -1535,6 +1541,9 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
             + (SELECT count(*) FROM tree_restore_coordinator_admissions)
             + (SELECT count(*) FROM tree_restore_protocol_descriptions)
             + (SELECT count(*) FROM tree_restore_protocol_records)
+            + (SELECT count(*) FROM tree_native_capacity_admissions)
+            + (SELECT count(*) FROM tree_native_action_headers)
+            + (SELECT count(*) FROM tree_native_action_records)
             + (SELECT count(*) FROM tree_restore_final_descriptions)
             + (SELECT count(*) FROM tree_restore_retained_descriptions)
             + max((SELECT coalesce(sum(reserved_rows),0) FROM tree_restore_original_reservations),
@@ -1595,6 +1604,12 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
                 FROM tree_restore_protocol_descriptions)
             + (SELECT coalesce(sum(length(CAST(record AS BLOB))+368),0)
                 FROM tree_restore_protocol_records)
+            + (SELECT coalesce(sum(length(CAST(request AS BLOB))+length(CAST(capacity AS BLOB))+576),0)
+                FROM tree_native_capacity_admissions)
+            + (SELECT coalesce(sum(length(CAST(request AS BLOB))+456),0)
+                FROM tree_native_action_headers)
+            + (SELECT coalesce(sum(length(CAST(record AS BLOB))+472),0)
+                FROM tree_native_action_records)
             + (SELECT coalesce(sum(length(CAST(request AS BLOB))+length(CAST(intent AS BLOB))+696),0)
                 FROM tree_restore_final_descriptions)
             + (SELECT coalesce(sum(length(CAST(description AS BLOB))+488),0)
@@ -1735,6 +1750,7 @@ pub use diagnostics::GcDiagnostics;
 mod original_retention;
 mod reference_reservation;
 mod rename_observation;
+mod storage_inventory;
 mod tree_coordinator_admission;
 mod tree_disposition_description;
 mod tree_disposition_generations;
@@ -1742,6 +1758,7 @@ mod tree_execution_records;
 mod tree_final_description;
 mod tree_final_observation;
 mod tree_native_protocol;
+mod tree_native_storage;
 mod tree_original_pins;
 mod tree_owner_description;
 mod tree_restore;
@@ -1752,6 +1769,10 @@ mod tree_storage_inventory;
 pub use original_retention::{OriginalDisposalAudit, OriginalDisposalIntent, OriginalDisposalStep};
 pub use reference_reservation::{
     ReferenceReservation, ReferenceReservationIntent, ReferenceSnapshotHandoff,
+};
+pub use storage_inventory::{
+    JournalStorageColumn, JournalStorageColumnValue, JournalStorageInventory, JournalStoredRow,
+    JournalStoredTable,
 };
 pub use tree_coordinator_admission::{
     TreeCoordinatorAdmissionAudit, TreeCoordinatorAdmissionInspection,
@@ -1766,6 +1787,7 @@ pub use tree_final_observation::{TreeFinalObservationInspection, TreeFinalObserv
 pub use tree_native_protocol::{
     TreeNativeProtocolDescriptionAudit, TreeNativeProtocolDescriptionRequest,
 };
+pub use tree_native_storage::{TreeNativePrewriteAudit, TreeNativePrewriteRequest};
 pub use tree_original_pins::{TreeOriginalPinRequest, TreeOriginalPinsAudit};
 pub use tree_owner_description::TreeOwnerDescriptionAudit;
 pub use tree_restore::{TreeRestorePreparation, TreeRestorePreparationIntent};
