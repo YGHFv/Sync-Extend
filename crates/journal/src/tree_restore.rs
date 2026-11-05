@@ -53,6 +53,7 @@ pub struct TreeRestorePreparation {
     pub final_description: Option<crate::TreeFinalDescriptionAudit>,
     pub disposition_description: Option<crate::TreeDispositionDescriptionAudit>,
     pub coordinator_admission: Option<crate::TreeCoordinatorAdmissionAudit>,
+    pub native_protocol_description: Option<crate::TreeNativeProtocolDescriptionAudit>,
 }
 
 struct PreparedPlan {
@@ -289,7 +290,13 @@ impl Journal {
                 WHERE i.transaction_id IS NULL)
              OR EXISTS(SELECT 1 FROM tree_restore_coordinator_admissions a
                 LEFT JOIN tree_restore_owner_intents o USING(transaction_id)
-                WHERE o.transaction_id IS NULL)",
+                WHERE o.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_protocol_descriptions p
+                LEFT JOIN tree_restore_coordinator_admissions a USING(transaction_id)
+                WHERE a.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_protocol_records r
+                LEFT JOIN tree_restore_protocol_descriptions p USING(transaction_id)
+                WHERE p.transaction_id IS NULL)",
             [],
             |r| r.get(0),
         )?;
@@ -535,6 +542,7 @@ impl Journal {
                 final_description: None,
                 disposition_description: None,
                 coordinator_admission: None,
+                native_protocol_description: None,
             };
             preparation.final_description =
                 crate::tree_final_description::audit_final(&self.connection, &preparation, max)?;
@@ -546,6 +554,8 @@ impl Journal {
                 )?;
             preparation.coordinator_admission =
                 crate::tree_coordinator_admission::audit(&self.connection, &preparation, max)?;
+            preparation.native_protocol_description =
+                crate::tree_native_protocol::audit(&self.connection, &preparation, max)?;
             audits.push(preparation);
         }
         if actual_native_bindings as u64 != native_bindings as u64 {
@@ -584,7 +594,9 @@ impl Journal {
              OR EXISTS(SELECT 1 FROM tree_restore_disposition_reservations)
              OR EXISTS(SELECT 1 FROM tree_restore_disposition_intents)
              OR EXISTS(SELECT 1 FROM tree_restore_disposition_records)
-             OR EXISTS(SELECT 1 FROM tree_restore_coordinator_admissions)",
+             OR EXISTS(SELECT 1 FROM tree_restore_coordinator_admissions)
+             OR EXISTS(SELECT 1 FROM tree_restore_protocol_descriptions)
+             OR EXISTS(SELECT 1 FROM tree_restore_protocol_records)",
             [],
             |r| r.get(0),
         )?;

@@ -65,7 +65,7 @@ impl Journal {
                 tx.execute_batch(include_str!("schema.sql"))?;
                 tx.commit()?;
             }
-            1..=30 => {}
+            1..=31 => {}
             _ => return Err(JournalError::Invariant("unsupported schema version")),
         }
         if version < 2 {
@@ -225,6 +225,11 @@ impl Journal {
         if version < 30 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-030.sql"))?;
+            tx.commit()?;
+        }
+        if version < 31 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-031.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -1510,6 +1515,8 @@ fn check_storage_metadata_limit(
             + (SELECT count(*) FROM tree_restore_disposition_intents)
             + (SELECT count(*) FROM tree_restore_disposition_records)
             + (SELECT count(*) FROM tree_restore_coordinator_admissions)
+            + (SELECT count(*) FROM tree_restore_protocol_descriptions)
+            + (SELECT count(*) FROM tree_restore_protocol_records)
             + (SELECT count(*) FROM tree_restore_final_descriptions)
             + (SELECT count(*) FROM tree_restore_retained_descriptions)
             + max((SELECT coalesce(sum(reserved_rows),0) FROM tree_restore_original_reservations),
@@ -1566,6 +1573,10 @@ fn check_storage_metadata_limit(
                 FROM tree_restore_disposition_records)
             + (SELECT coalesce(sum(length(CAST(request AS BLOB))+552),0)
                 FROM tree_restore_coordinator_admissions)
+            + (SELECT coalesce(sum(length(CAST(request AS BLOB))+232),0)
+                FROM tree_restore_protocol_descriptions)
+            + (SELECT coalesce(sum(length(CAST(record AS BLOB))+368),0)
+                FROM tree_restore_protocol_records)
             + (SELECT coalesce(sum(length(CAST(request AS BLOB))+length(CAST(intent AS BLOB))+696),0)
                 FROM tree_restore_final_descriptions)
             + (SELECT coalesce(sum(length(CAST(description AS BLOB))+488),0)
@@ -1722,6 +1733,7 @@ mod tree_disposition_description;
 mod tree_disposition_generations;
 mod tree_execution_records;
 mod tree_final_description;
+mod tree_native_protocol;
 mod tree_original_pins;
 mod tree_owner_description;
 mod tree_restore;
@@ -1741,6 +1753,9 @@ pub use tree_disposition_description::{
 };
 pub use tree_execution_records::TreeExecutionRecordsAudit;
 pub use tree_final_description::{TreeFinalDescriptionAudit, TreeFinalDescriptionRequest};
+pub use tree_native_protocol::{
+    TreeNativeProtocolDescriptionAudit, TreeNativeProtocolDescriptionRequest,
+};
 pub use tree_original_pins::{TreeOriginalPinRequest, TreeOriginalPinsAudit};
 pub use tree_owner_description::TreeOwnerDescriptionAudit;
 pub use tree_restore::{TreeRestorePreparation, TreeRestorePreparationIntent};

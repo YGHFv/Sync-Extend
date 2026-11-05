@@ -49,6 +49,7 @@ pub struct StorageReport {
     pub tree_restore_final_description_metadata_bytes: u64,
     pub tree_restore_disposition_description_metadata_bytes: u64,
     pub tree_restore_irreversible_admission_metadata_bytes: u64,
+    pub tree_restore_native_protocol_description_metadata_bytes: u64,
     pub tree_restore_reserved_worktree_logical_bytes: u64,
     pub tree_restore_input_unique_chunk_bytes: u64,
     pub tree_restore_execution_available: bool,
@@ -218,6 +219,15 @@ impl LocalSpace {
                 n.checked_add(a.metadata_bytes)
                     .ok_or(ReconcileError::ResourceLimit(
                         "tree admission metadata bytes",
+                    ))
+            })?;
+        let tree_restore_native_protocol_description_metadata_bytes = trees
+            .iter()
+            .filter_map(|p| p.native_protocol_description.as_ref())
+            .try_fold(0u64, |n, a| {
+                n.checked_add(a.metadata_bytes)
+                    .ok_or(ReconcileError::ResourceLimit(
+                        "tree protocol metadata bytes",
                     ))
             })?;
         let tree_restore_final_description_metadata_bytes = trees
@@ -415,6 +425,7 @@ impl LocalSpace {
             tree_restore_final_description_metadata_bytes,
             tree_restore_disposition_description_metadata_bytes,
             tree_restore_irreversible_admission_metadata_bytes,
+            tree_restore_native_protocol_description_metadata_bytes,
             tree_restore_reserved_worktree_logical_bytes,
             tree_restore_input_unique_chunk_bytes: refs.bytes(tree_inputs.iter())?,
             tree_restore_execution_available: false,

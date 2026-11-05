@@ -32,6 +32,34 @@ impl<T> TreeRestoreCapture<'_, T> {
 }
 
 impl LocalSpace {
+    pub fn describe_tree_native_protocol(
+        &self,
+        request: &sync_extend_journal::TreeNativeProtocolDescriptionRequest,
+    ) -> Result<sync_extend_journal::TreeNativeProtocolDescriptionAudit> {
+        let (held, audit) = self.journal.with_tree_native_protocol_description(
+            request,
+            self.limits.max_storage_entries,
+            |_| Ok::<_, crate::ReconcileError>(()),
+        )?;
+        drop(held);
+        Ok(audit)
+    }
+
+    pub fn describe_tree_native_protocol_record(
+        &self,
+        request: &sync_extend_journal::TreeNativeProtocolDescriptionRequest,
+        record: &sync_extend_core_model::tree_native_protocol::TreeNativeProtocolRecord,
+    ) -> Result<sync_extend_journal::TreeNativeProtocolDescriptionAudit> {
+        let (held, audit) = self.journal.with_tree_native_protocol_record_description(
+            request,
+            record,
+            self.limits.max_storage_entries,
+            |_| Ok::<_, crate::ReconcileError>(()),
+        )?;
+        drop(held);
+        Ok(audit)
+    }
+
     /// Irreversibly fence cancellation under fresh read guards, never execute a step.
     pub fn admit_tree_restore_coordinator(
         &self,

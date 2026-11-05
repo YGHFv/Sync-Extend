@@ -49,6 +49,11 @@ pub struct TreeCoordinatorAdmissionInspection {
     tree: TreeRestorePlan,
     baseline: Manifest,
     target: Manifest,
+    execution: sync_extend_core_model::tree_restore_execution_intent::TreeExecutionIntentPlan,
+    history: sync_extend_core_model::tree_restore_history::TreeRestoreHistoryPlan,
+    history_input: sync_extend_core_model::tree_restore_history::TreeRestoreHistoryInput,
+    originals: sync_extend_core_model::tree_original_reference::TreeOriginalReferencePlan,
+    owner: sync_extend_core_model::tree_owner_marker::TreeOwnerPlan,
 }
 impl TreeCoordinatorAdmissionInspection {
     pub fn plan(&self) -> &TreeCoordinatorAdmissionPlan {
@@ -69,9 +74,21 @@ impl TreeCoordinatorAdmissionInspection {
     pub fn target(&self) -> &Manifest {
         &self.target
     }
+    pub(crate) fn context(&self) -> TreeCoordinatorContext<'_> {
+        TreeCoordinatorContext {
+            execution: &self.execution,
+            identity: &self.identity,
+            history: &self.history,
+            history_input: &self.history_input,
+            originals: &self.originals,
+            owner: &self.owner,
+            baseline: &self.baseline,
+            target: &self.target,
+        }
+    }
 }
 
-fn project(
+pub(crate) fn project(
     connection: &Connection,
     p: &TreeRestorePreparation,
     request: &TreeCoordinatorAdmissionRequest,
@@ -191,6 +208,11 @@ fn project(
         tree,
         baseline,
         target,
+        execution: execution.plan,
+        history: history_plan,
+        history_input: history.intent.history.clone(),
+        originals: original_plan,
+        owner: owner_plan,
     })
 }
 
