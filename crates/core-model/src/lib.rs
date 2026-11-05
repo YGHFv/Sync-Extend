@@ -22,6 +22,8 @@ pub mod tree_restore;
 pub mod tree_restore_execution_intent;
 pub mod tree_restore_history;
 pub mod tree_restore_identity;
+pub mod tree_storage_capacity;
+pub mod tree_storage_footprint;
 
 pub use ids::*;
 pub use operation::*;
