@@ -96,6 +96,40 @@ pub(super) fn history_owners(
     identityless_snapshots(view, space, max)
 }
 
+pub(super) fn receive_owners(
+    view: &JournalReadView<'_>,
+    space: &SpaceId,
+    max: usize,
+    tables: &[JournalStoredTable],
+) -> Result<Owners> {
+    if view.state("space_id")?.is_some() {
+        if view.state("worktree")?.is_none() {
+            return Err(invalid("receive initialized worktree identity missing"));
+        }
+        return owners(view, space, max);
+    }
+    const IDENTITYLESS_RECEIVE_TABLES: &[&str] = &[
+        "operations",
+        "receive_cursors",
+        "snapshots",
+        "current_manifests",
+        "snapshot_objects",
+        "snapshot_prunings",
+        "read_lease_clock",
+        "read_leases",
+        "read_lease_objects",
+    ];
+    if tables
+        .iter()
+        .any(|table| table.rows != 0 && !IDENTITYLESS_RECEIVE_TABLES.contains(&table.table))
+    {
+        return Err(invalid(
+            "identityless receive inventory contains unsupported owner",
+        ));
+    }
+    identityless_snapshots(view, space, max)
+}
+
 fn identityless_snapshots(
     view: &JournalReadView<'_>,
     space: &SpaceId,

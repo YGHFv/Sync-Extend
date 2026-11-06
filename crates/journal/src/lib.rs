@@ -821,13 +821,17 @@ impl Journal {
 
     // Trusted local transport only. Authentication must precede this API in M2.
     pub fn receive(&mut self, op: &Operation) -> Result<ReceiveOutcome> {
-        self.require_no_tree_restore(&op.payload.space_id, limits::MAX_ENTRIES)?;
         op.validate()?;
         let json = serde_json::to_string(op)?;
         if json.len() > MAX_OPERATION_BYTES || op.payload.origin_seq > i64::MAX as u64 {
             return Err(JournalError::Invariant("operation resource limit"));
         }
-        let tx = self.connection.transaction()?;
+        let bounds = storage_policy::capacity_limits(self.max_storage_entries)?;
+        let tx =
+            Transaction::new_unchecked(&self.connection, rusqlite::TransactionBehavior::Immediate)?;
+        let view = self.read_view();
+        let before = view.audit_receive_capacity(&op.payload.space_id, bounds)?;
+        storage_policy::receive::tree_gate(&before)?;
         if let Some(existing) = tx
             .query_row(
                 "SELECT payload FROM operations WHERE op_id=?1",
@@ -839,8 +843,10 @@ impl Journal {
             if existing != json {
                 return Err(JournalError::Invariant("operation ID collision"));
             }
+            tx.commit()?;
             return Ok(ReceiveOutcome::Duplicate);
         }
+        storage_policy::receive::completion_gate(&before)?;
         let pending: i64 = tx.query_row(
             "SELECT count(*) FROM operations WHERE state='pending'",
             [],
@@ -849,6 +855,7 @@ impl Journal {
         if pending >= MAX_PENDING_OPS as i64 {
             return Err(JournalError::Invariant("pending queue full"));
         }
+        let projection = storage_policy::receive::project(&before, op, &json)?;
         tx.execute(
             "INSERT INTO operations VALUES (?1,?2,?3,?4,?5,'pending')",
             params![
@@ -859,18 +866,16 @@ impl Journal {
                 json
             ],
         )?;
-        promote_pending(&tx)?;
+        promote_pending(&tx, &projection)?;
         let state: String = tx.query_row(
             "SELECT state FROM operations WHERE op_id=?1",
             [op.op_id.as_str()],
             |r| r.get(0),
         )?;
+        let after = view.audit_receive_capacity(&op.payload.space_id, bounds)?;
+        let outcome = projection.receipt(&before, &after, op, &json, &state)?;
         tx.commit()?;
-        Ok(if state == "pending" {
-            ReceiveOutcome::Pending
-        } else {
-            ReceiveOutcome::Received
-        })
+        Ok(outcome)
     }
 
     pub fn commit_local(
@@ -1493,41 +1498,22 @@ fn sql_integer(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| JournalError::Invariant("SQLite integer overflow"))
 }
 
-fn promote_pending(tx: &Transaction<'_>) -> Result<()> {
-    loop {
-        let candidates: Vec<String> = {
-            let mut statement = tx.prepare(
-                "SELECT payload FROM operations WHERE state='pending' ORDER BY origin_seq",
-            )?;
-            let rows = statement.query_map([], |r| r.get(0))?;
-            rows.collect::<std::result::Result<_, _>>()?
-        };
-        let mut progressed = false;
-        for json in candidates {
-            let op: Operation = serde_json::from_str(&json)?;
-            let p = &op.payload;
-            if p.origin_seq != cursor(tx, &p.space_id, &p.origin_device_id)? + 1 {
-                continue;
-            }
-            let mut ready = true;
-            for (device, seq) in &p.causal.0 {
-                if cursor(tx, &p.space_id, device)? < *seq {
-                    ready = false;
-                    break;
-                }
-            }
-            if ready {
-                tx.execute(
-                    "UPDATE operations SET state='received' WHERE op_id=?1",
-                    [op.op_id.as_str()],
-                )?;
-                set_cursor(tx, &p.space_id, &p.origin_device_id, p.origin_seq)?;
-                progressed = true;
-            }
+fn promote_pending(
+    tx: &Transaction<'_>,
+    projection: &storage_policy::receive::Projection,
+) -> Result<()> {
+    // The immutable prewrite plan bounds execution even if triggers undo progress.
+    for step in projection.promotions() {
+        if tx.execute(
+            "UPDATE operations SET state='received' WHERE op_id=?1",
+            [step.operation.as_str()],
+        )? != 1
+        {
+            return Err(JournalError::Invariant(
+                "projected pending operation changed",
+            ));
         }
-        if !progressed {
-            break;
-        }
+        set_cursor(tx, &step.space, &step.device, step.sequence)?;
     }
     Ok(())
 }
