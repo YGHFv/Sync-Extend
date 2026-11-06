@@ -117,6 +117,19 @@ enum Command {
         #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=64))]
         max_rounds: u32,
     },
+    /// Repeat explicitly paired metadata-only cycles; does not apply remote files.
+    RunMetadata {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        address: std::net::SocketAddr,
+        #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=64))]
+        rounds: u32,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=86400))]
+        interval_secs: u64,
+    },
     /// Initialize a local space. Data must be outside the existing worktree.
     Init {
         #[arg(long)]
@@ -828,6 +841,74 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                             Err(error) => eprintln!("syncd: unapproved connection refused: {error}"),
                         }
                     }
+                }
+            }
+        }
+        Command::RunMetadata {
+            data_dir,
+            peer_device,
+            address,
+            rounds,
+            interval_secs,
+        } => {
+            let mut local = open(&data_dir)?;
+            let peer = local.read_transport_peer(&peer_device.parse()?)?;
+            let identity = local.transport_identity()?;
+            print(&serde_json::json!({
+                "role": "metadata_client",
+                "peer_device": peer.device_id,
+                "address": address,
+                "interval_secs": interval_secs,
+                "rounds": rounds,
+                "native_apply_enabled": false,
+                "automatic_file_sync": false,
+            }))?;
+            let shutdown = tokio::signal::ctrl_c();
+            tokio::pin!(shutdown);
+            loop {
+                // A local safety failure stops this worker; only transport
+                // failures retry. A settled native scan never applies remote rows.
+                local = tokio::task::spawn_blocking(move || {
+                    local.scan()?;
+                    Ok::<_, sync_extend_reconcile::ReconcileError>(local)
+                })
+                .await??;
+                let cycle = async {
+                    let mut connection =
+                        sync_extend_transport::Connection::connect(address, &identity, &peer)
+                            .await?;
+                    let receipt = local
+                        .exchange_peer_metadata(&mut connection, rounds)
+                        .await?;
+                    connection.finish().await?;
+                    Ok::<_, Box<dyn std::error::Error>>(receipt)
+                };
+                tokio::select! {
+                    result = &mut shutdown => { result?; break; }
+                    result = cycle => {
+                        match result {
+                            Ok(receipt) => print(&receipt)?,
+                            Err(error) => {
+                                if error.downcast_ref::<sync_extend_reconcile::ReconcileError>().is_some() {
+                                    return Err(error);
+                                }
+                                print(&serde_json::json!({
+                                    "metadata_cycle_complete": false,
+                                    "retry_after_secs": interval_secs,
+                                    "error": error.to_string(),
+                                    "durable_received_prefix_preserved": true,
+                                    "native_apply_enabled": false,
+                                    "automatic_file_sync": false,
+                                }))?;
+                            }
+                        }
+                    }
+                }
+                // Wait after each attempt; slow scans/peers never trigger
+                // catch-up bursts or an unbounded busy-loop on offline devices.
+                tokio::select! {
+                    result = &mut shutdown => { result?; break; }
+                    _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
                 }
             }
         }

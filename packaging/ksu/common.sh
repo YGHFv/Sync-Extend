@@ -29,12 +29,16 @@ load_config() {
     mode=local
     peer_device=
     listen=
+    address=
+    metadata_rounds=16
     seen_enabled=false
     seen_worktree=false
     seen_interval=false
     seen_mode=false
     seen_peer=false
     seen_listen=false
+    seen_address=false
+    seen_rounds=false
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
             ''|'#'*) continue ;;
@@ -62,21 +66,38 @@ load_config() {
                 [ "$seen_listen" = false ] || return 1
                 listen=${line#listen=}
                 seen_listen=true ;;
+            address=*)
+                [ "$seen_address" = false ] || return 1
+                address=${line#address=}
+                seen_address=true ;;
+            metadata_rounds=*)
+                [ "$seen_rounds" = false ] || return 1
+                metadata_rounds=${line#metadata_rounds=}
+                seen_rounds=true ;;
             *) fail 'unknown config key'; return 1 ;;
         esac
     done < "$CONFIG"
     case "$enabled" in true|false) ;; *) return 1 ;; esac
-    case "$mode" in local|files) ;; *) return 1 ;; esac
+    case "$mode" in local|files|metadata-client|metadata-server) ;; *) return 1 ;; esac
+    case "$metadata_rounds" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#metadata_rounds}" -le 2 ] &&
+        [ "$metadata_rounds" -ge 1 ] &&
+        [ "$metadata_rounds" -le 64 ] || return 1
     case "$scan_interval_secs" in ''|*[!0-9]*) return 1 ;; esac
     [ "${#scan_interval_secs}" -le 5 ] &&
         [ "$scan_interval_secs" -ge 1 ] &&
         [ "$scan_interval_secs" -le 86400 ] || return 1
     [ "$enabled" = true ] || return 0
-    if [ "$mode" = files ]; then
+    if [ "$mode" != local ]; then
         [ "${#peer_device}" -eq 64 ] || return 1
         case "$peer_device" in *[!0-9a-f]*) return 1 ;; esac
-        [ -n "$listen" ] || return 1
-        case "$listen" in *[!0-9a-fA-F.:\[\]]*) return 1 ;; esac
+        if [ "$mode" = metadata-client ]; then
+            [ -n "$address" ] && [ "${#address}" -le 128 ] || return 1
+            case "$address" in *[!0-9a-fA-F.:\[\]]*) return 1 ;; esac
+        else
+            [ -n "$listen" ] && [ "${#listen}" -le 128 ] || return 1
+            case "$listen" in *[!0-9a-fA-F.:\[\]]*) return 1 ;; esac
+        fi
     fi
     case "$worktree" in /*) ;; *) fail 'worktree must be absolute'; return 1 ;; esac
 }

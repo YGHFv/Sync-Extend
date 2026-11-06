@@ -2,5 +2,11 @@ enabled=false
 worktree=
 scan_interval_secs=30
 mode=local
+# Metadata modes exchange signed logs only, never apply remote files.
+# mode=metadata-client
+# address=192.168.1.10:17841
+# mode=metadata-server
+# listen=0.0.0.0:17841
+# metadata_rounds=16
 peer_device=
 listen=

@@ -36,4 +36,14 @@ if [ "$mode" = files ]; then
     exec "$MODDIR/bin/syncd" serve-files --data-dir "$DATA" \
         --peer-device "$peer_device" --listen "$listen"
 fi
+if [ "$mode" = metadata-client ]; then
+    exec "$MODDIR/bin/syncd" run-metadata --data-dir "$DATA" \
+        --peer-device "$peer_device" --address "$address" \
+        --rounds "$metadata_rounds" --interval-secs "$scan_interval_secs"
+fi
+if [ "$mode" = metadata-server ]; then
+    exec "$MODDIR/bin/syncd" serve-metadata --data-dir "$DATA" \
+        --peer-device "$peer_device" --listen "$listen" \
+        --max-rounds "$metadata_rounds"
+fi
 exec "$MODDIR/bin/syncd" run --data-dir "$DATA" --scan-interval-secs "$scan_interval_secs"
