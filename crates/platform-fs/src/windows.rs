@@ -22,6 +22,7 @@ use windows_sys::Win32::{
 
 #[path = "directory_create.rs"]
 mod directory_create;
+pub use directory_create::OriginalDirectoryCreation;
 #[path = "owned_file.rs"]
 mod owned_file;
 pub use owned_file::{OriginalFileCreation, OwnedFileCreation};
@@ -177,6 +178,7 @@ impl LockedDirectory {
 /// Application callers must journal intent before rename or empty disposition.
 pub struct LockedDirectoryMutation {
     file: File,
+    original_creation: Option<directory_create::DirectoryCreationLineage>,
 }
 
 impl LockedDirectoryMutation {
@@ -188,7 +190,10 @@ impl LockedDirectoryMutation {
             .open(path)?;
         regular(&file, true)?;
         local_ntfs(&file, path)?;
-        let held = Self { file };
+        let held = Self {
+            file,
+            original_creation: None,
+        };
         held.require_case_insensitive()?;
         Ok(held)
     }

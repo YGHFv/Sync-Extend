@@ -2,12 +2,60 @@ use super::{
     invalid, key, regular, require_case_insensitive, require_ntfs, LockedDirectory,
     LockedDirectoryMutation,
 };
+use crate::FileKey;
 use std::{fs::File, io, mem::size_of, os::windows::io::AsRawHandle, ptr};
 use windows_sys::Win32::{
     Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE},
     Storage::FileSystem::{GetDriveTypeW, DELETE, FILE_SHARE_READ},
     System::WindowsProgramming::DRIVE_FIXED,
 };
+
+pub(super) struct DirectoryCreationLineage {
+    parent: File,
+    original_key: FileKey,
+    original_parent_key: FileKey,
+    created_component: String,
+}
+
+/// Borrowed lineage from an actual native directory CREATE. Reopened mutation
+/// guards cannot mint this proof. It does not freeze membership or grant durable
+/// Journal ownership, and the original component is historical after rename.
+pub struct OriginalDirectoryCreation<'a> {
+    creator: &'a LockedDirectoryMutation,
+    lineage: &'a DirectoryCreationLineage,
+}
+
+impl OriginalDirectoryCreation<'_> {
+    pub fn key(&self) -> io::Result<FileKey> {
+        self.verify()?;
+        Ok(self.lineage.original_key)
+    }
+
+    pub fn parent_key(&self) -> io::Result<FileKey> {
+        self.verify()?;
+        Ok(self.lineage.original_parent_key)
+    }
+
+    /// The CREATE component is not evidence of the current pathname occupant.
+    pub fn created_component(&self) -> &str {
+        &self.lineage.created_component
+    }
+
+    pub fn verify(&self) -> io::Result<()> {
+        let lineage = self.lineage;
+        regular(&self.creator.file, true)?;
+        regular(&lineage.parent, true)?;
+        require_case_insensitive(&self.creator.file)?;
+        require_case_insensitive(&lineage.parent)?;
+        if key(&self.creator.file)? != lineage.original_key
+            || key(&lineage.parent)? != lineage.original_parent_key
+        {
+            return Err(invalid("original directory creator lineage changed"));
+        }
+        Ok(())
+    }
+}
+
 impl LockedDirectory {
     /// Create a new child through this exact retained parent handle.
     /// Caller must durably journal intent first and retain all root ancestors.
@@ -18,6 +66,21 @@ impl LockedDirectory {
 }
 
 impl LockedDirectoryMutation {
+    /// Only an actual CREATE retains original lineage and the immediate parent.
+    /// This is not recovery/adoption authority or an all-ancestors guard.
+    pub fn original_creation(&self) -> io::Result<OriginalDirectoryCreation<'_>> {
+        let lineage = self
+            .original_creation
+            .as_ref()
+            .ok_or_else(|| invalid("reopened directory has no original creator lineage"))?;
+        let proof = OriginalDirectoryCreation {
+            creator: self,
+            lineage,
+        };
+        proof.verify()?;
+        Ok(proof)
+    }
+
     /// A newly created parent's original handle can create its own children.
     /// Failures preserve possibly created orphans; no pathname cleanup/adoption.
     /// Publish parents before opening descendants that may block parent rename.
@@ -67,9 +130,20 @@ pub(super) enum NewChildKind {
 }
 
 fn create_new_directory_child(file: &File, name: &str) -> io::Result<LockedDirectoryMutation> {
-    Ok(LockedDirectoryMutation {
-        file: create_new_child(file, name, NewChildKind::Directory)?,
-    })
+    let original_parent_key = key(file)?;
+    let created = create_new_child(file, name, NewChildKind::Directory)?;
+    let original_key = key(&created)?;
+    let held = LockedDirectoryMutation {
+        file: created,
+        original_creation: Some(DirectoryCreationLineage {
+            parent: file.try_clone()?,
+            original_key,
+            original_parent_key,
+            created_component: name.into(),
+        }),
+    };
+    held.original_creation()?.verify()?;
+    Ok(held)
 }
 
 pub(super) fn create_new_child(file: &File, name: &str, kind: NewChildKind) -> io::Result<File> {
