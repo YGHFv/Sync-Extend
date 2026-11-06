@@ -13,6 +13,8 @@ mod gc_quarantine;
 mod guarded_mutation;
 mod identity;
 mod join;
+mod metadata_cycle;
+pub use metadata_cycle::PeerMetadataCycle;
 mod peer_operations;
 pub use peer_operations::PeerOperationPull;
 mod peer_pull;

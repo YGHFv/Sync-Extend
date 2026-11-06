@@ -95,6 +95,28 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Exchange bounded signed own-origin metadata in both directions; no file apply.
+    ExchangeMetadata {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        address: std::net::SocketAddr,
+        #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=64))]
+        rounds: u32,
+    },
+    /// Serve explicitly paired two-way metadata cycles; no automatic file sync.
+    ServeMetadata {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+        #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=64))]
+        max_rounds: u32,
+    },
     /// Initialize a local space. Data must be outside the existing worktree.
     Init {
         #[arg(long)]
@@ -748,6 +770,66 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::CausalFrontiers { data_dir } => {
             print(&open(&data_dir)?.causal_frontiers()?)?;
+        }
+        Command::ExchangeMetadata {
+            data_dir,
+            peer_device,
+            address,
+            rounds,
+        } => {
+            let mut local = open(&data_dir)?;
+            let peer = local.read_transport_peer(&peer_device.parse()?)?;
+            let identity = local.transport_identity()?;
+            local.scan()?;
+            let mut connection =
+                sync_extend_transport::Connection::connect(address, &identity, &peer).await?;
+            let result = local
+                .exchange_peer_metadata(&mut connection, rounds)
+                .await?;
+            connection.finish().await?;
+            print(&result)?;
+        }
+        Command::ServeMetadata {
+            data_dir,
+            peer_device,
+            listen,
+            max_rounds,
+        } => {
+            let mut local = open(&data_dir)?;
+            let device = peer_device.parse()?;
+            let peer = local.read_transport_peer(&device)?;
+            let identity = local.transport_identity()?;
+            let listener = sync_extend_transport::Listener::bind(listen, &identity, &peer)?;
+            print(&serde_json::json!({
+                "listening": listener.local_address()?,
+                "paired_device": device,
+                "max_rounds": max_rounds,
+                "own_origin_metadata_only": true,
+                "native_apply_enabled": false,
+                "automatic_file_sync": false,
+            }))?;
+            loop {
+                tokio::select! {
+                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    result = listener.accept(&identity, &peer) => {
+                        match result {
+                            Ok(mut connection) => {
+                                let result = async {
+                                    // Stable local scans author only native local changes.
+                                    local.scan()?;
+                                    local.serve_peer_metadata_cycle(&mut connection, max_rounds).await
+                                }.await;
+                                if let Err(error) = result {
+                                    eprintln!("syncd: metadata cycle refused: {error}");
+                                } else if let Err(error) = connection.finish().await {
+                                    eprintln!("syncd: metadata cycle finish failed: {error}");
+                                }
+                            }
+                            Err(error) => eprintln!("syncd: unapproved connection refused: {error}"),
+                        }
+                    }
+                }
+            }
         }
         Command::Init { data_dir, root } => {
             let local = LocalSpace::initialize_with_limits(&data_dir, &root, limits.clone())?;

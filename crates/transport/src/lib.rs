@@ -1,5 +1,6 @@
 mod connection;
 mod identity;
+mod metadata_cycle;
 mod operation_batch;
 mod signed;
 mod tls;
@@ -7,6 +8,7 @@ mod wire;
 
 pub use connection::{Connection, Listener, MAX_BLOCK_BYTES, MAX_CONTROL_BYTES};
 pub use identity::{PeerIdentity, TransportIdentity};
+pub use metadata_cycle::{MetadataCycleHello, MAX_METADATA_CYCLE_ROUNDS};
 pub use operation_batch::{
     OperationBatchRequest, OperationReceiveReceipt, SignedOperationBatch,
     SignedOperationReceiveReceipt,
