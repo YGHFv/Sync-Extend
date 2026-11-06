@@ -1,6 +1,6 @@
 id=sync_extend
-name=SyncExtend Local Core Alpha
+name=SyncExtend Paired File Alpha
 version=0.1.0
 versionCode=1
 author=YGHFv
-description=Arm64 local scan and history daemon. Explicit configuration required; network sync is not available in this stage.
+description=Arm64 local history and explicitly paired QUIC file serving. Configuration required; automatic multiway sync is not available.

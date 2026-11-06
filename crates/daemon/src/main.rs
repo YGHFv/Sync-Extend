@@ -10,7 +10,7 @@ use sync_extend_reconcile::LocalSpace;
 #[command(
     name = "syncd",
     version,
-    about = "SyncExtend offline local core prototype; network and WebDAV are not yet available"
+    about = "SyncExtend local alpha with explicitly paired QUIC file copy; automatic sync and WebDAV are not available"
 )]
 struct Cli {
     /// Apply a local limits JSON file to this invocation (not a retention/GC policy).
@@ -22,6 +22,49 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Join an explicitly approved space; creates a new independent local identity.
+    Join {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        space: String,
+    },
+    /// Export the public pairing identity only; never export device secrets.
+    PeerIdentity {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Explicitly approve a peer identity after out-of-band public-key comparison.
+    Pair {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer: PathBuf,
+        #[arg(long)]
+        expected_public_key: String,
+    },
+    /// Serve retained files to one explicitly paired peer over mutual TLS1.3 QUIC.
+    ServeFiles {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+    },
+    /// Pull one file as a conflict-preserving local copy; not whole-space convergence.
+    PullFile {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        address: std::net::SocketAddr,
+        #[arg(long)]
+        path: String,
+    },
     /// Initialize a local space. Data must be outside the existing worktree.
     Init {
         #[arg(long)]
@@ -460,12 +503,38 @@ fn print(value: &impl serde::Serialize) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match execute(Cli::parse()).await {
-        Ok(()) => ExitCode::SUCCESS,
+fn main() -> ExitCode {
+    // Bounded scan/protocol futures exceed the default Windows main-thread stack
+    // in debug builds. Use the same explicit bound on both delivery platforms.
+    let runner = std::thread::Builder::new()
+        .name("syncd-main".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(run_cli);
+    match runner {
+        Ok(runner) => runner.join().unwrap_or(ExitCode::FAILURE),
         Err(error) => {
-            eprintln!("syncd: {error}");
+            eprintln!("syncd: runtime thread failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[inline(never)]
+fn run_cli() -> ExitCode {
+    let cli = Cli::parse();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build();
+    match runtime {
+        Ok(runtime) => match runtime.block_on(Box::pin(execute(cli))) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("syncd: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("syncd: runtime failed: {error}");
             ExitCode::FAILURE
         }
     }
@@ -486,6 +555,84 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     limits.validate()?;
     let open = |data: &std::path::Path| LocalSpace::open(data)?.with_limits(limits.clone());
     match cli.command {
+        Command::Join {
+            data_dir,
+            root,
+            space,
+        } => {
+            let local = LocalSpace::join_space(&data_dir, &root, &space.parse()?, limits.clone())?;
+            print(&local.status()?)?;
+        }
+        Command::PeerIdentity { data_dir } => {
+            print(open(&data_dir)?.transport_identity()?.peer_identity())?;
+        }
+        Command::Pair {
+            data_dir,
+            peer,
+            expected_public_key,
+        } => {
+            let file = std::fs::File::open(peer)?;
+            let mut bytes = Vec::new();
+            file.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > 64 * 1024 {
+                return Err("peer identity exceeds 64 KiB".into());
+            }
+            let peer: sync_extend_transport::PeerIdentity = serde_json::from_slice(&bytes)?;
+            open(&data_dir)?.approve_transport_peer(&peer, &expected_public_key.parse()?)?;
+            print(
+                &serde_json::json!({"paired_device": peer.device_id, "space_id": peer.space_id}),
+            )?;
+        }
+        Command::ServeFiles {
+            data_dir,
+            peer_device,
+            listen,
+        } => {
+            let mut local = open(&data_dir)?;
+            let device = peer_device.parse()?;
+            let peer = local.read_transport_peer(&device)?;
+            let identity = local.transport_identity()?;
+            let listener = sync_extend_transport::Listener::bind(listen, &identity, &peer)?;
+            print(&serde_json::json!({
+                "listening": listener.local_address()?,
+                "paired_device": device,
+                "whole_space_convergence": false
+            }))?;
+            loop {
+                tokio::select! {
+                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    result = listener.accept(&identity, &peer) => {
+                        match result {
+                            Ok(mut connection) => {
+                                if let Err(error) = local.serve_peer_file(&mut connection).await {
+                                    eprintln!("syncd: file transfer refused: {error}");
+                                } else if let Err(error) = connection.finish().await {
+                                    eprintln!("syncd: file transfer finish failed: {error}");
+                                }
+                            }
+                            Err(error) => eprintln!("syncd: unapproved connection refused: {error}"),
+                        }
+                    }
+                }
+            }
+        }
+        Command::PullFile {
+            data_dir,
+            peer_device,
+            address,
+            path,
+        } => {
+            let mut local = open(&data_dir)?;
+            let peer = local.read_transport_peer(&peer_device.parse()?)?;
+            let identity = local.transport_identity()?;
+            let mut connection =
+                sync_extend_transport::Connection::connect(address, &identity, &peer).await?;
+            let result = local
+                .pull_peer_file(&mut connection, PortablePath::new(path)?)
+                .await?;
+            connection.finish().await?;
+            print(&result)?;
+        }
         Command::Init { data_dir, root } => {
             let local = LocalSpace::initialize_with_limits(&data_dir, &root, limits.clone())?;
             print(&local.status()?)?;

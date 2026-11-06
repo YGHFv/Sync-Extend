@@ -8,6 +8,11 @@ use std::{
 use sync_extend_core_model::DeviceId;
 
 pub fn load_or_create(path: &Path, create: bool) -> Result<DeviceId> {
+    let key = load_signing_key(path, create)?;
+    Ok(DeviceId::from_public_key(key.verifying_key().as_bytes()))
+}
+
+pub(crate) fn load_signing_key(path: &Path, create: bool) -> Result<SigningKey> {
     let secret = if path.try_exists()? {
         let metadata = fs::symlink_metadata(path)?;
         if !metadata.is_file()
@@ -54,8 +59,7 @@ pub fn load_or_create(path: &Path, create: bool) -> Result<DeviceId> {
         )?;
         secret
     };
-    let key = SigningKey::from_bytes(&secret);
-    Ok(DeviceId::from_public_key(key.verifying_key().as_bytes()))
+    Ok(SigningKey::from_bytes(&secret))
 }
 
 #[cfg(windows)]

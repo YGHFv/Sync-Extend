@@ -31,4 +31,9 @@ fi
 # The Rust daemon holds the data/worktree locks for its lifetime. A duplicate
 # service invocation fails there; no stale shell PID file can kill another process.
 # No unattended retry on a safety error. Reconfigure and reboot to retry.
+if [ "$mode" = files ]; then
+    # Pairing must already exist in the private data directory; no implicit trust.
+    exec "$MODDIR/bin/syncd" serve-files --data-dir "$DATA" \
+        --peer-device "$peer_device" --listen "$listen"
+fi
 exec "$MODDIR/bin/syncd" run --data-dir "$DATA" --scan-interval-secs "$scan_interval_secs"

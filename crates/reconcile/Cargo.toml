@@ -12,6 +12,7 @@ fault-injection = []
 sync-extend-core-model = { path = "../core-model" }
 sync-extend-cas = { path = "../cas" }
 sync-extend-journal = { path = "../journal" }
+sync-extend-transport = { path = "../transport" }
 blake3.workspace = true
 ed25519-dalek.workspace = true
 fs2.workspace = true

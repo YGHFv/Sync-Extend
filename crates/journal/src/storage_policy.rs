@@ -2,6 +2,7 @@ use crate::{Journal, JournalCapacityLimits, JournalError, Result, TreeRestoreInv
 use sync_extend_core_model::limits::MAX_ENTRIES;
 
 pub(crate) mod history;
+pub(crate) mod local_commit;
 pub(crate) mod receive;
 
 pub(crate) fn validate(max_entries: usize) -> Result<()> {

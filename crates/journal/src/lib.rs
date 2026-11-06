@@ -24,6 +24,7 @@ pub type Result<T> = std::result::Result<T, JournalError>;
 
 mod read_view;
 use read_view::JournalReadView;
+mod publication_lookup;
 mod storage_policy;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -885,13 +886,7 @@ impl Journal {
         operations: &[Operation],
         timestamp: u64,
     ) -> Result<SnapshotId> {
-        self.commit_local_inner(
-            expected_root,
-            manifest,
-            operations,
-            timestamp,
-            Completion::None,
-        )
+        self.commit_local_admitted(expected_root, manifest, operations, timestamp, None)
     }
 
     /// Commit optional local observations atomically with the exact visible tree.
@@ -905,12 +900,12 @@ impl Journal {
         observations: &persisted_rename::RenameObservationMap,
         max_entries: usize,
     ) -> Result<SnapshotId> {
-        self.commit_local_inner(
+        self.commit_local_admitted(
             expected_root,
             manifest,
             operations,
             timestamp,
-            Completion::ObservedScan(observations, max_entries),
+            Some((observations, max_entries)),
         )
     }
 
@@ -1087,6 +1082,121 @@ impl Journal {
         )
     }
 
+    fn commit_local_admitted(
+        &mut self,
+        expected_root: Option<&SnapshotId>,
+        manifest: &Manifest,
+        operations: &[Operation],
+        timestamp: u64,
+        observations: Option<(&persisted_rename::RenameObservationMap, usize)>,
+    ) -> Result<SnapshotId> {
+        sql_integer(timestamp)?;
+        manifest.validate()?;
+        if operations.len() > limits::MAX_ENTRIES {
+            return Err(JournalError::Invariant(
+                "local commit operation count limit",
+            ));
+        }
+        let bounds = match observations {
+            Some((_, max)) => self.writer_capacity_limits(max)?,
+            None => storage_policy::capacity_limits(self.max_storage_entries)?,
+        };
+        let mut chunk_visits = 0usize;
+        for content in manifest
+            .entries
+            .values()
+            .filter_map(|entry| entry.content.as_ref())
+        {
+            chunk_visits = chunk_visits
+                .checked_add(content.chunks.len())
+                .ok_or(JournalError::Invariant("local commit chunk count overflow"))?;
+            if chunk_visits > limits::MAX_CHUNKS {
+                return Err(JournalError::Invariant("local commit chunk count limit"));
+            }
+        }
+        let snapshot_json = serde_json::to_string(manifest)?;
+        if snapshot_json.len() > MAX_OPERATION_BYTES {
+            return Err(JournalError::Invariant("local commit snapshot byte limit"));
+        }
+        let mut operation_json = Vec::new();
+        let mut input_bytes = snapshot_json.len() as u64;
+        for op in operations {
+            op.validate()?;
+            sql_integer(op.payload.origin_seq)?;
+            let json = serde_json::to_string(op)?;
+            if json.len() > MAX_OPERATION_BYTES {
+                return Err(JournalError::Invariant("local commit operation byte limit"));
+            }
+            input_bytes = input_bytes
+                .checked_add(json.len() as u64)
+                .ok_or(JournalError::Invariant("local commit input byte overflow"))?;
+            if input_bytes > limits::MAX_ENTRIES as u64 * 1024 {
+                return Err(JournalError::Invariant(
+                    "local commit aggregate input byte limit",
+                ));
+            }
+            operation_json.push(json);
+        }
+        let observation_bytes = observations
+            .map(|(map, max)| {
+                map.validate(manifest, max)?;
+                rename_observation::serialize_observation(map)
+            })
+            .transpose()?;
+        let observation_json = observation_bytes
+            .as_deref()
+            .map(std::str::from_utf8)
+            .transpose()
+            .map_err(|_| JournalError::Invariant("rename observation serialization"))?;
+        let tx =
+            Transaction::new_unchecked(&self.connection, rusqlite::TransactionBehavior::Immediate)?;
+        let view = self.read_view();
+        let before = view.audit_local_commit_capacity(&manifest.space_id, bounds)?;
+        if observations.is_some() && view.state("worktree")?.is_none() {
+            return Err(JournalError::Invariant(
+                "observed commit requires initialized worktree",
+            ));
+        }
+        let projection = storage_policy::local_commit::project(
+            &before,
+            storage_policy::local_commit::Input {
+                expected_root,
+                manifest,
+                operations,
+                operation_json: &operation_json,
+                snapshot_json: &snapshot_json,
+                timestamp,
+                observation_json,
+            },
+        )?;
+        let root = self.commit_history_sql(
+            &tx,
+            expected_root,
+            manifest,
+            operations,
+            timestamp,
+            Completion::None,
+        )?;
+        if let Some((map, max)) = observations {
+            let json = observation_json
+                .ok_or(JournalError::Invariant("local observation bytes missing"))?;
+            tx.execute(
+                "INSERT INTO rename_observations VALUES (?1,?2,?3,?4)",
+                params![
+                    map.scope.space_id.as_str(),
+                    root.as_str(),
+                    json,
+                    ContentId::hash(json.as_bytes()).as_str()
+                ],
+            )?;
+            rename_observation::audit_observation(&tx, &manifest.space_id, max)?;
+        }
+        let after = view.audit_local_commit_capacity(&manifest.space_id, bounds)?;
+        projection.receipt(&after)?;
+        tx.commit()?;
+        Ok(root)
+    }
+
     fn commit_local_inner(
         &mut self,
         expected_root: Option<&SnapshotId>,
@@ -1095,26 +1205,36 @@ impl Journal {
         timestamp: u64,
         completion: Completion<'_>,
     ) -> Result<SnapshotId> {
+        // Mandatory after-native completions retain their separate legacy contract.
         self.require_no_tree_restore(&manifest.space_id, limits::MAX_ENTRIES)?;
         sql_integer(timestamp)?;
         manifest.validate()?;
-        let root = manifest.root()?;
-        self.require_unpruned_root(&root)?;
-        let observations = match completion {
-            Completion::ObservedScan(map, max) => {
-                map.validate(manifest, max)?;
-                Some((map, max, rename_observation::serialize_observation(map)?))
-            }
-            _ => None,
-        };
-        let tx = self.connection.transaction()?;
-        rename_observation::audit_observation(
+        self.require_unpruned_root(&manifest.root()?)?;
+        let tx =
+            Transaction::new_unchecked(&self.connection, rusqlite::TransactionBehavior::Deferred)?;
+        let root = self.commit_history_sql(
             &tx,
-            &manifest.space_id,
-            observations
-                .as_ref()
-                .map_or(limits::MAX_ENTRIES, |(_, max, _)| *max),
+            expected_root,
+            manifest,
+            operations,
+            timestamp,
+            completion,
         )?;
+        tx.commit()?;
+        Ok(root)
+    }
+
+    fn commit_history_sql(
+        &self,
+        tx: &Transaction<'_>,
+        expected_root: Option<&SnapshotId>,
+        manifest: &Manifest,
+        operations: &[Operation],
+        timestamp: u64,
+        completion: Completion<'_>,
+    ) -> Result<SnapshotId> {
+        let root = manifest.root()?;
+        rename_observation::audit_observation(tx, &manifest.space_id, limits::MAX_ENTRIES)?;
         let mutation_active: Option<String> = tx.query_row(
             "SELECT transaction_id FROM mutations WHERE space_id=?1 AND state IN ('prepared','executing','quarantined','moved','replaced')",
             [manifest.space_id.as_str()], |r| r.get(0),
@@ -1167,12 +1287,12 @@ impl Journal {
             let p = &op.payload;
             if p.space_id != manifest.space_id
                 || p.causal != expected_vector
-                || p.origin_seq != cursor(&tx, &p.space_id, &p.origin_device_id)? + 1
+                || p.origin_seq != cursor(tx, &p.space_id, &p.origin_device_id)? + 1
             {
                 return Err(JournalError::Invariant("local sequence discontinuity"));
             }
             for (device, seq) in &p.causal.0 {
-                if cursor(&tx, &p.space_id, device)? < *seq {
+                if cursor(tx, &p.space_id, device)? < *seq {
                     return Err(JournalError::Invariant("missing causal dependency"));
                 }
             }
@@ -1186,7 +1306,7 @@ impl Journal {
                     serde_json::to_string(op)?
                 ],
             )?;
-            set_cursor(&tx, &p.space_id, &p.origin_device_id, p.origin_seq)?;
+            set_cursor(tx, &p.space_id, &p.origin_device_id, p.origin_seq)?;
             expected_vector.observe(p.origin_device_id.clone(), p.origin_seq);
         }
         if manifest.version_vector != expected_vector {
@@ -1226,7 +1346,7 @@ impl Journal {
              ON CONFLICT(space_id) DO UPDATE SET snapshot_id=excluded.snapshot_id",
             params![manifest.space_id.as_str(), root.as_str()],
         )?;
-        pin_snapshot(&tx, root.as_str(), manifest)?;
+        pin_snapshot(tx, root.as_str(), manifest)?;
         if let Some(id) = publication {
             if tx.execute(
                 "UPDATE publications SET state='committed',committed_snapshot=?1
@@ -1255,22 +1375,6 @@ impl Journal {
                 [id.as_str()],
             )?;
         }
-        if let Some((map, max, bytes)) = observations {
-            let json = std::str::from_utf8(&bytes)
-                .map_err(|_| JournalError::Invariant("rename observation serialization"))?;
-            check_storage_metadata_limit(&tx, max, 1, bytes.len() as u64)?;
-            tx.execute(
-                "INSERT INTO rename_observations VALUES (?1,?2,?3,?4)",
-                params![
-                    map.scope.space_id.as_str(),
-                    root.as_str(),
-                    json,
-                    ContentId::hash(&bytes).as_str(),
-                ],
-            )?;
-            rename_observation::audit_observation(&tx, &manifest.space_id, max)?;
-        }
-        tx.commit()?;
         Ok(root)
     }
 
@@ -1292,7 +1396,6 @@ impl Journal {
 #[derive(Clone, Copy)]
 enum Completion<'a> {
     None,
-    ObservedScan(&'a persisted_rename::RenameObservationMap, usize),
     Publication(&'a EntryId),
     Mutation(&'a EntryId),
 }

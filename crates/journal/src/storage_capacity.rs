@@ -19,6 +19,7 @@ enum OwnerAudit {
     LeaseTransaction,
     HistoryTransaction,
     ReceiveTransaction,
+    LocalCommitTransaction,
 }
 
 pub(crate) struct CapacitySnapshot {
@@ -245,6 +246,19 @@ impl crate::JournalReadView<'_> {
         )
     }
 
+    pub(crate) fn audit_local_commit_capacity(
+        &self,
+        space: &SpaceId,
+        bounds: JournalCapacityLimits,
+    ) -> Result<CapacitySnapshot> {
+        self.capacity_snapshot(
+            space,
+            sync_extend_core_model::limits::MAX_ENTRIES,
+            bounds,
+            OwnerAudit::LocalCommitTransaction,
+        )
+    }
+
     fn capacity_snapshot(
         &self,
         space: &SpaceId,
@@ -277,6 +291,9 @@ impl crate::JournalReadView<'_> {
             OwnerAudit::LeaseTransaction => audit::lease_owners(self, space, max, &tables)?,
             OwnerAudit::HistoryTransaction => audit::history_owners(self, space, max, &tables)?,
             OwnerAudit::ReceiveTransaction => audit::receive_owners(self, space, max, &tables)?,
+            OwnerAudit::LocalCommitTransaction => {
+                audit::local_commit_owners(self, space, max, &tables)?
+            }
         };
         let mut rows = Vec::new();
         let mut actual = TreeStorageCharge::default();

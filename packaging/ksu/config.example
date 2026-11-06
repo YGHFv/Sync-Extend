@@ -1,3 +1,6 @@
 enabled=false
 worktree=
 scan_interval_secs=30
+mode=local
+peer_device=
+listen=

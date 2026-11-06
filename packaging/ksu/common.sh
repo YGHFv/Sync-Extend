@@ -26,9 +26,15 @@ load_config() {
     enabled=
     worktree=
     scan_interval_secs=
+    mode=local
+    peer_device=
+    listen=
     seen_enabled=false
     seen_worktree=false
     seen_interval=false
+    seen_mode=false
+    seen_peer=false
+    seen_listen=false
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
             ''|'#'*) continue ;;
@@ -44,15 +50,34 @@ load_config() {
                 [ "$seen_interval" = false ] || return 1
                 scan_interval_secs=${line#scan_interval_secs=}
                 seen_interval=true ;;
+            mode=*)
+                [ "$seen_mode" = false ] || return 1
+                mode=${line#mode=}
+                seen_mode=true ;;
+            peer_device=*)
+                [ "$seen_peer" = false ] || return 1
+                peer_device=${line#peer_device=}
+                seen_peer=true ;;
+            listen=*)
+                [ "$seen_listen" = false ] || return 1
+                listen=${line#listen=}
+                seen_listen=true ;;
             *) fail 'unknown config key'; return 1 ;;
         esac
     done < "$CONFIG"
     case "$enabled" in true|false) ;; *) return 1 ;; esac
+    case "$mode" in local|files) ;; *) return 1 ;; esac
     case "$scan_interval_secs" in ''|*[!0-9]*) return 1 ;; esac
     [ "${#scan_interval_secs}" -le 5 ] &&
         [ "$scan_interval_secs" -ge 1 ] &&
         [ "$scan_interval_secs" -le 86400 ] || return 1
     [ "$enabled" = true ] || return 0
+    if [ "$mode" = files ]; then
+        [ "${#peer_device}" -eq 64 ] || return 1
+        case "$peer_device" in *[!0-9a-f]*) return 1 ;; esac
+        [ -n "$listen" ] || return 1
+        case "$listen" in *[!0-9a-fA-F.:\[\]]*) return 1 ;; esac
+    fi
     case "$worktree" in /*) ;; *) fail 'worktree must be absolute'; return 1 ;; esac
 }
 

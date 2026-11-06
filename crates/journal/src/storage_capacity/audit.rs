@@ -130,6 +130,53 @@ pub(super) fn receive_owners(
     identityless_snapshots(view, space, max)
 }
 
+pub(super) fn local_commit_owners(
+    view: &JournalReadView<'_>,
+    space: &SpaceId,
+    max: usize,
+    tables: &[JournalStoredTable],
+) -> Result<Owners> {
+    if view.state("space_id")?.is_some() && view.state("worktree")?.is_none() {
+        return Err(invalid(
+            "local commit initialized worktree identity missing",
+        ));
+    }
+    if view.state("space_id")?.is_some() {
+        return owners(view, space, max);
+    }
+    const IDENTITYLESS_LOCAL_COMMIT_TABLES: &[&str] = &[
+        "operations",
+        "receive_cursors",
+        "snapshots",
+        "current_manifests",
+        "snapshot_objects",
+        "snapshot_prunings",
+        "read_lease_clock",
+        "read_leases",
+        "read_lease_objects",
+        "mutations",
+    ];
+    if tables
+        .iter()
+        .any(|table| table.rows != 0 && !IDENTITYLESS_LOCAL_COMMIT_TABLES.contains(&table.table))
+    {
+        return Err(invalid(
+            "identityless local commit contains unsupported owner",
+        ));
+    }
+    let mut audited = identityless_snapshots(view, space, max)?;
+    audited.mutations = view.mutations(space)?;
+    for mutation in &audited.mutations {
+        if mutation.state != crate::MutationState::Cancelled {
+            return Err(invalid(
+                "identityless local commit requires cancelled mutations",
+            ));
+        }
+        view.verify_mutation_references(&mutation.intent.transaction_id)?;
+    }
+    Ok(audited)
+}
+
 fn identityless_snapshots(
     view: &JournalReadView<'_>,
     space: &SpaceId,

@@ -12,6 +12,13 @@ mod gc_quarantine;
 #[cfg(windows)]
 mod guarded_mutation;
 mod identity;
+mod join;
+mod peer_pull;
+mod peer_transfer;
+mod remote_file;
+mod transport_identity;
+pub use peer_pull::PeerFilePull;
+pub use remote_file::{RemoteFileChunkImport, RemoteFileMaterialization, RemoteFilePreparation};
 mod move_file;
 mod mutation;
 mod original_retention;

@@ -114,6 +114,23 @@ impl LocalSpace {
         content: FileManifest,
         source: Option<SnapshotId>,
     ) -> Result<EntryId> {
+        self.begin_content_with_ids(
+            path,
+            content,
+            source,
+            EntryId::random()?,
+            EntryId::random()?,
+        )
+    }
+
+    pub(crate) fn begin_content_with_ids(
+        &mut self,
+        path: PortablePath,
+        content: FileManifest,
+        source: Option<SnapshotId>,
+        id: EntryId,
+        entry_id: EntryId,
+    ) -> Result<EntryId> {
         self.verify_root()?;
         self.check_publication_limits(&content)?;
         self.parent_for(&path)?;
@@ -126,7 +143,6 @@ impl LocalSpace {
             .values()
             .find(|entry| entry.path == path)
             .cloned();
-        let id = EntryId::random()?;
         let target_path = if requested_baseline.is_some() || self.occupied(&path)? {
             self.conflict_path(&path, &id, 0)?
         } else {
@@ -138,7 +154,7 @@ impl LocalSpace {
             format_version: FORMAT_VERSION,
             transaction_id: id.clone(),
             space_id: self.space_id.clone(),
-            entry_id: EntryId::random()?,
+            entry_id,
             requested_path: path,
             target_path,
             content,
@@ -185,7 +201,7 @@ impl LocalSpace {
         Ok(results)
     }
 
-    fn publication_result(&self, id: &EntryId) -> Result<PublishResult> {
+    pub(crate) fn publication_result(&self, id: &EntryId) -> Result<PublishResult> {
         let publication = self.journal.publication(id)?;
         Ok(PublishResult {
             transaction_id: id.clone(),
@@ -200,7 +216,7 @@ impl LocalSpace {
         })
     }
 
-    fn recover_transaction(&mut self, id: &EntryId) -> Result<()> {
+    pub(crate) fn recover_transaction(&mut self, id: &EntryId) -> Result<()> {
         loop {
             self.verify_root()?;
             let publication = self.journal.publication(id)?;

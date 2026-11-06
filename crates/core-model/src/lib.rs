@@ -7,6 +7,7 @@ pub mod original_retention;
 pub mod path;
 pub mod persisted_rename;
 pub mod reference_owner;
+pub mod remote_file;
 pub mod tree_coordinator_lifecycle;
 pub mod tree_execution_records;
 pub mod tree_final_description;
