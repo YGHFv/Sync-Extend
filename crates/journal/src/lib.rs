@@ -24,6 +24,7 @@ pub type Result<T> = std::result::Result<T, JournalError>;
 
 mod read_view;
 use read_view::JournalReadView;
+mod storage_policy;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiveOutcome {
@@ -35,10 +36,17 @@ pub enum ReceiveOutcome {
 pub struct Journal {
     connection: Connection,
     database_path: std::path::PathBuf,
+    max_storage_entries: usize,
 }
 
 impl Journal {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_storage_limit(path, limits::MAX_ENTRIES)
+    }
+
+    /// Configures converted writers before opening or migrating the database.
+    pub fn open_with_storage_limit(path: &Path, max_storage_entries: usize) -> Result<Self> {
+        storage_policy::validate(max_storage_entries)?;
         for ancestor in path.ancestors() {
             match std::fs::symlink_metadata(ancestor) {
                 Ok(metadata) => {
@@ -249,6 +257,7 @@ impl Journal {
         Ok(Self {
             connection,
             database_path: std::fs::canonicalize(path)?,
+            max_storage_entries,
         })
     }
 

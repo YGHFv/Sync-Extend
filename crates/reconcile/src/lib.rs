@@ -202,7 +202,10 @@ impl LocalSpace {
         let data_dir = fs::canonicalize(data_dir)?;
         validate_roots(&data_dir, &worktree)?;
         let lock = acquire_lock(&data_dir)?;
-        let mut journal = Journal::open(&data_dir.join("journal.sqlite"))?;
+        let mut journal = Journal::open_with_storage_limit(
+            &data_dir.join("journal.sqlite"),
+            limits.max_storage_entries,
+        )?;
         if journal.state("space_id")?.is_some() {
             return Err(ReconcileError::Invariant(
                 "space already initialized; use scan/status",
@@ -256,13 +259,21 @@ impl LocalSpace {
     }
 
     pub fn open(data_dir: &Path) -> Result<Self> {
+        Self::open_with_limits(data_dir, LocalLimits::default())
+    }
+
+    pub fn open_with_limits(data_dir: &Path, limits: LocalLimits) -> Result<Self> {
+        limits.validate()?;
         check_ancestors(data_dir)?;
         let data_dir = fs::canonicalize(data_dir)?;
         let lock = acquire_lock(&data_dir)?;
         if !data_dir.join("journal.sqlite").is_file() {
             return Err(ReconcileError::Invariant("space is not initialized"));
         }
-        let journal = Journal::open(&data_dir.join("journal.sqlite"))?;
+        let journal = Journal::open_with_storage_limit(
+            &data_dir.join("journal.sqlite"),
+            limits.max_storage_entries,
+        )?;
         let required = |key| {
             journal
                 .state(key)?
@@ -285,7 +296,7 @@ impl LocalSpace {
             data_dir,
             cas,
             journal,
-            limits: LocalLimits::default(),
+            limits,
             root_identity,
             _lock: lock,
             _worktree_lock: worktree_lock,
@@ -296,6 +307,8 @@ impl LocalSpace {
 
     pub fn with_limits(mut self, limits: LocalLimits) -> Result<Self> {
         limits.validate()?;
+        self.journal
+            .set_max_storage_entries(limits.max_storage_entries)?;
         self.limits = limits;
         Ok(self)
     }

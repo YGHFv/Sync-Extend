@@ -1,12 +1,11 @@
-use crate::{
-    check_storage_metadata_limit, sql_integer, Journal, JournalError, Result, MAX_OPERATION_BYTES,
-};
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::{sql_integer, Journal, JournalError, Result, MAX_OPERATION_BYTES};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use sync_extend_core_model::*;
 
 const MAX_TTL_MS: u64 = 86_400_000;
+mod capacity;
 
 pub fn read_lease_expiry(now: u64, ttl_secs: u64) -> Result<u64> {
     if !(1..=86_400).contains(&ttl_secs) {
@@ -92,7 +91,11 @@ impl Journal {
         intent: &ReadLeaseIntent,
         max_entries: usize,
     ) -> Result<ReadLease> {
-        self.check_storage_metadata_limit(max_entries)?;
+        let bounds = self.writer_capacity_limits(max_entries)?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let before = self
+            .read_view()
+            .audit_lease_capacity(&intent.space_id, bounds)?;
         self.validate_read_lease_intent(intent)?;
         let exists: Option<String> = self
             .connection
@@ -107,8 +110,12 @@ impl Journal {
             if lease.intent != *intent {
                 return Err(JournalError::Invariant("read lease ID collision"));
             }
+            tx.commit()?;
             return Ok(lease);
         }
+        capacity::within(&before.report)?;
+        let identity = capacity::identity(&before);
+        drop(before);
         let json = serde_json::to_string(intent)?;
         if json.len() > MAX_OPERATION_BYTES {
             return Err(JournalError::Invariant("read lease metadata limit"));
@@ -122,8 +129,6 @@ impl Journal {
             .iter()
             .map(|c| &c.content_id)
             .collect();
-        let tx = self.connection.transaction()?;
-        check_storage_metadata_limit(&tx, max_entries, chunks.len() as u64 + 1, json.len() as u64)?;
         observe(&tx, intent.created_at_ms)?;
         tx.execute(
             "INSERT INTO read_leases VALUES (?1,?2,?3,?4,?5,'active',?6,?7,NULL)",
@@ -143,8 +148,25 @@ impl Journal {
                 params![intent.lease_id.as_str(), id.as_str()],
             )?;
         }
+        let after = self
+            .read_view()
+            .audit_lease_capacity(&intent.space_id, bounds)?;
+        capacity::within(&after.report)?;
+        capacity::same_identity(&identity, &after)?;
+        capacity::observed(&after, intent.created_at_ms)?;
+        let lease = self.read_lease(&intent.lease_id)?;
+        capacity::expected_lease(
+            &lease,
+            &ReadLease {
+                intent: intent.clone(),
+                state: ReadLeaseState::Active,
+                observed_at_ms: intent.created_at_ms,
+                expires_at_ms: intent.initial_expires_at_ms,
+                finished_at_ms: None,
+            },
+        )?;
         tx.commit()?;
-        self.read_lease(&intent.lease_id)
+        Ok(lease)
     }
 
     pub fn renew_read_lease(
@@ -155,7 +177,12 @@ impl Journal {
         ttl_secs: u64,
         max_entries: usize,
     ) -> Result<ReadLease> {
-        self.check_storage_metadata_limit(max_entries)?;
+        let bounds = self.writer_capacity_limits(max_entries)?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let before = self.read_view().audit_lease_capacity(space, bounds)?;
+        capacity::within(&before.report)?;
+        let identity = capacity::identity(&before);
+        drop(before);
         let lease = self.require_read_lease(space, id)?;
         let expiry = read_lease_expiry(now, ttl_secs)?.max(lease.expires_at_ms);
         if lease.state != ReadLeaseState::Active || now >= lease.expires_at_ms {
@@ -163,8 +190,6 @@ impl Journal {
                 "only unexpired active read lease can renew",
             ));
         }
-        let tx = self.connection.transaction()?;
-        check_storage_metadata_limit(&tx, max_entries, 0, 0)?;
         observe(&tx, now)?;
         if tx.execute(
             "UPDATE read_leases SET observed_at_ms=?2,expires_at_ms=?3
@@ -174,8 +199,19 @@ impl Journal {
         {
             return Err(JournalError::Invariant("read lease state changed"));
         }
+        let after = self.read_view().audit_lease_capacity(space, bounds)?;
+        capacity::within(&after.report)?;
+        capacity::same_identity(&identity, &after)?;
+        capacity::observed(&after, now)?;
+        let expected = ReadLease {
+            observed_at_ms: now,
+            expires_at_ms: expiry,
+            ..lease
+        };
+        let lease = self.read_lease(id)?;
+        capacity::expected_lease(&lease, &expected)?;
         tx.commit()?;
-        self.read_lease(id)
+        Ok(lease)
     }
 
     pub fn release_read_lease(
@@ -184,12 +220,15 @@ impl Journal {
         id: &EntryId,
         now: u64,
     ) -> Result<ReadLease> {
+        let bounds = crate::storage_policy::capacity_limits(self.max_storage_entries)?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let before = self.read_view().audit_lease_capacity(space, bounds)?;
         let lease = self.require_read_lease(space, id)?;
         if lease.state != ReadLeaseState::Active {
+            tx.commit()?;
             return Ok(lease);
         }
         let now = now.max(clock(&self.connection)?).max(lease.observed_at_ms);
-        let tx = self.connection.transaction()?;
         observe(&tx, now)?;
         if tx.execute("UPDATE read_leases SET state='released',finished_at_ms=?2 WHERE lease_id=?1 AND state='active'",
             params![id.as_str(),sql_integer(now)?])? != 1 {
@@ -199,8 +238,11 @@ impl Journal {
             "DELETE FROM read_lease_objects WHERE lease_id=?1",
             [id.as_str()],
         )?;
+        let after = self.read_view().audit_lease_capacity(space, bounds)?;
+        capacity::released(&before, &after, id, now)?;
+        let lease = self.read_lease(id)?;
         tx.commit()?;
-        self.read_lease(id)
+        Ok(lease)
     }
 
     pub fn expire_read_leases(
@@ -209,13 +251,17 @@ impl Journal {
         now: u64,
         max_entries: usize,
     ) -> Result<Vec<ReadLease>> {
-        let leases = self.read_leases(space, max_entries)?;
+        let bounds = self.writer_capacity_limits(max_entries)?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let before = self.read_view().audit_lease_capacity(space, bounds)?;
+        capacity::within(&before.report)?;
+        let identity = capacity::identity(&before);
+        drop(before);
+        let leases = self.read_view().read_leases(space)?;
         let overdue: Vec<_> = leases
             .into_iter()
             .filter(|l| l.state == ReadLeaseState::Active && now >= l.expires_at_ms)
             .collect();
-        let tx = self.connection.transaction()?;
-        check_storage_metadata_limit(&tx, max_entries, 0, 0)?;
         observe(&tx, now)?;
         for lease in &overdue {
             let id = lease.intent.lease_id.as_str();
@@ -229,11 +275,25 @@ impl Journal {
             }
             tx.execute("DELETE FROM read_lease_objects WHERE lease_id=?1", [id])?;
         }
-        tx.commit()?;
-        overdue
+        let after = self.read_view().audit_lease_capacity(space, bounds)?;
+        capacity::within(&after.report)?;
+        capacity::same_identity(&identity, &after)?;
+        capacity::observed(&after, now)?;
+        let leases = overdue
             .into_iter()
-            .map(|l| self.read_lease(&l.intent.lease_id))
-            .collect()
+            .map(|old| {
+                let lease = self.read_lease(&old.intent.lease_id)?;
+                let expected = ReadLease {
+                    state: ReadLeaseState::Expired,
+                    finished_at_ms: Some(now),
+                    ..old
+                };
+                capacity::expected_lease(&lease, &expected)?;
+                Ok(lease)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        tx.commit()?;
+        Ok(leases)
     }
 
     pub fn admit_leased_read(
@@ -243,16 +303,24 @@ impl Journal {
         now: u64,
         max_entries: usize,
     ) -> Result<ReadLease> {
-        self.check_storage_metadata_limit(max_entries)?;
+        let bounds = self.writer_capacity_limits(max_entries)?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let before = self.read_view().audit_lease_capacity(space, bounds)?;
+        capacity::within(&before.report)?;
+        let identity = capacity::identity(&before);
+        drop(before);
         let lease = self.require_read_lease(space, id)?;
         if lease.state != ReadLeaseState::Active || now >= lease.expires_at_ms {
             return Err(JournalError::Invariant(
                 "read lease is not active and unexpired",
             ));
         }
-        let tx = self.connection.transaction()?;
-        check_storage_metadata_limit(&tx, max_entries, 0, 0)?;
         observe(&tx, now)?;
+        let after = self.read_view().audit_lease_capacity(space, bounds)?;
+        capacity::within(&after.report)?;
+        capacity::same_identity(&identity, &after)?;
+        capacity::observed(&after, now)?;
+        capacity::expected_lease(&self.read_lease(id)?, &lease)?;
         tx.commit()?;
         Ok(lease)
     }

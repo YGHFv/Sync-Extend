@@ -1,7 +1,8 @@
 use crate::{
     storage_inventory::reader::invalid, CleanupPlan, GcDisposalAudit, GcExecutionAudit,
-    GcMarkAudit, GcQuarantineAudit, JournalReadView, Mutation, OriginalDisposalAudit, Publication,
-    ReadLease, ReferenceReservation, Result, SnapshotAudit, TreeRestorePreparation,
+    GcMarkAudit, GcQuarantineAudit, JournalReadView, JournalStoredTable, Mutation,
+    OriginalDisposalAudit, Publication, ReadLease, ReferenceReservation, Result, SnapshotAudit,
+    TreeRestorePreparation,
 };
 use sync_extend_core_model::{DeviceId, SpaceId};
 
@@ -28,6 +29,61 @@ pub(super) fn owners(view: &JournalReadView<'_>, space: &SpaceId, max: usize) ->
         .state("device_id")?
         .ok_or(invalid("journal capacity device missing"))?
         .parse()?;
+    ordinary_scope(view, space)?;
+    typed_owners(view, space, max)
+}
+
+pub(super) fn lease_owners(
+    view: &JournalReadView<'_>,
+    space: &SpaceId,
+    max: usize,
+    tables: &[JournalStoredTable],
+) -> Result<Owners> {
+    if view.state("space_id")?.is_some() {
+        return owners(view, space, max);
+    }
+    // Trusted standalone snapshots predate initialize. This compatibility
+    // contract admits no identity row or unsupported owner, not an audit bypass.
+    const IDENTITYLESS_LEASE_TABLES: &[&str] = &[
+        "operations",
+        "receive_cursors",
+        "snapshots",
+        "current_manifests",
+        "snapshot_objects",
+        "read_lease_clock",
+        "read_leases",
+        "read_lease_objects",
+    ];
+    if tables
+        .iter()
+        .any(|table| table.rows != 0 && !IDENTITYLESS_LEASE_TABLES.contains(&table.table))
+    {
+        return Err(invalid(
+            "identityless lease inventory contains unsupported owner",
+        ));
+    }
+    ordinary_scope(view, space)?;
+    let snapshots = view.snapshot_audit(space)?;
+    view.current(space)?;
+    view.diagnostic_operation_count(space, max)?;
+    let leases = view.read_leases(space)?;
+    Ok(Owners {
+        snapshots,
+        leases,
+        mutations: Vec::new(),
+        publications: Vec::new(),
+        cleanup: Vec::new(),
+        references: Vec::new(),
+        originals: Vec::new(),
+        marks: Vec::new(),
+        executions: Vec::new(),
+        quarantines: Vec::new(),
+        disposals: Vec::new(),
+        trees: Vec::new(),
+    })
+}
+
+fn ordinary_scope(view: &JournalReadView<'_>, space: &SpaceId) -> Result<()> {
     let foreign = [
         "operations",
         "receive_cursors",
@@ -59,6 +115,10 @@ pub(super) fn owners(view: &JournalReadView<'_>, space: &SpaceId, max: usize) ->
     if foreign_keys.query([])?.next()?.is_some() {
         return Err(invalid("journal capacity orphan foreign key"));
     }
+    Ok(())
+}
+
+fn typed_owners(view: &JournalReadView<'_>, space: &SpaceId, max: usize) -> Result<Owners> {
     let snapshots = view.snapshot_audit(space)?;
     view.current(space)?;
     view.diagnostic_operation_count(space, max)?;

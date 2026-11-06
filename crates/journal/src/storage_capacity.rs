@@ -14,6 +14,16 @@ mod audit;
 mod ordinary;
 mod tree;
 
+enum OwnerAudit {
+    Initialized,
+    LeaseTransaction,
+}
+
+pub(crate) struct CapacitySnapshot {
+    pub(crate) report: JournalStorageCapacity,
+    pub(crate) rows: Vec<JournalStoredRow>,
+}
+
 const ACCOUNTING: &str =
     "actual-main-plus-audited-state-liabilities-v1;not-global-writer-enforcement";
 
@@ -190,6 +200,30 @@ impl crate::JournalReadView<'_> {
         max: usize,
         bounds: JournalCapacityLimits,
     ) -> Result<JournalStorageCapacity> {
+        self.capacity_snapshot(space, max, bounds, OwnerAudit::Initialized)
+            .map(|snapshot| snapshot.report)
+    }
+
+    pub(crate) fn audit_lease_capacity(
+        &self,
+        space: &SpaceId,
+        bounds: JournalCapacityLimits,
+    ) -> Result<CapacitySnapshot> {
+        self.capacity_snapshot(
+            space,
+            sync_extend_core_model::limits::MAX_ENTRIES,
+            bounds,
+            OwnerAudit::LeaseTransaction,
+        )
+    }
+
+    fn capacity_snapshot(
+        &self,
+        space: &SpaceId,
+        max: usize,
+        bounds: JournalCapacityLimits,
+        owners: OwnerAudit,
+    ) -> Result<CapacitySnapshot> {
         crate::tree_storage_inventory::validate_limits(max, bounds.inventory)?;
         if bounds.max_rows == 0
             || bounds.max_rows > max as u64
@@ -210,7 +244,10 @@ impl crate::JournalReadView<'_> {
             bounds.inventory.max_logical_bytes,
         )?;
         crate::tree_native_storage::preflight_all(self.connection, max)?;
-        let audited = audit::owners(self, space, max)?;
+        let audited = match owners {
+            OwnerAudit::Initialized => audit::owners(self, space, max)?,
+            OwnerAudit::LeaseTransaction => audit::lease_owners(self, space, max, &tables)?,
+        };
         let mut rows = Vec::new();
         let mut actual = TreeStorageCharge::default();
         for (spec, expected) in specs.iter().zip(&tables) {
@@ -283,7 +320,7 @@ impl crate::JournalReadView<'_> {
             &tree_owners,
             accounted_total,
         ))?;
-        Ok(JournalStorageCapacity {
+        let report = JournalStorageCapacity {
             accounting: ACCOUNTING,
             schema_version: SCHEMA_VERSION,
             space_id: space.clone(),
@@ -297,6 +334,7 @@ impl crate::JournalReadView<'_> {
             tree_owners,
             accounted_total,
             fingerprint,
-        })
+        };
+        Ok(CapacitySnapshot { report, rows })
     }
 }
