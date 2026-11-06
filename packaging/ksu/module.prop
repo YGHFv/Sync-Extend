@@ -1,0 +1,6 @@
+id=sync_extend
+name=SyncExtend Local Core Alpha
+version=0.1.0
+versionCode=1
+author=YGHFv
+description=Arm64 local scan and history daemon. Explicit configuration required; network sync is not available in this stage.
