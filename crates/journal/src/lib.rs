@@ -266,12 +266,21 @@ impl Journal {
     }
 
     pub fn initialize(&mut self, space: &SpaceId, device: &DeviceId, root: &str) -> Result<()> {
-        let tx = self.connection.transaction()?;
-        for (key, value) in [
+        let bounds = storage_policy::capacity_limits(self.max_storage_entries)?;
+        if root.len() > MAX_OPERATION_BYTES {
+            return Err(JournalError::Invariant("local root metadata limit"));
+        }
+        let tx =
+            Transaction::new_unchecked(&self.connection, rusqlite::TransactionBehavior::Immediate)?;
+        let view = self.read_view();
+        let before = view.audit_history_capacity(space, bounds)?;
+        let identity = [
             ("space_id", space.as_str()),
             ("device_id", device.as_str()),
             ("worktree", root),
-        ] {
+        ];
+        let mut present = 0;
+        for (key, value) in identity {
             let old: Option<String> = tx
                 .query_row("SELECT value FROM local_state WHERE key=?1", [key], |row| {
                     row.get(0)
@@ -280,11 +289,28 @@ impl Journal {
             if old.as_deref().is_some_and(|old| old != value) {
                 return Err(JournalError::Invariant("local identity/root mismatch"));
             }
-            tx.execute(
+            present += usize::from(old.is_some());
+        }
+        if present == identity.len() {
+            tx.commit()?;
+            return Ok(());
+        }
+        if present != 0 || before.rows.iter().any(|row| row.table() == "local_state") {
+            return Err(JournalError::Invariant("incomplete local identity"));
+        }
+        storage_policy::history::within(&before.report)?;
+        for (key, value) in identity {
+            if tx.execute(
                 "INSERT OR IGNORE INTO local_state VALUES (?1, ?2)",
                 params![key, value],
-            )?;
+            )? != 1
+            {
+                return Err(JournalError::Invariant("local identity changed"));
+            }
         }
+        let after = view.audit_history_capacity(space, bounds)?;
+        storage_policy::history::initialized(&before, &after, &identity)?;
+        storage_policy::history::within(&after.report)?;
         tx.commit()?;
         Ok(())
     }

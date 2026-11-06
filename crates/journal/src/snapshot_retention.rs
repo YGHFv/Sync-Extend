@@ -1,5 +1,5 @@
-use crate::{Journal, JournalError, Result, MAX_OPERATION_BYTES};
-use rusqlite::{params, Connection};
+use crate::{storage_policy, Journal, JournalError, Result, MAX_OPERATION_BYTES};
+use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use std::collections::BTreeSet;
 use sync_extend_core_model::*;
 
@@ -109,22 +109,36 @@ impl Journal {
         id: &SnapshotId,
         locked: bool,
     ) -> Result<RetainedSnapshot> {
-        let tx = self.connection.transaction()?;
+        let bounds = storage_policy::capacity_limits(self.max_storage_entries)?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let view = self.read_view();
+        let before = view.audit_history_capacity(space, bounds)?;
         let mut snapshot = audit_snapshot(&tx, space, id)?;
         super::snapshot_pruning::require_unpruned(&tx, id)?;
         if locked && snapshot.state != "materialized" {
             return Err(JournalError::Invariant("snapshot is not materialized"));
         }
-        if snapshot.locked != locked
-            && tx.execute(
-                "UPDATE snapshots SET locked=?1 WHERE space_id=?2 AND snapshot_id=?3 AND locked=?4",
-                params![locked, space.as_str(), id.as_str(), snapshot.locked],
-            )? != 1
+        if snapshot.locked == locked {
+            tx.commit()?;
+            return Ok(snapshot);
+        }
+        if locked {
+            storage_policy::history::within(&before.report)?;
+        }
+        if tx.execute(
+            "UPDATE snapshots SET locked=?1 WHERE space_id=?2 AND snapshot_id=?3 AND locked=?4",
+            params![locked, space.as_str(), id.as_str(), snapshot.locked],
+        )? != 1
         {
             return Err(JournalError::Invariant("snapshot lock changed"));
         }
-        tx.commit()?;
+        let after = view.audit_history_capacity(space, bounds)?;
+        storage_policy::history::snapshot_locked(&before, &after, id, locked)?;
+        if locked {
+            storage_policy::history::within(&after.report)?;
+        }
         snapshot.locked = locked;
+        tx.commit()?;
         Ok(snapshot)
     }
 

@@ -1,6 +1,6 @@
 use crate::{
-    check_storage_metadata_limit, snapshot_retention::audit_snapshot, sql_integer, Journal,
-    JournalError, Result, MAX_OPERATION_BYTES,
+    snapshot_retention::audit_snapshot, sql_integer, storage_policy, Journal, JournalError, Result,
+    MAX_OPERATION_BYTES,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -165,12 +165,15 @@ impl Journal {
         intent: &SnapshotPruning,
         max_entries: usize,
     ) -> Result<SnapshotPruning> {
+        let bounds = self.writer_capacity_limits(max_entries)?;
         if intent.format_version != FORMAT_VERSION || intent.snapshot_id == intent.baseline_root {
             return Err(JournalError::Invariant("invalid snapshot pruning intent"));
         }
         sql_integer(intent.pruned_at_ms)?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        if let Some(old) = self.snapshot_pruning(&intent.space_id, &intent.snapshot_id)? {
+        let view = self.read_view();
+        let before = view.audit_history_capacity(&intent.space_id, bounds)?;
+        if let Some(old) = pruning(&tx, &intent.space_id, &intent.snapshot_id)? {
             if old.baseline_root != intent.baseline_root {
                 return Err(JournalError::Invariant(
                     "snapshot pruning request baseline mismatch",
@@ -179,10 +182,9 @@ impl Journal {
             tx.commit()?;
             return Ok(old);
         }
-        self.check_storage_metadata_limit(max_entries)?;
-        self.snapshot_audit(&intent.space_id, max_entries)?;
-        let snapshots = self.retained_snapshots(&intent.space_id, max_entries)?;
-        let current = self
+        storage_policy::history::within(&before.report)?;
+        let snapshots = view.retained_snapshots(&intent.space_id)?;
+        let current = view
             .current(&intent.space_id)?
             .ok_or(JournalError::Invariant("missing current snapshot"))?;
         if current.root()? != intent.baseline_root {
@@ -195,15 +197,7 @@ impl Journal {
         if target.locked || target.state != "materialized" {
             return Err(JournalError::Invariant("snapshot pruning target protected"));
         }
-        // Validate every durable record before consulting its snapshot dependencies.
-        self.read_leases(&intent.space_id, max_entries)?;
-        for mutation in self.mutations(&intent.space_id)? {
-            self.verify_mutation_references(&mutation.intent.transaction_id)?;
-        }
-        self.publications(&intent.space_id, max_entries)?;
-        self.cleanup_plans(&intent.space_id)?;
-        self.original_disposals(&intent.space_id, max_entries)?;
-        self.tree_restore_preparations(&intent.space_id, max_entries)?;
+        // The complete prewrite capacity audit validates every durable owner.
         validate_pruned_snapshot(
             &tx,
             &intent.space_id,
@@ -222,7 +216,7 @@ impl Journal {
             {
                 visits = visits
                     .checked_add(content.chunks.len())
-                    .filter(|n| *n <= max_entries)
+                    .filter(|n| *n <= bounds.max_rows as usize)
                     .ok_or(JournalError::Invariant("pruning reference count limit"))?;
             }
             let rank = snapshot
@@ -260,7 +254,7 @@ impl Journal {
             ));
         }
         let json = serde_json::to_string(intent)?;
-        check_storage_metadata_limit(&tx, max_entries, 1, json.len() as u64)?;
+        storage_policy::history::admit_pruning(&before, &json)?;
         tx.execute(
             "INSERT INTO snapshot_prunings VALUES (?1,?2,?3,?4,?5,?6)",
             params![
@@ -276,7 +270,9 @@ impl Journal {
             "DELETE FROM snapshot_objects WHERE snapshot_id=?1",
             [intent.snapshot_id.as_str()],
         )?;
-        audit_snapshot(&tx, &intent.space_id, &intent.snapshot_id)?;
+        let after = view.audit_history_capacity(&intent.space_id, bounds)?;
+        storage_policy::history::snapshot_pruned(&before, &after, intent, &json)?;
+        storage_policy::history::within(&after.report)?;
         tx.commit()?;
         Ok(intent.clone())
     }

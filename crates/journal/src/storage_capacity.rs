@@ -17,6 +17,7 @@ mod tree;
 enum OwnerAudit {
     Initialized,
     LeaseTransaction,
+    HistoryTransaction,
 }
 
 pub(crate) struct CapacitySnapshot {
@@ -217,6 +218,19 @@ impl crate::JournalReadView<'_> {
         )
     }
 
+    pub(crate) fn audit_history_capacity(
+        &self,
+        space: &SpaceId,
+        bounds: JournalCapacityLimits,
+    ) -> Result<CapacitySnapshot> {
+        self.capacity_snapshot(
+            space,
+            sync_extend_core_model::limits::MAX_ENTRIES,
+            bounds,
+            OwnerAudit::HistoryTransaction,
+        )
+    }
+
     fn capacity_snapshot(
         &self,
         space: &SpaceId,
@@ -247,6 +261,7 @@ impl crate::JournalReadView<'_> {
         let audited = match owners {
             OwnerAudit::Initialized => audit::owners(self, space, max)?,
             OwnerAudit::LeaseTransaction => audit::lease_owners(self, space, max, &tables)?,
+            OwnerAudit::HistoryTransaction => audit::history_owners(self, space, max, &tables)?,
         };
         let mut rows = Vec::new();
         let mut actual = TreeStorageCharge::default();
