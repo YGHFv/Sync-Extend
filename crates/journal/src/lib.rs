@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 32;
+const SCHEMA_VERSION: u32 = 33;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -236,6 +236,11 @@ impl Journal {
         if version < 32 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-032.sql"))?;
+            tx.commit()?;
+        }
+        if version < 33 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-033.sql"))?;
             tx.commit()?;
         }
         Ok(Self {
@@ -1544,6 +1549,9 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
             + (SELECT count(*) FROM tree_native_capacity_admissions)
             + (SELECT count(*) FROM tree_native_action_headers)
             + (SELECT count(*) FROM tree_native_action_records)
+            + (SELECT count(*) FROM tree_native_future_admissions)
+            + (SELECT count(*) FROM tree_native_future_generations)
+            + (SELECT coalesce(sum(future_rows),0) FROM tree_native_future_admissions)
             + (SELECT count(*) FROM tree_restore_final_descriptions)
             + (SELECT count(*) FROM tree_restore_retained_descriptions)
             + max((SELECT coalesce(sum(reserved_rows),0) FROM tree_restore_original_reservations),
@@ -1610,6 +1618,10 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
                 FROM tree_native_action_headers)
             + (SELECT coalesce(sum(length(CAST(record AS BLOB))+472),0)
                 FROM tree_native_action_records)
+            + (SELECT coalesce(sum(length(CAST(request AS BLOB))+length(CAST(capacity AS BLOB))+752+future_bytes),0)
+                FROM tree_native_future_admissions)
+            + (SELECT coalesce(sum(136+length(CAST(purpose AS BLOB))),0)
+                FROM tree_native_future_generations)
             + (SELECT coalesce(sum(length(CAST(request AS BLOB))+length(CAST(intent AS BLOB))+696),0)
                 FROM tree_restore_final_descriptions)
             + (SELECT coalesce(sum(length(CAST(description AS BLOB))+488),0)
@@ -1757,6 +1769,7 @@ mod tree_disposition_generations;
 mod tree_execution_records;
 mod tree_final_description;
 mod tree_final_observation;
+mod tree_native_future;
 mod tree_native_protocol;
 mod tree_native_storage;
 mod tree_original_pins;
@@ -1784,6 +1797,7 @@ pub use tree_disposition_description::{
 pub use tree_execution_records::TreeExecutionRecordsAudit;
 pub use tree_final_description::{TreeFinalDescriptionAudit, TreeFinalDescriptionRequest};
 pub use tree_final_observation::{TreeFinalObservationInspection, TreeFinalObservationRequest};
+pub use tree_native_future::{TreeNativeFutureAdmissionAudit, TreeNativeFutureAdmissionRequest};
 pub use tree_native_protocol::{
     TreeNativeProtocolDescriptionAudit, TreeNativeProtocolDescriptionRequest,
 };

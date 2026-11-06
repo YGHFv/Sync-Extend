@@ -55,6 +55,7 @@ pub struct TreeRestorePreparation {
     pub coordinator_admission: Option<crate::TreeCoordinatorAdmissionAudit>,
     pub native_protocol_description: Option<crate::TreeNativeProtocolDescriptionAudit>,
     pub native_storage: Option<crate::TreeNativePrewriteAudit>,
+    pub native_future_admission: Option<crate::TreeNativeFutureAdmissionAudit>,
 }
 
 struct PreparedPlan {
@@ -546,6 +547,7 @@ impl Journal {
                 coordinator_admission: None,
                 native_protocol_description: None,
                 native_storage: None,
+                native_future_admission: None,
             };
             preparation.final_description =
                 crate::tree_final_description::audit_final(&self.connection, &preparation, max)?;
@@ -561,6 +563,8 @@ impl Journal {
                 crate::tree_native_protocol::audit(&self.connection, &preparation, max)?;
             preparation.native_storage =
                 crate::tree_native_storage::audit(&self.connection, &preparation, max)?;
+            preparation.native_future_admission =
+                crate::tree_native_future::audit(&self.connection, &preparation, max)?;
             audits.push(preparation);
         }
         if actual_native_bindings as u64 != native_bindings as u64 {
@@ -601,7 +605,22 @@ impl Journal {
              OR EXISTS(SELECT 1 FROM tree_restore_disposition_records)
              OR EXISTS(SELECT 1 FROM tree_restore_coordinator_admissions)
              OR EXISTS(SELECT 1 FROM tree_restore_protocol_descriptions)
-             OR EXISTS(SELECT 1 FROM tree_restore_protocol_records)",
+             OR EXISTS(SELECT 1 FROM tree_restore_protocol_records)
+             OR EXISTS(SELECT 1 FROM tree_native_capacity_admissions)
+             OR EXISTS(SELECT 1 FROM tree_native_action_headers)
+             OR EXISTS(SELECT 1 FROM tree_native_action_records)
+             OR EXISTS(SELECT 1 FROM tree_native_future_admissions)
+             OR EXISTS(SELECT 1 FROM tree_native_future_generations)
+             OR EXISTS(SELECT 1 FROM tree_native_action_attempts)
+             OR EXISTS(SELECT 1 FROM tree_native_final_intents)
+             OR EXISTS(SELECT 1 FROM tree_native_final_commits)
+             OR EXISTS(SELECT 1 FROM tree_native_input_releases)
+             OR EXISTS(SELECT 1 FROM tree_native_retained_owners)
+             OR EXISTS(SELECT 1 FROM tree_native_original_intents)
+             OR EXISTS(SELECT 1 FROM tree_native_original_absences)
+             OR EXISTS(SELECT 1 FROM tree_native_original_terminals)
+             OR EXISTS(SELECT 1 FROM tree_native_cleanup_intents)
+             OR EXISTS(SELECT 1 FROM tree_native_cleanup_records)",
             [],
             |r| r.get(0),
         )?;

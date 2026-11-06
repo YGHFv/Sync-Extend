@@ -277,6 +277,31 @@ pub fn plan_tree_original_release_layout(
     release_rows(intent, observed_at_ms, bounds)
 }
 
+pub(crate) fn release_set(
+    plan: &TreeOriginalTerminalLayoutPlan,
+    observed_at_ms: u64,
+    bounds: TreeOriginalTerminalLayoutLimits,
+) -> Result<BTreeMap<usize, TreeOriginalTerminalRowsLayout>> {
+    let Some((&last_index, _)) = plan.intents.last_key_value() else {
+        return Ok(BTreeMap::new());
+    };
+    if bounds.max_owners > limits::MAX_ENTRIES
+        || plan.intents.len() > bounds.max_owners
+        || bounds.max_input_bytes > MAX_TREE_HISTORY_BYTES
+    {
+        return Err(ModelError::InvalidData("original release set bounds"));
+    }
+    // The largest decimal index preserves every old per-owner tuple boundary.
+    encode_history_record(
+        &(plan.intents(), last_index, observed_at_ms),
+        bounds.max_input_bytes,
+    )?;
+    plan.intents
+        .iter()
+        .map(|(&index, intent)| Ok((index, release_rows(intent, observed_at_ms, bounds)?)))
+        .collect()
+}
+
 // A caller with an already bounded, reprojected owner set need not encode that
 // entire set again for every terminal in a cleanup closure.
 pub(crate) fn release_rows(

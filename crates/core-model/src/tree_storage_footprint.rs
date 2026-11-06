@@ -3,8 +3,7 @@ use crate::{
     tree_final_layout_source::TreeFinalLayoutSource,
     tree_native_action_layout::{TreeNativeActionLayoutRecord, TreeNativeActionScope},
     tree_original_terminal_layout::{
-        plan_tree_original_release_layout, TreeOriginalTerminalLayoutLimits,
-        TreeOriginalTerminalLayoutPlan,
+        release_set, TreeOriginalTerminalLayoutLimits, TreeOriginalTerminalLayoutPlan,
     },
     tree_restore_history::{encode_history_record, MAX_TREE_HISTORY_BYTES},
     ContentId, EntryId, ModelError, Result,
@@ -32,6 +31,7 @@ pub enum TreeStorageTable {
     OriginalReference,
     OwnerCleanupIntent,
     OwnerCleanupRecord,
+    ActionAttempt,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -375,8 +375,9 @@ pub fn tree_original_terminal_row_values(
     bounds: TreeOriginalTerminalLayoutLimits,
 ) -> Result<Vec<TreeStorageRowValues>> {
     let mut result = Vec::new();
+    let releases = release_set(plan, observed_at_ms, bounds)?;
     for (&index, i) in plan.intents() {
-        let r = plan_tree_original_release_layout(plan, index, observed_at_ms, bounds)?;
+        let r = &releases[&index];
         let key = vec![i.transaction_id.to_string(), index.to_string()];
         result.push(row(
             TreeStorageTable::OriginalIntent,

@@ -98,6 +98,8 @@ fn tables() -> Vec<TableSpec> {
         schema::TABLES,
         crate::tree_storage_inventory::schema::TABLES,
         crate::tree_native_storage::schema::TABLES,
+        crate::tree_native_future::schema::TABLES,
+        crate::tree_native_future::schema::EFFECT_TABLES,
     ]
     .concat()
 }

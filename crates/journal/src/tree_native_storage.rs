@@ -177,7 +177,7 @@ fn validate_request(request: &TreeNativePrewriteRequest, max: usize) -> Result<(
     Ok(())
 }
 
-fn initial_layout(
+pub(crate) fn initial_layout(
     connection: &Connection,
     p: &TreeRestorePreparation,
     request: &TreeNativePrewriteRequest,
@@ -354,8 +354,15 @@ fn derive(
 }
 
 pub(crate) fn preflight_all(connection: &Connection, max: usize) -> Result<()> {
-    validate_schema(connection, schema::TABLES, Namespace::TreeNative)?;
-    preflight(connection, schema::TABLES, max, max as u64 * 1024)?;
+    let tables = [
+        schema::TABLES,
+        crate::tree_native_future::schema::TABLES,
+        crate::tree_native_future::schema::EFFECT_TABLES,
+    ]
+    .concat();
+    validate_schema(connection, &tables, Namespace::TreeNative)?;
+    preflight(connection, &tables, max, max as u64 * 1024)?;
+    crate::tree_native_future::preflight_all(connection, max)?;
     let invalid_owner: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM main.tree_native_capacity_admissions c
             LEFT JOIN main.tree_restore_coordinator_admissions a USING(transaction_id)
