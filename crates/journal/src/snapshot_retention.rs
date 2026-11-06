@@ -205,6 +205,8 @@ impl crate::JournalReadView<'_> {
                 let expected: BTreeSet<_> =
                     if publication.state == crate::PublicationState::Committed {
                         BTreeSet::new()
+                    } else if let Some(completion) = &publication.intent.completion {
+                        completion.protected_objects.keys().cloned().collect()
                     } else {
                         publication
                             .intent

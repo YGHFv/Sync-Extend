@@ -150,6 +150,18 @@ impl LocalSpace {
         };
         let root_identity = Some(physical_identity(&self.worktree)?);
         let parent_identity = Some(physical_identity(&self.parent_for(&target_path)?)?);
+        let timestamp = now_ms()?;
+        let completion = sync_extend_journal::PublicationCompletion::new(
+            &manifest,
+            &self.device_id,
+            Entry {
+                entry_id: entry_id.clone(),
+                path: target_path.clone(),
+                kind: EntryKind::File,
+                content: Some(content.clone()),
+            },
+            timestamp,
+        )?;
         let intent = PublicationIntent {
             format_version: FORMAT_VERSION,
             transaction_id: id.clone(),
@@ -161,10 +173,11 @@ impl LocalSpace {
             baseline_root: manifest.root()?,
             requested_baseline,
             source_snapshot: source,
-            created_at_ms: now_ms()?,
+            created_at_ms: timestamp,
             attempt: 0,
             root_identity,
             parent_identity,
+            completion: Some(completion),
         };
         self.journal.begin_publication(&intent)?;
         checkpoint("after_intent");
@@ -247,6 +260,27 @@ impl LocalSpace {
             }
             self.check_publication_limits(&intent.content)?;
             self.cas.verify(&intent.content)?;
+            if intent.completion.is_some() {
+                let owned = payload.try_exists()?
+                    && same_owned_file(
+                        &Handle::from_path(&payload)?,
+                        &payload,
+                        &target,
+                        &intent.content,
+                    )?;
+                if self.occupied(&intent.target_path)? && !owned {
+                    self.retarget(&intent)?;
+                    continue;
+                }
+                let mut observed = self.stable_scan()?;
+                if owned {
+                    observed.remove(&intent.target_path);
+                }
+                if self.refresh_publication_observations(&intent, &observed)? {
+                    // Reload the durable plan before any staging or target effect.
+                    continue;
+                }
+            }
             if publication.state == PublicationState::Preparing
                 && !directory.join("owner").try_exists()?
             {

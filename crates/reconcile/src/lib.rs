@@ -369,6 +369,9 @@ impl LocalSpace {
         second: &scan::Scan,
         publication: Option<&sync_extend_journal::PublicationIntent>,
     ) -> Result<ScanResult> {
+        if let Some(intent) = publication.filter(|intent| intent.completion.is_some()) {
+            return self.commit_admitted_publication_scan(second, intent);
+        }
         let old = self.journal.current(&self.space_id)?;
         let baseline = old.as_ref().map(Manifest::root).transpose()?;
         let previous = old.unwrap_or_else(|| Manifest::empty(self.space_id.clone()));
@@ -495,6 +498,118 @@ impl LocalSpace {
                 .sum(),
             network_enabled: false,
         })
+    }
+
+    fn commit_admitted_publication_scan(
+        &mut self,
+        scanned: &scan::Scan,
+        intent: &sync_extend_journal::PublicationIntent,
+    ) -> Result<ScanResult> {
+        let mut observed = scanned.clone();
+        observed.remove(&intent.target_path);
+        self.refresh_publication_observations(intent, &observed)?;
+        let intent = self.journal.publication(&intent.transaction_id)?.intent;
+        let completion = intent.completion.as_ref().ok_or(ReconcileError::Invariant(
+            "publication completion admission missing",
+        ))?;
+        if scanned.len() != completion.manifest.entries.len()
+            || completion.manifest.entries.values().any(|entry| {
+                scanned.get(&entry.path).is_none_or(|observed| {
+                    observed.kind != entry.kind || observed.content != entry.content
+                })
+            })
+        {
+            return Err(ReconcileError::Invariant(
+                "native worktree differs from admitted publication; preserve pending owner",
+            ));
+        }
+        for content in completion
+            .manifest
+            .entries
+            .values()
+            .filter_map(|entry| entry.content.as_ref())
+        {
+            self.cas.verify(content)?;
+        }
+        let root = self.journal.commit_publication(
+            &intent.transaction_id,
+            &intent.baseline_root,
+            &completion.manifest,
+            &completion.operations,
+            completion.timestamp_ms,
+        )?;
+        Ok(ScanResult {
+            space_id: self.space_id.clone(),
+            snapshot_id: root,
+            entries: completion.manifest.entries.len(),
+            operations: completion.operations.len(),
+            files: completion
+                .manifest
+                .entries
+                .values()
+                .filter(|entry| entry.kind == EntryKind::File)
+                .count(),
+            logical_bytes: completion
+                .manifest
+                .entries
+                .values()
+                .filter_map(|entry| entry.content.as_ref())
+                .map(|content| content.length)
+                .sum(),
+            network_enabled: false,
+        })
+    }
+
+    fn refresh_publication_observations(
+        &mut self,
+        intent: &sync_extend_journal::PublicationIntent,
+        observed: &scan::Scan,
+    ) -> Result<bool> {
+        let prior = intent.completion.as_ref().ok_or(ReconcileError::Invariant(
+            "publication completion admission missing",
+        ))?;
+        let mut reference = prior.manifest.clone();
+        reference.entries.remove(&intent.entry_id);
+        let native = build_manifest(&reference, observed, &BTreeMap::new())?;
+        let mut completion = sync_extend_journal::PublicationCompletion::from_observed(
+            &prior.baseline,
+            &self.device_id,
+            native.entries,
+            Entry {
+                entry_id: intent.entry_id.clone(),
+                path: intent.target_path.clone(),
+                kind: EntryKind::File,
+                content: Some(intent.content.clone()),
+            },
+            intent.created_at_ms,
+        )?;
+        for (id, length) in &prior.protected_objects {
+            if completion
+                .protected_objects
+                .insert(id.clone(), *length)
+                .is_some_and(|observed| observed != *length)
+            {
+                return Err(ReconcileError::Invariant(
+                    "publication observed chunk length changed",
+                ));
+            }
+        }
+        if completion == *prior {
+            self.journal
+                .refresh_publication_completion(intent, &completion)?;
+            return Ok(false);
+        }
+        for content in completion
+            .manifest
+            .entries
+            .values()
+            .filter_map(|entry| entry.content.as_ref())
+        {
+            self.cas.verify(content)?;
+        }
+        self.journal
+            .refresh_publication_completion(intent, &completion)?;
+        Ok(true)
     }
 
     pub fn manifest(&self) -> Result<Option<Manifest>> {

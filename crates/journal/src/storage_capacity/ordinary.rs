@@ -142,11 +142,26 @@ pub(super) fn liabilities(owners: &Owners, rows: &[JournalStoredRow]) -> Result<
         let id = publication.intent.transaction_id.to_string();
         out.push("publication_terminal_columns", vec![id.clone()], 0, growth);
         if publication.state != PublicationState::Committed {
-            out.gap(
-                "publication",
-                id,
-                "pre-effect-history-and-extra-scan-admission-not-converted",
-            );
+            if let Some(completion) = &publication.intent.completion {
+                let charge = completion.charge()?;
+                out.push(
+                    "publication_exact_history_peak",
+                    vec![id.clone()],
+                    charge.rows,
+                    charge.logical_bytes,
+                );
+                out.gap(
+                    "publication",
+                    id,
+                    "native-creator-activation-provenance-not-implemented",
+                );
+            } else {
+                out.gap(
+                    "publication",
+                    id,
+                    "pre-effect-history-and-extra-scan-admission-not-converted",
+                );
+            }
         }
     }
     for mutation in &owners.mutations {

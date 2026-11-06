@@ -108,6 +108,22 @@ pub(crate) struct Input<'a> {
 }
 
 pub(crate) fn project(before: &CapacitySnapshot, input: Input<'_>) -> Result<Projection> {
+    project_inner(before, input, None)
+}
+
+pub(crate) fn project_publication(
+    before: &CapacitySnapshot,
+    input: Input<'_>,
+    publication: &crate::PublicationIntent,
+) -> Result<Projection> {
+    project_inner(before, input, Some(publication))
+}
+
+fn project_inner(
+    before: &CapacitySnapshot,
+    input: Input<'_>,
+    publication: Option<&crate::PublicationIntent>,
+) -> Result<Projection> {
     let Input {
         expected_root,
         manifest,
@@ -118,7 +134,20 @@ pub(crate) fn project(before: &CapacitySnapshot, input: Input<'_>) -> Result<Pro
         observation_json,
     } = input;
     crate::storage_policy::receive::tree_gate(before)?;
-    crate::storage_policy::receive::completion_gate(before)?;
+    if publication.is_none() {
+        crate::storage_policy::receive::completion_gate(before)?;
+    } else if before.rows.iter().any(|row| {
+        (row.table() == "mutations"
+            && !matches!(text(row.columns(), "state"), Ok("cancelled" | "committed")))
+            || (row.table() == "publications"
+                && row.primary_key().first().map(String::as_str)
+                    != publication.map(|intent| intent.transaction_id.as_str())
+                && !matches!(integer(row.columns(), "cleaned"), Ok(1)))
+    }) {
+        return Err(JournalError::Invariant(
+            "publication completion has another writer",
+        ));
+    }
     let mut rows: Rows = before
         .rows
         .iter()
@@ -130,7 +159,11 @@ pub(crate) fn project(before: &CapacitySnapshot, input: Input<'_>) -> Result<Pro
         })
         .collect();
     if rows.iter().any(|((table, _), columns)| {
-        table == "publications" && !matches!(integer(columns, "cleaned"), Ok(1))
+        table == "publications"
+            && !matches!(integer(columns, "cleaned"), Ok(1))
+            && publication.is_none_or(|intent| {
+                text(columns, "transaction_id").ok() != Some(intent.transaction_id.as_str())
+            })
     }) {
         return Err(JournalError::Invariant(
             "outstanding publication must be recovered first",
@@ -178,6 +211,53 @@ pub(crate) fn project(before: &CapacitySnapshot, input: Input<'_>) -> Result<Pro
         }
     }
     let mut charge = before.report.accounted_total();
+    let mut handed_off_pin_bytes = 0;
+    let mut handed_off_pin_rows = 0;
+    if let Some(intent) = publication {
+        let completion = intent
+            .completion
+            .as_ref()
+            .ok_or(JournalError::Invariant("publication reservation missing"))?;
+        let held = completion.charge()?;
+        subtract(&mut charge, held.rows, held.logical_bytes + 64)?;
+        let columns = rows
+            .get_mut(&key("publications", &[intent.transaction_id.as_str()]))
+            .ok_or(JournalError::Invariant(
+                "publication projected owner missing",
+            ))?;
+        if text(columns, "state")? != "published" {
+            return Err(JournalError::Invariant(
+                "publication projection requires published",
+            ));
+        }
+        columns
+            .iter_mut()
+            .find(|column| column.name == "state")
+            .unwrap()
+            .value = Value::Text("committed".into());
+        columns
+            .iter_mut()
+            .find(|column| column.name == "committed_snapshot")
+            .unwrap()
+            .value = Value::Text(root.to_string());
+        add(&mut charge, 0, 64)?;
+        let pins: Vec<_> = rows
+            .keys()
+            .filter(|(table, components)| {
+                table == "publication_objects"
+                    && components.first().map(String::as_str)
+                        == Some(intent.transaction_id.as_str())
+            })
+            .cloned()
+            .collect();
+        // Pin handoff happens after snapshot pin insertion. Keep these charges
+        // in the admission peak until the final projection below.
+        for pin in pins {
+            let columns = rows.remove(&pin).unwrap();
+            handed_off_pin_bytes += bytes(&columns)?;
+            handed_off_pin_rows += 1;
+        }
+    }
     if operations.len() != operation_json.len() {
         return Err(JournalError::Invariant(
             "local commit canonical operation count mismatch",
@@ -357,6 +437,7 @@ pub(crate) fn project(before: &CapacitySnapshot, input: Input<'_>) -> Result<Pro
             ));
         }
     }
+    subtract(&mut charge, handed_off_pin_rows, handed_off_pin_bytes)?;
     Ok(Projection { rows, charge })
 }
 

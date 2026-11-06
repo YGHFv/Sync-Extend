@@ -369,6 +369,25 @@ impl LocalSpace {
         for publication in self.journal.outstanding_publications(&self.space_id)? {
             if publication.state != PublicationState::Committed {
                 refs.add(&publication.intent.content, &mut expected)?;
+                if let Some(completion) = &publication.intent.completion {
+                    for (id, length) in &completion.protected_objects {
+                        refs.seen = refs
+                            .seen
+                            .checked_add(1)
+                            .filter(|seen| *seen <= refs.limit)
+                            .ok_or(ReconcileError::ResourceLimit("publication reference count"))?;
+                        if refs
+                            .lengths
+                            .insert(id.clone(), u64::from(*length))
+                            .is_some_and(|old| old != u64::from(*length))
+                        {
+                            return Err(ReconcileError::Invariant(
+                                "publication retained chunk length mismatch",
+                            ));
+                        }
+                        expected.insert(id.clone());
+                    }
+                }
             }
         }
         let protected: BTreeSet<_> = self.journal.protected_objects()?.into_iter().collect();

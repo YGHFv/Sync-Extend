@@ -26,6 +26,7 @@ mod causal_log;
 mod operation_batch;
 mod read_view;
 use read_view::JournalReadView;
+mod publication_admission;
 mod publication_lookup;
 mod storage_policy;
 
@@ -393,6 +394,9 @@ impl Journal {
     }
 
     pub fn begin_publication(&mut self, intent: &PublicationIntent) -> Result<()> {
+        if intent.completion.is_some() {
+            return self.begin_admitted_publication(intent);
+        }
         self.require_no_tree_restore(&intent.space_id, limits::MAX_ENTRIES)?;
         intent.validate()?;
         let baseline = self.snapshot(&intent.space_id, &intent.baseline_root)?;
@@ -462,6 +466,9 @@ impl Journal {
         expected: PublicationState,
         next: PublicationState,
     ) -> Result<()> {
+        if self.publication(id)?.intent.completion.is_some() {
+            return self.advance_admitted_publication(id, expected, next);
+        }
         if !matches!(
             (expected, next),
             (PublicationState::Preparing, PublicationState::Ready)
@@ -480,6 +487,9 @@ impl Journal {
     }
 
     pub fn retarget_publication(&mut self, id: &EntryId, path: PortablePath) -> Result<()> {
+        if self.publication(id)?.intent.completion.is_some() {
+            return self.retarget_admitted_publication(id, path);
+        }
         let publication = self.publication(id)?;
         if publication.state == PublicationState::Committed
             || path == publication.intent.target_path
@@ -511,6 +521,9 @@ impl Journal {
     }
 
     pub fn mark_publication_cleaned(&mut self, id: &EntryId) -> Result<()> {
+        if self.publication(id)?.intent.completion.is_some() {
+            return self.clean_admitted_publication(id);
+        }
         if self.connection.execute(
             "UPDATE publications SET cleaned=1 WHERE transaction_id=?1 AND state='committed'",
             [id.as_str()],
@@ -919,6 +932,15 @@ impl Journal {
         operations: &[Operation],
         timestamp: u64,
     ) -> Result<SnapshotId> {
+        if self.publication(id)?.intent.completion.is_some() {
+            return self.commit_admitted_publication(
+                id,
+                expected_root,
+                manifest,
+                operations,
+                timestamp,
+            );
+        }
         let publication = self.publication(id)?;
         let intent = &publication.intent;
         if publication.state != PublicationState::Published
@@ -1623,7 +1645,7 @@ fn promote_pending(
     Ok(())
 }
 mod publication;
-pub use publication::{Publication, PublicationIntent, PublicationState};
+pub use publication::{Publication, PublicationCompletion, PublicationIntent, PublicationState};
 mod mutation;
 pub use mutation::{
     DeleteExecution, Mutation, MutationAction, MutationExecution, MutationIntent, MutationState,
