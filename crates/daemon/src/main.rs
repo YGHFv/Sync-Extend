@@ -65,6 +65,31 @@ enum Command {
         #[arg(long)]
         path: String,
     },
+    /// Serve only this device's signed log pages; no remote content or apply.
+    ServeOperations {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+    },
+    /// Receive one authenticated log page; does not materialize the worktree.
+    PullOperations {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        address: std::net::SocketAddr,
+        #[arg(long, default_value_t = 0)]
+        after_sequence: u64,
+    },
+    /// Show bounded logical alternatives, not materialized or backed-up state.
+    CausalFrontiers {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Initialize a local space. Data must be outside the existing worktree.
     Init {
         #[arg(long)]
@@ -632,6 +657,60 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             connection.finish().await?;
             print(&result)?;
+        }
+        Command::ServeOperations {
+            data_dir,
+            peer_device,
+            listen,
+        } => {
+            let local = open(&data_dir)?;
+            let device = peer_device.parse()?;
+            let peer = local.read_transport_peer(&device)?;
+            let identity = local.transport_identity()?;
+            let listener = sync_extend_transport::Listener::bind(listen, &identity, &peer)?;
+            print(&serde_json::json!({
+                "listening": listener.local_address()?,
+                "paired_device": device,
+                "own_origin_metadata_only": true,
+                "whole_space_convergence": false
+            }))?;
+            loop {
+                tokio::select! {
+                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    result = listener.accept(&identity, &peer) => {
+                        match result {
+                            Ok(mut connection) => {
+                                if let Err(error) = local.serve_peer_operations(&mut connection).await {
+                                    eprintln!("syncd: operation metadata refused: {error}");
+                                } else if let Err(error) = connection.finish().await {
+                                    eprintln!("syncd: operation metadata finish failed: {error}");
+                                }
+                            }
+                            Err(error) => eprintln!("syncd: unapproved connection refused: {error}"),
+                        }
+                    }
+                }
+            }
+        }
+        Command::PullOperations {
+            data_dir,
+            peer_device,
+            address,
+            after_sequence,
+        } => {
+            let mut local = open(&data_dir)?;
+            let peer = local.read_transport_peer(&peer_device.parse()?)?;
+            let identity = local.transport_identity()?;
+            let mut connection =
+                sync_extend_transport::Connection::connect(address, &identity, &peer).await?;
+            let result = local
+                .pull_peer_operations(&mut connection, after_sequence)
+                .await?;
+            connection.finish().await?;
+            print(&result)?;
+        }
+        Command::CausalFrontiers { data_dir } => {
+            print(&open(&data_dir)?.causal_frontiers()?)?;
         }
         Command::Init { data_dir, root } => {
             let local = LocalSpace::initialize_with_limits(&data_dir, &root, limits.clone())?;

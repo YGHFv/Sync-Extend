@@ -22,6 +22,8 @@ pub enum JournalError {
 
 pub type Result<T> = std::result::Result<T, JournalError>;
 
+mod causal_log;
+mod operation_batch;
 mod read_view;
 use read_view::JournalReadView;
 mod publication_lookup;

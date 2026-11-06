@@ -1,11 +1,16 @@
 mod connection;
 mod identity;
+mod operation_batch;
 mod signed;
 mod tls;
 mod wire;
 
 pub use connection::{Connection, Listener, MAX_BLOCK_BYTES, MAX_CONTROL_BYTES};
 pub use identity::{PeerIdentity, TransportIdentity};
+pub use operation_batch::{
+    OperationBatchRequest, OperationReceiveReceipt, SignedOperationBatch,
+    SignedOperationReceiveReceipt,
+};
 pub use signed::{Hello, Receipt, ReceiptState, SignedHello, SignedOperation, SignedReceipt};
 pub use wire::{FileOffer, FileRequest, FileResponse, SignedFileOffer, MAX_OFFER_BYTES};
 

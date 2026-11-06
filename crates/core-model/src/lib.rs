@@ -1,8 +1,10 @@
+pub mod causal;
 pub mod config;
 pub mod gc_recovery;
 pub mod ids;
 pub mod limits;
 pub mod operation;
+pub mod operation_batch;
 pub mod original_retention;
 pub mod path;
 pub mod persisted_rename;

@@ -13,6 +13,8 @@ mod gc_quarantine;
 mod guarded_mutation;
 mod identity;
 mod join;
+mod peer_operations;
+pub use peer_operations::PeerOperationPull;
 mod peer_pull;
 mod peer_transfer;
 mod remote_file;
