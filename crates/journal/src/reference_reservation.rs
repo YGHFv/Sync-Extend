@@ -112,129 +112,7 @@ impl Journal {
         max: usize,
     ) -> Result<Vec<ReferenceReservation>> {
         self.check_storage_metadata_limit(max)?;
-        if self.state("space_id")?.as_deref() != Some(space.as_str()) {
-            return Err(JournalError::Invariant("reservation space mismatch"));
-        }
-        let orphan: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM reference_reservation_objects p
-                LEFT JOIN reference_reservations o USING(owner_id) WHERE o.owner_id IS NULL)
-             OR EXISTS(SELECT 1 FROM reference_snapshot_handoffs h
-                LEFT JOIN reference_reservations o USING(owner_id) WHERE o.owner_id IS NULL)",
-            [],
-            |r| r.get(0),
-        )?;
-        if orphan {
-            return Err(JournalError::Invariant("orphan reservation pin"));
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT owner_id,space_id,
-                CASE WHEN length(CAST(intent AS BLOB))<=16777216 THEN intent ELSE '' END,
-                intent_hash,created_at_ms FROM reference_reservations ORDER BY owner_id",
-        )?;
-        let rows = statement.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, i64>(4)?,
-            ))
-        })?;
-        let mut owners = Vec::new();
-        let mut all_lengths = BTreeMap::new();
-        let mut all_chunks = 0usize;
-        let mut all_files = 0usize;
-        for row in rows {
-            let (id, stored_space, json, hash, time) = row?;
-            let intent: ReferenceReservationIntent = serde_json::from_str(&json)?;
-            if intent.owner_id.as_str() != id
-                || intent.scope.space_id != *space
-                || stored_space != space.as_str()
-                || ContentId::hash(json.as_bytes()).as_str() != hash
-                || sql_integer(intent.created_at_ms)? != time
-            {
-                return Err(JournalError::Invariant(
-                    "reservation intent integrity mismatch",
-                ));
-            }
-            let mut expected = intent.chunks(max)?;
-            all_files = all_files
-                .checked_add(intent.scope.files.len())
-                .filter(|n| *n <= max)
-                .ok_or(JournalError::Invariant("reservation aggregate file limit"))?;
-            for file in &intent.scope.files {
-                all_chunks = all_chunks
-                    .checked_add(file.chunks.len())
-                    .filter(|n| *n <= max)
-                    .ok_or(JournalError::Invariant("reservation aggregate chunk limit"))?;
-            }
-            let handoff: Option<(String, String)> = self
-                .connection
-                .query_row(
-                    "SELECT CASE WHEN length(CAST(snapshot_id AS BLOB))=64 THEN snapshot_id ELSE '' END,
-                        CASE WHEN length(CAST(owner_intent_hash AS BLOB))=64 THEN owner_intent_hash ELSE '' END
-                     FROM reference_snapshot_handoffs WHERE owner_id=?1",
-                    [&id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let snapshot_handoff = if let Some((snapshot_id, owner_hash)) = handoff {
-                if owner_hash != hash {
-                    return Err(JournalError::Invariant("snapshot handoff hash mismatch"));
-                }
-                let snapshot_id = snapshot_id.parse()?;
-                let snapshot = crate::snapshot_retention::audit_snapshot(
-                    &self.connection,
-                    space,
-                    &snapshot_id,
-                )?;
-                require_snapshot_scope(&intent, &snapshot.manifest, &snapshot.state)?;
-                expected.clear();
-                Some(ReferenceSnapshotHandoff {
-                    snapshot_id,
-                    owner_intent_hash: owner_hash.parse()?,
-                })
-            } else {
-                None
-            };
-            let mut pins = self.connection.prepare(
-                "SELECT content_id FROM reference_reservation_objects WHERE owner_id=?1",
-            )?;
-            let actual: Vec<String> = pins
-                .query_map([&id], |r| r.get(0))?
-                .collect::<std::result::Result<_, _>>()?;
-            if actual.len() != expected.len()
-                || actual.iter().any(|id| {
-                    id.parse::<ContentId>()
-                        .map_or(true, |id| !expected.contains_key(&id))
-                })
-            {
-                return Err(JournalError::Invariant("reservation exact pin mismatch"));
-            }
-            for (id, length) in expected {
-                self.require_cas_access(&id)?;
-                if all_lengths
-                    .insert(id, length)
-                    .is_some_and(|old| old != length)
-                {
-                    return Err(JournalError::Invariant("reservation length mismatch"));
-                }
-            }
-            owners.push(ReferenceReservation {
-                intent,
-                state: if snapshot_handoff.is_some() {
-                    "transferred_to_snapshot"
-                } else {
-                    "reserved"
-                },
-                content_hashes_verified: false,
-                release_available: false,
-                worker_available: false,
-                remote_backup_complete: false,
-                snapshot_handoff,
-            });
-        }
-        Ok(owners)
+        self.read_view().reference_reservations(space, max)
     }
 
     /// Reserve exact content IDs before import, even when their bytes are missing.
@@ -420,4 +298,136 @@ fn require_snapshot_scope(
         return Err(JournalError::Invariant("snapshot handoff scope mismatch"));
     }
     Ok(())
+}
+
+impl crate::JournalReadView<'_> {
+    pub(crate) fn reference_reservations(
+        &self,
+        space: &SpaceId,
+        max: usize,
+    ) -> Result<Vec<ReferenceReservation>> {
+        if self.state("space_id")?.as_deref() != Some(space.as_str()) {
+            return Err(JournalError::Invariant("reservation space mismatch"));
+        }
+        let orphan: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM reference_reservation_objects p
+                LEFT JOIN reference_reservations o USING(owner_id) WHERE o.owner_id IS NULL)
+             OR EXISTS(SELECT 1 FROM reference_snapshot_handoffs h
+                LEFT JOIN reference_reservations o USING(owner_id) WHERE o.owner_id IS NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        if orphan {
+            return Err(JournalError::Invariant("orphan reservation pin"));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT owner_id,space_id,
+                CASE WHEN length(CAST(intent AS BLOB))<=16777216 THEN intent ELSE '' END,
+                intent_hash,created_at_ms FROM reference_reservations ORDER BY owner_id",
+        )?;
+        let rows = statement.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut owners = Vec::new();
+        let mut all_lengths = BTreeMap::new();
+        let mut all_chunks = 0usize;
+        let mut all_files = 0usize;
+        for row in rows {
+            let (id, stored_space, json, hash, time) = row?;
+            let intent: ReferenceReservationIntent = serde_json::from_str(&json)?;
+            if intent.owner_id.as_str() != id
+                || intent.scope.space_id != *space
+                || stored_space != space.as_str()
+                || ContentId::hash(json.as_bytes()).as_str() != hash
+                || sql_integer(intent.created_at_ms)? != time
+            {
+                return Err(JournalError::Invariant(
+                    "reservation intent integrity mismatch",
+                ));
+            }
+            let mut expected = intent.chunks(max)?;
+            all_files = all_files
+                .checked_add(intent.scope.files.len())
+                .filter(|n| *n <= max)
+                .ok_or(JournalError::Invariant("reservation aggregate file limit"))?;
+            for file in &intent.scope.files {
+                all_chunks = all_chunks
+                    .checked_add(file.chunks.len())
+                    .filter(|n| *n <= max)
+                    .ok_or(JournalError::Invariant("reservation aggregate chunk limit"))?;
+            }
+            let handoff: Option<(String, String)> = self
+                .connection
+                .query_row(
+                    "SELECT CASE WHEN length(CAST(snapshot_id AS BLOB))=64 THEN snapshot_id ELSE '' END,
+                        CASE WHEN length(CAST(owner_intent_hash AS BLOB))=64 THEN owner_intent_hash ELSE '' END
+                     FROM reference_snapshot_handoffs WHERE owner_id=?1",
+                    [&id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let snapshot_handoff = if let Some((snapshot_id, owner_hash)) = handoff {
+                if owner_hash != hash {
+                    return Err(JournalError::Invariant("snapshot handoff hash mismatch"));
+                }
+                let snapshot_id = snapshot_id.parse()?;
+                let snapshot = crate::snapshot_retention::audit_snapshot(
+                    self.connection,
+                    space,
+                    &snapshot_id,
+                )?;
+                require_snapshot_scope(&intent, &snapshot.manifest, &snapshot.state)?;
+                expected.clear();
+                Some(ReferenceSnapshotHandoff {
+                    snapshot_id,
+                    owner_intent_hash: owner_hash.parse()?,
+                })
+            } else {
+                None
+            };
+            let mut pins = self.connection.prepare(
+                "SELECT content_id FROM reference_reservation_objects WHERE owner_id=?1",
+            )?;
+            let actual: Vec<String> = pins
+                .query_map([&id], |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            if actual.len() != expected.len()
+                || actual.iter().any(|id| {
+                    id.parse::<ContentId>()
+                        .map_or(true, |id| !expected.contains_key(&id))
+                })
+            {
+                return Err(JournalError::Invariant("reservation exact pin mismatch"));
+            }
+            for (id, length) in expected {
+                self.require_cas_access(&id)?;
+                if all_lengths
+                    .insert(id, length)
+                    .is_some_and(|old| old != length)
+                {
+                    return Err(JournalError::Invariant("reservation length mismatch"));
+                }
+            }
+            owners.push(ReferenceReservation {
+                intent,
+                state: if snapshot_handoff.is_some() {
+                    "transferred_to_snapshot"
+                } else {
+                    "reserved"
+                },
+                content_hashes_verified: false,
+                release_available: false,
+                worker_available: false,
+                remote_backup_complete: false,
+                snapshot_handoff,
+            });
+        }
+        Ok(owners)
+    }
 }

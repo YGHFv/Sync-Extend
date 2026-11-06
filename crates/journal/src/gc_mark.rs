@@ -85,116 +85,11 @@ impl GcMark {
 impl Journal {
     pub fn gc_marks(&self, space: &SpaceId, max_entries: usize) -> Result<Vec<GcMarkAudit>> {
         self.check_storage_metadata_limit(max_entries)?;
-        if self.state("space_id")?.as_deref() != Some(space.as_str()) {
-            return Err(JournalError::Invariant("GC space mismatch"));
-        }
-        let clock: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT observed_at_ms FROM gc_clock WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if clock.is_some_and(|c| c < 0) {
-            return Err(JournalError::Invariant("negative GC clock"));
-        }
-        let orphan: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM gc_cancellations c LEFT JOIN gc_marks m USING(mark_id)
-                WHERE m.mark_id IS NULL)
-             OR EXISTS(SELECT 1 FROM gc_invalidations i LEFT JOIN gc_marks m USING(mark_id)
-                WHERE m.mark_id IS NULL)",
-            [],
-            |r| r.get(0),
-        )?;
-        if orphan {
-            return Err(JournalError::Invariant("orphan GC terminal record"));
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT mark_id,space_id,content_id,
-             CASE WHEN length(CAST(intent AS BLOB))<=4096 THEN intent ELSE '' END,
-             intent_hash,marked_at_ms,grace_until_ms
-             FROM gc_marks ORDER BY marked_at_ms,mark_id",
-        )?;
-        let rows = statement.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, i64>(6)?,
-            ))
-        })?;
-        let mut audits = Vec::new();
-        let mut live = std::collections::BTreeSet::new();
-        for row in rows {
-            let (id, stored_space, content, json, hash, time, until) = row?;
-            let intent: GcMark = serde_json::from_str(&json)?;
-            intent.validate()?;
-            if intent.mark_id.as_str() != id
-                || intent.space_id != *space
-                || stored_space != space.as_str()
-                || intent.content_id.as_str() != content
-                || ContentId::hash(json.as_bytes()).as_str() != hash
-                || sql_integer(intent.marked_at_ms)? != time
-                || sql_integer(intent.grace_until_ms)? != until
-                || clock.is_none_or(|c| c < time)
-            {
-                return Err(JournalError::Invariant("GC mark integrity mismatch"));
-            }
-            let cancelled: Option<i64> = self
-                .connection
-                .query_row(
-                    "SELECT cancelled_at_ms FROM gc_cancellations WHERE mark_id=?1",
-                    [&id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if cancelled.is_some_and(|c| c < time || clock.is_none_or(|t| t < c)) {
-                return Err(JournalError::Invariant("GC cancellation time mismatch"));
-            }
-            let invalidated: bool = self.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM gc_invalidations WHERE mark_id=?1)",
-                [&id],
-                |r| r.get(0),
-            )?;
-            let state = if cancelled.is_some() {
-                GcState::Cancelled
-            } else if invalidated {
-                GcState::Invalidated
-            } else {
-                GcState::Marked
-            };
-            if state == GcState::Marked
-                && (!live.insert(intent.content_id.clone())
-                    || self.gc_protected(&intent.content_id)?)
-            {
-                return Err(JournalError::Invariant(
-                    "live GC mark has duplicate or protected content",
-                ));
-            }
-            audits.push(GcMarkAudit {
-                intent,
-                state,
-                cancelled_at_ms: cancelled.map(|c| c as u64),
-            });
-        }
-        Ok(audits)
+        self.read_view().gc_marks(space)
     }
 
     pub(crate) fn gc_protected(&self, id: &ContentId) -> Result<bool> {
-        Ok(self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM snapshot_objects WHERE content_id=?1)
-             OR EXISTS(SELECT 1 FROM publication_objects WHERE content_id=?1)
-             OR EXISTS(SELECT 1 FROM mutation_objects WHERE content_id=?1)
-             OR EXISTS(SELECT 1 FROM read_lease_objects WHERE content_id=?1)
-             OR EXISTS(SELECT 1 FROM reference_reservation_objects WHERE content_id=?1)
-             OR EXISTS(SELECT 1 FROM tree_restore_objects WHERE content_id=?1)",
-            [id.as_str()],
-            |r| r.get(0),
-        )?)
+        self.read_view().gc_protected(id)
     }
 
     pub(crate) fn gc_observe_clock(&self, now: u64, max_entries: usize) -> Result<()> {
@@ -398,5 +293,120 @@ impl Journal {
         }
         self.gc_observe_clock(now, max_entries)?;
         Ok(audit.intent)
+    }
+}
+
+impl crate::JournalReadView<'_> {
+    pub(crate) fn gc_marks(&self, space: &SpaceId) -> Result<Vec<GcMarkAudit>> {
+        if self.state("space_id")?.as_deref() != Some(space.as_str()) {
+            return Err(JournalError::Invariant("GC space mismatch"));
+        }
+        let clock: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT observed_at_ms FROM gc_clock WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if clock.is_some_and(|c| c < 0) {
+            return Err(JournalError::Invariant("negative GC clock"));
+        }
+        let orphan: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gc_cancellations c LEFT JOIN gc_marks m USING(mark_id)
+                WHERE m.mark_id IS NULL)
+             OR EXISTS(SELECT 1 FROM gc_invalidations i LEFT JOIN gc_marks m USING(mark_id)
+                WHERE m.mark_id IS NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        if orphan {
+            return Err(JournalError::Invariant("orphan GC terminal record"));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT mark_id,space_id,content_id,
+             CASE WHEN length(CAST(intent AS BLOB))<=4096 THEN intent ELSE '' END,
+             intent_hash,marked_at_ms,grace_until_ms
+             FROM gc_marks ORDER BY marked_at_ms,mark_id",
+        )?;
+        let rows = statement.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut audits = Vec::new();
+        let mut live = std::collections::BTreeSet::new();
+        for row in rows {
+            let (id, stored_space, content, json, hash, time, until) = row?;
+            let intent: GcMark = serde_json::from_str(&json)?;
+            intent.validate()?;
+            if intent.mark_id.as_str() != id
+                || intent.space_id != *space
+                || stored_space != space.as_str()
+                || intent.content_id.as_str() != content
+                || ContentId::hash(json.as_bytes()).as_str() != hash
+                || sql_integer(intent.marked_at_ms)? != time
+                || sql_integer(intent.grace_until_ms)? != until
+                || clock.is_none_or(|c| c < time)
+            {
+                return Err(JournalError::Invariant("GC mark integrity mismatch"));
+            }
+            let cancelled: Option<i64> = self
+                .connection
+                .query_row(
+                    "SELECT cancelled_at_ms FROM gc_cancellations WHERE mark_id=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if cancelled.is_some_and(|c| c < time || clock.is_none_or(|t| t < c)) {
+                return Err(JournalError::Invariant("GC cancellation time mismatch"));
+            }
+            let invalidated: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM gc_invalidations WHERE mark_id=?1)",
+                [&id],
+                |r| r.get(0),
+            )?;
+            let state = if cancelled.is_some() {
+                GcState::Cancelled
+            } else if invalidated {
+                GcState::Invalidated
+            } else {
+                GcState::Marked
+            };
+            if state == GcState::Marked
+                && (!live.insert(intent.content_id.clone())
+                    || self.gc_protected(&intent.content_id)?)
+            {
+                return Err(JournalError::Invariant(
+                    "live GC mark has duplicate or protected content",
+                ));
+            }
+            audits.push(GcMarkAudit {
+                intent,
+                state,
+                cancelled_at_ms: cancelled.map(|c| c as u64),
+            });
+        }
+        Ok(audits)
+    }
+
+    pub(crate) fn gc_protected(&self, id: &ContentId) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM snapshot_objects WHERE content_id=?1)
+             OR EXISTS(SELECT 1 FROM publication_objects WHERE content_id=?1)
+             OR EXISTS(SELECT 1 FROM mutation_objects WHERE content_id=?1)
+             OR EXISTS(SELECT 1 FROM read_lease_objects WHERE content_id=?1)
+             OR EXISTS(SELECT 1 FROM reference_reservation_objects WHERE content_id=?1)
+             OR EXISTS(SELECT 1 FROM tree_restore_objects WHERE content_id=?1)",
+            [id.as_str()],
+            |r| r.get(0),
+        )?)
     }
 }

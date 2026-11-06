@@ -75,150 +75,16 @@ fn observe(connection: &Connection, now: u64) -> Result<()> {
 
 impl Journal {
     fn validate_read_lease_intent(&self, intent: &ReadLeaseIntent) -> Result<()> {
-        intent.entry.validate()?;
-        if intent.format_version != FORMAT_VERSION
-            || intent.entry.kind != EntryKind::File
-            || intent.initial_expires_at_ms <= intent.created_at_ms
-            || intent.initial_expires_at_ms - intent.created_at_ms > MAX_TTL_MS
-            || intent.initial_expires_at_ms - intent.created_at_ms < 1000
-        {
-            return Err(JournalError::Invariant("invalid read lease intent"));
-        }
-        sql_integer(intent.initial_expires_at_ms)?;
-        let manifest = self.snapshot(&intent.space_id, &intent.snapshot_id)?;
-        if manifest.entries.get(&intent.entry.entry_id) != Some(&intent.entry) {
-            return Err(JournalError::Invariant(
-                "read lease snapshot entry mismatch",
-            ));
-        }
-        let expected: BTreeSet<_> = manifest
-            .entries
-            .values()
-            .filter_map(|e| e.content.as_ref())
-            .flat_map(|c| c.chunks.iter().map(|chunk| chunk.content_id.clone()))
-            .collect();
-        let mut statement = self
-            .connection
-            .prepare("SELECT content_id FROM snapshot_objects WHERE snapshot_id=?1")?;
-        let ids: Vec<String> = statement
-            .query_map([intent.snapshot_id.as_str()], |r| r.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        let actual = ids
-            .into_iter()
-            .map(|id| id.parse())
-            .collect::<std::result::Result<BTreeSet<ContentId>, _>>()?;
-        if actual != expected {
-            return Err(JournalError::Invariant(
-                "read lease retained snapshot protection mismatch",
-            ));
-        }
-        Ok(())
+        self.read_view().validate_read_lease_intent(intent)
     }
 
     pub fn read_lease(&self, id: &EntryId) -> Result<ReadLease> {
-        let length: i64 = self.connection.query_row(
-            "SELECT length(CAST(intent AS BLOB)) FROM read_leases WHERE lease_id=?1",
-            [id.as_str()],
-            |r| r.get(0),
-        )?;
-        if !(1..=MAX_OPERATION_BYTES as i64).contains(&length) {
-            return Err(JournalError::Invariant("read lease metadata limit"));
-        }
-        let (space, snapshot, json, hash, state, observed, expires, finished):
-            (String,String,String,String,String,i64,i64,Option<i64>) = self.connection.query_row(
-                "SELECT space_id,snapshot_id,intent,intent_hash,state,observed_at_ms,expires_at_ms,finished_at_ms
-                 FROM read_leases WHERE lease_id=?1", [id.as_str()],
-                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)),
-            )?;
-        let intent: ReadLeaseIntent = serde_json::from_str(&json)?;
-        if intent.lease_id != *id
-            || intent.space_id.as_str() != space
-            || intent.snapshot_id.as_str() != snapshot
-            || ContentId::hash(json.as_bytes()).as_str() != hash
-        {
-            return Err(JournalError::Invariant(
-                "read lease intent integrity mismatch",
-            ));
-        }
-        self.validate_read_lease_intent(&intent)?;
-        let state = match state.as_str() {
-            "active" => ReadLeaseState::Active,
-            "released" => ReadLeaseState::Released,
-            "expired" => ReadLeaseState::Expired,
-            _ => return Err(JournalError::Invariant("unsupported read lease state")),
-        };
-        let observed_at_ms =
-            u64::try_from(observed).map_err(|_| JournalError::Invariant("invalid lease time"))?;
-        let expires_at_ms =
-            u64::try_from(expires).map_err(|_| JournalError::Invariant("invalid lease expiry"))?;
-        let finished_at_ms = finished
-            .map(u64::try_from)
-            .transpose()
-            .map_err(|_| JournalError::Invariant("invalid lease finish time"))?;
-        let watermark = clock(&self.connection)?;
-        if observed_at_ms < intent.created_at_ms
-            || expires_at_ms < intent.initial_expires_at_ms
-            || expires_at_ms <= observed_at_ms
-            || expires_at_ms - observed_at_ms > MAX_TTL_MS
-            || observed_at_ms > watermark
-            || (state == ReadLeaseState::Active) != finished_at_ms.is_none()
-            || finished_at_ms.is_some_and(|t| {
-                t < observed_at_ms
-                    || t > watermark
-                    || (state == ReadLeaseState::Expired && t < expires_at_ms)
-            })
-        {
-            return Err(JournalError::Invariant("read lease phase/time mismatch"));
-        }
-        let expected: BTreeSet<ContentId> = if state == ReadLeaseState::Active {
-            intent
-                .entry
-                .content
-                .as_ref()
-                .ok_or(JournalError::Invariant("read lease content missing"))?
-                .chunks
-                .iter()
-                .map(|c| c.content_id.clone())
-                .collect()
-        } else {
-            BTreeSet::new()
-        };
-        let mut statement = self
-            .connection
-            .prepare("SELECT content_id FROM read_lease_objects WHERE lease_id=?1")?;
-        let ids: Vec<String> = statement
-            .query_map([id.as_str()], |r| r.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        let actual = ids
-            .into_iter()
-            .map(|id| id.parse())
-            .collect::<std::result::Result<BTreeSet<ContentId>, _>>()?;
-        if actual != expected {
-            return Err(JournalError::Invariant(
-                "read lease object protection mismatch",
-            ));
-        }
-        Ok(ReadLease {
-            intent,
-            state,
-            observed_at_ms,
-            expires_at_ms,
-            finished_at_ms,
-        })
+        self.read_view().read_lease(id)
     }
 
     pub fn read_leases(&self, space: &SpaceId, max_entries: usize) -> Result<Vec<ReadLease>> {
         self.check_storage_metadata_limit(max_entries)?;
-        clock(&self.connection)?;
-        let mut statement = self
-            .connection
-            .prepare("SELECT lease_id FROM read_leases WHERE space_id=?1 ORDER BY lease_id")?;
-        let ids: Vec<String> = statement
-            .query_map([space.as_str()], |r| r.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        ids.into_iter()
-            .map(|id| self.read_lease(&id.parse()?))
-            .collect()
+        self.read_view().read_leases(space)
     }
 
     pub fn acquire_read_lease(
@@ -399,5 +265,153 @@ impl Journal {
             ));
         }
         Ok(lease)
+    }
+}
+
+impl crate::JournalReadView<'_> {
+    pub(crate) fn validate_read_lease_intent(&self, intent: &ReadLeaseIntent) -> Result<()> {
+        intent.entry.validate()?;
+        if intent.format_version != FORMAT_VERSION
+            || intent.entry.kind != EntryKind::File
+            || intent.initial_expires_at_ms <= intent.created_at_ms
+            || intent.initial_expires_at_ms - intent.created_at_ms > MAX_TTL_MS
+            || intent.initial_expires_at_ms - intent.created_at_ms < 1000
+        {
+            return Err(JournalError::Invariant("invalid read lease intent"));
+        }
+        sql_integer(intent.initial_expires_at_ms)?;
+        let manifest = self.snapshot(&intent.space_id, &intent.snapshot_id)?;
+        if manifest.entries.get(&intent.entry.entry_id) != Some(&intent.entry) {
+            return Err(JournalError::Invariant(
+                "read lease snapshot entry mismatch",
+            ));
+        }
+        let expected: BTreeSet<_> = manifest
+            .entries
+            .values()
+            .filter_map(|e| e.content.as_ref())
+            .flat_map(|c| c.chunks.iter().map(|chunk| chunk.content_id.clone()))
+            .collect();
+        let mut statement = self
+            .connection
+            .prepare("SELECT content_id FROM snapshot_objects WHERE snapshot_id=?1")?;
+        let ids: Vec<String> = statement
+            .query_map([intent.snapshot_id.as_str()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        let actual = ids
+            .into_iter()
+            .map(|id| id.parse())
+            .collect::<std::result::Result<BTreeSet<ContentId>, _>>()?;
+        if actual != expected {
+            return Err(JournalError::Invariant(
+                "read lease retained snapshot protection mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_lease(&self, id: &EntryId) -> Result<ReadLease> {
+        let length: i64 = self.connection.query_row(
+            "SELECT length(CAST(intent AS BLOB)) FROM read_leases WHERE lease_id=?1",
+            [id.as_str()],
+            |r| r.get(0),
+        )?;
+        if !(1..=MAX_OPERATION_BYTES as i64).contains(&length) {
+            return Err(JournalError::Invariant("read lease metadata limit"));
+        }
+        let (space, snapshot, json, hash, state, observed, expires, finished):
+            (String,String,String,String,String,i64,i64,Option<i64>) = self.connection.query_row(
+                "SELECT space_id,snapshot_id,intent,intent_hash,state,observed_at_ms,expires_at_ms,finished_at_ms
+                 FROM read_leases WHERE lease_id=?1", [id.as_str()],
+                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)),
+            )?;
+        let intent: ReadLeaseIntent = serde_json::from_str(&json)?;
+        if intent.lease_id != *id
+            || intent.space_id.as_str() != space
+            || intent.snapshot_id.as_str() != snapshot
+            || ContentId::hash(json.as_bytes()).as_str() != hash
+        {
+            return Err(JournalError::Invariant(
+                "read lease intent integrity mismatch",
+            ));
+        }
+        self.validate_read_lease_intent(&intent)?;
+        let state = match state.as_str() {
+            "active" => ReadLeaseState::Active,
+            "released" => ReadLeaseState::Released,
+            "expired" => ReadLeaseState::Expired,
+            _ => return Err(JournalError::Invariant("unsupported read lease state")),
+        };
+        let observed_at_ms =
+            u64::try_from(observed).map_err(|_| JournalError::Invariant("invalid lease time"))?;
+        let expires_at_ms =
+            u64::try_from(expires).map_err(|_| JournalError::Invariant("invalid lease expiry"))?;
+        let finished_at_ms = finished
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| JournalError::Invariant("invalid lease finish time"))?;
+        let watermark = clock(self.connection)?;
+        if observed_at_ms < intent.created_at_ms
+            || expires_at_ms < intent.initial_expires_at_ms
+            || expires_at_ms <= observed_at_ms
+            || expires_at_ms - observed_at_ms > MAX_TTL_MS
+            || observed_at_ms > watermark
+            || (state == ReadLeaseState::Active) != finished_at_ms.is_none()
+            || finished_at_ms.is_some_and(|t| {
+                t < observed_at_ms
+                    || t > watermark
+                    || (state == ReadLeaseState::Expired && t < expires_at_ms)
+            })
+        {
+            return Err(JournalError::Invariant("read lease phase/time mismatch"));
+        }
+        let expected: BTreeSet<ContentId> = if state == ReadLeaseState::Active {
+            intent
+                .entry
+                .content
+                .as_ref()
+                .ok_or(JournalError::Invariant("read lease content missing"))?
+                .chunks
+                .iter()
+                .map(|c| c.content_id.clone())
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let mut statement = self
+            .connection
+            .prepare("SELECT content_id FROM read_lease_objects WHERE lease_id=?1")?;
+        let ids: Vec<String> = statement
+            .query_map([id.as_str()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        let actual = ids
+            .into_iter()
+            .map(|id| id.parse())
+            .collect::<std::result::Result<BTreeSet<ContentId>, _>>()?;
+        if actual != expected {
+            return Err(JournalError::Invariant(
+                "read lease object protection mismatch",
+            ));
+        }
+        Ok(ReadLease {
+            intent,
+            state,
+            observed_at_ms,
+            expires_at_ms,
+            finished_at_ms,
+        })
+    }
+
+    pub(crate) fn read_leases(&self, space: &SpaceId) -> Result<Vec<ReadLease>> {
+        clock(self.connection)?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT lease_id FROM read_leases WHERE space_id=?1 ORDER BY lease_id")?;
+        let ids: Vec<String> = statement
+            .query_map([space.as_str()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        ids.into_iter()
+            .map(|id| self.read_lease(&id.parse()?))
+            .collect()
     }
 }

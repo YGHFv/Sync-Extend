@@ -44,49 +44,7 @@ pub enum OriginalDisposalStep {
 
 impl Journal {
     fn validate_original_disposal(&self, intent: &OriginalDisposalIntent) -> Result<()> {
-        let scope = &intent.scope;
-        scope.validate()?;
-        sql_integer(intent.prepared_at_ms)?;
-        let mutation = self.mutation(&scope.transaction_id)?;
-        self.verify_mutation_references(&scope.transaction_id)?;
-        let action = match &mutation.intent.action {
-            MutationAction::Delete => RetainedOriginalAction::Delete,
-            MutationAction::Replace { .. } => RetainedOriginalAction::Replace,
-            MutationAction::Move { .. } => {
-                return Err(JournalError::Invariant("Move has no retained original"));
-            }
-        };
-        let execution = mutation.execution.as_ref().ok_or(JournalError::Invariant(
-            "original preparation execution missing",
-        ))?;
-        let baseline = self.retained_snapshot(&scope.space_id, &scope.baseline_snapshot)?;
-        let completed = self.retained_snapshot(&scope.space_id, &scope.committed_snapshot)?;
-        if mutation.state != MutationState::Committed
-            || mutation.intent.space_id != scope.space_id
-            || mutation.intent.baseline_root != scope.baseline_snapshot
-            || mutation.committed_snapshot.as_ref() != Some(&scope.committed_snapshot)
-            || execution.execution_id != scope.execution_id
-            || action != scope.action
-            || ContentId::hash(serde_json::to_string(&mutation.intent)?.as_bytes())
-                != scope.mutation_intent_hash
-            || ContentId::hash(serde_json::to_string(execution)?.as_bytes()) != scope.execution_hash
-            || mutation.intent.file_identity != scope.original_identity
-            || mutation.intent.baseline_entry.content.as_ref() != Some(&scope.content)
-            || baseline.state != "materialized"
-            || completed.state != "materialized"
-            || intent.original_length != scope.content.length
-            || intent.prepared_at_ms < mutation.intent.created_at_ms
-            || intent.prepared_at_ms < baseline.created_at_ms
-            || intent.prepared_at_ms < completed.created_at_ms
-        {
-            return Err(JournalError::Invariant(
-                "original preparation committed generation mismatch",
-            ));
-        }
-        for chunk in &scope.content.chunks {
-            self.require_cas_access(&chunk.content_id)?;
-        }
-        Ok(())
+        self.read_view().validate_original_disposal(intent)
     }
 
     /// Metadata-only, bounded own-snapshot pin audit. No native or CAS hash proof.
@@ -111,100 +69,7 @@ impl Journal {
         max: usize,
     ) -> Result<Vec<OriginalDisposalAudit>> {
         self.check_storage_metadata_limit(max)?;
-        if self.state("space_id")?.as_deref() != Some(space.as_str()) {
-            return Err(JournalError::Invariant(
-                "original preparation space mismatch",
-            ));
-        }
-        let orphan: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM original_disposal_completions c
-                LEFT JOIN original_disposals p USING(transaction_id) WHERE p.transaction_id IS NULL)",
-            [],
-            |r| r.get(0),
-        )?;
-        if orphan {
-            return Err(JournalError::Invariant("orphan original completion"));
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT transaction_id,execution_id,plan_id,space_id,
-                CASE WHEN length(CAST(intent AS BLOB))<=16777216 THEN intent ELSE '' END,
-                intent_hash,prepared_at_ms FROM original_disposals ORDER BY transaction_id",
-        )?;
-        let rows = statement.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, i64>(6)?,
-            ))
-        })?;
-        let mut audits = Vec::new();
-        let mut visits = 0usize;
-        for row in rows {
-            let (transaction, execution, plan, stored_space, json, hash, time) = row?;
-            let intent: OriginalDisposalIntent = serde_json::from_str(&json)?;
-            visits = visits
-                .checked_add(intent.scope.content.chunks.len())
-                .filter(|n| *n <= max)
-                .ok_or(JournalError::Invariant("original preparation chunk budget"))?;
-            if intent.scope.transaction_id.as_str() != transaction
-                || intent.scope.execution_id.as_str() != execution
-                || intent.plan_id.as_str() != plan
-                || intent.scope.space_id != *space
-                || stored_space != space.as_str()
-                || sql_integer(intent.prepared_at_ms)? != time
-                || serde_json::to_string(&intent)? != json
-                || ContentId::hash(json.as_bytes()).as_str() != hash
-            {
-                return Err(JournalError::Invariant(
-                    "original preparation integrity mismatch",
-                ));
-            }
-            self.validate_original_disposal(&intent)?;
-            let completion: Option<(String, String, i64)> = self
-                .connection
-                .query_row(
-                    "SELECT CASE WHEN length(CAST(plan_id AS BLOB))=32 THEN plan_id ELSE '' END,
-                        CASE WHEN length(CAST(intent_hash AS BLOB))=64 THEN intent_hash ELSE '' END,
-                        completed_at_ms
-                     FROM original_disposal_completions WHERE transaction_id=?1",
-                    [&transaction],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-            let completed_at_ms = if let Some((plan_id, intent_hash, completed)) = completion {
-                if plan_id != plan || intent_hash != hash || completed < time {
-                    return Err(JournalError::Invariant(
-                        "original completion integrity mismatch",
-                    ));
-                }
-                Some(
-                    u64::try_from(completed)
-                        .map_err(|_| JournalError::Invariant("invalid original completion time"))?,
-                )
-            } else {
-                None
-            };
-            audits.push(OriginalDisposalAudit {
-                intent,
-                state: if completed_at_ms.is_some() {
-                    "disposed"
-                } else {
-                    "delete_pending"
-                },
-                completed_at_ms,
-                historical_snapshot_pins_verified: true,
-                content_hashes_verified: false,
-                disposition_executor_available: cfg!(windows),
-                automatic_cleanup_available: false,
-                physical_space_reclaimed: false,
-                remote_backup_complete: false,
-            });
-        }
-        Ok(audits)
+        self.read_view().audit_original_disposals(space, max)
     }
 
     /// Persist one single-use pending, not a native disposition request.
@@ -344,5 +209,154 @@ impl Journal {
         let audit = selected(self.original_disposals(space, max)?)?;
         tx.commit().map_err(JournalError::from)?;
         Ok((Some((coordination, guards)), audit))
+    }
+}
+
+impl crate::JournalReadView<'_> {
+    pub(crate) fn validate_original_disposal(&self, intent: &OriginalDisposalIntent) -> Result<()> {
+        let scope = &intent.scope;
+        scope.validate()?;
+        sql_integer(intent.prepared_at_ms)?;
+        let mutation = self.mutation(&scope.transaction_id)?;
+        self.verify_mutation_references(&scope.transaction_id)?;
+        let action = match &mutation.intent.action {
+            MutationAction::Delete => RetainedOriginalAction::Delete,
+            MutationAction::Replace { .. } => RetainedOriginalAction::Replace,
+            MutationAction::Move { .. } => {
+                return Err(JournalError::Invariant("Move has no retained original"));
+            }
+        };
+        let execution = mutation.execution.as_ref().ok_or(JournalError::Invariant(
+            "original preparation execution missing",
+        ))?;
+        let baseline = self.retained_snapshot(&scope.space_id, &scope.baseline_snapshot)?;
+        let completed = self.retained_snapshot(&scope.space_id, &scope.committed_snapshot)?;
+        if mutation.state != MutationState::Committed
+            || mutation.intent.space_id != scope.space_id
+            || mutation.intent.baseline_root != scope.baseline_snapshot
+            || mutation.committed_snapshot.as_ref() != Some(&scope.committed_snapshot)
+            || execution.execution_id != scope.execution_id
+            || action != scope.action
+            || ContentId::hash(serde_json::to_string(&mutation.intent)?.as_bytes())
+                != scope.mutation_intent_hash
+            || ContentId::hash(serde_json::to_string(execution)?.as_bytes()) != scope.execution_hash
+            || mutation.intent.file_identity != scope.original_identity
+            || mutation.intent.baseline_entry.content.as_ref() != Some(&scope.content)
+            || baseline.state != "materialized"
+            || completed.state != "materialized"
+            || intent.original_length != scope.content.length
+            || intent.prepared_at_ms < mutation.intent.created_at_ms
+            || intent.prepared_at_ms < baseline.created_at_ms
+            || intent.prepared_at_ms < completed.created_at_ms
+        {
+            return Err(JournalError::Invariant(
+                "original preparation committed generation mismatch",
+            ));
+        }
+        for chunk in &scope.content.chunks {
+            self.require_cas_access(&chunk.content_id)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn audit_original_disposals(
+        &self,
+        space: &SpaceId,
+        max: usize,
+    ) -> Result<Vec<OriginalDisposalAudit>> {
+        if self.state("space_id")?.as_deref() != Some(space.as_str()) {
+            return Err(JournalError::Invariant(
+                "original preparation space mismatch",
+            ));
+        }
+        let orphan: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM original_disposal_completions c
+                LEFT JOIN original_disposals p USING(transaction_id) WHERE p.transaction_id IS NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        if orphan {
+            return Err(JournalError::Invariant("orphan original completion"));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT transaction_id,execution_id,plan_id,space_id,
+                CASE WHEN length(CAST(intent AS BLOB))<=16777216 THEN intent ELSE '' END,
+                intent_hash,prepared_at_ms FROM original_disposals ORDER BY transaction_id",
+        )?;
+        let rows = statement.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut audits = Vec::new();
+        let mut visits = 0usize;
+        for row in rows {
+            let (transaction, execution, plan, stored_space, json, hash, time) = row?;
+            let intent: OriginalDisposalIntent = serde_json::from_str(&json)?;
+            visits = visits
+                .checked_add(intent.scope.content.chunks.len())
+                .filter(|n| *n <= max)
+                .ok_or(JournalError::Invariant("original preparation chunk budget"))?;
+            if intent.scope.transaction_id.as_str() != transaction
+                || intent.scope.execution_id.as_str() != execution
+                || intent.plan_id.as_str() != plan
+                || intent.scope.space_id != *space
+                || stored_space != space.as_str()
+                || sql_integer(intent.prepared_at_ms)? != time
+                || serde_json::to_string(&intent)? != json
+                || ContentId::hash(json.as_bytes()).as_str() != hash
+            {
+                return Err(JournalError::Invariant(
+                    "original preparation integrity mismatch",
+                ));
+            }
+            self.validate_original_disposal(&intent)?;
+            let completion: Option<(String, String, i64)> = self
+                .connection
+                .query_row(
+                    "SELECT CASE WHEN length(CAST(plan_id AS BLOB))=32 THEN plan_id ELSE '' END,
+                        CASE WHEN length(CAST(intent_hash AS BLOB))=64 THEN intent_hash ELSE '' END,
+                        completed_at_ms
+                     FROM original_disposal_completions WHERE transaction_id=?1",
+                    [&transaction],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let completed_at_ms = if let Some((plan_id, intent_hash, completed)) = completion {
+                if plan_id != plan || intent_hash != hash || completed < time {
+                    return Err(JournalError::Invariant(
+                        "original completion integrity mismatch",
+                    ));
+                }
+                Some(
+                    u64::try_from(completed)
+                        .map_err(|_| JournalError::Invariant("invalid original completion time"))?,
+                )
+            } else {
+                None
+            };
+            audits.push(OriginalDisposalAudit {
+                intent,
+                state: if completed_at_ms.is_some() {
+                    "disposed"
+                } else {
+                    "delete_pending"
+                },
+                completed_at_ms,
+                historical_snapshot_pins_verified: true,
+                content_hashes_verified: false,
+                disposition_executor_available: cfg!(windows),
+                automatic_cleanup_available: false,
+                physical_space_reclaimed: false,
+                remote_backup_complete: false,
+            });
+        }
+        Ok(audits)
     }
 }

@@ -37,114 +37,15 @@ pub struct CleanupPlan {
 
 impl Journal {
     fn validate_cleanup_intent(&self, intent: &CleanupIntent) -> Result<()> {
-        let mutation = self.mutation(&intent.transaction_id)?;
-        self.verify_mutation_references(&intent.transaction_id)?;
-        if intent.format_version != FORMAT_VERSION
-            || intent.space_id != mutation.intent.space_id
-            || mutation.state != MutationState::Committed
-            || !matches!(mutation.intent.action, MutationAction::Move { .. })
-            || mutation.execution.as_ref() != Some(&intent.execution)
-            || intent.created_at_ms < mutation.intent.created_at_ms
-        {
-            return Err(JournalError::Invariant(
-                "cleanup requires the exact committed Move execution",
-            ));
-        }
-        sql_integer(intent.created_at_ms)?;
-        Ok(())
+        self.read_view().validate_cleanup_intent(intent)
     }
 
     pub fn cleanup_plan(&self, id: &EntryId) -> Result<Option<CleanupPlan>> {
-        let length: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT length(CAST(intent AS BLOB)) FROM cleanup_plans WHERE transaction_id=?1",
-                [id.as_str()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(length) = length else {
-            return Ok(None);
-        };
-        if !(1..=MAX_CLEANUP_BYTES as i64).contains(&length) {
-            return Err(JournalError::Invariant("cleanup metadata limit"));
-        }
-        let (space, json, hash, state, authorized, cleaned): (
-            String,
-            String,
-            String,
-            String,
-            Option<i64>,
-            Option<i64>,
-        ) = self.connection.query_row(
-            "SELECT space_id,intent,intent_hash,state,authorized_at_ms,cleaned_at_ms
-                 FROM cleanup_plans WHERE transaction_id=?1",
-            [id.as_str()],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
-            },
-        )?;
-        let intent: CleanupIntent = serde_json::from_str(&json)?;
-        if intent.transaction_id != *id
-            || intent.space_id.as_str() != space
-            || ContentId::hash(json.as_bytes()).as_str() != hash
-        {
-            return Err(JournalError::Invariant("cleanup intent integrity mismatch"));
-        }
-        self.validate_cleanup_intent(&intent)?;
-        let state = match state.as_str() {
-            "prepared" => CleanupState::Prepared,
-            "cancelled" => CleanupState::Cancelled,
-            "executing" => CleanupState::Executing,
-            "cleaned" => CleanupState::Cleaned,
-            _ => return Err(JournalError::Invariant("unsupported cleanup state")),
-        };
-        let authorized_at_ms = authorized
-            .map(u64::try_from)
-            .transpose()
-            .map_err(|_| JournalError::Invariant("invalid cleanup authorization time"))?;
-        let cleaned_at_ms = cleaned
-            .map(u64::try_from)
-            .transpose()
-            .map_err(|_| JournalError::Invariant("invalid cleanup completion time"))?;
-        if matches!(state, CleanupState::Executing | CleanupState::Cleaned)
-            != authorized_at_ms.is_some()
-            || (state == CleanupState::Cleaned) != cleaned_at_ms.is_some()
-            || authorized_at_ms.is_some_and(|t| t < intent.created_at_ms)
-            || cleaned_at_ms
-                .zip(authorized_at_ms)
-                .is_some_and(|(c, a)| c < a)
-        {
-            return Err(JournalError::Invariant("cleanup phase/time mismatch"));
-        }
-        Ok(Some(CleanupPlan {
-            intent,
-            state,
-            authorized_at_ms,
-            cleaned_at_ms,
-        }))
+        self.read_view().cleanup_plan(id)
     }
 
     pub fn cleanup_plans(&self, space: &SpaceId) -> Result<Vec<CleanupPlan>> {
-        let mut statement = self.connection.prepare(
-            "SELECT transaction_id FROM cleanup_plans WHERE space_id=?1 ORDER BY transaction_id",
-        )?;
-        let ids: Vec<String> = statement
-            .query_map([space.as_str()], |r| r.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        ids.into_iter()
-            .map(|id| {
-                self.cleanup_plan(&id.parse()?)?
-                    .ok_or(JournalError::Invariant("cleanup plan disappeared"))
-            })
-            .collect()
+        self.read_view().cleanup_plans(space)
     }
 
     pub fn prepare_cleanup(&mut self, intent: &CleanupIntent) -> Result<CleanupPlan> {
@@ -235,5 +136,118 @@ impl Journal {
             return Err(JournalError::Invariant("cleanup belongs to another space"));
         }
         Ok(plan)
+    }
+}
+
+impl crate::JournalReadView<'_> {
+    pub(crate) fn validate_cleanup_intent(&self, intent: &CleanupIntent) -> Result<()> {
+        let mutation = self.mutation(&intent.transaction_id)?;
+        self.verify_mutation_references(&intent.transaction_id)?;
+        if intent.format_version != FORMAT_VERSION
+            || intent.space_id != mutation.intent.space_id
+            || mutation.state != MutationState::Committed
+            || !matches!(mutation.intent.action, MutationAction::Move { .. })
+            || mutation.execution.as_ref() != Some(&intent.execution)
+            || intent.created_at_ms < mutation.intent.created_at_ms
+        {
+            return Err(JournalError::Invariant(
+                "cleanup requires the exact committed Move execution",
+            ));
+        }
+        sql_integer(intent.created_at_ms)?;
+        Ok(())
+    }
+
+    pub(crate) fn cleanup_plan(&self, id: &EntryId) -> Result<Option<CleanupPlan>> {
+        let length: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT length(CAST(intent AS BLOB)) FROM cleanup_plans WHERE transaction_id=?1",
+                [id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(length) = length else {
+            return Ok(None);
+        };
+        if !(1..=MAX_CLEANUP_BYTES as i64).contains(&length) {
+            return Err(JournalError::Invariant("cleanup metadata limit"));
+        }
+        let (space, json, hash, state, authorized, cleaned): (
+            String,
+            String,
+            String,
+            String,
+            Option<i64>,
+            Option<i64>,
+        ) = self.connection.query_row(
+            "SELECT space_id,intent,intent_hash,state,authorized_at_ms,cleaned_at_ms
+                 FROM cleanup_plans WHERE transaction_id=?1",
+            [id.as_str()],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )?;
+        let intent: CleanupIntent = serde_json::from_str(&json)?;
+        if intent.transaction_id != *id
+            || intent.space_id.as_str() != space
+            || ContentId::hash(json.as_bytes()).as_str() != hash
+        {
+            return Err(JournalError::Invariant("cleanup intent integrity mismatch"));
+        }
+        self.validate_cleanup_intent(&intent)?;
+        let state = match state.as_str() {
+            "prepared" => CleanupState::Prepared,
+            "cancelled" => CleanupState::Cancelled,
+            "executing" => CleanupState::Executing,
+            "cleaned" => CleanupState::Cleaned,
+            _ => return Err(JournalError::Invariant("unsupported cleanup state")),
+        };
+        let authorized_at_ms = authorized
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| JournalError::Invariant("invalid cleanup authorization time"))?;
+        let cleaned_at_ms = cleaned
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| JournalError::Invariant("invalid cleanup completion time"))?;
+        if matches!(state, CleanupState::Executing | CleanupState::Cleaned)
+            != authorized_at_ms.is_some()
+            || (state == CleanupState::Cleaned) != cleaned_at_ms.is_some()
+            || authorized_at_ms.is_some_and(|t| t < intent.created_at_ms)
+            || cleaned_at_ms
+                .zip(authorized_at_ms)
+                .is_some_and(|(c, a)| c < a)
+        {
+            return Err(JournalError::Invariant("cleanup phase/time mismatch"));
+        }
+        Ok(Some(CleanupPlan {
+            intent,
+            state,
+            authorized_at_ms,
+            cleaned_at_ms,
+        }))
+    }
+
+    pub(crate) fn cleanup_plans(&self, space: &SpaceId) -> Result<Vec<CleanupPlan>> {
+        let mut statement = self.connection.prepare(
+            "SELECT transaction_id FROM cleanup_plans WHERE space_id=?1 ORDER BY transaction_id",
+        )?;
+        let ids: Vec<String> = statement
+            .query_map([space.as_str()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                self.cleanup_plan(&id.parse()?)?
+                    .ok_or(JournalError::Invariant("cleanup plan disappeared"))
+            })
+            .collect()
     }
 }

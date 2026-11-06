@@ -22,6 +22,9 @@ pub enum JournalError {
 
 pub type Result<T> = std::result::Result<T, JournalError>;
 
+mod read_view;
+use read_view::JournalReadView;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiveOutcome {
     Duplicate,
@@ -250,12 +253,7 @@ impl Journal {
     }
 
     pub fn state(&self, key: &str) -> Result<Option<String>> {
-        Ok(self
-            .connection
-            .query_row("SELECT value FROM local_state WHERE key=?1", [key], |row| {
-                row.get(0)
-            })
-            .optional()?)
+        self.read_view().state(key)
     }
 
     pub fn initialize(&mut self, space: &SpaceId, device: &DeviceId, root: &str) -> Result<()> {
@@ -283,43 +281,7 @@ impl Journal {
     }
 
     pub fn current(&self, space: &SpaceId) -> Result<Option<Manifest>> {
-        let root: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT snapshot_id FROM current_manifests WHERE space_id=?1",
-                [space.as_str()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(root) = &root {
-            self.require_snapshot_retained(space, &root.parse()?)?;
-        }
-        let json: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT s.manifest FROM current_manifests c JOIN snapshots s USING(snapshot_id)
-             WHERE c.space_id=?1",
-                [space.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        json.map(|json| {
-            let manifest: Manifest = serde_json::from_str(&json)?;
-            manifest.validate()?;
-            if manifest.space_id != *space {
-                return Err(JournalError::Invariant("current manifest space mismatch"));
-            }
-            let stored_root: String = self.connection.query_row(
-                "SELECT snapshot_id FROM current_manifests WHERE space_id=?1",
-                [space.as_str()],
-                |r| r.get(0),
-            )?;
-            if manifest.root()?.as_str() != stored_root {
-                return Err(JournalError::Invariant("current manifest root mismatch"));
-            }
-            Ok(manifest)
-        })
-        .transpose()
+        self.read_view().current(space)
     }
 
     pub fn operations(&self, space: &SpaceId) -> Result<Vec<Operation>> {
@@ -373,45 +335,11 @@ impl Journal {
     }
 
     pub fn snapshot(&self, space: &SpaceId, root: &SnapshotId) -> Result<Manifest> {
-        self.require_snapshot_retained(space, root)?;
-        let json: String = self.connection.query_row(
-            "SELECT manifest FROM snapshots WHERE space_id=?1 AND snapshot_id=?2",
-            params![space.as_str(), root.as_str()],
-            |r| r.get(0),
-        )?;
-        let manifest: Manifest = serde_json::from_str(&json)?;
-        if manifest.space_id != *space || manifest.root()? != *root {
-            return Err(JournalError::Invariant("snapshot integrity mismatch"));
-        }
-        Ok(manifest)
+        self.read_view().snapshot(space, root)
     }
 
     pub fn publication(&self, id: &EntryId) -> Result<Publication> {
-        let (json, hash, state, root, cleaned): (String, String, String, Option<String>, bool) =
-            self.connection.query_row(
-                "SELECT intent,intent_hash,state,committed_snapshot,cleaned FROM publications WHERE transaction_id=?1",
-                [id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )?;
-        let intent: PublicationIntent = serde_json::from_str(&json)?;
-        intent.validate()?;
-        if ContentId::hash(json.as_bytes()).as_str() != hash || intent.transaction_id != *id {
-            return Err(JournalError::Invariant(
-                "publication intent integrity mismatch",
-            ));
-        }
-        let state = match state.as_str() {
-            "preparing" => PublicationState::Preparing,
-            "ready" => PublicationState::Ready,
-            "published" => PublicationState::Published,
-            "committed" => PublicationState::Committed,
-            _ => return Err(JournalError::Invariant("unsupported publication state")),
-        };
-        Ok(Publication {
-            intent,
-            state,
-            committed_snapshot: root.map(|root| root.parse()).transpose()?,
-            cleaned,
-        })
+        self.read_view().publication(id)
     }
 
     pub fn outstanding_publications(&self, space: &SpaceId) -> Result<Vec<Publication>> {
@@ -558,102 +486,11 @@ impl Journal {
     }
 
     pub fn mutation(&self, id: &EntryId) -> Result<Mutation> {
-        let (space, root, json, hash, state): (String, String, String, String, String) =
-            self.connection.query_row(
-                "SELECT space_id,baseline_root,intent,intent_hash,state FROM mutations WHERE transaction_id=?1",
-                [id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )?;
-        if json.len() > MAX_OPERATION_BYTES || ContentId::hash(json.as_bytes()).as_str() != hash {
-            return Err(JournalError::Invariant(
-                "mutation intent integrity mismatch",
-            ));
-        }
-        let intent: MutationIntent = serde_json::from_str(&json)?;
-        intent.validate()?;
-        if intent.transaction_id != *id
-            || intent.space_id.as_str() != space
-            || intent.baseline_root.as_str() != root
-        {
-            return Err(JournalError::Invariant("mutation intent row mismatch"));
-        }
-        let state = match state.as_str() {
-            "prepared" => MutationState::Prepared,
-            "cancelled" => MutationState::Cancelled,
-            "executing" => MutationState::Executing,
-            "quarantined" => MutationState::Quarantined,
-            "moved" => MutationState::Moved,
-            "replaced" => MutationState::Replaced,
-            "committed" => MutationState::Committed,
-            _ => return Err(JournalError::Invariant("unsupported mutation state")),
-        };
-        let (json, hash, root): (Option<String>, Option<String>, Option<String>) = self.connection.query_row(
-            "SELECT execution,execution_hash,committed_snapshot FROM mutations WHERE transaction_id=?1",
-            [id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        let execution = match (json, hash) {
-            (None, None) if matches!(state, MutationState::Prepared | MutationState::Cancelled) => {
-                None
-            }
-            (Some(json), Some(hash))
-                if matches!(
-                    (&intent.action, state),
-                    (
-                        MutationAction::Delete,
-                        MutationState::Executing
-                            | MutationState::Quarantined
-                            | MutationState::Committed
-                    ) | (
-                        MutationAction::Move { .. },
-                        MutationState::Executing | MutationState::Moved | MutationState::Committed
-                    ) | (
-                        MutationAction::Replace { .. },
-                        MutationState::Executing
-                            | MutationState::Quarantined
-                            | MutationState::Replaced
-                            | MutationState::Committed
-                    )
-                ) && json.len() <= MAX_OPERATION_BYTES
-                    && ContentId::hash(json.as_bytes()).as_str() == hash =>
-            {
-                Some(serde_json::from_str::<MutationExecution>(&json)?)
-            }
-            _ => {
-                return Err(JournalError::Invariant(
-                    "mutation execution integrity mismatch",
-                ))
-            }
-        };
-        if let Some(execution) = &execution {
-            if execution.payload_identity.is_some()
-                != matches!(intent.action, MutationAction::Replace { .. })
-            {
-                return Err(JournalError::Invariant(
-                    "mutation payload identity mismatch",
-                ));
-            }
-        }
-        let committed_snapshot = root.map(|root| root.parse()).transpose()?;
-        if (state == MutationState::Committed) != committed_snapshot.is_some() {
-            return Err(JournalError::Invariant("mutation completion row mismatch"));
-        }
-        Ok(Mutation {
-            intent,
-            state,
-            execution,
-            committed_snapshot,
-        })
+        self.read_view().mutation(id)
     }
 
     pub fn mutations(&self, space: &SpaceId) -> Result<Vec<Mutation>> {
-        let mut statement = self.connection.prepare(
-            "SELECT transaction_id FROM mutations WHERE space_id=?1 ORDER BY transaction_id",
-        )?;
-        let ids: Vec<String> = statement
-            .query_map([space.as_str()], |r| r.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        ids.into_iter()
-            .map(|id| self.mutation(&id.parse()?))
-            .collect()
+        self.read_view().mutations(space)
     }
 
     pub fn outstanding_mutations(&self, space: &SpaceId) -> Result<Vec<Mutation>> {
@@ -669,76 +506,7 @@ impl Journal {
     }
 
     pub fn verify_mutation_references(&self, id: &EntryId) -> Result<()> {
-        let mutation = self.mutation(id)?;
-        let intent = &mutation.intent;
-        let baseline = self.snapshot(&intent.space_id, &intent.baseline_root)?;
-        if baseline.entries.get(&intent.baseline_entry.entry_id) != Some(&intent.baseline_entry) {
-            return Err(JournalError::Invariant(
-                "mutation retained baseline mismatch",
-            ));
-        }
-        let mut expected = std::collections::BTreeSet::new();
-        if mutation.state.active() {
-            for content in std::iter::once(
-                intent
-                    .baseline_entry
-                    .content
-                    .as_ref()
-                    .ok_or(JournalError::Invariant("mutation baseline content missing"))?,
-            )
-            .chain(match &intent.action {
-                MutationAction::Replace { content } => Some(content),
-                _ => None,
-            }) {
-                expected.extend(content.chunks.iter().map(|chunk| chunk.content_id.clone()));
-            }
-        }
-        let mut statement = self
-            .connection
-            .prepare("SELECT content_id FROM mutation_objects WHERE transaction_id=?1")?;
-        let ids: Vec<String> = statement
-            .query_map([id.as_str()], |r| r.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        let actual = ids
-            .into_iter()
-            .map(|id| id.parse())
-            .collect::<std::result::Result<std::collections::BTreeSet<ContentId>, _>>()?;
-        if actual != expected {
-            return Err(JournalError::Invariant(
-                "mutation object protection mismatch",
-            ));
-        }
-        if let Some(root) = &mutation.committed_snapshot {
-            let completed = self.snapshot(&intent.space_id, root)?;
-            let valid = match &intent.action {
-                MutationAction::Delete => {
-                    !completed
-                        .entries
-                        .contains_key(&intent.baseline_entry.entry_id)
-                        && completed
-                            .tombstones
-                            .contains_key(&intent.baseline_entry.entry_id)
-                }
-                MutationAction::Move { destination, .. } => {
-                    let mut entry = intent.baseline_entry.clone();
-                    entry.path = destination.clone();
-                    completed.entries.get(&entry.entry_id) == Some(&entry)
-                        && !completed.tombstones.contains_key(&entry.entry_id)
-                }
-                MutationAction::Replace { content } => {
-                    let mut entry = intent.baseline_entry.clone();
-                    entry.content = Some(content.clone());
-                    completed.entries.get(&entry.entry_id) == Some(&entry)
-                        && !completed.tombstones.contains_key(&entry.entry_id)
-                }
-            };
-            if !valid {
-                return Err(JournalError::Invariant(
-                    "mutation completion snapshot mismatch",
-                ));
-            }
-        }
-        Ok(())
+        self.read_view().verify_mutation_references(id)
     }
 
     pub fn begin_mutation(&mut self, intent: &MutationIntent) -> Result<()> {
@@ -1815,3 +1583,268 @@ pub use tree_storage_inventory::{
     TreeRestoreStoredOwner, TreeRestoreStoredReservation, TreeRestoreStoredRow,
     TreeRestoreStoredTable,
 };
+
+impl crate::JournalReadView<'_> {
+    pub(crate) fn state(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .connection
+            .query_row("SELECT value FROM local_state WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    pub(crate) fn current(&self, space: &SpaceId) -> Result<Option<Manifest>> {
+        let root: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT snapshot_id FROM current_manifests WHERE space_id=?1",
+                [space.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(root) = &root {
+            self.require_snapshot_retained(space, &root.parse()?)?;
+        }
+        let json: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT s.manifest FROM current_manifests c JOIN snapshots s USING(snapshot_id)
+             WHERE c.space_id=?1",
+                [space.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        json.map(|json| {
+            let manifest: Manifest = serde_json::from_str(&json)?;
+            manifest.validate()?;
+            if manifest.space_id != *space {
+                return Err(JournalError::Invariant("current manifest space mismatch"));
+            }
+            let stored_root: String = self.connection.query_row(
+                "SELECT snapshot_id FROM current_manifests WHERE space_id=?1",
+                [space.as_str()],
+                |r| r.get(0),
+            )?;
+            if manifest.root()?.as_str() != stored_root {
+                return Err(JournalError::Invariant("current manifest root mismatch"));
+            }
+            Ok(manifest)
+        })
+        .transpose()
+    }
+
+    pub(crate) fn snapshot(&self, space: &SpaceId, root: &SnapshotId) -> Result<Manifest> {
+        self.require_snapshot_retained(space, root)?;
+        let json: String = self.connection.query_row(
+            "SELECT manifest FROM snapshots WHERE space_id=?1 AND snapshot_id=?2",
+            params![space.as_str(), root.as_str()],
+            |r| r.get(0),
+        )?;
+        let manifest: Manifest = serde_json::from_str(&json)?;
+        if manifest.space_id != *space || manifest.root()? != *root {
+            return Err(JournalError::Invariant("snapshot integrity mismatch"));
+        }
+        Ok(manifest)
+    }
+
+    pub(crate) fn publication(&self, id: &EntryId) -> Result<Publication> {
+        let (json, hash, state, root, cleaned): (String, String, String, Option<String>, bool) =
+            self.connection.query_row(
+                "SELECT intent,intent_hash,state,committed_snapshot,cleaned FROM publications WHERE transaction_id=?1",
+                [id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?;
+        let intent: PublicationIntent = serde_json::from_str(&json)?;
+        intent.validate()?;
+        if ContentId::hash(json.as_bytes()).as_str() != hash || intent.transaction_id != *id {
+            return Err(JournalError::Invariant(
+                "publication intent integrity mismatch",
+            ));
+        }
+        let state = match state.as_str() {
+            "preparing" => PublicationState::Preparing,
+            "ready" => PublicationState::Ready,
+            "published" => PublicationState::Published,
+            "committed" => PublicationState::Committed,
+            _ => return Err(JournalError::Invariant("unsupported publication state")),
+        };
+        Ok(Publication {
+            intent,
+            state,
+            committed_snapshot: root.map(|root| root.parse()).transpose()?,
+            cleaned,
+        })
+    }
+
+    pub(crate) fn mutation(&self, id: &EntryId) -> Result<Mutation> {
+        let (space, root, json, hash, state): (String, String, String, String, String) =
+            self.connection.query_row(
+                "SELECT space_id,baseline_root,intent,intent_hash,state FROM mutations WHERE transaction_id=?1",
+                [id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?;
+        if json.len() > MAX_OPERATION_BYTES || ContentId::hash(json.as_bytes()).as_str() != hash {
+            return Err(JournalError::Invariant(
+                "mutation intent integrity mismatch",
+            ));
+        }
+        let intent: MutationIntent = serde_json::from_str(&json)?;
+        intent.validate()?;
+        if intent.transaction_id != *id
+            || intent.space_id.as_str() != space
+            || intent.baseline_root.as_str() != root
+        {
+            return Err(JournalError::Invariant("mutation intent row mismatch"));
+        }
+        let state = match state.as_str() {
+            "prepared" => MutationState::Prepared,
+            "cancelled" => MutationState::Cancelled,
+            "executing" => MutationState::Executing,
+            "quarantined" => MutationState::Quarantined,
+            "moved" => MutationState::Moved,
+            "replaced" => MutationState::Replaced,
+            "committed" => MutationState::Committed,
+            _ => return Err(JournalError::Invariant("unsupported mutation state")),
+        };
+        let (json, hash, root): (Option<String>, Option<String>, Option<String>) = self.connection.query_row(
+            "SELECT execution,execution_hash,committed_snapshot FROM mutations WHERE transaction_id=?1",
+            [id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let execution = match (json, hash) {
+            (None, None) if matches!(state, MutationState::Prepared | MutationState::Cancelled) => {
+                None
+            }
+            (Some(json), Some(hash))
+                if matches!(
+                    (&intent.action, state),
+                    (
+                        MutationAction::Delete,
+                        MutationState::Executing
+                            | MutationState::Quarantined
+                            | MutationState::Committed
+                    ) | (
+                        MutationAction::Move { .. },
+                        MutationState::Executing | MutationState::Moved | MutationState::Committed
+                    ) | (
+                        MutationAction::Replace { .. },
+                        MutationState::Executing
+                            | MutationState::Quarantined
+                            | MutationState::Replaced
+                            | MutationState::Committed
+                    )
+                ) && json.len() <= MAX_OPERATION_BYTES
+                    && ContentId::hash(json.as_bytes()).as_str() == hash =>
+            {
+                Some(serde_json::from_str::<MutationExecution>(&json)?)
+            }
+            _ => {
+                return Err(JournalError::Invariant(
+                    "mutation execution integrity mismatch",
+                ))
+            }
+        };
+        if let Some(execution) = &execution {
+            if execution.payload_identity.is_some()
+                != matches!(intent.action, MutationAction::Replace { .. })
+            {
+                return Err(JournalError::Invariant(
+                    "mutation payload identity mismatch",
+                ));
+            }
+        }
+        let committed_snapshot = root.map(|root| root.parse()).transpose()?;
+        if (state == MutationState::Committed) != committed_snapshot.is_some() {
+            return Err(JournalError::Invariant("mutation completion row mismatch"));
+        }
+        Ok(Mutation {
+            intent,
+            state,
+            execution,
+            committed_snapshot,
+        })
+    }
+
+    pub(crate) fn mutations(&self, space: &SpaceId) -> Result<Vec<Mutation>> {
+        let mut statement = self.connection.prepare(
+            "SELECT transaction_id FROM mutations WHERE space_id=?1 ORDER BY transaction_id",
+        )?;
+        let ids: Vec<String> = statement
+            .query_map([space.as_str()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        ids.into_iter()
+            .map(|id| self.mutation(&id.parse()?))
+            .collect()
+    }
+
+    pub(crate) fn verify_mutation_references(&self, id: &EntryId) -> Result<()> {
+        let mutation = self.mutation(id)?;
+        let intent = &mutation.intent;
+        let baseline = self.snapshot(&intent.space_id, &intent.baseline_root)?;
+        if baseline.entries.get(&intent.baseline_entry.entry_id) != Some(&intent.baseline_entry) {
+            return Err(JournalError::Invariant(
+                "mutation retained baseline mismatch",
+            ));
+        }
+        let mut expected = std::collections::BTreeSet::new();
+        if mutation.state.active() {
+            for content in std::iter::once(
+                intent
+                    .baseline_entry
+                    .content
+                    .as_ref()
+                    .ok_or(JournalError::Invariant("mutation baseline content missing"))?,
+            )
+            .chain(match &intent.action {
+                MutationAction::Replace { content } => Some(content),
+                _ => None,
+            }) {
+                expected.extend(content.chunks.iter().map(|chunk| chunk.content_id.clone()));
+            }
+        }
+        let mut statement = self
+            .connection
+            .prepare("SELECT content_id FROM mutation_objects WHERE transaction_id=?1")?;
+        let ids: Vec<String> = statement
+            .query_map([id.as_str()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        let actual = ids
+            .into_iter()
+            .map(|id| id.parse())
+            .collect::<std::result::Result<std::collections::BTreeSet<ContentId>, _>>()?;
+        if actual != expected {
+            return Err(JournalError::Invariant(
+                "mutation object protection mismatch",
+            ));
+        }
+        if let Some(root) = &mutation.committed_snapshot {
+            let completed = self.snapshot(&intent.space_id, root)?;
+            let valid = match &intent.action {
+                MutationAction::Delete => {
+                    !completed
+                        .entries
+                        .contains_key(&intent.baseline_entry.entry_id)
+                        && completed
+                            .tombstones
+                            .contains_key(&intent.baseline_entry.entry_id)
+                }
+                MutationAction::Move { destination, .. } => {
+                    let mut entry = intent.baseline_entry.clone();
+                    entry.path = destination.clone();
+                    completed.entries.get(&entry.entry_id) == Some(&entry)
+                        && !completed.tombstones.contains_key(&entry.entry_id)
+                }
+                MutationAction::Replace { content } => {
+                    let mut entry = intent.baseline_entry.clone();
+                    entry.content = Some(content.clone());
+                    completed.entries.get(&entry.entry_id) == Some(&entry)
+                        && !completed.tombstones.contains_key(&entry.entry_id)
+                }
+            };
+            if !valid {
+                return Err(JournalError::Invariant(
+                    "mutation completion snapshot mismatch",
+                ));
+            }
+        }
+        Ok(())
+    }
+}

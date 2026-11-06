@@ -61,106 +61,7 @@ impl Journal {
         max: usize,
     ) -> Result<Vec<GcDisposalAudit>> {
         check_storage_metadata_limit(&self.connection, max, 0, 0)?;
-        let orphan: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM gc_disposal_restorations r LEFT JOIN gc_disposals d USING(execution_id) WHERE d.execution_id IS NULL)",
-            [], |r| r.get(0))?;
-        if orphan {
-            return Err(JournalError::Invariant("orphan GC disposal restoration"));
-        }
-        if executions.iter().any(|e| {
-            e.state == GcExecutionState::Deleted
-                && !quarantines
-                    .iter()
-                    .any(|q| q.intent.execution_id == e.intent.execution_id)
-        }) {
-            return Err(JournalError::Invariant(
-                "deleted GC execution quarantine missing",
-            ));
-        }
-        let missing_disposal: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM gc_execution_deletions t LEFT JOIN gc_disposals d USING(execution_id) WHERE d.execution_id IS NULL)",
-            [], |r|r.get(0))?;
-        if missing_disposal {
-            return Err(JournalError::Invariant("deleted GC disposal missing"));
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT execution_id,disposal_id,CASE WHEN length(CAST(intent AS BLOB))<=4096 THEN intent ELSE '' END,intent_hash,admitted_at_ms FROM gc_disposals ORDER BY admitted_at_ms,execution_id",
-        )?;
-        let rows = statement.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, i64>(4)?,
-            ))
-        })?;
-        let mut audits = Vec::new();
-        for row in rows {
-            let (id, disposal, json, hash, time) = row?;
-            let intent: GcDisposalIntent = serde_json::from_str(&json)?;
-            let e = executions
-                .iter()
-                .find(|e| e.intent.execution_id.as_str() == id)
-                .ok_or(JournalError::Invariant("GC disposal execution missing"))?;
-            let q = quarantines
-                .iter()
-                .find(|q| q.intent.execution_id.as_str() == id)
-                .ok_or(JournalError::Invariant("GC disposal quarantine missing"))?;
-            let restored: Option<i64> = self.connection.query_row(
-                "SELECT restored_at_watermark_ms FROM gc_disposal_restorations WHERE execution_id=?1",
-                [&id], |r| r.get(0)).optional()?;
-            let watermark: i64 = self.connection.query_row(
-                "SELECT observed_at_ms FROM gc_clock WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )?;
-            if intent.format_version != FORMAT_VERSION
-                || intent.execution_id.as_str() != id
-                || intent.disposal_id.as_str() != disposal
-                || ContentId::hash(json.as_bytes()).as_str() != hash
-                || intent.execution_hash
-                    != ContentId::hash(serde_json::to_string(&e.intent)?.as_bytes())
-                || intent.quarantine != q.intent
-                || intent.quarantine_hash
-                    != ContentId::hash(serde_json::to_string(&q.intent)?.as_bytes())
-                || sql_integer(intent.admitted_at_ms)? != time
-                || intent.admitted_at_ms < q.intent.prepared_at_watermark_ms
-                || intent.admitted_at_ms >= e.intent.authorization.expires_at_ms
-                || watermark < time
-                || q.state == GcQuarantineState::Prepared
-                || (restored.is_some() != (q.state == GcQuarantineState::Restored))
-                || (restored.is_some() != (e.state == GcExecutionState::Aborted))
-                || (q.state == GcQuarantineState::Deleted) != (e.state == GcExecutionState::Deleted)
-                || e.deleted_at_watermark_ms
-                    .is_some_and(|t| t < intent.admitted_at_ms)
-                || restored.is_some_and(|r| {
-                    r < time || r > watermark || Some(r as u64) != e.aborted_at_watermark_ms
-                })
-            {
-                return Err(JournalError::Invariant("GC disposal integrity mismatch"));
-            }
-            audits.push(GcDisposalAudit {
-                intent,
-                state: if e.state == GcExecutionState::Deleted {
-                    GcDisposalState::Deleted
-                } else if restored.is_some() {
-                    GcDisposalState::Restored
-                } else if q.state == GcQuarantineState::RestorePending {
-                    GcDisposalState::RestorePending
-                } else {
-                    GcDisposalState::DeletePending
-                },
-                restored_at_watermark_ms: restored.map(|r| r as u64),
-                deleted_at_watermark_ms: e.deleted_at_watermark_ms,
-                content_fenced: e.content_fenced,
-                deletion_authorized: false,
-                disposition_executor_available: cfg!(windows),
-                sweep_available: false,
-                gc_enabled: false,
-            });
-        }
-        Ok(audits)
+        self.read_view().audit_gc_disposals(quarantines, executions)
     }
 
     /// Denied authority selects restoration; clock rollback still defers new deletion.
@@ -373,5 +274,114 @@ impl Journal {
             .ok_or(JournalError::Invariant("GC disposal disappeared"))?;
         tx.commit().map_err(JournalError::from)?;
         Ok((Some((coordination, guards)), audit))
+    }
+}
+
+impl crate::JournalReadView<'_> {
+    pub(crate) fn audit_gc_disposals(
+        &self,
+        quarantines: &[GcQuarantineAudit],
+        executions: &[GcExecutionAudit],
+    ) -> Result<Vec<GcDisposalAudit>> {
+        let orphan: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gc_disposal_restorations r LEFT JOIN gc_disposals d USING(execution_id) WHERE d.execution_id IS NULL)",
+            [], |r| r.get(0))?;
+        if orphan {
+            return Err(JournalError::Invariant("orphan GC disposal restoration"));
+        }
+        if executions.iter().any(|e| {
+            e.state == GcExecutionState::Deleted
+                && !quarantines
+                    .iter()
+                    .any(|q| q.intent.execution_id == e.intent.execution_id)
+        }) {
+            return Err(JournalError::Invariant(
+                "deleted GC execution quarantine missing",
+            ));
+        }
+        let missing_disposal: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gc_execution_deletions t LEFT JOIN gc_disposals d USING(execution_id) WHERE d.execution_id IS NULL)",
+            [], |r|r.get(0))?;
+        if missing_disposal {
+            return Err(JournalError::Invariant("deleted GC disposal missing"));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT execution_id,disposal_id,CASE WHEN length(CAST(intent AS BLOB))<=4096 THEN intent ELSE '' END,intent_hash,admitted_at_ms FROM gc_disposals ORDER BY admitted_at_ms,execution_id",
+        )?;
+        let rows = statement.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut audits = Vec::new();
+        for row in rows {
+            let (id, disposal, json, hash, time) = row?;
+            let intent: GcDisposalIntent = serde_json::from_str(&json)?;
+            let e = executions
+                .iter()
+                .find(|e| e.intent.execution_id.as_str() == id)
+                .ok_or(JournalError::Invariant("GC disposal execution missing"))?;
+            let q = quarantines
+                .iter()
+                .find(|q| q.intent.execution_id.as_str() == id)
+                .ok_or(JournalError::Invariant("GC disposal quarantine missing"))?;
+            let restored: Option<i64> = self.connection.query_row(
+                "SELECT restored_at_watermark_ms FROM gc_disposal_restorations WHERE execution_id=?1",
+                [&id], |r| r.get(0)).optional()?;
+            let watermark: i64 = self.connection.query_row(
+                "SELECT observed_at_ms FROM gc_clock WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )?;
+            if intent.format_version != FORMAT_VERSION
+                || intent.execution_id.as_str() != id
+                || intent.disposal_id.as_str() != disposal
+                || ContentId::hash(json.as_bytes()).as_str() != hash
+                || intent.execution_hash
+                    != ContentId::hash(serde_json::to_string(&e.intent)?.as_bytes())
+                || intent.quarantine != q.intent
+                || intent.quarantine_hash
+                    != ContentId::hash(serde_json::to_string(&q.intent)?.as_bytes())
+                || sql_integer(intent.admitted_at_ms)? != time
+                || intent.admitted_at_ms < q.intent.prepared_at_watermark_ms
+                || intent.admitted_at_ms >= e.intent.authorization.expires_at_ms
+                || watermark < time
+                || q.state == GcQuarantineState::Prepared
+                || (restored.is_some() != (q.state == GcQuarantineState::Restored))
+                || (restored.is_some() != (e.state == GcExecutionState::Aborted))
+                || (q.state == GcQuarantineState::Deleted) != (e.state == GcExecutionState::Deleted)
+                || e.deleted_at_watermark_ms
+                    .is_some_and(|t| t < intent.admitted_at_ms)
+                || restored.is_some_and(|r| {
+                    r < time || r > watermark || Some(r as u64) != e.aborted_at_watermark_ms
+                })
+            {
+                return Err(JournalError::Invariant("GC disposal integrity mismatch"));
+            }
+            audits.push(GcDisposalAudit {
+                intent,
+                state: if e.state == GcExecutionState::Deleted {
+                    GcDisposalState::Deleted
+                } else if restored.is_some() {
+                    GcDisposalState::Restored
+                } else if q.state == GcQuarantineState::RestorePending {
+                    GcDisposalState::RestorePending
+                } else {
+                    GcDisposalState::DeletePending
+                },
+                restored_at_watermark_ms: restored.map(|r| r as u64),
+                deleted_at_watermark_ms: e.deleted_at_watermark_ms,
+                content_fenced: e.content_fenced,
+                deletion_authorized: false,
+                disposition_executor_available: cfg!(windows),
+                sweep_available: false,
+                gc_enabled: false,
+            });
+        }
+        Ok(audits)
     }
 }

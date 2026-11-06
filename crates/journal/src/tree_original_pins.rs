@@ -148,7 +148,7 @@ fn project(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn audit_originals(
-    journal: &Journal,
+    journal: &crate::JournalReadView<'_>,
     preparation: &TreeRestorePreparationIntent,
     history: Option<&TreeRestoreHistoryReservation>,
     native: Option<&TreeRestoreNativeReservation>,
@@ -158,7 +158,7 @@ pub(crate) fn audit_originals(
     cancelled: Option<u64>,
     max: usize,
 ) -> Result<Option<TreeOriginalPinsAudit>> {
-    let connection = &journal.connection;
+    let connection = journal.connection;
     let request: Option<String> = connection
         .query_row(
             "SELECT CASE WHEN length(CAST(request AS BLOB)) BETWEEN 1 AND 16777216

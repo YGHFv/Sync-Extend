@@ -70,110 +70,7 @@ impl Journal {
         max_entries: usize,
     ) -> Result<Vec<GcAuthorizationAudit>> {
         let marks = self.gc_marks(space, max_entries)?;
-        let marks: std::collections::BTreeMap<_, _> = marks
-            .iter()
-            .map(|mark| (mark.intent.mark_id.as_str(), mark))
-            .collect();
-        let watermark: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT observed_at_ms FROM gc_clock WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let orphan: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM gc_revocations r LEFT JOIN gc_authorizations a USING(authorization_id)
-                WHERE a.authorization_id IS NULL)", [], |r| r.get(0))?;
-        if orphan {
-            return Err(JournalError::Invariant("orphan GC revocation"));
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT authorization_id,mark_id,
-                CASE WHEN length(CAST(intent AS BLOB))<=8192 THEN intent ELSE '' END,
-                intent_hash,authorized_at_ms,expires_at_ms FROM gc_authorizations
-                ORDER BY authorized_at_ms,authorization_id",
-        )?;
-        let rows = statement.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, i64>(5)?,
-            ))
-        })?;
-        let mut audits = Vec::new();
-        for row in rows {
-            let (id, mark_id, json, hash, time, expiry) = row?;
-            let intent: GcAuthorization = serde_json::from_str(&json)?;
-            let mark = marks
-                .get(mark_id.as_str())
-                .ok_or(JournalError::Invariant("authorization mark missing"))?;
-            let duration = intent.expires_at_ms.checked_sub(intent.authorized_at_ms);
-            let canonical = serde_json::to_string(&mark.intent)?;
-            if intent.format_version != FORMAT_VERSION
-                || intent.authorization_id.as_str() != id
-                || intent.mark != mark.intent
-                || intent.mark.space_id != *space
-                || intent.mark_hash != ContentId::hash(canonical.as_bytes())
-                || ContentId::hash(json.as_bytes()).as_str() != hash
-                || sql_integer(intent.authorized_at_ms)? != time
-                || sql_integer(intent.expires_at_ms)? != expiry
-                || intent.authorized_at_ms < intent.mark.grace_until_ms
-                || duration.is_none_or(|n| !(1000..=3600000).contains(&n) || n % 1000 != 0)
-                || watermark.is_none_or(|n| n < time)
-            {
-                return Err(JournalError::Invariant(
-                    "GC authorization integrity mismatch",
-                ));
-            }
-            let revoked: Option<i64> = self
-                .connection
-                .query_row(
-                    "SELECT revoked_at_ms FROM gc_revocations WHERE authorization_id=?1",
-                    [&id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if revoked.is_some_and(|t| t < time || watermark.is_none_or(|w| t > w)) {
-                return Err(JournalError::Invariant("GC revocation time mismatch"));
-            }
-            let watermark = watermark.ok_or(JournalError::Invariant("GC clock missing"))? as u64;
-            let execution: Option<String> = self
-                .connection
-                .query_row(
-                    "SELECT execution_id FROM gc_executions WHERE authorization_id=?1",
-                    [&id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            let state = if revoked.is_some() {
-                GcAuthorizationState::Revoked
-            } else if mark.state == GcState::Cancelled {
-                GcAuthorizationState::MarkCancelled
-            } else if mark.state == GcState::Invalidated {
-                GcAuthorizationState::Invalidated
-            } else if watermark >= intent.expires_at_ms {
-                GcAuthorizationState::Expired
-            } else if execution.is_some() {
-                GcAuthorizationState::Consumed
-            } else {
-                GcAuthorizationState::ActiveIntent
-            };
-            audits.push(GcAuthorizationAudit {
-                intent,
-                state,
-                revoked_at_ms: revoked.map(|t| t as u64),
-                evaluated_at_watermark_ms: watermark,
-                execution_id: execution.map(|id| id.parse()).transpose()?,
-                deletion_authorized: false,
-                sweep_available: false,
-                gc_enabled: false,
-            });
-        }
-        Ok(audits)
+        self.read_view().gc_authorizations(space, &marks)
     }
 
     pub fn revoke_gc_authorization(
@@ -316,5 +213,118 @@ impl Journal {
         }
         self.require_gc_preflight(space, &audit.intent.mark.mark_id, now, max_entries)?;
         Ok(audit.intent)
+    }
+}
+
+impl crate::JournalReadView<'_> {
+    pub(crate) fn gc_authorizations(
+        &self,
+        space: &SpaceId,
+        marks: &[crate::GcMarkAudit],
+    ) -> Result<Vec<GcAuthorizationAudit>> {
+        let marks: std::collections::BTreeMap<_, _> = marks
+            .iter()
+            .map(|mark| (mark.intent.mark_id.as_str(), mark))
+            .collect();
+        let watermark: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT observed_at_ms FROM gc_clock WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let orphan: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gc_revocations r LEFT JOIN gc_authorizations a USING(authorization_id)
+                WHERE a.authorization_id IS NULL)", [], |r| r.get(0))?;
+        if orphan {
+            return Err(JournalError::Invariant("orphan GC revocation"));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT authorization_id,mark_id,
+                CASE WHEN length(CAST(intent AS BLOB))<=8192 THEN intent ELSE '' END,
+                intent_hash,authorized_at_ms,expires_at_ms FROM gc_authorizations
+                ORDER BY authorized_at_ms,authorization_id",
+        )?;
+        let rows = statement.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })?;
+        let mut audits = Vec::new();
+        for row in rows {
+            let (id, mark_id, json, hash, time, expiry) = row?;
+            let intent: GcAuthorization = serde_json::from_str(&json)?;
+            let mark = marks
+                .get(mark_id.as_str())
+                .ok_or(JournalError::Invariant("authorization mark missing"))?;
+            let duration = intent.expires_at_ms.checked_sub(intent.authorized_at_ms);
+            let canonical = serde_json::to_string(&mark.intent)?;
+            if intent.format_version != FORMAT_VERSION
+                || intent.authorization_id.as_str() != id
+                || intent.mark != mark.intent
+                || intent.mark.space_id != *space
+                || intent.mark_hash != ContentId::hash(canonical.as_bytes())
+                || ContentId::hash(json.as_bytes()).as_str() != hash
+                || sql_integer(intent.authorized_at_ms)? != time
+                || sql_integer(intent.expires_at_ms)? != expiry
+                || intent.authorized_at_ms < intent.mark.grace_until_ms
+                || duration.is_none_or(|n| !(1000..=3600000).contains(&n) || n % 1000 != 0)
+                || watermark.is_none_or(|n| n < time)
+            {
+                return Err(JournalError::Invariant(
+                    "GC authorization integrity mismatch",
+                ));
+            }
+            let revoked: Option<i64> = self
+                .connection
+                .query_row(
+                    "SELECT revoked_at_ms FROM gc_revocations WHERE authorization_id=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if revoked.is_some_and(|t| t < time || watermark.is_none_or(|w| t > w)) {
+                return Err(JournalError::Invariant("GC revocation time mismatch"));
+            }
+            let watermark = watermark.ok_or(JournalError::Invariant("GC clock missing"))? as u64;
+            let execution: Option<String> = self
+                .connection
+                .query_row(
+                    "SELECT execution_id FROM gc_executions WHERE authorization_id=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let state = if revoked.is_some() {
+                GcAuthorizationState::Revoked
+            } else if mark.state == GcState::Cancelled {
+                GcAuthorizationState::MarkCancelled
+            } else if mark.state == GcState::Invalidated {
+                GcAuthorizationState::Invalidated
+            } else if watermark >= intent.expires_at_ms {
+                GcAuthorizationState::Expired
+            } else if execution.is_some() {
+                GcAuthorizationState::Consumed
+            } else {
+                GcAuthorizationState::ActiveIntent
+            };
+            audits.push(GcAuthorizationAudit {
+                intent,
+                state,
+                revoked_at_ms: revoked.map(|t| t as u64),
+                evaluated_at_watermark_ms: watermark,
+                execution_id: execution.map(|id| id.parse()).transpose()?,
+                deletion_authorized: false,
+                sweep_available: false,
+                gc_enabled: false,
+            });
+        }
+        Ok(audits)
     }
 }

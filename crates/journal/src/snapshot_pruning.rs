@@ -138,15 +138,6 @@ impl Journal {
         require_unpruned(&self.connection, id)
     }
 
-    pub(crate) fn require_snapshot_retained(&self, space: &SpaceId, id: &SnapshotId) -> Result<()> {
-        if pruning(&self.connection, space, id)?.is_some() {
-            return Err(JournalError::Invariant(
-                "snapshot content has been explicitly pruned",
-            ));
-        }
-        Ok(())
-    }
-
     pub fn snapshot_pruning(
         &self,
         space: &SpaceId,
@@ -166,25 +157,7 @@ impl Journal {
         max_entries: usize,
     ) -> Result<Vec<SnapshotAudit>> {
         self.check_storage_metadata_limit(max_entries)?;
-        let mut statement = self.connection.prepare("SELECT snapshot_id FROM snapshots WHERE space_id=?1 ORDER BY created_at_ms,snapshot_id")?;
-        let ids: Vec<String> = statement
-            .query_map([space.as_str()], |r| r.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        ids.into_iter()
-            .map(|id| {
-                let id = id.parse()?;
-                let snapshot = audit_snapshot(&self.connection, space, &id)?;
-                let pruning = pruning(&self.connection, space, &id)?;
-                Ok(SnapshotAudit {
-                    snapshot_id: id,
-                    created_at_ms: snapshot.created_at_ms,
-                    state: snapshot.state,
-                    locked: snapshot.locked,
-                    content_retained: pruning.is_none(),
-                    pruning,
-                })
-            })
-            .collect()
+        self.read_view().snapshot_audit(space)
     }
 
     pub fn prune_snapshot(
@@ -306,5 +279,38 @@ impl Journal {
         audit_snapshot(&tx, &intent.space_id, &intent.snapshot_id)?;
         tx.commit()?;
         Ok(intent.clone())
+    }
+}
+
+impl crate::JournalReadView<'_> {
+    pub(crate) fn require_snapshot_retained(&self, space: &SpaceId, id: &SnapshotId) -> Result<()> {
+        if pruning(self.connection, space, id)?.is_some() {
+            return Err(JournalError::Invariant(
+                "snapshot content has been explicitly pruned",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn snapshot_audit(&self, space: &SpaceId) -> Result<Vec<SnapshotAudit>> {
+        let mut statement = self.connection.prepare("SELECT snapshot_id FROM snapshots WHERE space_id=?1 ORDER BY created_at_ms,snapshot_id")?;
+        let ids: Vec<String> = statement
+            .query_map([space.as_str()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                let id = id.parse()?;
+                let snapshot = audit_snapshot(self.connection, space, &id)?;
+                let pruning = pruning(self.connection, space, &id)?;
+                Ok(SnapshotAudit {
+                    snapshot_id: id,
+                    created_at_ms: snapshot.created_at_ms,
+                    state: snapshot.state,
+                    locked: snapshot.locked,
+                    content_retained: pruning.is_none(),
+                    pruning,
+                })
+            })
+            .collect()
     }
 }

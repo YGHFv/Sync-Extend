@@ -225,361 +225,7 @@ impl Journal {
         }
         crate::tree_native_storage::preflight_all(&self.connection, max)?;
         self.check_storage_metadata_limit(max)?;
-        if self.state("space_id")?.as_deref() != Some(space.as_str()) {
-            return Err(JournalError::Invariant("tree restore space mismatch"));
-        }
-        let orphan: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tree_restore_steps s
-                LEFT JOIN tree_restore_preparations p USING(transaction_id) WHERE p.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_objects o
-                LEFT JOIN tree_restore_preparations p USING(transaction_id) WHERE p.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_cancellations c
-                LEFT JOIN tree_restore_preparations p USING(transaction_id) WHERE p.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_histories h
-                LEFT JOIN tree_restore_preparations p USING(transaction_id) WHERE p.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_native_reservations n
-                LEFT JOIN tree_restore_preparations p USING(transaction_id)
-                LEFT JOIN tree_restore_histories h USING(transaction_id)
-                WHERE p.transaction_id IS NULL OR h.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_execution_intents e
-                LEFT JOIN tree_restore_preparations p USING(transaction_id)
-                LEFT JOIN tree_restore_histories h USING(transaction_id)
-                LEFT JOIN tree_restore_native_reservations n USING(transaction_id)
-                WHERE p.transaction_id IS NULL OR h.transaction_id IS NULL OR n.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_execution_step_intents s
-                LEFT JOIN tree_restore_execution_intents e USING(transaction_id)
-                WHERE e.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_execution_records r
-                LEFT JOIN tree_restore_execution_step_intents s
-                    ON s.transaction_id=r.transaction_id AND s.step_index=r.step_index
-                WHERE s.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_original_reservations h
-                LEFT JOIN tree_restore_execution_intents c USING(transaction_id)
-                WHERE c.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_original_owners o
-                LEFT JOIN tree_restore_original_reservations h USING(transaction_id)
-                LEFT JOIN tree_restore_execution_step_intents s
-                    ON s.transaction_id=o.transaction_id AND s.step_index=o.step_index
-                WHERE h.transaction_id IS NULL OR s.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_original_objects p
-                LEFT JOIN tree_restore_original_owners o
-                    ON o.transaction_id=p.transaction_id AND o.step_index=p.step_index
-                WHERE o.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_owner_intents o
-                LEFT JOIN tree_restore_original_reservations h USING(transaction_id)
-                WHERE h.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_owner_records r
-                LEFT JOIN tree_restore_owner_intents o USING(transaction_id)
-                WHERE o.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_final_descriptions f
-                LEFT JOIN tree_restore_owner_intents o USING(transaction_id)
-                WHERE o.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_retained_descriptions r
-                LEFT JOIN tree_restore_final_descriptions f USING(transaction_id)
-                LEFT JOIN tree_restore_original_owners o
-                    ON o.transaction_id=r.transaction_id AND o.step_index=r.step_index
-                WHERE f.transaction_id IS NULL OR o.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_disposition_reservations h
-                LEFT JOIN tree_restore_final_descriptions f USING(transaction_id)
-                WHERE f.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_disposition_intents i
-                LEFT JOIN tree_restore_disposition_reservations h USING(transaction_id)
-                LEFT JOIN tree_restore_retained_descriptions r
-                    ON r.transaction_id=i.transaction_id AND r.step_index=i.step_index
-                WHERE h.transaction_id IS NULL OR r.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_disposition_records r
-                LEFT JOIN tree_restore_disposition_intents i
-                    ON i.transaction_id=r.transaction_id AND i.step_index=r.step_index
-                WHERE i.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_coordinator_admissions a
-                LEFT JOIN tree_restore_owner_intents o USING(transaction_id)
-                WHERE o.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_protocol_descriptions p
-                LEFT JOIN tree_restore_coordinator_admissions a USING(transaction_id)
-                WHERE a.transaction_id IS NULL)
-             OR EXISTS(SELECT 1 FROM tree_restore_protocol_records r
-                LEFT JOIN tree_restore_protocol_descriptions p USING(transaction_id)
-                WHERE p.transaction_id IS NULL)",
-            [],
-            |r| r.get(0),
-        )?;
-        if orphan {
-            return Err(JournalError::Invariant("orphan tree restore metadata"));
-        }
-        crate::tree_restore_execution_intent::audit_generation_inventory(&self.connection, max)?;
-        crate::tree_disposition_generations::audit_inventory(&self.connection, max)?;
-        let (native_rows, native_bindings): (i64, i64) = self.connection.query_row(
-            "SELECT count(*),coalesce(sum(binding_count),0) FROM tree_restore_native_reservations",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        if native_rows < 0
-            || native_bindings < 0
-            || native_rows as u64 > max as u64
-            || native_bindings as u64 > max as u64
-        {
-            return Err(JournalError::Invariant(
-                "tree native aggregate inventory limit",
-            ));
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT CASE WHEN length(CAST(transaction_id AS BLOB))=32 THEN transaction_id ELSE '' END,
-                CASE WHEN length(CAST(space_id AS BLOB))=32 THEN space_id ELSE '' END,
-                CASE WHEN length(CAST(baseline_root AS BLOB))=64 THEN baseline_root ELSE '' END,
-                CASE WHEN length(CAST(target_root AS BLOB))=64 THEN target_root ELSE '' END,
-                CASE WHEN length(CAST(intent AS BLOB))<=16777216 THEN intent ELSE '' END,
-                CASE WHEN length(CAST(intent_hash AS BLOB))=64 THEN intent_hash ELSE '' END,
-                prepared_at_ms,step_count,reserved_rows,reserved_bytes
-             FROM tree_restore_preparations ORDER BY transaction_id",
-        )?;
-        let mut rows = statement.query([])?;
-        let mut audits = Vec::new();
-        let mut active_count = 0;
-        let mut inventory = 0usize;
-        let mut lengths = BTreeMap::new();
-        let mut actual_native_bindings = 0usize;
-        while let Some(row) = rows.next()? {
-            let id: String = row.get(0)?;
-            let json: String = row.get(4)?;
-            let hash: String = row.get(5)?;
-            let intent: TreeRestorePreparationIntent = serde_json::from_str(&json)?;
-            if intent.transaction_id.as_str() != id
-                || intent.scope.space_id != *space
-                || intent.scope.space_id.as_str() != row.get::<_, String>(1)?
-                || intent.scope.baseline_snapshot.as_str() != row.get::<_, String>(2)?
-                || intent.scope.target_snapshot.as_str() != row.get::<_, String>(3)?
-                || ContentId::hash(json.as_bytes()).as_str() != hash
-                || sql_integer(intent.prepared_at_ms)? != row.get::<_, i64>(6)?
-            {
-                return Err(JournalError::Invariant(
-                    "tree restore preparation integrity mismatch",
-                ));
-            }
-            let terminal: Option<(String, i64)> = self.connection.query_row(
-                "SELECT CASE WHEN length(CAST(intent_hash AS BLOB))=64 THEN intent_hash ELSE '' END,
-                    cancelled_at_ms FROM tree_restore_cancellations WHERE transaction_id=?1",
-                [&id], |r| Ok((r.get(0)?, r.get(1)?)),
-            ).optional()?;
-            let cancelled_at_ms = terminal
-                .map(|(terminal_hash, time)| {
-                    let time = u64::try_from(time)
-                        .map_err(|_| JournalError::Invariant("tree restore cancellation time"))?;
-                    if terminal_hash != hash || time < intent.prepared_at_ms {
-                        return Err(JournalError::Invariant(
-                            "tree restore cancellation mismatch",
-                        ));
-                    }
-                    Ok(time)
-                })
-                .transpose()?;
-            let active = cancelled_at_ms.is_none();
-            let prepared = intent.plan(&self.connection, max, active)?;
-            if prepared.json != json
-                || sql_integer(prepared.steps.len() as u64)? != row.get::<_, i64>(7)?
-                || sql_integer(prepared.reserved_rows)? != row.get::<_, i64>(8)?
-                || sql_integer(prepared.reserved_bytes)? != row.get::<_, i64>(9)?
-            {
-                return Err(JournalError::Invariant(
-                    "tree restore plan reservation mismatch",
-                ));
-            }
-            inventory =
-                inventory
-                    .checked_add(prepared.input_inventory)
-                    .ok_or(JournalError::Invariant(
-                        "tree restore aggregate inventory overflow",
-                    ))?;
-            if inventory > max {
-                return Err(JournalError::Invariant(
-                    "tree restore aggregate input inventory limit",
-                ));
-            }
-            let mut steps = self.connection.prepare(
-                "SELECT step_index,CASE WHEN length(CAST(step AS BLOB))<=16777216 THEN step ELSE '' END,
-                    CASE WHEN length(CAST(step_hash AS BLOB))=64 THEN step_hash ELSE '' END
-                 FROM tree_restore_steps WHERE transaction_id=?1 ORDER BY step_index",
-            )?;
-            let mut stored = steps.query([&id])?;
-            for (index, expected) in prepared.steps.iter().enumerate() {
-                let row = stored
-                    .next()?
-                    .ok_or(JournalError::Invariant("tree restore step missing"))?;
-                let step: String = row.get(1)?;
-                if sql_integer(index as u64)? != row.get::<_, i64>(0)?
-                    || *expected != step
-                    || ContentId::hash(step.as_bytes()).as_str() != row.get::<_, String>(2)?
-                {
-                    return Err(JournalError::Invariant("tree restore exact step mismatch"));
-                }
-            }
-            if stored.next()?.is_some() {
-                return Err(JournalError::Invariant("extra tree restore step"));
-            }
-            let mut pins = self.connection.prepare(
-                "SELECT CASE WHEN length(CAST(content_id AS BLOB))=64 THEN content_id ELSE '' END,
-                    length FROM tree_restore_objects WHERE transaction_id=?1 ORDER BY content_id",
-            )?;
-            let mut pins = pins.query([&id])?;
-            if active {
-                for (chunk, length) in &prepared.chunks {
-                    let row = pins
-                        .next()?
-                        .ok_or(JournalError::Invariant("tree restore pin missing"))?;
-                    if row.get::<_, String>(0)? != chunk.as_str()
-                        || row.get::<_, i64>(1)? != i64::from(*length)
-                    {
-                        return Err(JournalError::Invariant("tree restore exact pin mismatch"));
-                    }
-                    self.require_cas_access(chunk)?;
-                    if lengths
-                        .insert(chunk.clone(), *length)
-                        .is_some_and(|old| old != *length)
-                    {
-                        return Err(JournalError::Invariant(
-                            "tree restore chunk length mismatch",
-                        ));
-                    }
-                }
-                active_count += 1;
-            }
-            if pins.next()?.is_some() {
-                return Err(JournalError::Invariant("extra tree restore pin"));
-            }
-            let history_reservation = crate::tree_restore_history::audit_history(
-                &self.connection,
-                &intent,
-                &prepared.plan,
-                cancelled_at_ms,
-                max,
-            )?;
-            // Cancelled descriptions depend on immutable metadata, not retained content.
-            let baseline =
-                audit_snapshot(&self.connection, space, &intent.scope.baseline_snapshot)?.manifest;
-            let native_reservation = crate::tree_restore_native_identity::audit_native(
-                &self.connection,
-                &intent,
-                history_reservation.as_ref(),
-                &prepared.plan,
-                &baseline,
-                cancelled_at_ms,
-                max,
-            )?;
-            let target =
-                audit_snapshot(&self.connection, space, &intent.scope.target_snapshot)?.manifest;
-            let execution_description = crate::tree_restore_execution_intent::audit_description(
-                &self.connection,
-                &intent,
-                history_reservation.as_ref(),
-                native_reservation.as_ref(),
-                &baseline,
-                &target,
-                cancelled_at_ms,
-                max,
-            )?;
-            let execution_records = crate::tree_execution_records::audit_records(
-                &self.connection,
-                &intent,
-                history_reservation.as_ref(),
-                native_reservation.as_ref(),
-                execution_description.as_ref(),
-                &baseline,
-                &target,
-                cancelled_at_ms,
-                max,
-            )?;
-            let original_pins = crate::tree_original_pins::audit_originals(
-                self,
-                &intent,
-                history_reservation.as_ref(),
-                native_reservation.as_ref(),
-                execution_description.as_ref(),
-                &baseline,
-                &target,
-                cancelled_at_ms,
-                max,
-            )?;
-            let owner_description = crate::tree_owner_description::audit_owner(
-                &self.connection,
-                &intent,
-                history_reservation.as_ref(),
-                native_reservation.as_ref(),
-                execution_description.as_ref(),
-                original_pins.as_ref(),
-                &baseline,
-                &target,
-                cancelled_at_ms,
-                max,
-            )?;
-            if let Some(native) = &native_reservation {
-                actual_native_bindings = actual_native_bindings
-                    .checked_add(native.binding_count)
-                    .filter(|n| *n <= max)
-                    .ok_or(JournalError::Invariant(
-                        "tree native actual aggregate limit",
-                    ))?;
-            }
-            let mut preparation = TreeRestorePreparation {
-                intent,
-                steps: prepared.plan.steps().to_vec(),
-                state: if active { "prepared" } else { "cancelled" },
-                cancelled_at_ms,
-                reserved_rows: prepared.reserved_rows,
-                reserved_metadata_bytes: prepared.reserved_bytes,
-                target_logical_bytes: prepared.plan.target_logical_bytes(),
-                retained_and_staging_bytes: prepared.plan.retained_and_staging_bytes(),
-                exact_input_pins_verified: active,
-                writer_gate_held: active,
-                content_hashes_verified: false,
-                native_tree_verified: false,
-                execution_admission_available: false,
-                executor_available: false,
-                final_handoff_capacity_verified: false,
-                tree_atomic: false,
-                remote_backup_complete: false,
-                history_reservation,
-                native_reservation,
-                execution_description,
-                execution_records,
-                original_pins,
-                owner_description,
-                final_description: None,
-                disposition_description: None,
-                coordinator_admission: None,
-                native_protocol_description: None,
-                native_storage: None,
-                native_future_admission: None,
-            };
-            preparation.final_description =
-                crate::tree_final_description::audit_final(&self.connection, &preparation, max)?;
-            preparation.disposition_description =
-                crate::tree_disposition_description::audit_dispositions(
-                    &self.connection,
-                    &preparation,
-                    max,
-                )?;
-            preparation.coordinator_admission =
-                crate::tree_coordinator_admission::audit(&self.connection, &preparation, max)?;
-            preparation.native_protocol_description =
-                crate::tree_native_protocol::audit(&self.connection, &preparation, max)?;
-            preparation.native_storage =
-                crate::tree_native_storage::audit(&self.connection, &preparation, max)?;
-            preparation.native_future_admission =
-                crate::tree_native_future::audit(&self.connection, &preparation, max)?;
-            audits.push(preparation);
-        }
-        if actual_native_bindings as u64 != native_bindings as u64 {
-            return Err(JournalError::Invariant(
-                "tree native aggregate counter mismatch",
-            ));
-        }
-        if active_count > 1 {
-            return Err(JournalError::Invariant("multiple tree restore writers"));
-        }
-        crate::tree_coordinator_admission::audit_generations(&self.connection, max)?;
-        if active_count != 0 {
-            require_no_ordinary_writer(&self.connection, space)?;
-        }
-        Ok(audits)
+        self.read_view().audit_tree_restore_preparations(space, max)
     }
 
     pub fn require_no_tree_restore(&self, space: &SpaceId, max: usize) -> Result<()> {
@@ -813,4 +459,368 @@ fn require_no_ordinary_writer(connection: &Connection, space: &SpaceId) -> Resul
         ));
     }
     Ok(())
+}
+
+impl crate::JournalReadView<'_> {
+    pub(crate) fn audit_tree_restore_preparations(
+        &self,
+        space: &SpaceId,
+        max: usize,
+    ) -> Result<Vec<TreeRestorePreparation>> {
+        if self.state("space_id")?.as_deref() != Some(space.as_str()) {
+            return Err(JournalError::Invariant("tree restore space mismatch"));
+        }
+        let orphan: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tree_restore_steps s
+                LEFT JOIN tree_restore_preparations p USING(transaction_id) WHERE p.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_objects o
+                LEFT JOIN tree_restore_preparations p USING(transaction_id) WHERE p.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_cancellations c
+                LEFT JOIN tree_restore_preparations p USING(transaction_id) WHERE p.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_histories h
+                LEFT JOIN tree_restore_preparations p USING(transaction_id) WHERE p.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_native_reservations n
+                LEFT JOIN tree_restore_preparations p USING(transaction_id)
+                LEFT JOIN tree_restore_histories h USING(transaction_id)
+                WHERE p.transaction_id IS NULL OR h.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_execution_intents e
+                LEFT JOIN tree_restore_preparations p USING(transaction_id)
+                LEFT JOIN tree_restore_histories h USING(transaction_id)
+                LEFT JOIN tree_restore_native_reservations n USING(transaction_id)
+                WHERE p.transaction_id IS NULL OR h.transaction_id IS NULL OR n.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_execution_step_intents s
+                LEFT JOIN tree_restore_execution_intents e USING(transaction_id)
+                WHERE e.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_execution_records r
+                LEFT JOIN tree_restore_execution_step_intents s
+                    ON s.transaction_id=r.transaction_id AND s.step_index=r.step_index
+                WHERE s.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_original_reservations h
+                LEFT JOIN tree_restore_execution_intents c USING(transaction_id)
+                WHERE c.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_original_owners o
+                LEFT JOIN tree_restore_original_reservations h USING(transaction_id)
+                LEFT JOIN tree_restore_execution_step_intents s
+                    ON s.transaction_id=o.transaction_id AND s.step_index=o.step_index
+                WHERE h.transaction_id IS NULL OR s.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_original_objects p
+                LEFT JOIN tree_restore_original_owners o
+                    ON o.transaction_id=p.transaction_id AND o.step_index=p.step_index
+                WHERE o.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_owner_intents o
+                LEFT JOIN tree_restore_original_reservations h USING(transaction_id)
+                WHERE h.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_owner_records r
+                LEFT JOIN tree_restore_owner_intents o USING(transaction_id)
+                WHERE o.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_final_descriptions f
+                LEFT JOIN tree_restore_owner_intents o USING(transaction_id)
+                WHERE o.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_retained_descriptions r
+                LEFT JOIN tree_restore_final_descriptions f USING(transaction_id)
+                LEFT JOIN tree_restore_original_owners o
+                    ON o.transaction_id=r.transaction_id AND o.step_index=r.step_index
+                WHERE f.transaction_id IS NULL OR o.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_disposition_reservations h
+                LEFT JOIN tree_restore_final_descriptions f USING(transaction_id)
+                WHERE f.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_disposition_intents i
+                LEFT JOIN tree_restore_disposition_reservations h USING(transaction_id)
+                LEFT JOIN tree_restore_retained_descriptions r
+                    ON r.transaction_id=i.transaction_id AND r.step_index=i.step_index
+                WHERE h.transaction_id IS NULL OR r.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_disposition_records r
+                LEFT JOIN tree_restore_disposition_intents i
+                    ON i.transaction_id=r.transaction_id AND i.step_index=r.step_index
+                WHERE i.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_coordinator_admissions a
+                LEFT JOIN tree_restore_owner_intents o USING(transaction_id)
+                WHERE o.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_protocol_descriptions p
+                LEFT JOIN tree_restore_coordinator_admissions a USING(transaction_id)
+                WHERE a.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM tree_restore_protocol_records r
+                LEFT JOIN tree_restore_protocol_descriptions p USING(transaction_id)
+                WHERE p.transaction_id IS NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        if orphan {
+            return Err(JournalError::Invariant("orphan tree restore metadata"));
+        }
+        crate::tree_restore_execution_intent::audit_generation_inventory(self.connection, max)?;
+        crate::tree_disposition_generations::audit_inventory(self.connection, max)?;
+        let (native_rows, native_bindings): (i64, i64) = self.connection.query_row(
+            "SELECT count(*),coalesce(sum(binding_count),0) FROM tree_restore_native_reservations",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if native_rows < 0
+            || native_bindings < 0
+            || native_rows as u64 > max as u64
+            || native_bindings as u64 > max as u64
+        {
+            return Err(JournalError::Invariant(
+                "tree native aggregate inventory limit",
+            ));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT CASE WHEN length(CAST(transaction_id AS BLOB))=32 THEN transaction_id ELSE '' END,
+                CASE WHEN length(CAST(space_id AS BLOB))=32 THEN space_id ELSE '' END,
+                CASE WHEN length(CAST(baseline_root AS BLOB))=64 THEN baseline_root ELSE '' END,
+                CASE WHEN length(CAST(target_root AS BLOB))=64 THEN target_root ELSE '' END,
+                CASE WHEN length(CAST(intent AS BLOB))<=16777216 THEN intent ELSE '' END,
+                CASE WHEN length(CAST(intent_hash AS BLOB))=64 THEN intent_hash ELSE '' END,
+                prepared_at_ms,step_count,reserved_rows,reserved_bytes
+             FROM tree_restore_preparations ORDER BY transaction_id",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut audits = Vec::new();
+        let mut active_count = 0;
+        let mut inventory = 0usize;
+        let mut lengths = BTreeMap::new();
+        let mut actual_native_bindings = 0usize;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let json: String = row.get(4)?;
+            let hash: String = row.get(5)?;
+            let intent: TreeRestorePreparationIntent = serde_json::from_str(&json)?;
+            if intent.transaction_id.as_str() != id
+                || intent.scope.space_id != *space
+                || intent.scope.space_id.as_str() != row.get::<_, String>(1)?
+                || intent.scope.baseline_snapshot.as_str() != row.get::<_, String>(2)?
+                || intent.scope.target_snapshot.as_str() != row.get::<_, String>(3)?
+                || ContentId::hash(json.as_bytes()).as_str() != hash
+                || sql_integer(intent.prepared_at_ms)? != row.get::<_, i64>(6)?
+            {
+                return Err(JournalError::Invariant(
+                    "tree restore preparation integrity mismatch",
+                ));
+            }
+            let terminal: Option<(String, i64)> = self.connection.query_row(
+                "SELECT CASE WHEN length(CAST(intent_hash AS BLOB))=64 THEN intent_hash ELSE '' END,
+                    cancelled_at_ms FROM tree_restore_cancellations WHERE transaction_id=?1",
+                [&id], |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional()?;
+            let cancelled_at_ms = terminal
+                .map(|(terminal_hash, time)| {
+                    let time = u64::try_from(time)
+                        .map_err(|_| JournalError::Invariant("tree restore cancellation time"))?;
+                    if terminal_hash != hash || time < intent.prepared_at_ms {
+                        return Err(JournalError::Invariant(
+                            "tree restore cancellation mismatch",
+                        ));
+                    }
+                    Ok(time)
+                })
+                .transpose()?;
+            let active = cancelled_at_ms.is_none();
+            let prepared = intent.plan(self.connection, max, active)?;
+            if prepared.json != json
+                || sql_integer(prepared.steps.len() as u64)? != row.get::<_, i64>(7)?
+                || sql_integer(prepared.reserved_rows)? != row.get::<_, i64>(8)?
+                || sql_integer(prepared.reserved_bytes)? != row.get::<_, i64>(9)?
+            {
+                return Err(JournalError::Invariant(
+                    "tree restore plan reservation mismatch",
+                ));
+            }
+            inventory =
+                inventory
+                    .checked_add(prepared.input_inventory)
+                    .ok_or(JournalError::Invariant(
+                        "tree restore aggregate inventory overflow",
+                    ))?;
+            if inventory > max {
+                return Err(JournalError::Invariant(
+                    "tree restore aggregate input inventory limit",
+                ));
+            }
+            let mut steps = self.connection.prepare(
+                "SELECT step_index,CASE WHEN length(CAST(step AS BLOB))<=16777216 THEN step ELSE '' END,
+                    CASE WHEN length(CAST(step_hash AS BLOB))=64 THEN step_hash ELSE '' END
+                 FROM tree_restore_steps WHERE transaction_id=?1 ORDER BY step_index",
+            )?;
+            let mut stored = steps.query([&id])?;
+            for (index, expected) in prepared.steps.iter().enumerate() {
+                let row = stored
+                    .next()?
+                    .ok_or(JournalError::Invariant("tree restore step missing"))?;
+                let step: String = row.get(1)?;
+                if sql_integer(index as u64)? != row.get::<_, i64>(0)?
+                    || *expected != step
+                    || ContentId::hash(step.as_bytes()).as_str() != row.get::<_, String>(2)?
+                {
+                    return Err(JournalError::Invariant("tree restore exact step mismatch"));
+                }
+            }
+            if stored.next()?.is_some() {
+                return Err(JournalError::Invariant("extra tree restore step"));
+            }
+            let mut pins = self.connection.prepare(
+                "SELECT CASE WHEN length(CAST(content_id AS BLOB))=64 THEN content_id ELSE '' END,
+                    length FROM tree_restore_objects WHERE transaction_id=?1 ORDER BY content_id",
+            )?;
+            let mut pins = pins.query([&id])?;
+            if active {
+                for (chunk, length) in &prepared.chunks {
+                    let row = pins
+                        .next()?
+                        .ok_or(JournalError::Invariant("tree restore pin missing"))?;
+                    if row.get::<_, String>(0)? != chunk.as_str()
+                        || row.get::<_, i64>(1)? != i64::from(*length)
+                    {
+                        return Err(JournalError::Invariant("tree restore exact pin mismatch"));
+                    }
+                    self.require_cas_access(chunk)?;
+                    if lengths
+                        .insert(chunk.clone(), *length)
+                        .is_some_and(|old| old != *length)
+                    {
+                        return Err(JournalError::Invariant(
+                            "tree restore chunk length mismatch",
+                        ));
+                    }
+                }
+                active_count += 1;
+            }
+            if pins.next()?.is_some() {
+                return Err(JournalError::Invariant("extra tree restore pin"));
+            }
+            let history_reservation = crate::tree_restore_history::audit_history(
+                self.connection,
+                &intent,
+                &prepared.plan,
+                cancelled_at_ms,
+                max,
+            )?;
+            // Cancelled descriptions depend on immutable metadata, not retained content.
+            let baseline =
+                audit_snapshot(self.connection, space, &intent.scope.baseline_snapshot)?.manifest;
+            let native_reservation = crate::tree_restore_native_identity::audit_native(
+                self.connection,
+                &intent,
+                history_reservation.as_ref(),
+                &prepared.plan,
+                &baseline,
+                cancelled_at_ms,
+                max,
+            )?;
+            let target =
+                audit_snapshot(self.connection, space, &intent.scope.target_snapshot)?.manifest;
+            let execution_description = crate::tree_restore_execution_intent::audit_description(
+                self.connection,
+                &intent,
+                history_reservation.as_ref(),
+                native_reservation.as_ref(),
+                &baseline,
+                &target,
+                cancelled_at_ms,
+                max,
+            )?;
+            let execution_records = crate::tree_execution_records::audit_records(
+                self.connection,
+                &intent,
+                history_reservation.as_ref(),
+                native_reservation.as_ref(),
+                execution_description.as_ref(),
+                &baseline,
+                &target,
+                cancelled_at_ms,
+                max,
+            )?;
+            let original_pins = crate::tree_original_pins::audit_originals(
+                self,
+                &intent,
+                history_reservation.as_ref(),
+                native_reservation.as_ref(),
+                execution_description.as_ref(),
+                &baseline,
+                &target,
+                cancelled_at_ms,
+                max,
+            )?;
+            let owner_description = crate::tree_owner_description::audit_owner(
+                self.connection,
+                &intent,
+                history_reservation.as_ref(),
+                native_reservation.as_ref(),
+                execution_description.as_ref(),
+                original_pins.as_ref(),
+                &baseline,
+                &target,
+                cancelled_at_ms,
+                max,
+            )?;
+            if let Some(native) = &native_reservation {
+                actual_native_bindings = actual_native_bindings
+                    .checked_add(native.binding_count)
+                    .filter(|n| *n <= max)
+                    .ok_or(JournalError::Invariant(
+                        "tree native actual aggregate limit",
+                    ))?;
+            }
+            let mut preparation = TreeRestorePreparation {
+                intent,
+                steps: prepared.plan.steps().to_vec(),
+                state: if active { "prepared" } else { "cancelled" },
+                cancelled_at_ms,
+                reserved_rows: prepared.reserved_rows,
+                reserved_metadata_bytes: prepared.reserved_bytes,
+                target_logical_bytes: prepared.plan.target_logical_bytes(),
+                retained_and_staging_bytes: prepared.plan.retained_and_staging_bytes(),
+                exact_input_pins_verified: active,
+                writer_gate_held: active,
+                content_hashes_verified: false,
+                native_tree_verified: false,
+                execution_admission_available: false,
+                executor_available: false,
+                final_handoff_capacity_verified: false,
+                tree_atomic: false,
+                remote_backup_complete: false,
+                history_reservation,
+                native_reservation,
+                execution_description,
+                execution_records,
+                original_pins,
+                owner_description,
+                final_description: None,
+                disposition_description: None,
+                coordinator_admission: None,
+                native_protocol_description: None,
+                native_storage: None,
+                native_future_admission: None,
+            };
+            preparation.final_description =
+                crate::tree_final_description::audit_final(self.connection, &preparation, max)?;
+            preparation.disposition_description =
+                crate::tree_disposition_description::audit_dispositions(
+                    self.connection,
+                    &preparation,
+                    max,
+                )?;
+            preparation.coordinator_admission =
+                crate::tree_coordinator_admission::audit(self.connection, &preparation, max)?;
+            preparation.native_protocol_description =
+                crate::tree_native_protocol::audit(self.connection, &preparation, max)?;
+            preparation.native_storage =
+                crate::tree_native_storage::audit(self.connection, &preparation, max)?;
+            preparation.native_future_admission =
+                crate::tree_native_future::audit(self.connection, &preparation, max)?;
+            audits.push(preparation);
+        }
+        if actual_native_bindings as u64 != native_bindings as u64 {
+            return Err(JournalError::Invariant(
+                "tree native aggregate counter mismatch",
+            ));
+        }
+        if active_count > 1 {
+            return Err(JournalError::Invariant("multiple tree restore writers"));
+        }
+        crate::tree_coordinator_admission::audit_generations(self.connection, max)?;
+        if active_count != 0 {
+            require_no_ordinary_writer(self.connection, space)?;
+        }
+        Ok(audits)
+    }
 }

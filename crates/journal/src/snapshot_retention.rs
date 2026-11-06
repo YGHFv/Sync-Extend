@@ -91,8 +91,7 @@ pub(crate) fn audit_snapshot(
 
 impl Journal {
     pub fn retained_snapshot(&self, space: &SpaceId, id: &SnapshotId) -> Result<RetainedSnapshot> {
-        self.require_snapshot_retained(space, id)?;
-        audit_snapshot(&self.connection, space, id)
+        self.read_view().retained_snapshot(space, id)
     }
 
     pub fn retained_snapshots(
@@ -101,16 +100,7 @@ impl Journal {
         max_entries: usize,
     ) -> Result<Vec<RetainedSnapshot>> {
         self.check_storage_metadata_limit(max_entries)?;
-        let mut statement = self
-            .connection
-            .prepare("SELECT snapshot_id FROM snapshots WHERE space_id=?1
-                AND snapshot_id NOT IN (SELECT snapshot_id FROM snapshot_prunings) ORDER BY snapshot_id")?;
-        let ids: Vec<String> = statement
-            .query_map([space.as_str()], |r| r.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        ids.into_iter()
-            .map(|id| self.retained_snapshot(space, &id.parse()?))
-            .collect()
+        self.read_view().retained_snapshots(space)
     }
 
     pub fn set_snapshot_locked(
@@ -144,6 +134,34 @@ impl Journal {
         max_entries: usize,
     ) -> Result<Vec<crate::Publication>> {
         self.check_storage_metadata_limit(max_entries)?;
+        self.read_view().publications(space)
+    }
+}
+
+impl crate::JournalReadView<'_> {
+    pub(crate) fn retained_snapshot(
+        &self,
+        space: &SpaceId,
+        id: &SnapshotId,
+    ) -> Result<RetainedSnapshot> {
+        self.require_snapshot_retained(space, id)?;
+        audit_snapshot(self.connection, space, id)
+    }
+
+    pub(crate) fn retained_snapshots(&self, space: &SpaceId) -> Result<Vec<RetainedSnapshot>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT snapshot_id FROM snapshots WHERE space_id=?1
+                AND snapshot_id NOT IN (SELECT snapshot_id FROM snapshot_prunings) ORDER BY snapshot_id")?;
+        let ids: Vec<String> = statement
+            .query_map([space.as_str()], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        ids.into_iter()
+            .map(|id| self.retained_snapshot(space, &id.parse()?))
+            .collect()
+    }
+
+    pub(crate) fn publications(&self, space: &SpaceId) -> Result<Vec<crate::Publication>> {
         let mut statement = self.connection.prepare(
             "SELECT transaction_id FROM publications WHERE space_id=?1 ORDER BY transaction_id",
         )?;

@@ -30,50 +30,7 @@ pub struct GcDiagnostics {
 
 impl Journal {
     pub fn diagnostic_operation_count(&self, space: &SpaceId, max: usize) -> Result<usize> {
-        let (count, bytes): (i64, i64) = self.connection.query_row(
-            "SELECT count(*),coalesce(sum(length(CAST(payload AS BLOB))),0) FROM operations WHERE space_id=?1",
-            [space.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        let budget = (max as u64)
-            .checked_mul(1024)
-            .ok_or(JournalError::Invariant(
-                "diagnostic operation budget overflow",
-            ))?;
-        if count < 0 || bytes < 0 || count as u64 > max as u64 || bytes as u64 > budget {
-            return Err(JournalError::Invariant(
-                "diagnostic operation inventory limit",
-            ));
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT op_id,origin_device_id,origin_seq,
-                CASE WHEN length(CAST(payload AS BLOB))<=16777216 THEN payload ELSE '' END
-             FROM operations WHERE space_id=?1 ORDER BY origin_device_id,origin_seq",
-        )?;
-        let rows = statement.query_map([space.as_str()], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (id, device, sequence, json) = row?;
-            let op: Operation = serde_json::from_str(&json)?;
-            op.validate()?;
-            if op.op_id.as_str() != id
-                || op.payload.space_id != *space
-                || op.payload.origin_device_id.as_str() != device
-                || crate::sql_integer(op.payload.origin_seq)? != sequence
-            {
-                return Err(JournalError::Invariant(
-                    "diagnostic operation integrity mismatch",
-                ));
-            }
-        }
-        usize::try_from(count)
-            .map_err(|_| JournalError::Invariant("diagnostic operation count overflow"))
+        self.read_view().diagnostic_operation_count(space, max)
     }
 
     pub fn gc_diagnostics(&self, space: &SpaceId, max: usize) -> Result<GcDiagnostics> {
@@ -223,4 +180,53 @@ fn counters(keys: &[&'static str]) -> BTreeMap<&'static str, usize> {
 
 fn increment(counts: &mut BTreeMap<&'static str, usize>, key: &'static str) {
     *counts.entry(key).or_default() += 1;
+}
+
+impl crate::JournalReadView<'_> {
+    pub(crate) fn diagnostic_operation_count(&self, space: &SpaceId, max: usize) -> Result<usize> {
+        let (count, bytes): (i64, i64) = self.connection.query_row(
+            "SELECT count(*),coalesce(sum(length(CAST(payload AS BLOB))),0) FROM operations WHERE space_id=?1",
+            [space.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let budget = (max as u64)
+            .checked_mul(1024)
+            .ok_or(JournalError::Invariant(
+                "diagnostic operation budget overflow",
+            ))?;
+        if count < 0 || bytes < 0 || count as u64 > max as u64 || bytes as u64 > budget {
+            return Err(JournalError::Invariant(
+                "diagnostic operation inventory limit",
+            ));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT op_id,origin_device_id,origin_seq,
+                CASE WHEN length(CAST(payload AS BLOB))<=16777216 THEN payload ELSE '' END
+             FROM operations WHERE space_id=?1 ORDER BY origin_device_id,origin_seq",
+        )?;
+        let rows = statement.query_map([space.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, device, sequence, json) = row?;
+            let op: Operation = serde_json::from_str(&json)?;
+            op.validate()?;
+            if op.op_id.as_str() != id
+                || op.payload.space_id != *space
+                || op.payload.origin_device_id.as_str() != device
+                || crate::sql_integer(op.payload.origin_seq)? != sequence
+            {
+                return Err(JournalError::Invariant(
+                    "diagnostic operation integrity mismatch",
+                ));
+            }
+        }
+        usize::try_from(count)
+            .map_err(|_| JournalError::Invariant("diagnostic operation count overflow"))
+    }
 }

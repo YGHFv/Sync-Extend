@@ -84,66 +84,7 @@ impl Journal {
         executions: &[GcExecutionAudit],
         max_entries: usize,
     ) -> Result<Vec<GcQuarantineAudit>> {
-        let mut statement = self.connection.prepare(
-            "SELECT execution_id,plan_id,CASE WHEN length(CAST(intent AS BLOB))<=2048 THEN intent ELSE '' END,intent_hash,state FROM gc_quarantines ORDER BY execution_id",
-        )?;
-        let rows = statement.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        })?;
-        let mut audits = Vec::new();
-        for row in rows {
-            let (id, plan, json, hash, state) = row?;
-            let intent: GcQuarantineIntent = serde_json::from_str(&json)?;
-            let execution = executions
-                .iter()
-                .find(|e| e.intent.execution_id.as_str() == id)
-                .ok_or(JournalError::Invariant("orphan GC quarantine"))?;
-            let watermark: i64 = self.connection.query_row(
-                "SELECT observed_at_ms FROM gc_clock WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )?;
-            let state = match state.as_str() {
-                "prepared" => GcQuarantineState::Prepared,
-                "quarantined" if execution.state == GcExecutionState::Deleted => {
-                    GcQuarantineState::Deleted
-                }
-                "quarantined" => GcQuarantineState::Quarantined,
-                "restore_pending" => GcQuarantineState::RestorePending,
-                "restored" => GcQuarantineState::Restored,
-                _ => return Err(JournalError::Invariant("invalid GC quarantine state")),
-            };
-            if intent.format_version != FORMAT_VERSION
-                || intent.execution_id.as_str() != id
-                || intent.plan_id.as_str() != plan
-                || ContentId::hash(json.as_bytes()).as_str() != hash
-                || intent.prepared_at_watermark_ms < execution.intent.admitted_at_ms
-                || intent.prepared_at_watermark_ms >= execution.intent.authorization.expires_at_ms
-                || intent.prepared_at_watermark_ms > watermark as u64
-                || execution
-                    .aborted_at_watermark_ms
-                    .is_some_and(|time| time < intent.prepared_at_watermark_ms)
-                || (state == GcQuarantineState::Restored)
-                    != (execution.state == GcExecutionState::Aborted)
-                || (state == GcQuarantineState::Deleted)
-                    != (execution.state == GcExecutionState::Deleted)
-            {
-                return Err(JournalError::Invariant("GC quarantine integrity mismatch"));
-            }
-            audits.push(GcQuarantineAudit {
-                intent,
-                state,
-                deletion_authorized: false,
-                sweep_available: false,
-                gc_enabled: false,
-            });
-        }
+        let audits = self.read_view().audit_gc_quarantines(executions)?;
         self.audit_gc_disposals(&audits, executions, max_entries)?;
         Ok(audits)
     }
@@ -339,5 +280,74 @@ impl Journal {
             .ok_or(JournalError::Invariant("quarantine disappeared"))?;
         tx.commit().map_err(JournalError::from)?;
         Ok((Some((coordination, guards)), q))
+    }
+}
+
+impl crate::JournalReadView<'_> {
+    pub(crate) fn audit_gc_quarantines(
+        &self,
+        executions: &[GcExecutionAudit],
+    ) -> Result<Vec<GcQuarantineAudit>> {
+        let mut statement = self.connection.prepare(
+            "SELECT execution_id,plan_id,CASE WHEN length(CAST(intent AS BLOB))<=2048 THEN intent ELSE '' END,intent_hash,state FROM gc_quarantines ORDER BY execution_id",
+        )?;
+        let rows = statement.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut audits = Vec::new();
+        for row in rows {
+            let (id, plan, json, hash, state) = row?;
+            let intent: GcQuarantineIntent = serde_json::from_str(&json)?;
+            let execution = executions
+                .iter()
+                .find(|e| e.intent.execution_id.as_str() == id)
+                .ok_or(JournalError::Invariant("orphan GC quarantine"))?;
+            let watermark: i64 = self.connection.query_row(
+                "SELECT observed_at_ms FROM gc_clock WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )?;
+            let state = match state.as_str() {
+                "prepared" => GcQuarantineState::Prepared,
+                "quarantined" if execution.state == GcExecutionState::Deleted => {
+                    GcQuarantineState::Deleted
+                }
+                "quarantined" => GcQuarantineState::Quarantined,
+                "restore_pending" => GcQuarantineState::RestorePending,
+                "restored" => GcQuarantineState::Restored,
+                _ => return Err(JournalError::Invariant("invalid GC quarantine state")),
+            };
+            if intent.format_version != FORMAT_VERSION
+                || intent.execution_id.as_str() != id
+                || intent.plan_id.as_str() != plan
+                || ContentId::hash(json.as_bytes()).as_str() != hash
+                || intent.prepared_at_watermark_ms < execution.intent.admitted_at_ms
+                || intent.prepared_at_watermark_ms >= execution.intent.authorization.expires_at_ms
+                || intent.prepared_at_watermark_ms > watermark as u64
+                || execution
+                    .aborted_at_watermark_ms
+                    .is_some_and(|time| time < intent.prepared_at_watermark_ms)
+                || (state == GcQuarantineState::Restored)
+                    != (execution.state == GcExecutionState::Aborted)
+                || (state == GcQuarantineState::Deleted)
+                    != (execution.state == GcExecutionState::Deleted)
+            {
+                return Err(JournalError::Invariant("GC quarantine integrity mismatch"));
+            }
+            audits.push(GcQuarantineAudit {
+                intent,
+                state,
+                deletion_authorized: false,
+                sweep_available: false,
+                gc_enabled: false,
+            });
+        }
+        Ok(audits)
     }
 }
