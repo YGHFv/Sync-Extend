@@ -1,4 +1,10 @@
 //! Narrow handle-based filesystem primitives. Application crates forbid unsafe.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(unsafe_code)]
+mod unix_noreplace;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use unix_noreplace::{probe_no_replace, NoReplaceProbeReport, UnixFileKey};
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows;

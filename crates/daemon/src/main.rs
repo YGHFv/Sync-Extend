@@ -22,6 +22,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Probe Linux/Android no-replace in a fresh private directory; preserve residues.
+    ProbeNoReplace {
+        #[arg(long)]
+        parent: PathBuf,
+    },
     /// Join an explicitly approved space; creates a new independent local identity.
     Join {
         #[arg(long)]
@@ -580,6 +585,38 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     limits.validate()?;
     let open = |data: &std::path::Path| LocalSpace::open(data)?.with_limits(limits.clone());
     match cli.command {
+        Command::ProbeNoReplace { parent } => {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            {
+                let report = sync_extend_platform_fs::probe_no_replace(&parent)?;
+                let key = |key: sync_extend_platform_fs::UnixFileKey| serde_json::json!({ "device": key.device, "inode": key.inode });
+                print(&serde_json::json!({
+                    "probe_directory": report.probe_directory,
+                    "parent_key": key(report.parent_key),
+                    "original_creator_key": report.original_creator_key.map(key),
+                    "observations_complete": report.observations_complete(),
+                    "observed_no_replace": report.observed_no_replace,
+                    "occupied_file_preserved": report.occupied_file_preserved,
+                    "occupied_directory_preserved": report.occupied_directory_preserved,
+                    "occupied_symlink_preserved": report.occupied_symlink_preserved,
+                    "original_creator_verified": report.original_creator_verified,
+                    "directories_flushed": report.directories_flushed,
+                    "failure": report.failure,
+                    "residues_preserved": true,
+                    "source_slot_exclusion": false,
+                    "native_apply_enabled": false,
+                    "android_device_certified": false,
+                }))?;
+                if !report.observations_complete() {
+                    return Err("no-replace probe incomplete; residues preserved".into());
+                }
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            {
+                let _ = parent;
+                return Err("no-replace probe is Linux/Android-only; no paths changed".into());
+            }
+        }
         Command::Join {
             data_dir,
             root,

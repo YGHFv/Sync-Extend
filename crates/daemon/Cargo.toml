@@ -13,6 +13,7 @@ path = "src/main.rs"
 sync-extend-core-model = { path = "../core-model" }
 sync-extend-reconcile = { path = "../reconcile" }
 sync-extend-transport = { path = "../transport" }
+sync-extend-platform-fs = { path = "../platform-fs" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
