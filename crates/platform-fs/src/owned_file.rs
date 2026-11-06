@@ -14,27 +14,87 @@ use std::{fs::File, io, path::Path};
 /// before and after action boundaries. No external alias-free proof is implied.
 pub struct OwnedFileCreation {
     file: File,
+    parent: File,
+    original_key: FileKey,
+    original_parent_key: FileKey,
+    created_component: String,
+}
+
+/// Borrowed provenance from an actual exclusive native CREATE, not a reopened
+/// pathname, immutable-content receipt, current-slot witness or Journal grant.
+/// No public constructor, cloning or deserialization can mint this proof.
+pub struct OriginalFileCreation<'a> {
+    creator: &'a OwnedFileCreation,
+}
+
+impl OriginalFileCreation<'_> {
+    pub fn key(&self) -> io::Result<FileKey> {
+        self.verify()?;
+        Ok(self.creator.original_key)
+    }
+
+    pub fn parent_key(&self) -> io::Result<FileKey> {
+        self.verify()?;
+        Ok(self.creator.original_parent_key)
+    }
+
+    /// Historical name used by CREATE; a later rename does not make this a
+    /// claim that the original pathname still identifies the created file.
+    pub fn created_component(&self) -> &str {
+        &self.creator.created_component
+    }
+
+    pub fn verify(&self) -> io::Result<()> {
+        regular(&self.creator.file, false)?;
+        regular(&self.creator.parent, true)?;
+        if key(&self.creator.file)? != self.creator.original_key
+            || key(&self.creator.parent)? != self.creator.original_parent_key
+        {
+            return Err(super::invalid("original creator lineage changed"));
+        }
+        Ok(())
+    }
+}
+
+fn create(parent: &File, name: &str) -> io::Result<OwnedFileCreation> {
+    let original_parent_key = key(parent)?;
+    let file = create_new_child(parent, name, NewChildKind::File)?;
+    let original_key = key(&file)?;
+    let created = OwnedFileCreation {
+        file,
+        parent: parent.try_clone()?,
+        original_key,
+        original_parent_key,
+        created_component: name.into(),
+    };
+    created.original_creation()?.verify()?;
+    Ok(created)
 }
 
 impl LockedDirectory {
     /// Create one new file through this exact retained real NTFS parent.
     pub fn create_new_file(&self, name: &str) -> io::Result<OwnedFileCreation> {
-        Ok(OwnedFileCreation {
-            file: create_new_child(&self.file, name, NewChildKind::File)?,
-        })
+        create(&self.file, name)
     }
 }
 
 impl LockedDirectoryMutation {
     /// Create one new file through the original live owned parent handle.
     pub fn create_new_file(&self, name: &str) -> io::Result<OwnedFileCreation> {
-        Ok(OwnedFileCreation {
-            file: create_new_child(&self.file, name, NewChildKind::File)?,
-        })
+        create(&self.file, name)
     }
 }
 
 impl OwnedFileCreation {
+    /// Retains both original handles for the entire lifetime of the proof.
+    /// The creator remains writable; callers must separately close content and
+    /// durably bind the proof to their exact transaction before native effects.
+    pub fn original_creation(&self) -> io::Result<OriginalFileCreation<'_>> {
+        let proof = OriginalFileCreation { creator: self };
+        proof.verify()?;
+        Ok(proof)
+    }
+
     pub fn key(&self) -> io::Result<FileKey> {
         key(&self.file)
     }
