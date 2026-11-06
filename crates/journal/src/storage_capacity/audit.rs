@@ -1,0 +1,134 @@
+use crate::{
+    storage_inventory::reader::invalid, CleanupPlan, GcDisposalAudit, GcExecutionAudit,
+    GcMarkAudit, GcQuarantineAudit, JournalReadView, Mutation, OriginalDisposalAudit, Publication,
+    ReadLease, ReferenceReservation, Result, SnapshotAudit, TreeRestorePreparation,
+};
+use sync_extend_core_model::{DeviceId, SpaceId};
+
+pub(super) struct Owners {
+    pub snapshots: Vec<SnapshotAudit>,
+    pub leases: Vec<ReadLease>,
+    pub mutations: Vec<Mutation>,
+    pub publications: Vec<Publication>,
+    pub cleanup: Vec<CleanupPlan>,
+    pub references: Vec<ReferenceReservation>,
+    pub originals: Vec<OriginalDisposalAudit>,
+    pub marks: Vec<GcMarkAudit>,
+    pub executions: Vec<GcExecutionAudit>,
+    pub quarantines: Vec<GcQuarantineAudit>,
+    pub disposals: Vec<GcDisposalAudit>,
+    pub trees: Vec<TreeRestorePreparation>,
+}
+
+pub(super) fn owners(view: &JournalReadView<'_>, space: &SpaceId, max: usize) -> Result<Owners> {
+    if view.state("space_id")?.as_deref() != Some(space.as_str()) {
+        return Err(invalid("journal capacity space mismatch"));
+    }
+    let _: DeviceId = view
+        .state("device_id")?
+        .ok_or(invalid("journal capacity device missing"))?
+        .parse()?;
+    let foreign = [
+        "operations",
+        "receive_cursors",
+        "snapshots",
+        "current_manifests",
+        "mutations",
+        "publications",
+        "cleanup_plans",
+        "read_leases",
+        "snapshot_prunings",
+        "gc_marks",
+        "reference_reservations",
+        "original_disposals",
+        "rename_observations",
+    ]
+    .into_iter()
+    .map(|table| format!("EXISTS(SELECT 1 FROM main.{table} WHERE space_id!=?1)"))
+    .collect::<Vec<_>>()
+    .join(" OR ");
+    if view
+        .connection
+        .query_row(&format!("SELECT {foreign}"), [space.as_str()], |r| {
+            r.get::<_, bool>(0)
+        })?
+    {
+        return Err(invalid("journal capacity foreign ordinary row"));
+    }
+    let mut foreign_keys = view.connection.prepare("PRAGMA main.foreign_key_check")?;
+    if foreign_keys.query([])?.next()?.is_some() {
+        return Err(invalid("journal capacity orphan foreign key"));
+    }
+    let snapshots = view.snapshot_audit(space)?;
+    view.current(space)?;
+    view.diagnostic_operation_count(space, max)?;
+    crate::rename_observation::audit_observation(view.connection, space, max)?;
+    let leases = view.read_leases(space)?;
+    let mutations = view.mutations(space)?;
+    for mutation in &mutations {
+        view.verify_mutation_references(&mutation.intent.transaction_id)?;
+    }
+    let publications = view.publications(space)?;
+    for publication in &publications {
+        let intent = &publication.intent;
+        let baseline = view
+            .retained_snapshot(space, &intent.baseline_root)?
+            .manifest;
+        let requested = baseline
+            .entries
+            .values()
+            .find(|e| e.path == intent.requested_path);
+        if requested != intent.requested_baseline.as_ref()
+            || baseline.entries.contains_key(&intent.entry_id)
+        {
+            return Err(invalid("journal capacity publication baseline mismatch"));
+        }
+        if let Some(root) = &intent.source_snapshot {
+            let source = view.retained_snapshot(space, root)?;
+            if !source
+                .manifest
+                .entries
+                .values()
+                .any(|e| e.content.as_ref() == Some(&intent.content))
+            {
+                return Err(invalid("journal capacity publication source mismatch"));
+            }
+        }
+        if let Some(root) = &publication.committed_snapshot {
+            let completed = view.retained_snapshot(space, root)?;
+            if completed
+                .manifest
+                .entries
+                .get(&intent.entry_id)
+                .is_none_or(|e| {
+                    e.path != intent.target_path || e.content.as_ref() != Some(&intent.content)
+                })
+            {
+                return Err(invalid("journal capacity publication completion mismatch"));
+            }
+        }
+    }
+    let cleanup = view.cleanup_plans(space)?;
+    let references = view.reference_reservations(space, max)?;
+    let originals = view.audit_original_disposals(space, max)?;
+    let marks = view.gc_marks(space)?;
+    let authorizations = view.gc_authorizations(space, &marks)?;
+    let executions = view.gc_executions(&authorizations)?;
+    let quarantines = view.audit_gc_quarantines(&executions)?;
+    let disposals = view.audit_gc_disposals(&quarantines, &executions)?;
+    let trees = view.audit_tree_restore_preparations(space, max)?;
+    Ok(Owners {
+        snapshots,
+        leases,
+        mutations,
+        publications,
+        cleanup,
+        references,
+        originals,
+        marks,
+        executions,
+        quarantines,
+        disposals,
+        trees,
+    })
+}

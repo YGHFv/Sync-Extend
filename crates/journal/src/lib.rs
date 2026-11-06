@@ -1530,6 +1530,7 @@ pub use diagnostics::GcDiagnostics;
 mod original_retention;
 mod reference_reservation;
 mod rename_observation;
+mod storage_capacity;
 mod storage_inventory;
 mod tree_coordinator_admission;
 mod tree_disposition_description;
@@ -1550,6 +1551,10 @@ mod tree_storage_inventory;
 pub use original_retention::{OriginalDisposalAudit, OriginalDisposalIntent, OriginalDisposalStep};
 pub use reference_reservation::{
     ReferenceReservation, ReferenceReservationIntent, ReferenceSnapshotHandoff,
+};
+pub use storage_capacity::{
+    JournalCapacityGap, JournalCapacityLimits, JournalCapacityObligation,
+    JournalCapacityReservation, JournalCapacityRow, JournalStorageCapacity, JournalTreeCapacity,
 };
 pub use storage_inventory::{
     JournalStorageColumn, JournalStorageColumnValue, JournalStorageInventory, JournalStoredRow,

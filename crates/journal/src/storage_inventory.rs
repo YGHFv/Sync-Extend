@@ -93,7 +93,7 @@ impl JournalStorageInventory {
     }
 }
 
-fn tables() -> Vec<TableSpec> {
+pub(crate) fn tables() -> Vec<TableSpec> {
     [
         schema::TABLES,
         crate::tree_storage_inventory::schema::TABLES,
