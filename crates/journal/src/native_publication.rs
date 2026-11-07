@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 use sync_extend_core_model::{tree_storage_capacity::TreeStorageCharge, ContentId, EntryId};
 
 #[cfg(windows)]
+pub(crate) mod cleanup;
+#[cfg(windows)]
 pub(crate) mod creation;
 #[cfg(windows)]
 pub(crate) mod issuance;
@@ -190,7 +192,6 @@ pub(crate) fn obligations(
                 publication.state,
                 PublicationState::Preparing | PublicationState::Committed
             )
-            || publication.cleaned
             || header.intent.completion.is_none()
         {
             return Err(invalid("native creator owner cannot use legacy completion"));
@@ -199,6 +200,7 @@ pub(crate) fn obligations(
         let mut activations = BTreeMap::new();
         let mut creators = BTreeMap::new();
         let mut phases = Vec::new();
+        let mut dispositions = BTreeMap::new();
         let planned = steps(&header);
         for effect in rows.iter().filter(|r| {
             r.table() != "native_publication_headers"
@@ -206,7 +208,23 @@ pub(crate) fn obligations(
                 && matches!(field(r,"transaction_id"),Ok(value) if value==id)
         }) {
             if effect.table() == "native_publication_dispositions" {
-                return Err(invalid("native phase issuer not implemented"));
+                let step = number(effect, "step")? as usize;
+                let stage = field(effect, "stage")?;
+                if !matches!(stage, "intended" | "absent" | "terminal")
+                    || step > 3
+                    || field(effect, "generation")? != header.generation.as_str()
+                    || field(effect, "header_hash")? != hash(&header)?.as_str()
+                    || number(effect, "observed_at_ms")? != header.intent.created_at_ms
+                {
+                    return Err(invalid("native phase issuer not implemented"));
+                }
+                dispositions.insert((step, stage), effect);
+                actual.rows += 1;
+                actual.logical_bytes = actual
+                    .logical_bytes
+                    .checked_add(effect.logical_bytes())
+                    .ok_or(invalid("native actual disposition overflow"))?;
+                continue;
             }
             if effect.table() == "native_publication_phases" {
                 phases.push(effect);
@@ -299,7 +317,8 @@ pub(crate) fn obligations(
         if !phases.is_empty()
             && (!phase_names.contains("ready")
                 || (phase_names.contains("observed") && !phase_names.contains("publishing"))
-                || (phase_names.contains("final") && !phase_names.contains("observed")))
+                || (phase_names.contains("final") && !phase_names.contains("observed"))
+                || (phase_names.contains("cleanup") && !phase_names.contains("final")))
         {
             return Err(invalid("native forward phase predecessor missing"));
         }
@@ -310,6 +329,33 @@ pub(crate) fn obligations(
         {
             return Err(invalid("native final exact history state differs"));
         }
+        for (&(step, stage), row) in &dispositions {
+            let original = creators
+                .get(&step)
+                .map(|(_, key)| key)
+                .ok_or(invalid("native disposition original receipt missing"))?;
+            if !phase_names.contains("final")
+                || field(row, "identity_hash")? != physical(original)?.as_str()
+                || (stage != "intended" && !dispositions.contains_key(&(step, "intended")))
+                || (stage == "terminal" && !dispositions.contains_key(&(step, "absent")))
+                || (step < 3 && !dispositions.contains_key(&(step + 1, "terminal")))
+            {
+                return Err(invalid("native disposition exact prefix differs"));
+            }
+        }
+        let required = if header.existing_base.is_some() {
+            1..=3
+        } else {
+            0..=3
+        };
+        if publication.cleaned != phase_names.contains("cleanup")
+            || (phase_names.contains("cleanup")
+                && required
+                    .into_iter()
+                    .any(|step| !dispositions.contains_key(&(step, "terminal"))))
+        {
+            return Err(invalid("native cleanup exact terminal closure differs"));
+        }
         for phase in &phases {
             let payload = creators
                 .get(&3)
@@ -319,12 +365,12 @@ pub(crate) fn obligations(
                 .get(&1)
                 .map(|(_, key)| key)
                 .ok_or(invalid("native Ready original owner missing"))?;
-            if phases.len() > 4
+            if phases.len() > 5
                 || creators.len() != if header.existing_base.is_some() { 3 } else { 4 }
                 || activations.len() != creators.len()
                 || !matches!(
                     field(phase, "phase")?,
-                    "ready" | "publishing" | "observed" | "final"
+                    "ready" | "publishing" | "observed" | "final" | "cleanup"
                 )
                 || number(phase, "attempt")? != 0
                 || field(phase, "generation")? != header.generation.as_str()
@@ -348,17 +394,21 @@ pub(crate) fn obligations(
         out.push(crate::JournalCapacityObligation {
             family: "native_publication_exact_continuation",
             owner_key: vec![id.into()],
-            charge: TreeStorageCharge {
-                rows: header
-                    .native_peak
-                    .rows
-                    .checked_sub(actual.rows)
-                    .ok_or(invalid("native row liability underflow"))?,
-                logical_bytes: header
-                    .native_peak
-                    .logical_bytes
-                    .checked_sub(actual.logical_bytes)
-                    .ok_or(invalid("native byte liability underflow"))?,
+            charge: if publication.cleaned {
+                TreeStorageCharge::default()
+            } else {
+                TreeStorageCharge {
+                    rows: header
+                        .native_peak
+                        .rows
+                        .checked_sub(actual.rows)
+                        .ok_or(invalid("native row liability underflow"))?,
+                    logical_bytes: header
+                        .native_peak
+                        .logical_bytes
+                        .checked_sub(actual.logical_bytes)
+                        .ok_or(invalid("native byte liability underflow"))?,
+                }
             },
         });
     }
@@ -445,6 +495,7 @@ pub(crate) fn validate_schema(connection: &rusqlite::Connection) -> Result<()> {
     expected.execute_batch(include_str!("migration-035.sql"))?;
     expected.execute_batch(include_str!("migration-036.sql"))?;
     expected.execute_batch(include_str!("migration-037.sql"))?;
+    expected.execute_batch(include_str!("migration-038.sql"))?;
     if objects(connection)? != objects(&expected)? {
         return Err(invalid("native publication schema/trigger/index differs"));
     }
