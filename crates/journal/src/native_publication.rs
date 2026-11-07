@@ -195,16 +195,24 @@ pub(crate) fn obligations(
         let mut actual = TreeStorageCharge::default();
         let mut activations = BTreeMap::new();
         let mut creators = BTreeMap::new();
+        let mut phases = Vec::new();
         let planned = steps(&header);
         for effect in rows.iter().filter(|r| {
             r.table() != "native_publication_headers"
                 && r.table().starts_with("native_publication_")
                 && matches!(field(r,"transaction_id"),Ok(value) if value==id)
         }) {
-            if effect.table() == "native_publication_phases"
-                || effect.table() == "native_publication_dispositions"
-            {
+            if effect.table() == "native_publication_dispositions" {
                 return Err(invalid("native phase issuer not implemented"));
+            }
+            if effect.table() == "native_publication_phases" {
+                phases.push(effect);
+                actual.rows += 1;
+                actual.logical_bytes = actual
+                    .logical_bytes
+                    .checked_add(effect.logical_bytes())
+                    .ok_or(invalid("native actual bytes overflow"))?;
+                continue;
             }
             let index = number(effect, "step")? as usize;
             let step = planned
@@ -280,6 +288,35 @@ pub(crate) fn obligations(
             })
         {
             return Err(invalid("native original identities alias scope"));
+        }
+        for phase in &phases {
+            let payload = creators
+                .get(&3)
+                .map(|(_, key)| key)
+                .ok_or(invalid("native Ready original payload missing"))?;
+            let owner = creators
+                .get(&1)
+                .map(|(_, key)| key)
+                .ok_or(invalid("native Ready original owner missing"))?;
+            if phases.len() != 1
+                || creators.len() != if header.existing_base.is_some() { 3 } else { 4 }
+                || activations.len() != creators.len()
+                || field(phase, "phase")? != "ready"
+                || number(phase, "attempt")? != 0
+                || field(phase, "generation")? != header.generation.as_str()
+                || field(phase, "header_hash")? != hash(&header)?.as_str()
+                || field(phase, "identity_hash")? != physical(payload)?.as_str()
+                || field(phase, "content_id")? != header.intent.content.content_id.as_str()
+                || field(phase, "target_hash")? != hash(&header.intent.target_path)?.as_str()
+                || number(phase, "observed_at_ms")? != header.intent.created_at_ms
+                || field(phase, "source_parent_volume")? != owner.volume
+                || field(phase, "source_parent_id")? != owner.id
+                || field(phase, "target_parent_volume")? != header.parent.volume
+                || field(phase, "target_parent_id")? != header.parent.id
+                || field(phase, "target_path")? != header.intent.target_path.as_str()
+            {
+                return Err(invalid("native Ready exact original scope differs"));
+            }
         }
         if owners.insert(id.to_string(), ()).is_some() {
             return Err(invalid("native owner duplicate"));
@@ -381,6 +418,7 @@ pub(crate) fn validate_schema(connection: &rusqlite::Connection) -> Result<()> {
     }
     let expected = rusqlite::Connection::open_in_memory()?;
     expected.execute_batch(include_str!("migration-034.sql"))?;
+    expected.execute_batch(include_str!("migration-035.sql"))?;
     if objects(connection)? != objects(&expected)? {
         return Err(invalid("native publication schema/trigger/index differs"));
     }

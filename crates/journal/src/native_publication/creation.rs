@@ -50,6 +50,13 @@ pub(super) enum Base {
     Created(LockedDirectoryMutation),
 }
 impl Base {
+    pub(super) fn require_case_insensitive(&self) -> Result<()> {
+        match self {
+            Self::Existing(held) => held.require_case_insensitive()?,
+            Self::Created(held) => held.require_case_insensitive()?,
+        }
+        Ok(())
+    }
     pub(super) fn key(&self) -> Result<FileKey> {
         Ok(match self {
             Self::Existing(h) => h.key()?,
@@ -147,7 +154,7 @@ fn charge(values: &[Value]) -> Result<TreeStorageCharge> {
     })
 }
 impl Journal {
-    fn native_insert(
+    pub(super) fn native_insert(
         &mut self,
         header: &Header,
         table: &'static str,

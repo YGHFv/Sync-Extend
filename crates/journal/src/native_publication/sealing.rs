@@ -29,6 +29,7 @@ pub struct NativePublicationReadiness {
     header: Header,
     marker_key: Key,
     payload_key: Key,
+    owner_key: Key,
 }
 impl NativePublicationReadiness {
     pub fn transaction_id(&self) -> &EntryId {
@@ -51,7 +52,11 @@ impl NativePublicationReadiness {
                 return Err(invalid("native readiness full ancestor differs"));
             }
         }
-        self.owner.original_creation()?.verify()?;
+        self.base.require_case_insensitive()?;
+        self.owner.require_case_insensitive()?;
+        if key(self.owner.key()?) != self.owner_key {
+            return Err(invalid("native readiness original owner identity differs"));
+        }
         sync_extend_platform_fs::verify_regular_file(self.marker.reader())?;
         sync_extend_platform_fs::verify_regular_file(self.payload.reader())?;
         if key(self.marker.key()?) != self.marker_key
@@ -118,6 +123,152 @@ fn creator_key(
     })
 }
 impl Journal {
+    /// Reacquire guarded content only from a complete original creator set and
+    /// exact durable Ready. This never creates, repairs, publishes or deletes.
+    pub fn reopen_native_publication_ready(
+        &mut self,
+        id: &EntryId,
+    ) -> Result<NativePublicationReadiness> {
+        if !self.connection.is_autocommit() {
+            return Err(invalid(
+                "native Ready reopen refuses caller-owned transaction",
+            ));
+        }
+        let cas = self.acquire_cas_coordination()?;
+        let bounds = storage_policy::capacity_limits(self.max_storage_entries)?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let publication = self.publication(id)?;
+        let before = self
+            .read_view()
+            .audit_local_commit_capacity(&publication.intent.space_id, bounds)?;
+        let stored = before
+            .rows
+            .iter()
+            .find(|row| {
+                row.table() == "native_publication_headers" && row.primary_key() == [id.as_str()]
+            })
+            .ok_or(invalid("native Ready reopen header missing"))?;
+        let header: Header = serde_json::from_str(super::field(stored, "header")?)?;
+        if !before.rows.iter().any(|row| {
+            row.table() == "native_publication_phases"
+                && row.primary_key() == [id.as_str(), "0", "ready"]
+        }) || !before.report.within_accounted_limits()
+        {
+            return Err(invalid(
+                "native Ready reopen requires durable phase and capacity",
+            ));
+        }
+        if self
+            .current(&header.intent.space_id)?
+            .map(|m| m.root())
+            .transpose()?
+            .as_ref()
+            != Some(&header.intent.baseline_root)
+        {
+            return Err(invalid("native Ready reopen baseline changed"));
+        }
+        for content in header
+            .intent
+            .completion
+            .as_ref()
+            .ok_or(invalid("native Ready reopen history missing"))?
+            .protected_objects
+            .keys()
+        {
+            self.require_cas_access(content)?;
+        }
+        let mut ancestors = Vec::new();
+        for expected in &header.ancestors {
+            let path = PathBuf::from(&expected.path);
+            let held = LockedDirectory::open(&path)?;
+            held.require_local_ntfs(&path)?;
+            held.require_case_insensitive()?;
+            if key(held.key()?) != expected.key {
+                return Err(invalid("native Ready reopen original ancestor changed"));
+            }
+            ancestors.push(held);
+        }
+        let parent_path = PathBuf::from(&header.ancestors[0].path);
+        let parent = LockedDirectory::open(&parent_path)?;
+        let base_path = parent_path.join(".sync-tmp");
+        let base = if header.existing_base.is_some() {
+            Base::Existing(LockedDirectory::open(&base_path)?)
+        } else {
+            Base::Created(LockedDirectoryMutation::open(&base_path)?)
+        };
+        let base_key = header
+            .existing_base
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| creator_key(&before, &header, 0))?;
+        if key(base.key()?) != base_key {
+            return Err(invalid("native Ready reopen original scaffold changed"));
+        }
+        let owner_path = base_path.join(format!("native-{}", header.generation));
+        let owner_key = creator_key(&before, &header, 1)?;
+        let held = NativePublicationReadiness {
+            ancestors,
+            parent,
+            base,
+            owner: LockedDirectoryMutation::open(&owner_path)?,
+            marker: LockedFile::open(&owner_path.join("owner"))?,
+            payload: LockedFile::open(&owner_path.join("payload-0"))?,
+            _cas: cas,
+            marker_key: creator_key(&before, &header, 2)?,
+            payload_key: creator_key(&before, &header, 3)?,
+            owner_key,
+            header,
+        };
+        held.verify_content()?;
+        let after = self
+            .read_view()
+            .audit_local_commit_capacity(&held.header.intent.space_id, bounds)?;
+        if before.rows != after.rows || before.report != after.report {
+            return Err(invalid("native Ready reopen changed stored state"));
+        }
+        held.verify_content()?;
+        tx.commit()?;
+        Ok(held)
+    }
+
+    /// Persist the sole Ready row while exact receipt-backed guarded content
+    /// remains live. This neither publishes nor changes legacy publication state.
+    pub fn record_native_publication_ready(
+        &mut self,
+        held: NativePublicationReadiness,
+    ) -> Result<NativePublicationReadiness> {
+        if !self.connection.is_autocommit() {
+            return Err(invalid("native Ready refuses caller-owned transaction"));
+        }
+        held.verify_content()?;
+        let header = &held.header;
+        let owner = key(held.owner.key()?);
+        let text = |value: &str| rusqlite::types::Value::Text(value.into());
+        self.native_insert(
+            header,
+            "native_publication_phases",
+            vec![
+                text(header.intent.transaction_id.as_str()),
+                text(header.generation.as_str()),
+                rusqlite::types::Value::Integer(0),
+                text(hash(header)?.as_str()),
+                text("ready"),
+                text(physical(&held.payload_key)?.as_str()),
+                text(header.intent.content.content_id.as_str()),
+                text(hash(&header.intent.target_path)?.as_str()),
+                rusqlite::types::Value::Integer(header.intent.created_at_ms as i64),
+                text(&owner.volume),
+                text(&owner.id),
+                text(&header.parent.volume),
+                text(&header.parent.id),
+                text(header.intent.target_path.as_str()),
+            ],
+            false,
+            || held.verify_content(),
+        )?;
+        Ok(held)
+    }
+
     /// Consumes and flushes original writers, then reacquires exact receipt-backed
     /// guarded reads. Leaked writable clones refuse; errors preserve all objects.
     /// No SQL Ready or native publication/cleanup effect is issued by this call.
@@ -171,9 +322,10 @@ impl Journal {
         creation.verify_originals()?;
         let marker_key = creator_key(&before, &creation.header, 2)?;
         let payload_key = creator_key(&before, &creation.header, 3)?;
+        let owner_key = creator_key(&before, &creation.header, 1)?;
         if key(creation.marker.key()?) != marker_key
             || key(creation.payload.key()?) != payload_key
-            || key(creation._owner.key()?) != creator_key(&before, &creation.header, 1)?
+            || key(creation._owner.key()?) != owner_key
         {
             return Err(invalid(
                 "native readiness creator differs from original receipt",
@@ -216,6 +368,7 @@ impl Journal {
             header,
             marker_key,
             payload_key,
+            owner_key,
         };
         held.verify_content()?;
         if physical(&key(held.parent.key()?))?
