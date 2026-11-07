@@ -186,7 +186,10 @@ pub(crate) fn obligations(
             .find(|p| p.intent.transaction_id == header.intent.transaction_id)
             .ok_or(invalid("native header publication missing"))?;
         if publication.intent != header.intent
-            || publication.state != PublicationState::Preparing
+            || !matches!(
+                publication.state,
+                PublicationState::Preparing | PublicationState::Committed
+            )
             || publication.cleaned
             || header.intent.completion.is_none()
         {
@@ -295,9 +298,17 @@ pub(crate) fn obligations(
             .collect::<Result<_>>()?;
         if !phases.is_empty()
             && (!phase_names.contains("ready")
-                || (phase_names.contains("observed") && !phase_names.contains("publishing")))
+                || (phase_names.contains("observed") && !phase_names.contains("publishing"))
+                || (phase_names.contains("final") && !phase_names.contains("observed")))
         {
             return Err(invalid("native forward phase predecessor missing"));
+        }
+        if (publication.state == PublicationState::Committed) != phase_names.contains("final")
+            || (phase_names.contains("final")
+                && publication.committed_snapshot.as_ref()
+                    != Some(&header.intent.completion.as_ref().unwrap().manifest.root()?))
+        {
+            return Err(invalid("native final exact history state differs"));
         }
         for phase in &phases {
             let payload = creators
@@ -308,10 +319,13 @@ pub(crate) fn obligations(
                 .get(&1)
                 .map(|(_, key)| key)
                 .ok_or(invalid("native Ready original owner missing"))?;
-            if phases.len() > 3
+            if phases.len() > 4
                 || creators.len() != if header.existing_base.is_some() { 3 } else { 4 }
                 || activations.len() != creators.len()
-                || !matches!(field(phase, "phase")?, "ready" | "publishing" | "observed")
+                || !matches!(
+                    field(phase, "phase")?,
+                    "ready" | "publishing" | "observed" | "final"
+                )
                 || number(phase, "attempt")? != 0
                 || field(phase, "generation")? != header.generation.as_str()
                 || field(phase, "header_hash")? != hash(&header)?.as_str()
@@ -430,6 +444,7 @@ pub(crate) fn validate_schema(connection: &rusqlite::Connection) -> Result<()> {
     expected.execute_batch(include_str!("migration-034.sql"))?;
     expected.execute_batch(include_str!("migration-035.sql"))?;
     expected.execute_batch(include_str!("migration-036.sql"))?;
+    expected.execute_batch(include_str!("migration-037.sql"))?;
     if objects(connection)? != objects(&expected)? {
         return Err(invalid("native publication schema/trigger/index differs"));
     }

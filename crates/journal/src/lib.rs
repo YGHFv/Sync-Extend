@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 36;
+const SCHEMA_VERSION: u32 = 37;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -280,6 +280,11 @@ impl Journal {
         if version < 36 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-036.sql"))?;
+            tx.commit()?;
+        }
+        if version < 37 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-037.sql"))?;
             tx.commit()?;
         }
         native_publication::validate_schema(&connection)?;
@@ -1298,6 +1303,8 @@ impl Journal {
         };
         let publication = match completion {
             Completion::Publication(id) => Some(id),
+            #[cfg(windows)]
+            Completion::NativePublication(id) => Some(id),
             _ => None,
         };
         if mutation_active.as_deref() != mutation.map(EntryId::as_str) {
@@ -1401,12 +1408,24 @@ impl Journal {
         )?;
         pin_snapshot(tx, root.as_str(), manifest)?;
         if let Some(id) = publication {
-            if tx.execute(
-                "UPDATE publications SET state='committed',committed_snapshot=?1
+            #[cfg(windows)]
+            let native = matches!(completion, Completion::NativePublication(_));
+            #[cfg(not(windows))]
+            let native = false;
+            let changed = if native {
+                tx.execute(
+                    "UPDATE publications SET state='committed',committed_snapshot=?1
+                     WHERE transaction_id=?2 AND state='preparing'",
+                    params![root.as_str(), id.as_str()],
+                )?
+            } else {
+                tx.execute(
+                    "UPDATE publications SET state='committed',committed_snapshot=?1
                  WHERE transaction_id=?2 AND state='published'",
-                params![root.as_str(), id.as_str()],
-            )? != 1
-            {
+                    params![root.as_str(), id.as_str()],
+                )?
+            };
+            if changed != 1 {
                 return Err(JournalError::Invariant(
                     "publication changed before completion",
                 ));
@@ -1450,6 +1469,8 @@ impl Journal {
 enum Completion<'a> {
     None,
     Publication(&'a EntryId),
+    #[cfg(windows)]
+    NativePublication(&'a EntryId),
     Mutation(&'a EntryId),
 }
 

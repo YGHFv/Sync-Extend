@@ -8,6 +8,9 @@ use crate::{
 use std::{fs, path::PathBuf};
 use sync_extend_core_model::EntryId;
 
+#[path = "finalization.rs"]
+mod finalization;
+
 /// Exact guarded original payload observed at its admitted target. This is not
 /// history completion, remote apply, reference release or cleanup permission.
 pub struct NativePublicationObservation {

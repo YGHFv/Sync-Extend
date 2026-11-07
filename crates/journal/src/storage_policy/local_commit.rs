@@ -108,7 +108,7 @@ pub(crate) struct Input<'a> {
 }
 
 pub(crate) fn project(before: &CapacitySnapshot, input: Input<'_>) -> Result<Projection> {
-    project_inner(before, input, None)
+    project_inner(before, input, None, false)
 }
 
 pub(crate) fn project_publication(
@@ -116,13 +116,23 @@ pub(crate) fn project_publication(
     input: Input<'_>,
     publication: &crate::PublicationIntent,
 ) -> Result<Projection> {
-    project_inner(before, input, Some(publication))
+    project_inner(before, input, Some(publication), false)
+}
+
+#[cfg(windows)]
+pub(crate) fn project_native_publication(
+    before: &CapacitySnapshot,
+    input: Input<'_>,
+    publication: &crate::PublicationIntent,
+) -> Result<Projection> {
+    project_inner(before, input, Some(publication), true)
 }
 
 fn project_inner(
     before: &CapacitySnapshot,
     input: Input<'_>,
     publication: Option<&crate::PublicationIntent>,
+    native: bool,
 ) -> Result<Projection> {
     let Input {
         expected_root,
@@ -225,7 +235,7 @@ fn project_inner(
             .ok_or(JournalError::Invariant(
                 "publication projected owner missing",
             ))?;
-        if text(columns, "state")? != "published" {
+        if text(columns, "state")? != if native { "preparing" } else { "published" } {
             return Err(JournalError::Invariant(
                 "publication projection requires published",
             ));
@@ -442,6 +452,19 @@ fn project_inner(
 }
 
 impl Projection {
+    #[cfg(windows)]
+    pub(crate) fn native_final_phase(
+        &mut self,
+        id: &sync_extend_core_model::EntryId,
+        columns: Vec<JournalStorageColumn>,
+    ) -> Result<()> {
+        insert(
+            &mut self.rows,
+            key("native_publication_phases", &[id.as_str(), "0", "final"]),
+            columns,
+        )
+    }
+
     pub(crate) fn receipt(&self, after: &CapacitySnapshot) -> Result<()> {
         let actual: Rows = after
             .rows
