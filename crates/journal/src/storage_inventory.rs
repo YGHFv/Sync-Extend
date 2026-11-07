@@ -100,6 +100,7 @@ pub(crate) fn tables() -> Vec<TableSpec> {
         crate::tree_native_storage::schema::TABLES,
         crate::tree_native_future::schema::TABLES,
         crate::tree_native_future::schema::EFFECT_TABLES,
+        crate::native_publication::schema::TABLES,
     ]
     .concat()
 }
@@ -150,6 +151,14 @@ impl Journal {
         }
         if rows.len() > bounds.max_rows || logical_bytes > bounds.max_logical_bytes {
             return Err(invalid("storage inventory total bounds"));
+        }
+        crate::native_publication::validate_schema(&self.connection)?;
+        if rows
+            .iter()
+            .any(|row| row.table() == "native_publication_headers")
+        {
+            crate::native_publication::scope(&rows, &self.connection)?;
+            crate::native_publication::obligations(&rows, &self.read_view().publications(space)?)?;
         }
         let (budget_rows, metadata_bytes) = storage_metadata_budget_usage(&self.connection)?;
         let conservative_budget = TreeRestoreLegacyBudget {

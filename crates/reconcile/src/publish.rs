@@ -233,6 +233,7 @@ impl LocalSpace {
         loop {
             self.verify_root()?;
             let publication = self.journal.publication(id)?;
+            self.journal.require_legacy_publication(id)?;
             let intent = publication.intent;
             if intent.space_id != self.space_id {
                 return Err(ReconcileError::Invariant(

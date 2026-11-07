@@ -312,6 +312,14 @@ impl crate::JournalReadView<'_> {
             &row_hashes,
         ))?;
         let mut liabilities = ordinary::liabilities(&audited, &rows)?;
+        crate::native_publication::validate_schema(self.connection)?;
+        crate::native_publication::scope(&rows, self.connection)?;
+        liabilities
+            .obligations
+            .extend(crate::native_publication::obligations(
+                &rows,
+                &audited.publications,
+            )?);
         let tree_owners = tree::owners(self.connection, &audited.trees, &rows, max)?;
         let mut attributed = BTreeSet::new();
         let mut accounted_total = TreeStorageCharge::default();

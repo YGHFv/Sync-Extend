@@ -171,6 +171,7 @@ fn history_context(before: &CapacitySnapshot, intent: &PublicationIntent) -> Res
 
 impl Journal {
     pub(crate) fn clean_admitted_publication(&mut self, id: &EntryId) -> Result<()> {
+        crate::native_publication::legacy_gate(&self.connection, id)?;
         let bounds = storage_policy::capacity_limits(self.max_storage_entries)?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let publication = self.publication(id)?;
@@ -384,6 +385,7 @@ impl Journal {
         expected_state: PublicationState,
         next: PublicationState,
     ) -> Result<()> {
+        crate::native_publication::legacy_gate(&self.connection, id)?;
         if !matches!(
             (expected_state, next),
             (PublicationState::Preparing, PublicationState::Ready)
@@ -432,6 +434,7 @@ impl Journal {
         id: &EntryId,
         path: PortablePath,
     ) -> Result<()> {
+        crate::native_publication::legacy_gate(&self.connection, id)?;
         let bounds = storage_policy::capacity_limits(self.max_storage_entries)?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let publication = self.publication(id)?;
@@ -524,6 +527,7 @@ impl Journal {
         expected_intent: &PublicationIntent,
         completion: &crate::PublicationCompletion,
     ) -> Result<()> {
+        crate::native_publication::legacy_gate(&self.connection, &expected_intent.transaction_id)?;
         let bounds = storage_policy::capacity_limits(self.max_storage_entries)?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let publication = self.publication(&expected_intent.transaction_id)?;
@@ -692,6 +696,7 @@ impl Journal {
         operations: &[Operation],
         timestamp: u64,
     ) -> Result<SnapshotId> {
+        crate::native_publication::legacy_gate(&self.connection, id)?;
         let bounds = storage_policy::capacity_limits(self.max_storage_entries)?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let publication = self.publication(id)?;

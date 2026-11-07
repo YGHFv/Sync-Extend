@@ -152,8 +152,15 @@ pub(super) fn liabilities(owners: &Owners, rows: &[JournalStoredRow]) -> Result<
                 );
                 out.gap(
                     "publication",
-                    id,
-                    "native-creator-activation-provenance-not-implemented",
+                    id.clone(),
+                    if rows.iter().any(|row| {
+                        row.table() == "native_publication_headers"
+                            && row.primary_key() == [id.clone()]
+                    }) {
+                        "native-ready-publishing-recovery-history-cleanup-not-implemented"
+                    } else {
+                        "native-creator-activation-provenance-not-implemented"
+                    },
                 );
             } else {
                 out.gap(

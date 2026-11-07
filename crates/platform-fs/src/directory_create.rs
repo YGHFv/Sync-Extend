@@ -61,7 +61,13 @@ impl LockedDirectory {
     /// Caller must durably journal intent first and retain all root ancestors.
     /// Creation success alone is not durable restart-safe ownership.
     pub fn create_new_child(&self, name: &str) -> io::Result<LockedDirectoryMutation> {
-        create_new_directory_child(&self.file, name)
+        create_new_directory_child(&self.file, name, NewChildKind::Directory)
+    }
+
+    /// Fixed internal scaffold only; ordinary component creation still refuses
+    /// reserved names. Callers must activate this distinct CREATE beforehand.
+    pub fn create_new_staging_directory(&self) -> io::Result<LockedDirectoryMutation> {
+        create_new_directory_child(&self.file, ".sync-tmp", NewChildKind::StagingDirectory)
     }
 }
 
@@ -85,7 +91,7 @@ impl LockedDirectoryMutation {
     /// Failures preserve possibly created orphans; no pathname cleanup/adoption.
     /// Publish parents before opening descendants that may block parent rename.
     pub fn create_new_child(&self, name: &str) -> io::Result<Self> {
-        create_new_directory_child(&self.file, name)
+        create_new_directory_child(&self.file, name, NewChildKind::Directory)
     }
 }
 
@@ -126,12 +132,17 @@ fn local_ntfs_from_handle(file: &File) -> io::Result<()> {
 
 pub(super) enum NewChildKind {
     Directory,
+    StagingDirectory,
     File,
 }
 
-fn create_new_directory_child(file: &File, name: &str) -> io::Result<LockedDirectoryMutation> {
+fn create_new_directory_child(
+    file: &File,
+    name: &str,
+    kind: NewChildKind,
+) -> io::Result<LockedDirectoryMutation> {
     let original_parent_key = key(file)?;
-    let created = create_new_child(file, name, NewChildKind::Directory)?;
+    let created = create_new_child(file, name, kind)?;
     let original_key = key(&created)?;
     let held = LockedDirectoryMutation {
         file: created,
@@ -165,13 +176,19 @@ pub(super) fn create_new_child(file: &File, name: &str, kind: NewChildKind) -> i
             System::{WindowsProgramming::FILE_CREATED, IO::IO_STATUS_BLOCK},
         },
     };
-    validate_directory_component(name)?;
+    if matches!(kind, NewChildKind::StagingDirectory) {
+        if name != ".sync-tmp" {
+            return Err(invalid("internal scaffold name differs"));
+        }
+    } else {
+        validate_directory_component(name)?;
+    }
     regular(file, true)?;
     require_case_insensitive(file)?;
     local_ntfs_from_handle(file)?;
     let parent_key = key(file)?;
     let (access, share, options, directory) = match kind {
-        NewChildKind::Directory => (
+        NewChildKind::Directory | NewChildKind::StagingDirectory => (
             GENERIC_READ | DELETE | SYNCHRONIZE,
             FILE_SHARE_READ,
             FILE_DIRECTORY_FILE,

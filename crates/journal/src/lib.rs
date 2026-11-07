@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 33;
+const SCHEMA_VERSION: u32 = 34;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -26,7 +26,10 @@ mod causal_log;
 mod operation_batch;
 mod read_view;
 use read_view::JournalReadView;
+mod native_publication;
 mod publication_admission;
+#[cfg(windows)]
+pub use native_publication::creation::NativePublicationCreation;
 mod publication_lookup;
 mod storage_policy;
 
@@ -41,6 +44,8 @@ pub struct Journal {
     connection: Connection,
     database_path: std::path::PathBuf,
     max_storage_entries: usize,
+    #[cfg(windows)]
+    native_issuance: native_publication::issuance::Gate,
 }
 
 impl Journal {
@@ -258,10 +263,20 @@ impl Journal {
             tx.execute_batch(include_str!("migration-033.sql"))?;
             tx.commit()?;
         }
+        if version < 34 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-034.sql"))?;
+            tx.commit()?;
+        }
+        native_publication::validate_schema(&connection)?;
+        #[cfg(windows)]
+        let native_issuance = native_publication::issuance::register(&connection)?;
         Ok(Self {
             connection,
             database_path: std::fs::canonicalize(path)?,
             max_storage_entries,
+            #[cfg(windows)]
+            native_issuance,
         })
     }
 
@@ -1583,7 +1598,37 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
     if rows < 0 || bytes < 0 {
         return Err(JournalError::Invariant("storage metadata inventory limit"));
     }
-    Ok((rows as u64, bytes as u64))
+    let specs = native_publication::schema::TABLES;
+    let tables = storage_inventory::reader::preflight(
+        connection,
+        specs,
+        sync_extend_core_model::limits::MAX_ENTRIES,
+        sync_extend_core_model::limits::MAX_ENTRIES as u64 * 1024,
+    )?;
+    let actual_rows: u64 = tables
+        .iter()
+        .filter(|table| table.table == "native_publication_headers")
+        .map(|table| table.rows)
+        .sum();
+    let actual_bytes: u64 = tables
+        .iter()
+        .filter(|table| table.table == "native_publication_headers")
+        .map(|table| table.logical_bytes)
+        .sum();
+    let (reserved_rows, reserved_bytes): (u64, u64) = connection.query_row(
+        "SELECT coalesce(sum(reserved_rows),0),coalesce(sum(reserved_bytes),0) FROM native_publication_headers",
+        [], |row| Ok((row.get::<_,i64>(0)? as u64, row.get::<_,i64>(1)? as u64)),
+    )?;
+    Ok((
+        (rows as u64)
+            .checked_add(actual_rows)
+            .and_then(|n| n.checked_add(reserved_rows))
+            .ok_or(JournalError::Invariant("native budget row overflow"))?,
+        (bytes as u64)
+            .checked_add(actual_bytes)
+            .and_then(|n| n.checked_add(reserved_bytes))
+            .ok_or(JournalError::Invariant("native budget byte overflow"))?,
+    ))
 }
 
 fn pin_snapshot(tx: &Transaction<'_>, root: &str, manifest: &Manifest) -> Result<()> {
