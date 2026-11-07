@@ -40,6 +40,8 @@ pub use native_publication::sealing::NativePublicationReadiness;
 mod publication_lookup;
 mod remote_publication;
 pub use remote_publication::RemotePublicationProof;
+mod remote_replay;
+pub use remote_replay::{RemoteReplayDisposition, RemoteReplayReport};
 mod storage_policy;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

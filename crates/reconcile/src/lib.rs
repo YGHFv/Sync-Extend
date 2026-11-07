@@ -20,6 +20,7 @@ pub use peer_operations::PeerOperationPull;
 mod peer_pull;
 mod peer_transfer;
 mod remote_file;
+mod remote_replay;
 mod transport_identity;
 pub use peer_pull::PeerFilePull;
 pub use remote_file::{RemoteFileChunkImport, RemoteFileMaterialization, RemoteFilePreparation};

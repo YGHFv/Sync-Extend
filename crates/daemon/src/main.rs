@@ -95,6 +95,15 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Replay an approved original signed operation read-only; never apply or receive.
+    ReplayRemoteOperation {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        signed_operation: PathBuf,
+    },
     /// Exchange bounded signed own-origin metadata in both directions; no file apply.
     ExchangeMetadata {
         #[arg(long)]
@@ -819,6 +828,23 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::CausalFrontiers { data_dir } => {
             print(&open(&data_dir)?.causal_frontiers()?)?;
+        }
+        Command::ReplayRemoteOperation {
+            data_dir,
+            peer_device,
+            signed_operation,
+        } => {
+            let mut bytes = Vec::new();
+            std::fs::File::open(signed_operation)?
+                .take(16 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 16 * 1024 * 1024 {
+                return Err("signed operation exceeds 16 MiB".into());
+            }
+            let signed = serde_json::from_slice(&bytes)?;
+            let local = open(&data_dir)?;
+            let peer = local.read_transport_peer(&peer_device.parse()?)?;
+            print(&local.replay_signed_remote_operation(&peer, &signed)?)?;
         }
         Command::ExchangeMetadata {
             data_dir,
