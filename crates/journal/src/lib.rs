@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 35;
+const SCHEMA_VERSION: u32 = 36;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -30,6 +30,8 @@ mod native_publication;
 mod publication_admission;
 #[cfg(windows)]
 pub use native_publication::creation::NativePublicationCreation;
+#[cfg(windows)]
+pub use native_publication::sealing::NativePublicationObservation;
 #[cfg(windows)]
 pub use native_publication::sealing::NativePublicationReadiness;
 mod publication_lookup;
@@ -273,6 +275,11 @@ impl Journal {
         if version < 35 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-035.sql"))?;
+            tx.commit()?;
+        }
+        if version < 36 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-036.sql"))?;
             tx.commit()?;
         }
         native_publication::validate_schema(&connection)?;

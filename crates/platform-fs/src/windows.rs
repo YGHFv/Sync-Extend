@@ -15,7 +15,7 @@ use windows_sys::Win32::{
         GetVolumePathNameW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_CASE_SENSITIVE_INFO, FILE_DISPOSITION_INFO,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_RENAME_INFO,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     },
     System::WindowsProgramming::DRIVE_FIXED,
 };
@@ -297,6 +297,19 @@ impl LockedFile {
 
     pub fn reader(&self) -> &File {
         &self.file
+    }
+
+    /// Observe a non-following named slot while this mutation-excluding handle
+    /// remains live. This is not a new original-creation or ownership proof.
+    pub fn matches_path(&self, path: &Path) -> io::Result<bool> {
+        let slot = OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        regular(&slot, false)?;
+        regular(&self.file, false)?;
+        Ok(key(&slot)? == key(&self.file)?)
     }
 
     /// Mark this protected single-link file for deletion when all handles close.

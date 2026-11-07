@@ -16,7 +16,11 @@ use std::{
 use sync_extend_core_model::{ContentId, EntryId};
 use sync_extend_platform_fs::{LockedDirectory, LockedDirectoryMutation, LockedFile};
 
-/// Receipt-backed live verified content only; not durable Ready, publication or
+#[path = "publishing.rs"]
+mod publishing;
+pub use publishing::NativePublicationObservation;
+
+/// Receipt-backed live verified content only; not by itself publication or
 /// cleanup authority. No writer access, construction, Clone or serialization.
 pub struct NativePublicationReadiness {
     ancestors: Vec<LockedDirectory>,
@@ -129,6 +133,14 @@ impl Journal {
         &mut self,
         id: &EntryId,
     ) -> Result<NativePublicationReadiness> {
+        self.reopen_native_publication_guarded(id, false)
+    }
+
+    fn reopen_native_publication_guarded(
+        &mut self,
+        id: &EntryId,
+        forward: bool,
+    ) -> Result<NativePublicationReadiness> {
         if !self.connection.is_autocommit() {
             return Err(invalid(
                 "native Ready reopen refuses caller-owned transaction",
@@ -157,6 +169,13 @@ impl Journal {
             return Err(invalid(
                 "native Ready reopen requires durable phase and capacity",
             ));
+        }
+        let publishing = before.rows.iter().any(|row| {
+            row.table() == "native_publication_phases"
+                && row.primary_key() == [id.as_str(), "0", "publishing"]
+        });
+        if publishing != forward {
+            return Err(invalid("native guarded reopen forward scope differs"));
         }
         if self
             .current(&header.intent.space_id)?
@@ -206,13 +225,24 @@ impl Journal {
         }
         let owner_path = base_path.join(format!("native-{}", header.generation));
         let owner_key = creator_key(&before, &header, 1)?;
+        let source_path = owner_path.join("payload-0");
+        let target_path = publishing::target_path(&header)?;
+        let source_present = publishing::slot_present(&source_path)?;
+        let target_present = publishing::slot_present(&target_path)?;
+        let payload_path = if forward && !source_present && target_present {
+            target_path
+        } else if source_present && (!forward || !target_present) {
+            source_path
+        } else {
+            return Err(invalid("native guarded reopen ambiguous source or target"));
+        };
         let held = NativePublicationReadiness {
             ancestors,
             parent,
             base,
             owner: LockedDirectoryMutation::open(&owner_path)?,
             marker: LockedFile::open(&owner_path.join("owner"))?,
-            payload: LockedFile::open(&owner_path.join("payload-0"))?,
+            payload: LockedFile::open(&payload_path)?,
             _cas: cas,
             marker_key: creator_key(&before, &header, 2)?,
             payload_key: creator_key(&before, &header, 3)?,
@@ -220,6 +250,9 @@ impl Journal {
             header,
         };
         held.verify_content()?;
+        if forward {
+            publishing::verify_forward_slot(&held)?;
+        }
         let after = self
             .read_view()
             .audit_local_commit_capacity(&held.header.intent.space_id, bounds)?;
@@ -227,6 +260,9 @@ impl Journal {
             return Err(invalid("native Ready reopen changed stored state"));
         }
         held.verify_content()?;
+        if forward {
+            publishing::verify_forward_slot(&held)?;
+        }
         tx.commit()?;
         Ok(held)
     }
