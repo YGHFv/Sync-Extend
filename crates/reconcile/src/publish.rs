@@ -199,6 +199,7 @@ impl LocalSpace {
     }
 
     pub fn recover(&mut self) -> Result<Vec<PublishResult>> {
+        self.journal.require_no_remote_rename(&self.space_id)?;
         let prepared_tree = self
             .journal
             .tree_restore_preparations(&self.space_id, self.limits.max_storage_entries)?

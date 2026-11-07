@@ -312,6 +312,9 @@ impl crate::JournalReadView<'_> {
             &row_hashes,
         ))?;
         let mut liabilities = ordinary::liabilities(&audited, &rows)?;
+        liabilities
+            .obligations
+            .extend(crate::remote_rename::obligations(&rows, self.connection)?);
         crate::native_publication::validate_schema(self.connection)?;
         crate::native_publication::scope(&rows, self.connection)?;
         liabilities

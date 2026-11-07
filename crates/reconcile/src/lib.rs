@@ -34,7 +34,11 @@ mod publish;
 #[cfg(windows)]
 mod remote_native;
 #[cfg(windows)]
+mod remote_rename;
+#[cfg(windows)]
 pub use native_publish::NativePublishResult;
+#[cfg(windows)]
+pub use remote_rename::RemoteRenameResult;
 mod read_lease;
 mod reference_reservation;
 mod replace_file;

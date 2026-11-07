@@ -104,6 +104,30 @@ enum Command {
         #[arg(long)]
         signed_operation: PathBuf,
     },
+    /// Apply one approved original signed file Rename without local reauthoring.
+    #[cfg(windows)]
+    ApplyRemoteRename {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        signed_operation: PathBuf,
+    },
+    /// Inspect original signed Rename receipts without native recovery.
+    #[cfg(windows)]
+    RemoteRenames {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Resume only one exact admitted original signed Rename.
+    #[cfg(windows)]
+    RecoverRemoteRename {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        transaction: String,
+    },
     /// Exchange bounded signed own-origin metadata in both directions; no file apply.
     ExchangeMetadata {
         #[arg(long)]
@@ -845,6 +869,35 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let local = open(&data_dir)?;
             let peer = local.read_transport_peer(&peer_device.parse()?)?;
             print(&local.replay_signed_remote_operation(&peer, &signed)?)?;
+        }
+        #[cfg(windows)]
+        Command::ApplyRemoteRename {
+            data_dir,
+            peer_device,
+            signed_operation,
+        } => {
+            let mut bytes = Vec::new();
+            std::fs::File::open(signed_operation)?
+                .take(16 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 16 * 1024 * 1024 {
+                return Err("signed operation exceeds 16 MiB".into());
+            }
+            let signed = serde_json::from_slice(&bytes)?;
+            let mut local = open(&data_dir)?;
+            let peer = local.read_transport_peer(&peer_device.parse()?)?;
+            print(&local.apply_signed_remote_rename(&peer, &signed)?)?;
+        }
+        #[cfg(windows)]
+        Command::RemoteRenames { data_dir } => {
+            print(&open(&data_dir)?.remote_rename_receipts()?)?;
+        }
+        #[cfg(windows)]
+        Command::RecoverRemoteRename {
+            data_dir,
+            transaction,
+        } => {
+            print(&open(&data_dir)?.recover_remote_rename(&transaction.parse()?)?)?;
         }
         Command::ExchangeMetadata {
             data_dir,

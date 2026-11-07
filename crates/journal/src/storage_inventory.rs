@@ -101,6 +101,7 @@ pub(crate) fn tables() -> Vec<TableSpec> {
         crate::tree_native_future::schema::TABLES,
         crate::tree_native_future::schema::EFFECT_TABLES,
         crate::native_publication::schema::TABLES,
+        crate::remote_rename::schema::TABLES,
     ]
     .concat()
 }
@@ -153,6 +154,7 @@ impl Journal {
             return Err(invalid("storage inventory total bounds"));
         }
         crate::native_publication::validate_schema(&self.connection)?;
+        crate::remote_rename::obligations(&rows, &self.connection)?;
         if rows
             .iter()
             .any(|row| row.table() == "native_publication_headers")
