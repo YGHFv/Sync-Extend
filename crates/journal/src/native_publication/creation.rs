@@ -45,12 +45,12 @@ impl Original<'_> {
         }
     }
 }
-enum Base {
+pub(super) enum Base {
     Existing(LockedDirectory),
     Created(LockedDirectoryMutation),
 }
 impl Base {
-    fn key(&self) -> Result<FileKey> {
+    pub(super) fn key(&self) -> Result<FileKey> {
         Ok(match self {
             Self::Existing(h) => h.key()?,
             Self::Created(h) => h.key()?,
@@ -66,14 +66,15 @@ impl Base {
 /// Live original creator set only. No path-open constructor, Clone or durable
 /// publication grant. Content/Ready/publishing/recovery remain separate stages.
 pub struct NativePublicationCreation {
-    _ancestors: Vec<LockedDirectory>,
-    _parent: LockedDirectory,
-    _base: Base,
-    _owner: LockedDirectoryMutation,
-    marker: OwnedFileCreation,
-    payload: OwnedFileCreation,
-    _cas: CasAccessGuard,
-    transaction: EntryId,
+    pub(super) _ancestors: Vec<LockedDirectory>,
+    pub(super) _parent: LockedDirectory,
+    pub(super) _base: Base,
+    pub(super) _owner: LockedDirectoryMutation,
+    pub(super) marker: OwnedFileCreation,
+    pub(super) payload: OwnedFileCreation,
+    pub(super) _cas: CasAccessGuard,
+    pub(super) transaction: EntryId,
+    pub(super) header: Header,
 }
 impl NativePublicationCreation {
     pub fn transaction_id(&self) -> &EntryId {
@@ -95,7 +96,7 @@ impl NativePublicationCreation {
         Ok(())
     }
 }
-fn key(key: FileKey) -> Key {
+pub(super) fn key(key: FileKey) -> Key {
     Key {
         volume: format!("{:016x}", key.volume),
         id: format!("{:032x}", key.id),
@@ -462,6 +463,7 @@ impl Journal {
             payload,
             _cas: cas,
             transaction: id.clone(),
+            header,
         };
         created.verify_originals()?;
         Ok(created)

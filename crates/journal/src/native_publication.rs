@@ -14,10 +14,12 @@ pub(crate) mod creation;
 #[cfg(windows)]
 pub(crate) mod issuance;
 pub(crate) mod schema;
+#[cfg(windows)]
+pub(crate) mod sealing;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Key {
+pub(super) struct Key {
     volume: String,
     id: String,
 }

@@ -30,6 +30,8 @@ mod native_publication;
 mod publication_admission;
 #[cfg(windows)]
 pub use native_publication::creation::NativePublicationCreation;
+#[cfg(windows)]
+pub use native_publication::sealing::NativePublicationReadiness;
 mod publication_lookup;
 mod storage_policy;
 
