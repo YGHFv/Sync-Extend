@@ -17,7 +17,7 @@ use sync_extend_core_model::{ContentId, EntryId};
 use sync_extend_platform_fs::{LockedDirectory, LockedDirectoryMutation, LockedFile};
 
 #[path = "publishing.rs"]
-mod publishing;
+pub(super) mod publishing;
 pub use publishing::NativePublicationObservation;
 
 /// Receipt-backed live verified content only; not by itself publication or
@@ -27,10 +27,10 @@ pub struct NativePublicationReadiness {
     parent: LockedDirectory,
     base: Base,
     owner: LockedDirectoryMutation,
-    marker: LockedFile,
-    payload: LockedFile,
+    pub(super) marker: LockedFile,
+    pub(super) payload: LockedFile,
     _cas: CasAccessGuard,
-    header: Header,
+    pub(super) header: Header,
     marker_key: Key,
     payload_key: Key,
     owner_key: Key,

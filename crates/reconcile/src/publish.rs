@@ -131,6 +131,18 @@ impl LocalSpace {
         id: EntryId,
         entry_id: EntryId,
     ) -> Result<EntryId> {
+        self.begin_content_selected(path, content, source, id, entry_id, false)
+    }
+
+    pub(crate) fn begin_content_selected(
+        &mut self,
+        path: PortablePath,
+        content: FileManifest,
+        source: Option<SnapshotId>,
+        id: EntryId,
+        entry_id: EntryId,
+        native_only: bool,
+    ) -> Result<EntryId> {
         self.verify_root()?;
         self.check_publication_limits(&content)?;
         self.parent_for(&path)?;
@@ -178,6 +190,7 @@ impl LocalSpace {
             root_identity,
             parent_identity,
             completion: Some(completion),
+            native_only,
         };
         self.journal.begin_publication(&intent)?;
         checkpoint("after_intent");

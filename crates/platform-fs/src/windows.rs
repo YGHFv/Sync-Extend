@@ -79,6 +79,18 @@ pub fn verify_regular_file(file: &File) -> io::Result<()> {
     regular(file, false)
 }
 
+/// Metadata-only non-following slot witness; not original creator authority.
+pub fn regular_file_matches_path(file: &File, path: &Path) -> io::Result<bool> {
+    let slot = OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    regular(&slot, false)?;
+    regular(file, false)?;
+    Ok(key(&slot)? == key(file)?)
+}
+
 /// Read alias multiplicity from the retained regular-file handle, not its path.
 pub fn regular_file_link_count(file: &File) -> io::Result<u32> {
     use std::os::windows::fs::MetadataExt;

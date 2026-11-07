@@ -43,6 +43,13 @@ pub struct PublicationIntent {
     pub parent_identity: Option<ContentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<PublicationCompletion>,
+    /// Durable opt-in selection, including the interval before a native header.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub native_only: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Exact pre-effect history continuation, not native creator or apply authority.
@@ -305,6 +312,7 @@ impl PublicationIntent {
             || self.attempt > 16
             || self.requested_path.parent() != self.target_path.parent()
             || self.root_identity.is_some() != self.parent_identity.is_some()
+            || self.native_only && (self.completion.is_none() || self.attempt != 0)
         {
             return Err(JournalError::Invariant("invalid publication intent"));
         }

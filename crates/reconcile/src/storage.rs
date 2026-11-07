@@ -545,6 +545,46 @@ impl LocalSpace {
         Ok(())
     }
 
+    #[cfg(windows)]
+    pub(crate) fn reserve_native_internal_worktree(
+        &self,
+        view: &sync_extend_journal::NativePublicationFileView<'_>,
+    ) -> Result<()> {
+        let remaining = view.remaining_internal_bytes()?;
+        let pass = || {
+            self.verify_root()?;
+            view.verify()?;
+            let mut inventory = BTreeMap::new();
+            visit(
+                &self.worktree,
+                &self.worktree,
+                Region::Worktree,
+                false,
+                (0, self.limits.max_storage_entries),
+                &mut inventory,
+                Some(view),
+            )?;
+            view.verify()?;
+            self.verify_root()?;
+            Ok::<_, ReconcileError>(inventory)
+        };
+        let first = pass()?;
+        checkpoint("after_native_internal_inventory");
+        let second = pass()?;
+        if first != second || remaining != view.remaining_internal_bytes()? {
+            return Err(ReconcileError::Unstable);
+        }
+        if inventory_bytes(&second)?
+            .checked_add(remaining)
+            .is_none_or(|bytes| bytes > self.limits.max_internal_worktree_bytes)
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "aggregate native internal worktree bytes",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn storage_inventory(&self, region: Region) -> Result<Inventory> {
         let root = match region {
             Region::Worktree => self.worktree.clone(),
@@ -558,9 +598,10 @@ impl LocalSpace {
                 &root,
                 region,
                 false,
-                0,
-                self.limits.max_storage_entries,
+                (0, self.limits.max_storage_entries),
                 &mut inventory,
+                #[cfg(windows)]
+                None,
             )?;
             self.verify_root()?;
             Ok::<_, ReconcileError>(inventory)
@@ -655,10 +696,11 @@ fn visit(
     path: &Path,
     region: Region,
     internal: bool,
-    depth: usize,
-    limit: usize,
+    bounds: (usize, usize),
     inventory: &mut Inventory,
+    #[cfg(windows)] view: Option<&sync_extend_journal::NativePublicationFileView<'_>>,
 ) -> Result<()> {
+    let (depth, limit) = bounds;
     if inventory.len() >= limit || depth > 160 {
         return Err(ReconcileError::ResourceLimit(
             "storage inventory entries/depth",
@@ -669,7 +711,38 @@ fn visit(
     if metadata.file_type().is_symlink() || is_reparse(&metadata) {
         return Err(ReconcileError::Invariant("unsafe storage inventory path"));
     }
-    let identity = PathIdentity::capture(path)?;
+    #[cfg(windows)]
+    let native = view
+        .map(|view| view.observe_file(path))
+        .transpose()?
+        .flatten();
+    #[cfg(windows)]
+    let identity = if native.is_some() {
+        None
+    } else {
+        Some(PathIdentity::capture(path)?)
+    };
+    #[cfg(not(windows))]
+    let identity = Some(PathIdentity::capture(path)?);
+    #[cfg(windows)]
+    let physical = if let Some(native) = &native {
+        if !crate::filesystem::same_metadata(&metadata, &native.metadata) {
+            return Err(ReconcileError::Unstable);
+        }
+        native.physical_identity.clone()
+    } else {
+        identity
+            .as_ref()
+            .ok_or(ReconcileError::Unstable)?
+            .physical
+            .clone()
+    };
+    #[cfg(not(windows))]
+    let physical = identity
+        .as_ref()
+        .ok_or(ReconcileError::Unstable)?
+        .physical
+        .clone();
     let relative = path
         .strip_prefix(root)
         .map_err(|_| ReconcileError::Invariant("storage root escaped"))?;
@@ -719,7 +792,7 @@ fn visit(
     inventory.insert(
         path.to_owned(),
         Observation {
-            identity: identity.physical.clone(),
+            identity: physical.clone(),
             length: if metadata.is_dir() { 0 } else { metadata.len() },
             modified: metadata.modified()?,
             directory: metadata.is_dir(),
@@ -750,12 +823,13 @@ fn visit(
                 &entry.path(),
                 region,
                 internal,
-                depth + 1,
-                limit,
+                (depth + 1, limit),
                 inventory,
+                #[cfg(windows)]
+                view,
             )?;
         }
-    } else {
+    } else if let Some(identity) = &identity {
         let observed = ObservedFile::open(path)?;
         if observed.identity.physical != identity.physical
             || observed.metadata.len() != metadata.len()
@@ -765,7 +839,21 @@ fn visit(
         }
         observed.verify(path)?;
     }
-    identity.verify(path)?;
+    if let Some(identity) = &identity {
+        identity.verify(path)?;
+    }
+    #[cfg(windows)]
+    if native.is_some() {
+        let again = view
+            .ok_or(ReconcileError::Unstable)?
+            .observe_file(path)?
+            .ok_or(ReconcileError::Unstable)?;
+        if again.physical_identity != physical
+            || !crate::filesystem::same_metadata(&metadata, &again.metadata)
+        {
+            return Err(ReconcileError::Unstable);
+        }
+    }
     if metadata.modified()? != fs::symlink_metadata(path)?.modified()? {
         return Err(ReconcileError::Unstable);
     }

@@ -25,9 +25,13 @@ pub use peer_pull::PeerFilePull;
 pub use remote_file::{RemoteFileChunkImport, RemoteFileMaterialization, RemoteFilePreparation};
 mod move_file;
 mod mutation;
+#[cfg(windows)]
+mod native_publish;
 mod original_retention;
 mod persisted_rename;
 mod publish;
+#[cfg(windows)]
+pub use native_publish::NativePublishResult;
 mod read_lease;
 mod reference_reservation;
 mod replace_file;

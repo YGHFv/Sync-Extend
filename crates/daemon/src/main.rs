@@ -475,6 +475,22 @@ enum Command {
         #[arg(long)]
         path: String,
     },
+    /// Explicit Windows NTFS native local publication; not remote apply or sync.
+    #[cfg(windows)]
+    PublishNative {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        path: String,
+    },
+    /// Resume only exact durable native receipts; incomplete creators stay pending.
+    #[cfg(windows)]
+    RecoverNative {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Restore one retained file as a new local change; occupied paths keep a conflict copy.
     Restore {
         #[arg(long)]
@@ -1161,6 +1177,18 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             path,
         } => {
             print(&open(&data_dir)?.restore_file(&snapshot.parse()?, PortablePath::new(path)?)?)?;
+        }
+        #[cfg(windows)]
+        Command::PublishNative {
+            data_dir,
+            source,
+            path,
+        } => {
+            print(&open(&data_dir)?.publish_native_file(&source, PortablePath::new(path)?)?)?;
+        }
+        #[cfg(windows)]
+        Command::RecoverNative { data_dir } => {
+            print(&open(&data_dir)?.recover_native_publications()?)?;
         }
         Command::Recover { data_dir } => {
             print(&open(&data_dir)?.recover()?)?;

@@ -27,6 +27,9 @@ mod operation_batch;
 mod read_view;
 use read_view::JournalReadView;
 mod native_publication;
+pub use native_publication::NativePublicationStage;
+#[cfg(windows)]
+pub use native_publication::{NativePublicationFileObservation, NativePublicationFileView};
 mod publication_admission;
 #[cfg(windows)]
 pub use native_publication::creation::NativePublicationCreation;

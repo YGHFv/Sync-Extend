@@ -349,7 +349,15 @@ impl Journal {
                 "native creator requires initial admitted publication",
             ));
         }
-        super::legacy_gate(&self.connection, id)?;
+        let stage = self.audit_native_publication_stage(id)?;
+        if !matches!(
+            stage,
+            super::NativePublicationStage::Legacy | super::NativePublicationStage::Selected
+        ) {
+            return Err(invalid(
+                "native CREATE already selected a creator generation",
+            ));
+        }
         let root_path = PathBuf::from(
             self.state("worktree")?
                 .ok_or(invalid("native root missing"))?,

@@ -14,7 +14,7 @@ mod finalization;
 /// Exact guarded original payload observed at its admitted target. This is not
 /// history completion, remote apply, reference release or cleanup permission.
 pub struct NativePublicationObservation {
-    held: NativePublicationReadiness,
+    pub(in crate::native_publication) held: NativePublicationReadiness,
 }
 impl NativePublicationObservation {
     pub fn transaction_id(&self) -> &EntryId {
@@ -26,7 +26,7 @@ impl NativePublicationObservation {
     }
 }
 
-pub(super) fn slot_present(path: &std::path::Path) -> Result<bool> {
+pub(in crate::native_publication) fn slot_present(path: &std::path::Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -142,7 +142,37 @@ impl Journal {
                 "native forward recovery refuses caller-owned transaction",
             ));
         }
-        let held = self.reopen_native_publication_guarded(id, true)?;
+        let held = self.reopen_native_publication_forward_guard(id)?;
+        self.resume_native_publication_forward(held)
+    }
+
+    /// Reacquire exact original forward guards without issuing another effect.
+    pub fn reopen_native_publication_forward_guard(
+        &mut self,
+        id: &EntryId,
+    ) -> Result<NativePublicationReadiness> {
+        self.reopen_native_publication_guarded(id, true)
+    }
+
+    /// Resume an already durable Publishing under the retained original guards.
+    pub fn resume_native_publication_forward(
+        &mut self,
+        held: NativePublicationReadiness,
+    ) -> Result<NativePublicationObservation> {
+        if !self.connection.is_autocommit() {
+            return Err(invalid(
+                "native forward resume refuses caller-owned transaction",
+            ));
+        }
+        let id = held.transaction_id();
+        let stage = self.audit_native_publication_stage(id)?;
+        if !matches!(
+            stage,
+            super::super::NativePublicationStage::Publishing
+                | super::super::NativePublicationStage::Observed
+        ) {
+            return Err(invalid("native forward resume requires durable Publishing"));
+        }
         let observed: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM native_publication_phases
              WHERE transaction_id=?1 AND attempt=0 AND phase='observed')",

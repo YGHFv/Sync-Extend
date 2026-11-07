@@ -16,8 +16,14 @@ pub(crate) mod creation;
 #[cfg(windows)]
 pub(crate) mod issuance;
 pub(crate) mod schema;
+mod status;
+pub use status::NativePublicationStage;
 #[cfg(windows)]
 pub(crate) mod sealing;
+#[cfg(windows)]
+mod view;
+#[cfg(windows)]
+pub use view::{NativePublicationFileObservation, NativePublicationFileView};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -474,6 +480,20 @@ pub(crate) fn legacy_gate(connection: &rusqlite::Connection, id: &EntryId) -> Re
         return Err(invalid(
             "original-creator publication pending; legacy path refused",
         ));
+    }
+    let json: Option<String> = connection
+        .query_row(
+            "SELECT intent FROM main.publications WHERE transaction_id=?1",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if json
+        .map(|json| serde_json::from_str::<PublicationIntent>(&json))
+        .transpose()?
+        .is_some_and(|intent| intent.native_only)
+    {
+        return Err(invalid("native-only selection refuses legacy execution"));
     }
     Ok(())
 }

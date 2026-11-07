@@ -33,7 +33,45 @@ pub fn scan(root: &Path, cas: &Cas, limits: &LocalLimits) -> Result<Scan> {
         bytes: 0,
         chunks: 0,
     };
-    visit(root, root, cas, &mut result, &mut collisions, &mut budget)?;
+    visit(
+        root,
+        root,
+        cas,
+        &mut result,
+        &mut collisions,
+        &mut budget,
+        #[cfg(windows)]
+        None,
+    )?;
+    Ok(result)
+}
+
+#[cfg(windows)]
+pub(crate) fn scan_native(
+    root: &Path,
+    cas: &Cas,
+    limits: &LocalLimits,
+    view: &sync_extend_journal::NativePublicationFileView<'_>,
+) -> Result<Scan> {
+    view.verify()?;
+    let mut result = BTreeMap::new();
+    let mut collisions = BTreeSet::new();
+    let mut budget = Budget {
+        limits,
+        entries: 0,
+        bytes: 0,
+        chunks: 0,
+    };
+    visit(
+        root,
+        root,
+        cas,
+        &mut result,
+        &mut collisions,
+        &mut budget,
+        Some(view),
+    )?;
+    view.verify()?;
     Ok(result)
 }
 
@@ -44,6 +82,7 @@ fn visit(
     result: &mut Scan,
     collisions: &mut BTreeSet<String>,
     budget: &mut Budget<'_>,
+    #[cfg(windows)] view: Option<&sync_extend_journal::NativePublicationFileView<'_>>,
 ) -> Result<()> {
     let before = fs::symlink_metadata(directory)?;
     if !before.is_dir() || before.file_type().is_symlink() || is_reparse(&before) {
@@ -90,7 +129,16 @@ fn visit(
         }
         let entry = if metadata.is_dir() {
             let identity = PathIdentity::capture(&full_path)?;
-            visit(root, &full_path, cas, result, collisions, budget)?;
+            visit(
+                root,
+                &full_path,
+                cas,
+                result,
+                collisions,
+                budget,
+                #[cfg(windows)]
+                view,
+            )?;
             identity.verify(&full_path)?;
             ScannedEntry {
                 kind: EntryKind::Directory,
@@ -99,6 +147,34 @@ fn visit(
                 single_link: false,
             }
         } else if metadata.is_file() {
+            #[cfg(windows)]
+            if let Some(native) = view
+                .map(|view| view.observe_file(&full_path))
+                .transpose()?
+                .flatten()
+            {
+                let content = native.content.ok_or(ReconcileError::Invariant(
+                    "native scan view requires exact observed target",
+                ))?;
+                if !same_metadata(&metadata, &native.metadata) || content.length != metadata.len() {
+                    return Err(ReconcileError::Unstable);
+                }
+                budget.reserve_bytes(content.length)?;
+                if content.chunks.len() > budget.limits.max_scan_chunks - budget.chunks {
+                    return Err(ReconcileError::ResourceLimit("scan chunks"));
+                }
+                budget.chunks += content.chunks.len();
+                result.insert(
+                    path,
+                    ScannedEntry {
+                        kind: EntryKind::File,
+                        content: Some(content),
+                        physical_identity: native.physical_identity,
+                        single_link: true,
+                    },
+                );
+                continue;
+            }
             let observed = ObservedFile::open(&full_path)?;
             let single_link = single_link(&observed.file)?;
             if !same_metadata(&metadata, &observed.metadata) {
