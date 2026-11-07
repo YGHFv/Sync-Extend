@@ -46,6 +46,8 @@ pub struct PublicationIntent {
     /// Durable opt-in selection, including the interval before a native header.
     #[serde(default, skip_serializing_if = "is_false")]
     pub native_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<crate::RemotePublicationProof>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -219,6 +221,20 @@ impl PublicationCompletion {
         {
             return Err(JournalError::Invariant("publication completion scope"));
         }
+        if let Some(proof) = &intent.remote {
+            proof.verify()?;
+            if !intent.native_only
+                || self != &Self::from_remote(&self.baseline, proof)?
+                || intent.requested_path != intent.target_path
+                || intent.requested_baseline.is_some()
+                || intent.source_snapshot.is_some()
+            {
+                return Err(JournalError::Invariant(
+                    "remote publication original completion differs",
+                ));
+            }
+            return Ok(());
+        }
         let mut observed = self.manifest.entries.clone();
         observed
             .remove(&intent.entry_id)
@@ -313,6 +329,7 @@ impl PublicationIntent {
             || self.requested_path.parent() != self.target_path.parent()
             || self.root_identity.is_some() != self.parent_identity.is_some()
             || self.native_only && (self.completion.is_none() || self.attempt != 0)
+            || self.remote.is_some() && !self.native_only
         {
             return Err(JournalError::Invariant("invalid publication intent"));
         }

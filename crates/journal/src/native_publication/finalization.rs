@@ -153,14 +153,18 @@ impl Journal {
         {
             return Err(invalid("native final phase insertion missing"));
         }
-        let root = self.commit_history_sql(
-            &tx,
-            Some(&intent.baseline_root),
-            &completion.manifest,
-            &completion.operations,
-            completion.timestamp_ms,
-            Completion::NativePublication(&intent.transaction_id),
-        )?;
+        let root = if intent.remote.is_some() {
+            self.commit_remote_publication_sql(&tx, intent)?
+        } else {
+            self.commit_history_sql(
+                &tx,
+                Some(&intent.baseline_root),
+                &completion.manifest,
+                &completion.operations,
+                completion.timestamp_ms,
+                Completion::NativePublication(&intent.transaction_id),
+            )?
+        };
         let after = self
             .read_view()
             .audit_local_commit_capacity(&intent.space_id, bounds)?;

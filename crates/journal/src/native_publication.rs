@@ -202,6 +202,26 @@ pub(crate) fn obligations(
         {
             return Err(invalid("native creator owner cannot use legacy completion"));
         }
+        if let Some(proof) = &header.intent.remote {
+            proof.verify()?;
+            let operation = rows
+                .iter()
+                .find(|row| {
+                    row.table() == "operations"
+                        && row.primary_key() == [proof.operation.op_id.as_str()]
+                })
+                .ok_or(invalid("native remote original operation missing"))?;
+            let expected = if publication.state == PublicationState::Committed {
+                "materialized"
+            } else {
+                "received"
+            };
+            if field(operation, "payload")? != serde_json::to_string(&proof.operation)?
+                || field(operation, "state")? != expected
+            {
+                return Err(invalid("native remote original operation state differs"));
+            }
+        }
         let mut actual = TreeStorageCharge::default();
         let mut activations = BTreeMap::new();
         let mut creators = BTreeMap::new();

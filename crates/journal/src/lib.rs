@@ -38,6 +38,8 @@ pub use native_publication::sealing::NativePublicationObservation;
 #[cfg(windows)]
 pub use native_publication::sealing::NativePublicationReadiness;
 mod publication_lookup;
+mod remote_publication;
+pub use remote_publication::RemotePublicationProof;
 mod storage_policy;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -436,6 +438,11 @@ impl Journal {
     }
 
     pub fn begin_publication(&mut self, intent: &PublicationIntent) -> Result<()> {
+        if intent.remote.is_some() {
+            return Err(JournalError::Invariant(
+                "remote publication requires distinct native admission",
+            ));
+        }
         if intent.completion.is_some() {
             return self.begin_admitted_publication(intent);
         }

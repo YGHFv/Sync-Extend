@@ -168,6 +168,9 @@ impl Journal {
             .read_view()
             .audit_local_commit_capacity(&header.intent.space_id, bounds)?;
         let current = self.publication(&header.intent.transaction_id)?;
+        if header.intent.remote.is_some() {
+            self.require_remote_publication_received(&header.intent)?;
+        }
         if current.intent != header.intent
             || current.state != PublicationState::Preparing
             || current.cleaned

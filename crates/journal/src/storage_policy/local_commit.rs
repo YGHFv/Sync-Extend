@@ -276,6 +276,33 @@ fn project_inner(
     for (op, json) in operations.iter().zip(operation_json) {
         let payload = &op.payload;
         let device = payload.origin_device_id.as_str();
+        if let Some(intent) = publication.filter(|intent| intent.remote.is_some()) {
+            let proof = intent.remote.as_ref().unwrap();
+            proof.verify()?;
+            let columns = rows
+                .get_mut(&key("operations", &[op.op_id.as_str()]))
+                .ok_or(JournalError::Invariant(
+                    "remote projected received operation missing",
+                ))?;
+            if proof.operation != *op
+                || operations.len() != 1
+                || text(columns, "payload")? != json
+                || text(columns, "state")? != "received"
+                || !vector.dominates(&payload.causal)
+                || vector.get(&payload.origin_device_id).checked_add(1) != Some(payload.origin_seq)
+            {
+                return Err(JournalError::Invariant(
+                    "remote original applied vector or received state differs",
+                ));
+            }
+            columns
+                .iter_mut()
+                .find(|column| column.name == "state")
+                .unwrap()
+                .value = Value::Text("materialized".into());
+            vector.observe(payload.origin_device_id.clone(), payload.origin_seq);
+            continue;
+        }
         let previous = cursors.get(device).copied().unwrap_or(0);
         if payload.space_id != manifest.space_id
             || payload.causal != vector

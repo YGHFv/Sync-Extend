@@ -191,6 +191,7 @@ impl LocalSpace {
             parent_identity,
             completion: Some(completion),
             native_only,
+            remote: None,
         };
         self.journal.begin_publication(&intent)?;
         checkpoint("after_intent");

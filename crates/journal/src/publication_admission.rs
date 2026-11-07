@@ -230,7 +230,11 @@ impl Journal {
         }
         storage_policy::receive::tree_gate(&before)?;
         storage_policy::receive::completion_gate(&before)?;
-        history_context(&before, intent)?;
+        if intent.remote.is_some() {
+            self.require_remote_publication_received(intent)?;
+        } else {
+            history_context(&before, intent)?;
+        }
         let completion = intent
             .completion
             .as_ref()
@@ -238,12 +242,13 @@ impl Journal {
         let operation = completion.operations.last().ok_or(JournalError::Invariant(
             "publication completion operation missing",
         ))?;
-        if crate::PublicationCompletion::new(
-            &completion.baseline,
-            &operation.payload.origin_device_id,
-            completion.manifest.entries[&intent.entry_id].clone(),
-            intent.created_at_ms,
-        )? != *completion
+        if intent.remote.is_none()
+            && crate::PublicationCompletion::new(
+                &completion.baseline,
+                &operation.payload.origin_device_id,
+                completion.manifest.entries[&intent.entry_id].clone(),
+                intent.created_at_ms,
+            )? != *completion
         {
             return Err(JournalError::Invariant(
                 "initial publication contains unobserved changes",
@@ -254,7 +259,9 @@ impl Journal {
                 "admitted publication requires physical parent scope",
             ));
         }
-        if self.state("device_id")?.as_deref() != Some(operation.payload.origin_device_id.as_str())
+        if (intent.remote.is_none()
+            && self.state("device_id")?.as_deref()
+                != Some(operation.payload.origin_device_id.as_str()))
             || self
                 .current(&intent.space_id)?
                 .as_ref()

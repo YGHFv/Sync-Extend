@@ -31,6 +31,8 @@ mod original_retention;
 mod persisted_rename;
 mod publish;
 #[cfg(windows)]
+mod remote_native;
+#[cfg(windows)]
 pub use native_publish::NativePublishResult;
 mod read_lease;
 mod reference_reservation;

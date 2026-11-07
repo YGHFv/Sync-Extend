@@ -491,6 +491,26 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Export one original own-origin signed operation; never sign a foreign origin.
+    SignOperation {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        operation: String,
+    },
+    /// Explicit paired original signed new-file Put apply; verified CAS required.
+    #[cfg(windows)]
+    ApplyRemotePut {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        signed_operation: PathBuf,
+        /// Optional downloaded local source, verified against the original signed content.
+        #[arg(long)]
+        source: Option<PathBuf>,
+    },
     /// Restore one retained file as a new local change; occupied paths keep a conflict copy.
     Restore {
         #[arg(long)]
@@ -1189,6 +1209,45 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(windows)]
         Command::RecoverNative { data_dir } => {
             print(&open(&data_dir)?.recover_native_publications()?)?;
+        }
+        Command::SignOperation {
+            data_dir,
+            operation,
+        } => {
+            let local = open(&data_dir)?;
+            let operation: sync_extend_core_model::OperationId = operation.parse()?;
+            let original = local
+                .operations()?
+                .into_iter()
+                .find(|op| op.op_id == operation)
+                .ok_or("operation not found")?;
+            print(&sync_extend_transport::SignedOperation::sign(
+                &local.transport_identity()?,
+                original,
+            )?)?;
+        }
+        #[cfg(windows)]
+        Command::ApplyRemotePut {
+            data_dir,
+            peer_device,
+            signed_operation,
+            source,
+        } => {
+            let file = std::fs::File::open(signed_operation)?;
+            let mut bytes = Vec::new();
+            file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > 16 * 1024 * 1024 {
+                return Err("signed operation exceeds 16 MiB".into());
+            }
+            let signed: sync_extend_transport::SignedOperation = serde_json::from_slice(&bytes)?;
+            let mut local = open(&data_dir)?;
+            let peer = local.read_transport_peer(&peer_device.parse()?)?;
+            let result = if let Some(source) = source {
+                local.apply_signed_remote_put_from_file(&peer, &signed, &source)?
+            } else {
+                local.apply_signed_remote_put(&peer, &signed)?
+            };
+            print(&result)?;
         }
         Command::Recover { data_dir } => {
             print(&open(&data_dir)?.recover()?)?;

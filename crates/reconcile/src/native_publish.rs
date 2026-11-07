@@ -50,7 +50,8 @@ impl LocalSpace {
         self.native_publish_result(&id, outcome.err().map(|error| error.to_string()))
     }
 
-    fn create_native_pipeline(&mut self, id: &EntryId, peak: u64) -> Result<()> {
+    pub(crate) fn create_native_pipeline(&mut self, id: &EntryId, peak: u64) -> Result<()> {
+        self.check_native_remote_approval(id)?;
         self.verify_root()?;
         self.require_no_mutation()?;
         self.reserve_internal_worktree(peak)?;
@@ -71,6 +72,7 @@ impl LocalSpace {
         checkpoint("after_native_seal");
         let ready = self.journal.record_native_publication_ready(ready)?;
         checkpoint("after_native_ready");
+        self.check_native_remote_approval(id)?;
         self.reserve_native_internal_worktree(&ready.file_view())?;
         self.verify_root()?;
         self.cas.verify(&publication.intent.content)?;
@@ -84,6 +86,7 @@ impl LocalSpace {
         observation: NativePublicationObservation,
     ) -> Result<()> {
         let id = observation.transaction_id().clone();
+        self.check_native_remote_approval(&id)?;
         self.verify_root()?;
         self.require_no_mutation()?;
         self.reserve_native_internal_worktree(&observation.file_view())?;
@@ -140,6 +143,7 @@ impl LocalSpace {
             return Err(ReconcileError::Unstable);
         }
         observation.verify_content()?;
+        self.check_native_remote_approval(&id)?;
         self.verify_root()?;
         // Two scans are cooperative observation, not exclusion of unrelated writers.
         self.journal.finalize_native_publication(observation)?;
@@ -160,7 +164,10 @@ impl LocalSpace {
             if stage == Stage::Legacy {
                 continue;
             }
-            let outcome = match stage {
+            let outcome = if let Err(error) = self.check_native_remote_approval(&id) {
+                Err(error)
+            } else {
+                match stage {
                 Stage::Selected | Stage::Creating => Err(ReconcileError::Invariant(
                     "incomplete native creation preserved; no receiptless CREATE or writer retry",
                 )),
@@ -188,6 +195,7 @@ impl LocalSpace {
                 })(),
                 Stage::Cleanup => Ok(()),
                 Stage::Legacy => unreachable!(),
+            }
             };
             results.push(
                 self.native_publish_result(&id, outcome.err().map(|error| error.to_string()))?,
@@ -196,7 +204,7 @@ impl LocalSpace {
         Ok(results)
     }
 
-    fn native_publish_result(
+    pub(crate) fn native_publish_result(
         &self,
         id: &EntryId,
         pending_reason: Option<String>,
