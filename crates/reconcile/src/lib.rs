@@ -32,11 +32,15 @@ mod original_retention;
 mod persisted_rename;
 mod publish;
 #[cfg(windows)]
+mod remote_delete;
+#[cfg(windows)]
 mod remote_native;
 #[cfg(windows)]
 mod remote_rename;
 #[cfg(windows)]
 pub use native_publish::NativePublishResult;
+#[cfg(windows)]
+pub use remote_delete::RemoteDeleteResult;
 #[cfg(windows)]
 pub use remote_rename::RemoteRenameResult;
 mod read_lease;

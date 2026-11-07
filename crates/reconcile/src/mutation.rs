@@ -29,6 +29,7 @@ impl LocalSpace {
 
     pub(crate) fn require_no_mutation(&self) -> Result<()> {
         self.journal.require_no_remote_rename(&self.space_id)?;
+        self.journal.require_no_remote_delete(&self.space_id)?;
         self.require_no_tree_restore()?;
         if !self
             .journal

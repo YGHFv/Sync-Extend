@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 39;
+const SCHEMA_VERSION: u32 = 40;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -46,6 +46,10 @@ mod remote_rename;
 pub use remote_rename::{remote_rename_transaction, RemoteRenameReceipt, RemoteRenameStage};
 #[cfg(windows)]
 pub use remote_rename::{RemoteRenameObservation, RemoteRenameSource};
+mod remote_delete;
+pub use remote_delete::{remote_delete_transaction, RemoteDeleteReceipt, RemoteDeleteStage};
+#[cfg(windows)]
+pub use remote_delete::{RemoteDeleteObservation, RemoteDeleteSource};
 mod storage_policy;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,6 +67,8 @@ pub struct Journal {
     native_issuance: native_publication::issuance::Gate,
     #[cfg(windows)]
     remote_rename_issuance: remote_rename::issuance::Gate,
+    #[cfg(windows)]
+    remote_delete_issuance: remote_delete::issuance::Gate,
 }
 
 impl Journal {
@@ -310,6 +316,15 @@ impl Journal {
             tx.execute_batch(include_str!("migration-039.sql"))?;
             tx.commit()?;
         }
+        if version < 40 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-040.sql"))?;
+            tx.commit()?;
+        }
+        remote_delete::validate_schema(&connection)?;
+        let remote_delete_issuance = remote_delete::issuance::Gate::register(&connection)?;
+        #[cfg(not(windows))]
+        let _ = remote_delete_issuance;
         remote_rename::validate_schema(&connection)?;
         let remote_rename_issuance = remote_rename::issuance::Gate::register(&connection)?;
         #[cfg(not(windows))]
@@ -325,6 +340,8 @@ impl Journal {
             native_issuance,
             #[cfg(windows)]
             remote_rename_issuance,
+            #[cfg(windows)]
+            remote_delete_issuance,
         })
     }
 
@@ -1689,16 +1706,19 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
         [], |row| Ok((row.get::<_,i64>(0)? as u64, row.get::<_,i64>(1)? as u64)),
     )?;
     let (rename_rows, rename_bytes) = remote_rename::metadata_budget(connection)?;
+    let (delete_rows, delete_bytes) = remote_delete::metadata_budget(connection)?;
     Ok((
         (rows as u64)
             .checked_add(actual_rows)
             .and_then(|n| n.checked_add(reserved_rows))
             .and_then(|n| n.checked_add(rename_rows))
+            .and_then(|n| n.checked_add(delete_rows))
             .ok_or(JournalError::Invariant("native budget row overflow"))?,
         (bytes as u64)
             .checked_add(actual_bytes)
             .and_then(|n| n.checked_add(reserved_bytes))
             .and_then(|n| n.checked_add(rename_bytes))
+            .and_then(|n| n.checked_add(delete_bytes))
             .ok_or(JournalError::Invariant("native budget byte overflow"))?,
     ))
 }
