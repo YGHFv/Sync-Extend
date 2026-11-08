@@ -4,11 +4,11 @@ use ed25519_dalek::{Signature, Signer, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use sync_extend_core_model::{
-    causal::reduce_operations,
     conflict_resolution::{
-        plan_file_resolution, FileResolutionPlan, ResolutionEvent, ResolutionLimits,
+        plan_file_resolution, resolving_file_operations, verify_file_resolution_projection,
+        FileResolutionPlan, ResolutionLimits,
     },
-    Change, ContentId, DeviceId, Operation, OperationPayload, SpaceId, FORMAT_VERSION,
+    ContentId, DeviceId, Operation, SpaceId,
 };
 
 const DOMAIN: &str = "SyncExtend signed canonical file resolution v1";
@@ -74,97 +74,6 @@ fn authenticated_originals(
     Ok(originals)
 }
 
-fn resolving_operations(
-    plan: &FileResolutionPlan,
-    resolver: &DeviceId,
-    created_at_ms: u64,
-    limits: ResolutionLimits,
-) -> Result<Vec<Operation>> {
-    if plan.events.is_empty() || created_at_ms > i64::MAX as u64 {
-        return Err(refused(
-            "resolution requires unresolved conflict and valid display time",
-        ));
-    }
-    let mut causal = plan.received_vector.clone();
-    let mut operations = Vec::new();
-    for file in &plan.files {
-        let mut changes = vec![Change::Put {
-            entry: file.entry.clone(),
-        }];
-        // A Put retaining a known path cannot dominate the separate Rename
-        // register. Resolve it explicitly, even if its chosen name is unchanged.
-        if !file.preserved_copy
-            && plan.events.iter().any(|event| {
-                matches!(
-                    event, ResolutionEvent::RenameConflict { source_entry_id, .. }
-                        if source_entry_id == &file.source_entry_id
-                )
-            })
-        {
-            changes.push(Change::Rename {
-                entry_id: file.entry.entry_id.clone(),
-                path: file.entry.path.clone(),
-            });
-        }
-        for change in changes {
-            if plan.input_operations.len().saturating_add(operations.len()) >= limits.max_operations
-            {
-                return Err(refused("resolution aggregate operation budget"));
-            }
-            let sequence = causal
-                .get(resolver)
-                .checked_add(1)
-                .filter(|sequence| *sequence <= i64::MAX as u64)
-                .ok_or(refused("resolution own sequence exhausted"))?;
-            let operation = Operation::new(OperationPayload {
-                format_version: FORMAT_VERSION,
-                space_id: plan.space_id.clone(),
-                origin_device_id: resolver.clone(),
-                origin_seq: sequence,
-                causal: causal.clone(),
-                change,
-                created_at_ms,
-            })?;
-            causal.observe(resolver.clone(), sequence);
-            operations.push(operation);
-        }
-    }
-    Ok(operations)
-}
-
-fn verify_projection(
-    plan: &FileResolutionPlan,
-    originals: &[Operation],
-    resolving: &[Operation],
-    limits: ResolutionLimits,
-) -> Result<()> {
-    let mut combined = originals.to_vec();
-    combined.extend_from_slice(resolving);
-    let reduced = reduce_operations(&plan.space_id, &combined, limits.max_operations)?;
-    if !reduced.path_collisions.is_empty()
-        || reduced.entries.len() != plan.projected.entries.len() + plan.projected.tombstones.len()
-    {
-        return Err(refused("resolution reduced namespace differs"));
-    }
-    for (id, frontier) in &reduced.entries {
-        if let Some(entry) = plan.projected.entries.get(id) {
-            if frontier.deleted
-                || frontier.delete_conflict
-                || frontier.paths.len() != 1
-                || frontier.paths[0].path != entry.path
-                || frontier.contents.len() != 1
-                || frontier.contents[0].kind != entry.kind
-                || frontier.contents[0].content != entry.content
-            {
-                return Err(refused("resolution actual causal result differs"));
-            }
-        } else if !frontier.deleted || !plan.projected.tombstones.contains_key(id) {
-            return Err(refused("resolution reduced deletion differs"));
-        }
-    }
-    Ok(())
-}
-
 impl SignedFileResolution {
     /// Parse only a bounded envelope. This does not authenticate or authorize it.
     pub fn from_slice(bytes: &[u8], limits: ResolutionLimits) -> Result<Self> {
@@ -207,8 +116,8 @@ impl SignedFileResolution {
         let plan = plan_file_resolution(&payload.space_id, &operations, limits)?;
         payload.plan_fingerprint = plan.fingerprint()?;
         let resolving =
-            resolving_operations(&plan, &payload.resolver_device, created_at_ms, limits)?;
-        verify_projection(&plan, &operations, &resolving, limits)?;
+            resolving_file_operations(&plan, &payload.resolver_device, created_at_ms, limits)?;
+        verify_file_resolution_projection(&plan, &operations, &resolving, limits)?;
         payload.resolving = resolving
             .into_iter()
             .map(|operation| SignedOperation::sign(identity, operation))
@@ -259,7 +168,7 @@ impl SignedFileResolution {
         if plan.fingerprint()? != payload.plan_fingerprint {
             return Err(refused("resolution canonical fingerprint differs"));
         }
-        let expected = resolving_operations(
+        let expected = resolving_file_operations(
             &plan,
             &payload.resolver_device,
             payload.created_at_ms,
@@ -274,7 +183,7 @@ impl SignedFileResolution {
                 return Err(refused("resolution canonical resolving operation differs"));
             }
         }
-        verify_projection(&plan, &originals, &expected, limits)?;
+        verify_file_resolution_projection(&plan, &originals, &expected, limits)?;
         Ok(plan)
     }
 }

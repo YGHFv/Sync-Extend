@@ -103,6 +103,99 @@ impl FileResolutionPlan {
     }
 }
 
+/// Canonical own-origin prefix only. This neither reserves sequence numbers nor
+/// authenticates originals; durable admission must bind the complete local log.
+pub fn resolving_file_operations(
+    plan: &FileResolutionPlan,
+    resolver: &DeviceId,
+    created_at_ms: u64,
+    limits: ResolutionLimits,
+) -> Result<Vec<Operation>> {
+    limits.validate()?;
+    if plan.events.is_empty() || created_at_ms > i64::MAX as u64 {
+        return Err(invalid(
+            "resolution requires conflict and valid display time",
+        ));
+    }
+    let mut causal = plan.received_vector.clone();
+    let mut operations = Vec::new();
+    for file in &plan.files {
+        let mut changes = vec![crate::Change::Put {
+            entry: file.entry.clone(),
+        }];
+        // Put cannot dominate an independent Rename register on a known path.
+        if !file.preserved_copy
+            && plan.events.iter().any(|event| {
+                matches!(event, ResolutionEvent::RenameConflict { source_entry_id, .. }
+                    if source_entry_id == &file.source_entry_id)
+            })
+        {
+            changes.push(crate::Change::Rename {
+                entry_id: file.entry.entry_id.clone(),
+                path: file.entry.path.clone(),
+            });
+        }
+        for change in changes {
+            if plan.input_operations.len().saturating_add(operations.len()) >= limits.max_operations
+            {
+                return Err(invalid("resolution aggregate operation budget"));
+            }
+            let sequence = causal
+                .get(resolver)
+                .checked_add(1)
+                .filter(|sequence| *sequence <= i64::MAX as u64)
+                .ok_or(invalid("resolution own sequence exhausted"))?;
+            let operation = Operation::new(crate::OperationPayload {
+                format_version: crate::FORMAT_VERSION,
+                space_id: plan.space_id.clone(),
+                origin_device_id: resolver.clone(),
+                origin_seq: sequence,
+                causal: causal.clone(),
+                change,
+                created_at_ms,
+            })?;
+            causal.observe(resolver.clone(), sequence);
+            operations.push(operation);
+        }
+    }
+    Ok(operations)
+}
+
+/// Recompute the actual combined causal result, not merely a plan hash.
+pub fn verify_file_resolution_projection(
+    plan: &FileResolutionPlan,
+    originals: &[Operation],
+    resolving: &[Operation],
+    limits: ResolutionLimits,
+) -> Result<()> {
+    limits.validate()?;
+    let mut combined = originals.to_vec();
+    combined.extend_from_slice(resolving);
+    let reduced = reduce_operations(&plan.space_id, &combined, limits.max_operations)?;
+    if !reduced.path_collisions.is_empty()
+        || reduced.entries.len() != plan.projected.entries.len() + plan.projected.tombstones.len()
+    {
+        return Err(invalid("resolution reduced namespace differs"));
+    }
+    for (id, frontier) in &reduced.entries {
+        if let Some(entry) = plan.projected.entries.get(id) {
+            if frontier.deleted
+                || frontier.delete_conflict
+                || frontier.paths.len() != 1
+                || frontier.paths[0].path != entry.path
+                || frontier.contents.len() != 1
+                || frontier.contents[0].kind != entry.kind
+                || frontier.contents[0].content != entry.content
+            {
+                return Err(invalid("resolution actual causal result differs"));
+            }
+        } else if !frontier.deleted || !plan.projected.tombstones.contains_key(id) {
+            return Err(invalid("resolution reduced deletion differs"));
+        }
+    }
+    Ok(())
+}
+
 fn invalid(message: &'static str) -> ModelError {
     ModelError::InvalidData(message)
 }

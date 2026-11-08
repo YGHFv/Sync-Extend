@@ -241,6 +241,17 @@ impl Journal {
         self.reference_reservations(space, max_entries)?;
         self.original_disposals(space, max_entries)?;
         self.tree_restore_preparations(space, max_entries)?;
+        let conflict_owner: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.conflict_resolution_admissions)
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_signatures)
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_sequences)
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_objects)",
+            [],
+            |row| row.get(0),
+        )?;
+        if conflict_owner {
+            self.conflict_resolution_admissions(space)?;
+        }
         Ok(())
     }
 
@@ -402,6 +413,7 @@ impl crate::JournalReadView<'_> {
             "SELECT EXISTS(SELECT 1 FROM snapshot_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM publication_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM remote_replace_objects WHERE content_id=?1)
+             OR EXISTS(SELECT 1 FROM conflict_resolution_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM mutation_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM read_lease_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM reference_reservation_objects WHERE content_id=?1)

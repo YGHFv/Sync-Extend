@@ -315,7 +315,7 @@ fn number(row: &JournalStoredRow, name: &str) -> Result<u64> {
 }
 pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     fn objects(db: &Connection) -> Result<Vec<(String, String, Option<String>)>> {
-        Ok(db.prepare("SELECT type,name,sql FROM main.sqlite_schema WHERE name LIKE 'remote_replace_%' OR tbl_name LIKE 'remote_replace_%' ORDER BY type,name")?
+        Ok(db.prepare("SELECT type,name,sql FROM main.sqlite_schema WHERE (name LIKE 'remote_replace_%' OR tbl_name LIKE 'remote_replace_%') AND name NOT LIKE 'conflict_resolution_%' ORDER BY type,name")?
             .query_map([],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?
             .collect::<std::result::Result<_,_>>()?)
     }

@@ -169,6 +169,18 @@ enum Command {
         #[arg(long)]
         signed_resolution: PathBuf,
     },
+    /// Reserve exact local signed resolution history; no native apply or release.
+    AdmitConflictResolution {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        signed_resolution: PathBuf,
+    },
+    /// Inspect durable prospective local conflict resolution owners.
+    ConflictResolutions {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Inspect original signed Replace receipts without native recovery.
     #[cfg(windows)]
     RemoteReplaces {
@@ -1029,6 +1041,24 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .read_to_end(&mut bytes)?;
             let signed = sync_extend_transport::SignedFileResolution::from_slice(&bytes, limits)?;
             print(&open(&data_dir)?.prepare_signed_conflict_branches(&signed, limits)?)?;
+        }
+        Command::AdmitConflictResolution {
+            data_dir,
+            signed_resolution,
+        } => {
+            let limits = sync_extend_core_model::conflict_resolution::ResolutionLimits {
+                max_bytes: 16 * 1024 * 1024,
+                ..Default::default()
+            };
+            let mut bytes = Vec::new();
+            std::fs::File::open(signed_resolution)?
+                .take(limits.max_bytes as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            let signed = sync_extend_transport::SignedFileResolution::from_slice(&bytes, limits)?;
+            print(&open(&data_dir)?.admit_signed_file_resolution(&signed, limits)?)?;
+        }
+        Command::ConflictResolutions { data_dir } => {
+            print(&open(&data_dir)?.conflict_resolution_admissions()?)?;
         }
         Command::ExchangeMetadata {
             data_dir,

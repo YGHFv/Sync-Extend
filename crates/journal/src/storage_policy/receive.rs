@@ -78,6 +78,7 @@ pub(crate) fn tree_gate(before: &CapacitySnapshot) -> Result<()> {
 pub(crate) fn completion_gate(before: &CapacitySnapshot) -> Result<()> {
     for row in &before.rows {
         let active = match row.table() {
+            "conflict_resolution_admissions" => true,
             "publications" => text(row, "state")? != "committed",
             "mutations" => !matches!(text(row, "state")?, "cancelled" | "committed"),
             _ => false,

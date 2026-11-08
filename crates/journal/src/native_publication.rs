@@ -522,7 +522,8 @@ pub(crate) fn validate_schema(connection: &rusqlite::Connection) -> Result<()> {
     fn objects(connection: &rusqlite::Connection) -> Result<Objects> {
         let mut statement = connection.prepare(
             "SELECT type,name,sql FROM main.sqlite_schema WHERE
-             name LIKE 'native_publication_%' OR tbl_name LIKE 'native_publication_%'
+             (name LIKE 'native_publication_%' OR tbl_name LIKE 'native_publication_%')
+             AND name NOT LIKE 'conflict_resolution_%'
              ORDER BY type,name",
         )?;
         let rows = statement

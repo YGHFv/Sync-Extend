@@ -1,4 +1,6 @@
 mod cleanup;
+mod conflict_admission;
+pub use conflict_admission::LocalConflictAdmission;
 mod conflict_branches;
 pub use conflict_branches::ConflictBranchPreparation;
 mod delete;

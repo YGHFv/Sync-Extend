@@ -104,6 +104,7 @@ pub(crate) fn tables() -> Vec<TableSpec> {
         crate::remote_rename::schema::TABLES,
         crate::remote_delete::schema::TABLES,
         crate::remote_replace::schema::TABLES,
+        crate::conflict_resolution::schema::TABLES,
     ]
     .concat()
 }
@@ -159,6 +160,7 @@ impl Journal {
         crate::remote_rename::obligations(&rows, &self.connection)?;
         crate::remote_delete::obligations(&rows, &self.connection)?;
         crate::remote_replace::obligations(&rows, &self.connection)?;
+        crate::conflict_resolution::obligations(&rows, &self.connection)?;
         if rows
             .iter()
             .any(|row| row.table() == "native_publication_headers")
