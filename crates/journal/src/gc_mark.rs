@@ -401,6 +401,7 @@ impl crate::JournalReadView<'_> {
         Ok(self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM snapshot_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM publication_objects WHERE content_id=?1)
+             OR EXISTS(SELECT 1 FROM remote_replace_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM mutation_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM read_lease_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM reference_reservation_objects WHERE content_id=?1)

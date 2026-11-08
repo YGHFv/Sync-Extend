@@ -51,7 +51,7 @@ pub(crate) fn scan_native(
     root: &Path,
     cas: &Cas,
     limits: &LocalLimits,
-    view: &sync_extend_journal::NativePublicationFileView<'_>,
+    view: &dyn crate::native_file_view::NativeFileView,
 ) -> Result<Scan> {
     view.verify()?;
     let mut result = BTreeMap::new();
@@ -82,7 +82,7 @@ fn visit(
     result: &mut Scan,
     collisions: &mut BTreeSet<String>,
     budget: &mut Budget<'_>,
-    #[cfg(windows)] view: Option<&sync_extend_journal::NativePublicationFileView<'_>>,
+    #[cfg(windows)] view: Option<&dyn crate::native_file_view::NativeFileView>,
 ) -> Result<()> {
     let before = fs::symlink_metadata(directory)?;
     if !before.is_dir() || before.file_type().is_symlink() || is_reparse(&before) {

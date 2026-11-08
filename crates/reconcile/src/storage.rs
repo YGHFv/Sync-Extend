@@ -548,7 +548,7 @@ impl LocalSpace {
     #[cfg(windows)]
     pub(crate) fn reserve_native_internal_worktree(
         &self,
-        view: &sync_extend_journal::NativePublicationFileView<'_>,
+        view: &dyn crate::native_file_view::NativeFileView,
     ) -> Result<()> {
         let remaining = view.remaining_internal_bytes()?;
         let pass = || {
@@ -698,7 +698,7 @@ fn visit(
     internal: bool,
     bounds: (usize, usize),
     inventory: &mut Inventory,
-    #[cfg(windows)] view: Option<&sync_extend_journal::NativePublicationFileView<'_>>,
+    #[cfg(windows)] view: Option<&dyn crate::native_file_view::NativeFileView>,
 ) -> Result<()> {
     let (depth, limit) = bounds;
     if inventory.len() >= limit || depth > 160 {

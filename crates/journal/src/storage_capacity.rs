@@ -318,6 +318,9 @@ impl crate::JournalReadView<'_> {
         liabilities
             .obligations
             .extend(crate::remote_delete::obligations(&rows, self.connection)?);
+        liabilities
+            .obligations
+            .extend(crate::remote_replace::obligations(&rows, self.connection)?);
         crate::native_publication::validate_schema(self.connection)?;
         crate::native_publication::scope(&rows, self.connection)?;
         liabilities

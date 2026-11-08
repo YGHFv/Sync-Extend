@@ -151,6 +151,31 @@ enum Command {
         #[arg(long)]
         transaction: String,
     },
+    #[cfg(windows)]
+    ApplyRemoteReplace {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        signed_operation: PathBuf,
+        #[arg(long)]
+        source: Option<PathBuf>,
+    },
+    /// Inspect original signed Replace receipts without native recovery.
+    #[cfg(windows)]
+    RemoteReplaces {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Resume only one exact admitted original signed Replace.
+    #[cfg(windows)]
+    RecoverRemoteReplace {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        transaction: String,
+    },
     /// Exchange bounded signed own-origin metadata in both directions; no file apply.
     ExchangeMetadata {
         #[arg(long)]
@@ -950,6 +975,41 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             transaction,
         } => {
             print(&open(&data_dir)?.recover_remote_delete(&transaction.parse()?)?)?;
+        }
+        #[cfg(windows)]
+        Command::ApplyRemoteReplace {
+            data_dir,
+            peer_device,
+            signed_operation,
+            source,
+        } => {
+            let mut bytes = Vec::new();
+            std::fs::File::open(signed_operation)?
+                .take(16 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 16 * 1024 * 1024 {
+                return Err("signed operation exceeds 16 MiB".into());
+            }
+            let signed = serde_json::from_slice(&bytes)?;
+            let mut local = open(&data_dir)?;
+            let peer = local.read_transport_peer(&peer_device.parse()?)?;
+            match source {
+                Some(source) => {
+                    print(&local.apply_signed_remote_replace_from_file(&peer, &signed, &source)?)?
+                }
+                None => print(&local.apply_signed_remote_replace(&peer, &signed)?)?,
+            }
+        }
+        #[cfg(windows)]
+        Command::RemoteReplaces { data_dir } => {
+            print(&open(&data_dir)?.remote_replace_receipts()?)?;
+        }
+        #[cfg(windows)]
+        Command::RecoverRemoteReplace {
+            data_dir,
+            transaction,
+        } => {
+            print(&open(&data_dir)?.recover_remote_replace(&transaction.parse()?)?)?;
         }
         Command::ExchangeMetadata {
             data_dir,

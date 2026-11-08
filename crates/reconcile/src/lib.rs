@@ -27,6 +27,8 @@ pub use remote_file::{RemoteFileChunkImport, RemoteFileMaterialization, RemoteFi
 mod move_file;
 mod mutation;
 #[cfg(windows)]
+mod native_file_view;
+#[cfg(windows)]
 mod native_publish;
 mod original_retention;
 mod persisted_rename;
@@ -38,11 +40,15 @@ mod remote_native;
 #[cfg(windows)]
 mod remote_rename;
 #[cfg(windows)]
+mod remote_replace;
+#[cfg(windows)]
 pub use native_publish::NativePublishResult;
 #[cfg(windows)]
 pub use remote_delete::RemoteDeleteResult;
 #[cfg(windows)]
 pub use remote_rename::RemoteRenameResult;
+#[cfg(windows)]
+pub use remote_replace::RemoteReplaceResult;
 mod read_lease;
 mod reference_reservation;
 mod replace_file;
