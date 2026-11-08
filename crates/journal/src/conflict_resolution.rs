@@ -15,6 +15,7 @@ use sync_extend_core_model::{
 
 pub(crate) mod issuance;
 mod native_binding;
+mod native_effects;
 pub(crate) mod native_future_schema;
 mod native_history_templates;
 mod native_ledger;
@@ -32,7 +33,8 @@ pub(crate) mod schema;
 #[cfg(windows)]
 pub use native_baseline::{
     ConflictNativeAdmission, ConflictNativeAdmissionLimits, ConflictNativeAdmissionReport,
-    ConflictNativeBaseline, ConflictNativeBaselineReport,
+    ConflictNativeBaseline, ConflictNativeBaselineReport, ConflictNativeCreation,
+    ConflictNativeReadiness,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

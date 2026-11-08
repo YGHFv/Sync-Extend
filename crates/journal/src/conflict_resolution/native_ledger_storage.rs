@@ -150,13 +150,14 @@ pub(super) fn audit(
         }
         let ledger = header.validate(&parent, &binding)?;
         require_fresh_generation(&header, rows, connection)?;
-        for (suffix, values) in values(&header, &ledger)? {
+        let effects = super::native_effects::audit(&header, &binding, &ledger, rows)?;
+        for (suffix, values) in values(&header, &ledger)?.into_iter().chain(effects.values) {
             let (key, columns) = value_columns(suffix, &values)?;
             if expected.insert(key, columns).is_some() {
                 return Err(invalid("conflict future duplicate exact actual row"));
             }
         }
-        for template in &ledger.templates {
+        for template in effects.remaining {
             obligations.push(JournalCapacityObligation {
                 family: "original_conflict_native_future_template",
                 owner_key: vec![parent.transaction_id.to_string(), template.name.clone()],

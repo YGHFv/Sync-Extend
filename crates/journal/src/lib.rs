@@ -27,7 +27,8 @@ mod conflict_resolution;
 #[cfg(windows)]
 pub use conflict_resolution::{
     ConflictNativeAdmission, ConflictNativeAdmissionLimits, ConflictNativeAdmissionReport,
-    ConflictNativeBaseline, ConflictNativeBaselineReport,
+    ConflictNativeBaseline, ConflictNativeBaselineReport, ConflictNativeCreation,
+    ConflictNativeReadiness,
 };
 pub use conflict_resolution::{
     ConflictResolutionAdmission, ConflictResolutionAdmissionIntent, ConflictResolutionKey,

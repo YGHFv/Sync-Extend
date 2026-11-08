@@ -2,6 +2,8 @@
 use super::super::native_ledger::{NativeHeader, Residue, ResidueDirectory, ResidueFile};
 use super::super::native_ledger_storage;
 use super::*;
+mod creators;
+pub use creators::{ConflictNativeCreation, ConflictNativeReadiness};
 
 struct RetainedResidue {
     description: Residue,
@@ -17,6 +19,30 @@ fn descriptive(key: FileKey) -> super::super::native_binding::Key {
 }
 
 impl RetainedResidue {
+    fn reopen(
+        selected: &ConflictNativeBaseline,
+        description: Residue,
+        owned_base: Option<FileKey>,
+        owner: Option<&Path>,
+    ) -> Result<Self> {
+        let directories = description
+            .directories
+            .iter()
+            .map(|row| directory(Path::new(&row.path)))
+            .collect::<Result<_>>()?;
+        let files = description
+            .files
+            .iter()
+            .map(|row| Ok((row.clone(), GuardedReadFile::open(Path::new(&row.path))?)))
+            .collect::<Result<_>>()?;
+        let retained = Self {
+            description,
+            directories,
+            files,
+        };
+        retained.verify_scope(selected, owned_base, owner)?;
+        Ok(retained)
+    }
     fn open(selected: &ConflictNativeBaseline, maximum: usize) -> Result<Self> {
         if maximum == 0 || maximum > sync_extend_core_model::limits::MAX_ENTRIES {
             return Err(invalid("conflict future residue traversal limit"));
@@ -122,10 +148,23 @@ impl RetainedResidue {
         Ok(retained)
     }
     fn verify(&self, selected: &ConflictNativeBaseline) -> Result<()> {
-        selected.verify_native()?;
+        self.verify_scope(selected, None, None)
+    }
+    fn verify_scope(
+        &self,
+        selected: &ConflictNativeBaseline,
+        owned_base: Option<FileKey>,
+        owner: Option<&Path>,
+    ) -> Result<()> {
+        selected.verify_native_scope(owned_base)?;
         let mut expected: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
         if let Some(base) = &selected.base {
             expected.insert(base.path.clone(), BTreeSet::new());
+        }
+        if owned_base.is_some() {
+            expected
+                .entry(selected.directories[0].path.join(".sync-tmp"))
+                .or_default();
         }
         for directory in &self.directories {
             let observed = super::directory(&directory.path)?;
@@ -147,10 +186,24 @@ impl RetainedResidue {
                 .ok_or(invalid("conflict future residue parent guard missing"))?
                 .insert(path);
         }
+        if let Some(owner) = owner {
+            expected
+                .get_mut(
+                    owner
+                        .parent()
+                        .ok_or(invalid("conflict owned scope parent"))?,
+                )
+                .ok_or(invalid("conflict owned original base guard missing"))?
+                .insert(owner.to_path_buf());
+        }
         for (parent, children) in expected {
-            let actual: BTreeSet<_> = fs::read_dir(parent)?
-                .map(|child| child.map(|row| row.path()))
-                .collect::<std::io::Result<_>>()?;
+            let mut actual = BTreeSet::new();
+            for child in fs::read_dir(parent)? {
+                if actual.len() >= children.len() {
+                    return Err(invalid("conflict bounded exact residue membership grew"));
+                }
+                actual.insert(child?.path());
+            }
             if actual != children {
                 return Err(invalid(
                     "conflict future exact borrowed residue membership changed",

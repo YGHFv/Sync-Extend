@@ -4,6 +4,7 @@ mod admission;
 use crate::NativePublicationFileObservation;
 pub use admission::{
     ConflictNativeAdmission, ConflictNativeAdmissionLimits, ConflictNativeAdmissionReport,
+    ConflictNativeCreation, ConflictNativeReadiness,
 };
 use std::{
     fs,
@@ -77,13 +78,16 @@ fn verify_original(original: &Original) -> Result<()> {
         ));
     }
     sync_extend_platform_fs::verify_regular_file(original.held.reader())?;
-    let content = original.entry.content.as_ref().ok_or(invalid(
+    verify_content(original.held.reader(), &original.entry)
+}
+fn verify_content(reader: &fs::File, entry: &sync_extend_core_model::Entry) -> Result<()> {
+    let content = entry.content.as_ref().ok_or(invalid(
         "conflict baseline original content description missing",
     ))?;
-    if original.held.reader().metadata()?.len() != content.length {
+    if reader.metadata()?.len() != content.length {
         return Err(invalid("conflict baseline original length changed"));
     }
-    let mut reader = original.held.reader();
+    let mut reader = reader;
     reader.seek(SeekFrom::Start(0))?;
     let mut whole = blake3::Hasher::new();
     let mut buffer = [0u8; 65536];
@@ -131,6 +135,9 @@ impl ConflictNativeBaseline {
         })
     }
     pub fn verify_native(&self) -> Result<()> {
+        self.verify_native_scope(None)
+    }
+    fn verify_native_scope(&self, owned_base: Option<FileKey>) -> Result<()> {
         self.marker_file.verify_single_link()?;
         let mut marker = self.marker_file.reader();
         marker.seek(SeekFrom::Start(0))?;
@@ -165,7 +172,7 @@ impl ConflictNativeBaseline {
                 .ok_or(invalid("conflict baseline root filename UTF8"))?
                 .to_string();
             if name == ".sync-tmp" {
-                if self.base.is_none() {
+                if self.base.is_none() && owned_base.is_none() {
                     return Err(invalid("conflict baseline unexpected staging base"));
                 }
                 continue;
@@ -253,6 +260,15 @@ impl Journal {
         transaction: &EntryId,
         limits: ConflictNativeLayoutLimits,
     ) -> Result<ConflictNativeBaseline> {
+        self.hold_conflict_baseline_scope(transaction, limits, None, None)
+    }
+    fn hold_conflict_baseline_scope(
+        &self,
+        transaction: &EntryId,
+        limits: ConflictNativeLayoutLimits,
+        original_binding: Option<&super::native_binding::Binding>,
+        owned_base: Option<FileKey>,
+    ) -> Result<ConflictNativeBaseline> {
         if !self.connection.is_autocommit() {
             return Err(invalid("conflict baseline refuses caller transaction"));
         }
@@ -287,10 +303,14 @@ impl Journal {
         let base_path = root.join(".sync-tmp");
         let marker = directory(&root.join(".sync-extend"))?;
         let marker_file = GuardedReadFile::open(&root.join(".sync-extend/space-id"))?;
-        let base = match fs::symlink_metadata(&base_path) {
-            Ok(_) => Some(directory(&base_path)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
+        let base = if original_binding.is_some_and(|binding| binding.existing_base.is_none()) {
+            None
+        } else {
+            match fs::symlink_metadata(&base_path) {
+                Ok(_) => Some(directory(&base_path)?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            }
         };
         let mut originals = BTreeMap::new();
         let mut keys = BTreeSet::new();
@@ -327,7 +347,7 @@ impl Journal {
             _cas: cas,
             bound: false,
         };
-        selected.verify_native()?;
+        selected.verify_native_scope(owned_base)?;
         if let Some(binding) = super::native_binding::stored(&self.connection, &selected.header)? {
             if binding != selected.binding()? {
                 return Err(invalid(
@@ -335,6 +355,12 @@ impl Journal {
                 ));
             }
             selected.bound = true;
+        }
+        if original_binding.is_some_and(|binding| selected.binding().ok().as_ref() != Some(binding))
+        {
+            return Err(invalid(
+                "conflict creator retained original durable binding differs",
+            ));
         }
         let after = self
             .read_view()
