@@ -24,6 +24,8 @@ pub type Result<T> = std::result::Result<T, JournalError>;
 
 mod causal_log;
 mod conflict_resolution;
+#[cfg(windows)]
+pub use conflict_resolution::{ConflictNativeBaseline, ConflictNativeBaselineReport};
 pub use conflict_resolution::{
     ConflictResolutionAdmission, ConflictResolutionAdmissionIntent, ConflictResolutionKey,
     ConflictResolutionPayload, ConflictResolutionProof, ConflictSignedOperation,

@@ -19,7 +19,11 @@ pub use proof::{
     ConflictResolutionKey, ConflictResolutionPayload, ConflictResolutionProof,
     ConflictSignedOperation,
 };
+#[cfg(windows)]
+mod native_baseline;
 pub(crate) mod schema;
+#[cfg(windows)]
+pub use native_baseline::{ConflictNativeBaseline, ConflictNativeBaselineReport};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
