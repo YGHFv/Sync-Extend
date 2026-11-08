@@ -245,7 +245,8 @@ impl Journal {
             "SELECT EXISTS(SELECT 1 FROM main.conflict_resolution_admissions)
              OR EXISTS(SELECT 1 FROM main.conflict_resolution_signatures)
              OR EXISTS(SELECT 1 FROM main.conflict_resolution_sequences)
-             OR EXISTS(SELECT 1 FROM main.conflict_resolution_objects)",
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_objects)
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_native_bindings)",
             [],
             |row| row.get(0),
         )?;

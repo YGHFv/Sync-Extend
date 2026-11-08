@@ -14,6 +14,7 @@ use sync_extend_core_model::{
 };
 
 pub(crate) mod issuance;
+mod native_binding;
 mod proof;
 pub use proof::{
     ConflictResolutionKey, ConflictResolutionPayload, ConflictResolutionProof,
@@ -374,6 +375,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
         ))?;
     }
     expected.execute_batch(include_str!("migration-042.sql"))?;
+    expected.execute_batch(include_str!("migration-043.sql"))?;
     if objects(connection)? != objects(&expected)? {
         return Err(invalid(
             "conflict resolution exact schema/trigger/index differs",
@@ -508,7 +510,10 @@ pub(crate) fn obligations(
     validate_schema(connection)?;
     let own: Vec<_> = rows
         .iter()
-        .filter(|r| r.table().starts_with("conflict_resolution_"))
+        .filter(|r| {
+            r.table().starts_with("conflict_resolution_")
+                && r.table() != "conflict_resolution_native_bindings"
+        })
         .collect();
     let headers: Vec<_> = own
         .iter()
@@ -551,6 +556,7 @@ pub(crate) fn obligations(
             "conflict admission exact signature/sequence/pins rows differ",
         ));
     }
+    native_binding::audit(connection)?;
     // Schema42 admission has no future writer/Final authority or liability
     // reservation. Native capacity must be reserved separately before C4 effects.
     Ok(Vec::new())

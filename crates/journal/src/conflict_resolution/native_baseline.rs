@@ -33,6 +33,7 @@ pub struct ConflictNativeBaselineReport {
     pub original_files: usize,
     pub originals_verified: bool,
     pub native_admission_persisted: bool,
+    pub original_keys_persisted: bool,
     pub execution_authorized: bool,
     pub worktree_materialized: bool,
     pub cas_content_closed: bool,
@@ -49,6 +50,7 @@ pub struct ConflictNativeBaseline {
     base: Option<Directory>,
     originals: BTreeMap<sync_extend_core_model::PortablePath, Original>,
     _cas: CasAccessGuard,
+    bound: bool,
 }
 
 fn physical(key: FileKey) -> ContentId {
@@ -118,6 +120,7 @@ impl ConflictNativeBaseline {
             original_files: self.originals.len(),
             originals_verified: true,
             native_admission_persisted: false,
+            original_keys_persisted: self.bound,
             execution_authorized: false,
             worktree_materialized: false,
             cas_content_closed: false,
@@ -182,6 +185,39 @@ impl ConflictNativeBaseline {
             verify_original(original)?;
         }
         Ok(())
+    }
+    fn binding(&self) -> Result<super::native_binding::Binding> {
+        let key = |key: FileKey| super::native_binding::Key {
+            volume: format!("{:016x}", key.volume),
+            id: format!("{:032x}", key.id),
+        };
+        Ok(super::native_binding::Binding {
+            format: 1,
+            transaction_id: self.header.transaction_id.clone(),
+            parent_hash: hash(&self.header)?,
+            ancestors: self
+                .directories
+                .iter()
+                .map(|directory| {
+                    Ok(super::native_binding::Directory {
+                        path: directory
+                            .path
+                            .to_str()
+                            .ok_or(invalid("conflict binding ancestor UTF8"))?
+                            .into(),
+                        key: key(directory.key),
+                    })
+                })
+                .collect::<Result<_>>()?,
+            marker_directory: key(self.marker.key),
+            marker_file: key(self.marker_file.key()?),
+            existing_base: self.base.as_ref().map(|base| key(base.key)),
+            originals: self
+                .originals
+                .values()
+                .map(|original| (original.entry.entry_id.clone(), key(original.key)))
+                .collect(),
+        })
     }
     /// Borrowed read-only observation; never a new path-open writer or creator.
     pub fn observe_file(&self, path: &Path) -> Result<Option<NativePublicationFileObservation>> {
@@ -276,7 +312,7 @@ impl Journal {
         for (_, content) in pins(&header)?.keys() {
             self.require_cas_access(content)?;
         }
-        let selected = ConflictNativeBaseline {
+        let mut selected = ConflictNativeBaseline {
             header,
             layout,
             directories,
@@ -285,8 +321,17 @@ impl Journal {
             base,
             originals,
             _cas: cas,
+            bound: false,
         };
         selected.verify_native()?;
+        if let Some(binding) = super::native_binding::stored(&self.connection, &selected.header)? {
+            if binding != selected.binding()? {
+                return Err(invalid(
+                    "conflict baseline original persisted fullkeys changed",
+                ));
+            }
+            selected.bound = true;
+        }
         let after = self
             .read_view()
             .audit_local_commit_capacity(&selected.header.intent.baseline.space_id, bounds)?;
@@ -296,6 +341,89 @@ impl Journal {
             ));
         }
         tx.commit()?;
+        Ok(selected)
+    }
+    /// Persist only the Journal-opened original baseline keys. This reserves no
+    /// future effects and grants no creator, Ready, Final or cleanup authority.
+    pub fn bind_conflict_native_baseline(
+        &self,
+        mut selected: ConflictNativeBaseline,
+    ) -> Result<ConflictNativeBaseline> {
+        if !self.connection.is_autocommit() {
+            return Err(invalid(
+                "conflict baseline binding refuses caller transaction",
+            ));
+        }
+        let _coordination = self.acquire_cas_coordination()?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let space = &selected.header.intent.baseline.space_id;
+        let bounds = storage_policy::capacity_limits(self.max_storage_entries)?;
+        let before = self
+            .read_view()
+            .audit_local_commit_capacity(space, bounds)?;
+        let plan = selected.header.plan()?;
+        bind(&self.connection, &selected.header, &plan)?;
+        selected.verify_native()?;
+        let binding = selected.binding()?;
+        binding.validate(&selected.header)?;
+        let mut expected = row_map(&before.rows);
+        if let Some(stored) = super::native_binding::stored(&self.connection, &selected.header)? {
+            if stored != binding {
+                return Err(invalid("conflict baseline binding exact retry differs"));
+            }
+        } else {
+            let json = serde_json::to_string(&binding)?;
+            if json.len() > crate::MAX_OPERATION_BYTES {
+                return Err(invalid("conflict baseline binding encoded budget"));
+            }
+            let values = vec![
+                Value::Text(binding.transaction_id.to_string()),
+                Value::Text(binding.parent_hash.to_string()),
+                Value::Text(hash(&binding)?.to_string()),
+                Value::Text(json),
+            ];
+            let (row, columns) = value_columns("native_bindings", &values)?;
+            if expected.insert(row, columns).is_some() {
+                return Err(invalid("conflict baseline binding row collision"));
+            }
+            let bytes: u64 = values
+                .iter()
+                .map(|v| match v {
+                    Value::Text(s) => s.len() as u64,
+                    _ => 8,
+                })
+                .sum();
+            let total = before.report.accounted_total();
+            if total
+                .rows
+                .checked_add(1)
+                .is_none_or(|n| n > bounds.max_rows)
+                || total
+                    .logical_bytes
+                    .checked_add(bytes)
+                    .is_none_or(|n| n > bounds.max_logical_bytes)
+            {
+                return Err(invalid("conflict baseline binding prewrite exact capacity"));
+            }
+            let mut issued = vec![Value::Text("native_bindings".into())];
+            issued.extend(values.clone());
+            let _permit = self.conflict_resolution_issuance.permit(Some(issued))?;
+            tx.execute(
+                "INSERT INTO main.conflict_resolution_native_bindings VALUES(?1,?2,?3,?4)",
+                rusqlite::params_from_iter(values),
+            )?;
+        }
+        let after = self
+            .read_view()
+            .audit_local_commit_capacity(space, bounds)?;
+        if row_map(&after.rows) != expected || !after.report.within_accounted_limits() {
+            return Err(invalid(
+                "conflict baseline binding exact allvalue receipt differs",
+            ));
+        }
+        selected.verify_native()?;
+        tx.commit()?;
+        selected.bound = true;
         Ok(selected)
     }
 }
