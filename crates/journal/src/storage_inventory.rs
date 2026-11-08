@@ -105,6 +105,7 @@ pub(crate) fn tables() -> Vec<TableSpec> {
         crate::remote_delete::schema::TABLES,
         crate::remote_replace::schema::TABLES,
         crate::conflict_resolution::schema::TABLES,
+        crate::conflict_resolution::native_future_schema::TABLES,
     ]
     .concat()
 }

@@ -1,6 +1,10 @@
 //! Held complete baseline only; no durable native admission or execution grant.
 use super::*;
+mod admission;
 use crate::NativePublicationFileObservation;
+pub use admission::{
+    ConflictNativeAdmission, ConflictNativeAdmissionLimits, ConflictNativeAdmissionReport,
+};
 use std::{
     fs,
     io::{Read, Seek, SeekFrom},

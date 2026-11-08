@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 43;
+const SCHEMA_VERSION: u32 = 44;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -25,7 +25,10 @@ pub type Result<T> = std::result::Result<T, JournalError>;
 mod causal_log;
 mod conflict_resolution;
 #[cfg(windows)]
-pub use conflict_resolution::{ConflictNativeBaseline, ConflictNativeBaselineReport};
+pub use conflict_resolution::{
+    ConflictNativeAdmission, ConflictNativeAdmissionLimits, ConflictNativeAdmissionReport,
+    ConflictNativeBaseline, ConflictNativeBaselineReport,
+};
 pub use conflict_resolution::{
     ConflictResolutionAdmission, ConflictResolutionAdmissionIntent, ConflictResolutionKey,
     ConflictResolutionPayload, ConflictResolutionProof, ConflictSignedOperation,
@@ -351,6 +354,11 @@ impl Journal {
         if version < 43 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-043.sql"))?;
+            tx.commit()?;
+        }
+        if version < 44 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-044.sql"))?;
             tx.commit()?;
         }
         conflict_resolution::validate_schema(&connection)?;

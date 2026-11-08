@@ -15,6 +15,12 @@ use sync_extend_core_model::{
 
 pub(crate) mod issuance;
 mod native_binding;
+pub(crate) mod native_future_schema;
+mod native_history_templates;
+mod native_ledger;
+mod native_ledger_storage;
+mod native_template_schema;
+mod native_templates;
 mod proof;
 pub use proof::{
     ConflictResolutionKey, ConflictResolutionPayload, ConflictResolutionProof,
@@ -24,7 +30,10 @@ pub use proof::{
 mod native_baseline;
 pub(crate) mod schema;
 #[cfg(windows)]
-pub use native_baseline::{ConflictNativeBaseline, ConflictNativeBaselineReport};
+pub use native_baseline::{
+    ConflictNativeAdmission, ConflictNativeAdmissionLimits, ConflictNativeAdmissionReport,
+    ConflictNativeBaseline, ConflictNativeBaselineReport,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -376,6 +385,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     }
     expected.execute_batch(include_str!("migration-042.sql"))?;
     expected.execute_batch(include_str!("migration-043.sql"))?;
+    expected.execute_batch(include_str!("migration-044.sql"))?;
     if objects(connection)? != objects(&expected)? {
         return Err(invalid(
             "conflict resolution exact schema/trigger/index differs",
@@ -384,17 +394,34 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn all_tables() -> Vec<crate::storage_inventory::reader::TableSpec> {
+    [schema::TABLES, native_future_schema::TABLES].concat()
+}
+
 pub(crate) fn metadata_budget(connection: &Connection) -> Result<(u64, u64)> {
     let tables = preflight(
         connection,
-        schema::TABLES,
+        &all_tables(),
         sync_extend_core_model::limits::MAX_ENTRIES,
         sync_extend_core_model::limits::MAX_ENTRIES as u64 * 1024,
     )?;
-    Ok((
-        tables.iter().map(|t| t.rows).sum(),
-        tables.iter().map(|t| t.logical_bytes).sum(),
-    ))
+    let (reserved_rows,reserved_bytes):(i64,i64)=connection.query_row(
+        "SELECT coalesce(sum(reserved_rows),0),coalesce(sum(reserved_bytes),0) FROM main.conflict_resolution_native_headers",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    let reserved_rows = u64::try_from(reserved_rows)
+        .map_err(|_| invalid("conflict future negative reserved rows"))?;
+    let reserved_bytes = u64::try_from(reserved_bytes)
+        .map_err(|_| invalid("conflict future negative reserved bytes"))?;
+    let rows = tables.iter().try_fold(reserved_rows, |total, t| {
+        total
+            .checked_add(t.rows)
+            .ok_or(invalid("conflict future legacy row budget overflow"))
+    })?;
+    let bytes = tables.iter().try_fold(reserved_bytes, |total, t| {
+        total
+            .checked_add(t.logical_bytes)
+            .ok_or(invalid("conflict future legacy byte budget overflow"))
+    })?;
+    Ok((rows, bytes))
 }
 
 fn expected_values(header: &Header) -> Result<Vec<(&'static str, Vec<Value>)>> {
@@ -461,7 +488,8 @@ type RowMap = BTreeMap<RowKey, RowValue>;
 fn value_columns(suffix: &str, values: &[Value]) -> Result<(RowKey, RowValue)> {
     use crate::{JournalStorageColumn, JournalStorageColumnValue};
     let name = format!("conflict_resolution_{suffix}");
-    let spec = schema::TABLES
+    let specs = all_tables();
+    let spec = specs
         .iter()
         .find(|s| s.name == name)
         .ok_or(invalid("conflict row table"))?;
@@ -512,7 +540,7 @@ pub(crate) fn obligations(
         .iter()
         .filter(|r| {
             r.table().starts_with("conflict_resolution_")
-                && r.table() != "conflict_resolution_native_bindings"
+                && !r.table().starts_with("conflict_resolution_native_")
         })
         .collect();
     let headers: Vec<_> = own
@@ -559,7 +587,7 @@ pub(crate) fn obligations(
     native_binding::audit(connection)?;
     // Schema42 admission has no future writer/Final authority or liability
     // reservation. Native capacity must be reserved separately before C4 effects.
-    Ok(Vec::new())
+    native_ledger_storage::audit(rows, connection)
 }
 
 impl Journal {

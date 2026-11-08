@@ -246,7 +246,18 @@ impl Journal {
              OR EXISTS(SELECT 1 FROM main.conflict_resolution_signatures)
              OR EXISTS(SELECT 1 FROM main.conflict_resolution_sequences)
              OR EXISTS(SELECT 1 FROM main.conflict_resolution_objects)
-             OR EXISTS(SELECT 1 FROM main.conflict_resolution_native_bindings)",
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_native_bindings)
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_native_headers)
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_native_templates)
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_native_activations)
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_native_creators)
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_native_phases)
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_native_steps)
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_native_dispositions)
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_native_history)
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_native_events)
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_native_history_objects)
+             OR EXISTS(SELECT 1 FROM main.conflict_resolution_native_branch_handoffs)",
             [],
             |row| row.get(0),
         )?;
