@@ -1,5 +1,6 @@
 pub mod causal;
 pub mod config;
+pub mod conflict_native_layout;
 pub mod conflict_resolution;
 pub mod gc_recovery;
 pub mod ids;
