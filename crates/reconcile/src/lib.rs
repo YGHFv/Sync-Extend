@@ -1,4 +1,6 @@
 mod cleanup;
+mod conflict_branches;
+pub use conflict_branches::ConflictBranchPreparation;
 mod delete;
 mod diagnostics;
 mod fault;

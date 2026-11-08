@@ -162,6 +162,13 @@ enum Command {
         #[arg(long)]
         source: Option<PathBuf>,
     },
+    /// Pin every authenticated canonical conflict branch; never apply or release.
+    PrepareConflictBranches {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        signed_resolution: PathBuf,
+    },
     /// Inspect original signed Replace receipts without native recovery.
     #[cfg(windows)]
     RemoteReplaces {
@@ -1010,6 +1017,18 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             transaction,
         } => {
             print(&open(&data_dir)?.recover_remote_replace(&transaction.parse()?)?)?;
+        }
+        Command::PrepareConflictBranches {
+            data_dir,
+            signed_resolution,
+        } => {
+            let limits = sync_extend_core_model::conflict_resolution::ResolutionLimits::default();
+            let mut bytes = Vec::new();
+            std::fs::File::open(signed_resolution)?
+                .take(limits.max_bytes as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            let signed = sync_extend_transport::SignedFileResolution::from_slice(&bytes, limits)?;
+            print(&open(&data_dir)?.prepare_signed_conflict_branches(&signed, limits)?)?;
         }
         Command::ExchangeMetadata {
             data_dir,
