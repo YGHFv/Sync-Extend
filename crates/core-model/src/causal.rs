@@ -248,7 +248,12 @@ pub fn reduce_operations(
                 let known_paths = frontier(&known_paths, &operations, &mut work)?;
                 // Ordinary edits carry the old path in Put. They must not undo
                 // an independent Rename the editor had not yet observed.
+                // Observing a Delete ends the old path incarnation, even when
+                // a concurrent live branch remains in the known frontier.
                 if !known_live
+                    || known
+                        .iter()
+                        .any(|&old| matches!(operations[old].payload.change, Change::Delete { .. }))
                     || !known_paths
                         .iter()
                         .any(|&old| path(operations[old]).is_ok_and(|p| p == &entry.path))
