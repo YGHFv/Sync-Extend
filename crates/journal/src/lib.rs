@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 44;
+const SCHEMA_VERSION: u32 = 47;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -28,7 +28,7 @@ mod conflict_resolution;
 pub use conflict_resolution::{
     ConflictNativeAdmission, ConflictNativeAdmissionLimits, ConflictNativeAdmissionReport,
     ConflictNativeBaseline, ConflictNativeBaselineReport, ConflictNativeCreation,
-    ConflictNativeReadiness,
+    ConflictNativeExecution, ConflictNativeObservation, ConflictNativeReadiness,
 };
 pub use conflict_resolution::{
     ConflictResolutionAdmission, ConflictResolutionAdmissionIntent, ConflictResolutionKey,
@@ -360,6 +360,21 @@ impl Journal {
         if version < 44 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-044.sql"))?;
+            tx.commit()?;
+        }
+        if version < 45 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-045.sql"))?;
+            tx.commit()?;
+        }
+        if version < 46 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-046.sql"))?;
+            tx.commit()?;
+        }
+        if version < 47 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-047.sql"))?;
             tx.commit()?;
         }
         conflict_resolution::validate_schema(&connection)?;
@@ -954,6 +969,7 @@ impl Journal {
              UNION SELECT content_id FROM mutation_objects
              UNION SELECT content_id FROM read_lease_objects
              UNION SELECT content_id FROM reference_reservation_objects
+             UNION SELECT content_id FROM conflict_resolution_native_history_objects
              UNION SELECT content_id FROM conflict_resolution_objects
              UNION SELECT content_id FROM tree_restore_objects
              UNION SELECT content_id FROM tree_restore_original_objects ORDER BY content_id",

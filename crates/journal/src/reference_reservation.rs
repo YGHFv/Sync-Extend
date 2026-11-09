@@ -82,7 +82,7 @@ impl Journal {
             .into_iter()
             .find(|o| o.intent.owner_id == *owner_id)
             .ok_or(JournalError::Invariant("unknown reference reservation"))?;
-        if owner.snapshot_handoff.is_some() {
+        if owner.snapshot_handoff.is_some() || owner.state == "transferred_to_conflict_history" {
             return Err(JournalError::Invariant("reference reservation is terminal").into());
         }
         let length =
@@ -220,6 +220,11 @@ impl Journal {
                 .ok_or(JournalError::Invariant("unknown reference reservation"))
         };
         let replay = |owner: &ReferenceReservation| -> Result<bool> {
+            if owner.state == "transferred_to_conflict_history" {
+                return Err(JournalError::Invariant(
+                    "conflict history cannot impersonate snapshot handoff",
+                ));
+            }
             if let Some(handoff) = &owner.snapshot_handoff {
                 if handoff.snapshot_id != *snapshot_id {
                     return Err(JournalError::Invariant("snapshot handoff target collision"));
@@ -391,6 +396,14 @@ impl crate::JournalReadView<'_> {
             } else {
                 None
             };
+            let conflict_handoff =
+                crate::conflict_resolution::native_handoff_state::reference_terminal(
+                    self.connection,
+                    &intent,
+                )?;
+            if conflict_handoff {
+                expected.clear();
+            }
             let mut pins = self.connection.prepare(
                 "SELECT content_id FROM reference_reservation_objects WHERE owner_id=?1",
             )?;
@@ -416,7 +429,9 @@ impl crate::JournalReadView<'_> {
             }
             owners.push(ReferenceReservation {
                 intent,
-                state: if snapshot_handoff.is_some() {
+                state: if conflict_handoff {
+                    "transferred_to_conflict_history"
+                } else if snapshot_handoff.is_some() {
                     "transferred_to_snapshot"
                 } else {
                     "reserved"

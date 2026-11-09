@@ -106,6 +106,7 @@ pub(crate) fn validate_pruned_snapshot(
         "SELECT EXISTS(SELECT 1 FROM current_manifests WHERE snapshot_id=?1)
             OR EXISTS(SELECT 1 FROM read_leases WHERE snapshot_id=?1)
             OR EXISTS(SELECT 1 FROM mutations WHERE baseline_root=?1 OR committed_snapshot=?1)
+            OR EXISTS(SELECT 1 FROM conflict_resolution_native_history WHERE target_root=?1)
             OR EXISTS(SELECT 1 FROM publications WHERE committed_snapshot=?1
                 OR json_extract(intent,'$.baseline_root')=?1 OR json_extract(intent,'$.source_snapshot')=?1)
             OR EXISTS(SELECT 1 FROM tree_restore_preparations p

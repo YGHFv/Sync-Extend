@@ -425,6 +425,7 @@ impl crate::JournalReadView<'_> {
             "SELECT EXISTS(SELECT 1 FROM snapshot_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM publication_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM remote_replace_objects WHERE content_id=?1)
+             OR EXISTS(SELECT 1 FROM conflict_resolution_native_history_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM conflict_resolution_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM mutation_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM read_lease_objects WHERE content_id=?1)

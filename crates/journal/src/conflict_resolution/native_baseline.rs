@@ -4,7 +4,8 @@ mod admission;
 use crate::NativePublicationFileObservation;
 pub use admission::{
     ConflictNativeAdmission, ConflictNativeAdmissionLimits, ConflictNativeAdmissionReport,
-    ConflictNativeCreation, ConflictNativeReadiness,
+    ConflictNativeCreation, ConflictNativeExecution, ConflictNativeObservation,
+    ConflictNativeReadiness,
 };
 use std::{
     fs,
@@ -138,6 +139,10 @@ impl ConflictNativeBaseline {
         self.verify_native_scope(None)
     }
     fn verify_native_scope(&self, owned_base: Option<FileKey>) -> Result<()> {
+        self.verify_retained_ancestors()?;
+        self.verify_root_originals(owned_base)
+    }
+    fn verify_retained_ancestors(&self) -> Result<()> {
         self.marker_file.verify_single_link()?;
         let mut marker = self.marker_file.reader();
         marker.seek(SeekFrom::Start(0))?;
@@ -162,6 +167,9 @@ impl ConflictNativeBaseline {
                 ));
             }
         }
+        Ok(())
+    }
+    fn verify_root_originals(&self, owned_base: Option<FileKey>) -> Result<()> {
         let root = &self.directories[0].path;
         let mut seen = BTreeSet::new();
         for child in fs::read_dir(root)? {

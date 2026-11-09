@@ -128,9 +128,6 @@ pub(super) fn audit(
         .iter()
         .filter(|row| row.table() == "conflict_resolution_native_headers")
         .collect();
-    if owners.len() > 1 {
-        return Err(invalid("conflict future multiple immutable owners"));
-    }
     for owner in owners {
         let json: String = connection.query_row(
             "SELECT header FROM main.conflict_resolution_admissions WHERE transaction_id=?1",
@@ -143,14 +140,27 @@ pub(super) fn audit(
         let binding = super::native_binding::stored(connection, &parent)?.ok_or(invalid(
             "conflict future missing durable native original keys",
         ))?;
-        let history =
-            super::native_history_templates::HistorySelection::from_actual(&parent, rows)?;
-        if history != header.history {
-            return Err(invalid("conflict future selected actual history changed"));
+        if super::native_final_state::present(connection, &parent)? {
+            super::native_final_state::exact_history(connection, &parent)?;
+        } else {
+            let history =
+                super::native_history_templates::HistorySelection::from_actual(&parent, rows)?;
+            if history != header.history {
+                return Err(invalid("conflict future selected actual history changed"));
+            }
         }
         let ledger = header.validate(&parent, &binding)?;
         require_fresh_generation(&header, rows, connection)?;
-        let effects = super::native_effects::audit(&header, &binding, &ledger, rows)?;
+        let scoped = rows
+            .iter()
+            .filter(|row| {
+                !row.table().starts_with("conflict_resolution_native_")
+                    || row.primary_key().first().map(String::as_str)
+                        == Some(parent.transaction_id.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let effects = super::native_effects::audit(&header, &binding, &ledger, &scoped)?;
         for (suffix, values) in values(&header, &ledger)?.into_iter().chain(effects.values) {
             let (key, columns) = value_columns(suffix, &values)?;
             if expected.insert(key, columns).is_some() {

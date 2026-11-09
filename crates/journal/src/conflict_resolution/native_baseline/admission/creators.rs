@@ -4,21 +4,21 @@ use super::*;
 use sync_extend_platform_fs::OwnedFileCreation;
 
 pub struct ConflictNativeCreation {
-    admission: ConflictNativeAdmission,
-    base: LockedDirectory,
-    owner: LockedDirectory,
-    keys: BTreeMap<u64, Key>,
-    payloads: BTreeMap<EntryId, (u64, OwnedFileCreation)>,
+    pub(super) admission: ConflictNativeAdmission,
+    pub(super) base: LockedDirectory,
+    pub(super) owner: LockedDirectory,
+    pub(super) keys: BTreeMap<u64, Key>,
+    pub(super) payloads: BTreeMap<EntryId, (u64, OwnedFileCreation)>,
 }
 pub struct ConflictNativeReadiness {
-    admission: ConflictNativeAdmission,
-    base: LockedDirectory,
-    owner: LockedDirectory,
-    keys: BTreeMap<u64, Key>,
-    payloads: BTreeMap<EntryId, LockedFile>,
+    pub(super) admission: ConflictNativeAdmission,
+    pub(super) base: Option<LockedDirectory>,
+    pub(super) owner: Option<LockedDirectory>,
+    pub(super) keys: BTreeMap<u64, Key>,
+    pub(super) payloads: BTreeMap<EntryId, LockedFile>,
 }
 
-fn physical_key(key: &Key) -> Result<FileKey> {
+pub(super) fn physical_key(key: &Key) -> Result<FileKey> {
     Ok(FileKey {
         volume: u64::from_str_radix(&key.volume, 16)
             .map_err(|_| invalid("conflict original creator volume"))?,
@@ -26,10 +26,10 @@ fn physical_key(key: &Key) -> Result<FileKey> {
             .map_err(|_| invalid("conflict original creator full ID"))?,
     })
 }
-fn base_path(admission: &ConflictNativeAdmission) -> PathBuf {
+pub(super) fn base_path(admission: &ConflictNativeAdmission) -> PathBuf {
     admission.selected.directories[0].path.join(".sync-tmp")
 }
-fn owner_path(admission: &ConflictNativeAdmission) -> PathBuf {
+pub(super) fn owner_path(admission: &ConflictNativeAdmission) -> PathBuf {
     base_path(admission).join(format!("conflict-{}", admission.header.generation))
 }
 fn original_scope(admission: &ConflictNativeAdmission, keys: &BTreeMap<u64, Key>) -> Result<()> {
@@ -47,7 +47,10 @@ fn original_scope(admission: &ConflictNativeAdmission, keys: &BTreeMap<u64, Key>
     }
     Ok(())
 }
-fn base_key(admission: &ConflictNativeAdmission, keys: &BTreeMap<u64, Key>) -> Result<Key> {
+pub(super) fn base_key(
+    admission: &ConflictNativeAdmission,
+    keys: &BTreeMap<u64, Key>,
+) -> Result<Key> {
     admission
         .selected
         .binding()?
@@ -232,8 +235,8 @@ impl Journal {
         }
         let ready = ConflictNativeReadiness {
             admission,
-            base,
-            owner,
+            base: Some(base),
+            owner: Some(owner),
             keys,
             payloads,
         };
@@ -243,7 +246,10 @@ impl Journal {
         })?;
         Ok(ready)
     }
-    fn verify_conflict_creator_cas(&self, admission: &ConflictNativeAdmission) -> Result<()> {
+    pub(super) fn verify_conflict_creator_cas(
+        &self,
+        admission: &ConflictNativeAdmission,
+    ) -> Result<()> {
         let parent = self
             .database_path
             .parent()
@@ -275,7 +281,7 @@ impl Journal {
         }
         Ok(())
     }
-    fn fulfill_conflict_creator(
+    pub(super) fn fulfill_conflict_creator(
         &mut self,
         admission: &ConflictNativeAdmission,
         name: &str,
@@ -289,7 +295,10 @@ impl Journal {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let bounds = storage_policy::capacity_limits(self.max_storage_entries)?;
         let parent = &admission.selected.header;
-        let binding = admission.selected.binding()?;
+        let binding = super::super::super::native_binding::stored(&self.connection, parent)?
+            .ok_or(invalid(
+                "conflict effect original immutable binding missing",
+            ))?;
         let before = self
             .read_view()
             .audit_local_commit_capacity(&parent.target.space_id, bounds)?;
@@ -312,9 +321,18 @@ impl Journal {
             .ok_or(invalid("conflict creator named future template missing"))?;
         if !matches!(
             template.table.as_str(),
-            "conflict_resolution_native_activations" | "conflict_resolution_native_creators"
-        ) && template.name != "phase/ready"
-        {
+            "conflict_resolution_native_activations"
+                | "conflict_resolution_native_creators"
+                | "conflict_resolution_native_steps"
+                | "conflict_resolution_native_dispositions"
+        ) && !matches!(
+            template.name.as_str(),
+            "phase/ready"
+                | "phase/quarantined"
+                | "phase/observed"
+                | "phase/files_cleaned"
+                | "phase/cleanup"
+        ) {
             return Err(invalid("conflict unsupported native effect endpoint"));
         }
         if template
@@ -551,8 +569,8 @@ impl Journal {
         }
         let readiness = ConflictNativeReadiness {
             admission,
-            base,
-            owner,
+            base: Some(base),
+            owner: Some(owner),
             keys,
             payloads,
         };
@@ -581,8 +599,18 @@ impl ConflictNativeReadiness {
     }
     pub fn verify_content(&self) -> Result<()> {
         original_scope(&self.admission, &self.keys)?;
-        if descriptive(self.owner.key()?) != self.keys[&1]
-            || descriptive(self.base.key()?) != base_key(&self.admission, &self.keys)?
+        if descriptive(
+            self.owner
+                .as_ref()
+                .ok_or(invalid("conflict Ready owner absent"))?
+                .key()?,
+        ) != self.keys[&1]
+            || descriptive(
+                self.base
+                    .as_ref()
+                    .ok_or(invalid("conflict Ready base absent"))?
+                    .key()?,
+            ) != base_key(&self.admission, &self.keys)?
         {
             return Err(invalid("conflict whole Ready retained directories differ"));
         }

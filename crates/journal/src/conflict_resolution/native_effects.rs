@@ -95,6 +95,14 @@ pub(super) fn audit<'a>(
             )
         })
         .collect();
+    let final_present = actual.contains_key(&(
+        "conflict_resolution_native_phases".into(),
+        vec![header.transaction_id.to_string(), "final".into()],
+    ));
+    let handed_off = actual.contains_key(&(
+        "conflict_resolution_native_phases".into(),
+        vec![header.transaction_id.to_string(), "history_handoff".into()],
+    ));
     let mut result = Effects {
         values: Vec::new(),
         remaining: Vec::new(),
@@ -113,10 +121,95 @@ pub(super) fn audit<'a>(
         .chain(header.residue.files.iter().map(|row| row.key.clone()))
         .collect();
     for template in &ledger.templates {
+        if handed_off && template.name.starts_with("release/") {
+            if template
+                .dependencies
+                .iter()
+                .any(|name| !result.fulfilled.contains(name))
+            {
+                return Err(invalid("conflict handoff exact release dependency absent"));
+            }
+            let cells = template
+                .prior
+                .as_ref()
+                .ok_or(invalid("conflict handoff release prior absent"))?;
+            let values = resolve(cells, &result.creators)?;
+            let found = rows.iter().any(|row| {
+                row.table() == template.table
+                    && row
+                        .columns()
+                        .iter()
+                        .zip(&values)
+                        .all(|(c, v)| match (&c.value, v) {
+                            (crate::JournalStorageColumnValue::Text(a), Value::Text(b)) => a == b,
+                            (crate::JournalStorageColumnValue::Integer(a), Value::Integer(b)) => {
+                                *a == *b as u64
+                            }
+                            _ => false,
+                        })
+            });
+            if found {
+                return Err(invalid("conflict handoff incomplete atomic release"));
+            }
+            result.fulfilled.insert(template.name.clone());
+            continue;
+        }
+        if template.name.starts_with("history/") && final_present {
+            if template
+                .dependencies
+                .iter()
+                .any(|name| !result.fulfilled.contains(name))
+            {
+                return Err(invalid("conflict Final history dependency missing"));
+            }
+            if template.table.starts_with("conflict_resolution_native_") {
+                let suffix = template
+                    .table
+                    .strip_prefix("conflict_resolution_")
+                    .ok_or(invalid("conflict Final history namespace"))?;
+                let stored = actual
+                    .get(&key(template)?)
+                    .ok_or(invalid("conflict Final history receipt absent"))?;
+                let values = resolve(
+                    template
+                        .future
+                        .as_ref()
+                        .ok_or(invalid("conflict Final history future absent"))?,
+                    &result.creators,
+                )?;
+                let (_, expected) = value_columns(suffix, &values)?;
+                if *stored != expected {
+                    return Err(invalid("conflict Final exact history receipt differs"));
+                }
+                let suffix = match suffix {
+                    "native_history" => "native_history",
+                    "native_events" => "native_events",
+                    "native_history_objects" => "native_history_objects",
+                    "native_branch_handoffs" => "native_branch_handoffs",
+                    _ => return Err(invalid("conflict Final unsupported history receipt table")),
+                };
+                result.values.push((suffix, values));
+            }
+            result.fulfilled.insert(template.name.clone());
+            continue;
+        }
         let suffix = match template.table.as_str() {
             "conflict_resolution_native_activations" => "native_activations",
             "conflict_resolution_native_creators" => "native_creators",
-            "conflict_resolution_native_phases" if template.name == "phase/ready" => {
+            "conflict_resolution_native_steps" => "native_steps",
+            "conflict_resolution_native_dispositions" => "native_dispositions",
+            "conflict_resolution_native_phases"
+                if matches!(
+                    template.name.as_str(),
+                    "phase/ready"
+                        | "phase/quarantined"
+                        | "phase/observed"
+                        | "phase/final"
+                        | "phase/history_handoff"
+                        | "phase/files_cleaned"
+                        | "phase/cleanup"
+                ) =>
+            {
                 "native_phases"
             }
             _ => {

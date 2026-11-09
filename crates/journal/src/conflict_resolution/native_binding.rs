@@ -129,16 +129,23 @@ pub(super) fn audit(connection: &Connection) -> Result<()> {
     if count == 0 {
         return Ok(());
     }
-    if count != 1 {
-        return Err(invalid("conflict baseline binding multiple owners"));
+    if count > sync_extend_core_model::limits::MAX_ENTRIES as i64 {
+        return Err(invalid("conflict baseline binding owner bound"));
     }
-    let json: String = connection.query_row(
-        "SELECT a.header FROM main.conflict_resolution_admissions a JOIN main.conflict_resolution_native_bindings b USING(transaction_id)",
-        [], |r|r.get(0),
+    let mut statement = connection.prepare(
+        "SELECT a.header FROM main.conflict_resolution_admissions a JOIN main.conflict_resolution_native_bindings b USING(transaction_id) ORDER BY a.transaction_id",
     )?;
-    let header: Header = serde_json::from_str(&json)?;
-    if stored(connection, &header)?.is_none() {
-        return Err(invalid("conflict baseline binding original parent missing"));
+    let mut rows = statement.query([])?;
+    let mut actual = 0;
+    while let Some(row) = rows.next()? {
+        let header: Header = serde_json::from_str(&row.get::<_, String>(0)?)?;
+        if stored(connection, &header)?.is_none() {
+            return Err(invalid("conflict baseline binding original parent missing"));
+        }
+        actual += 1;
+    }
+    if actual != count {
+        return Err(invalid("conflict baseline binding orphan parent"));
     }
     Ok(())
 }

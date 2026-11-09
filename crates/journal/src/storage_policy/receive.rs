@@ -78,7 +78,13 @@ pub(crate) fn tree_gate(before: &CapacitySnapshot) -> Result<()> {
 pub(crate) fn completion_gate(before: &CapacitySnapshot) -> Result<()> {
     for row in &before.rows {
         let active = match row.table() {
-            "conflict_resolution_admissions" => true,
+            // CapacitySnapshot has already reconstructed every immutable native
+            // dependency; this is not an unaudited bare cleanup-phase escape.
+            "conflict_resolution_admissions" => !before.rows.iter().any(|phase| {
+                phase.table() == "conflict_resolution_native_phases"
+                    && phase.primary_key().first() == row.primary_key().first()
+                    && text(phase, "phase").ok() == Some("cleanup")
+            }),
             "publications" => text(row, "state")? != "committed",
             "mutations" => !matches!(text(row, "state")?, "cancelled" | "committed"),
             _ => false,

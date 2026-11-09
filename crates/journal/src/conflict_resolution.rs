@@ -15,8 +15,11 @@ use sync_extend_core_model::{
 
 pub(crate) mod issuance;
 mod native_binding;
+mod native_cleanup_state;
 mod native_effects;
+mod native_final_state;
 pub(crate) mod native_future_schema;
+pub(crate) mod native_handoff_state;
 mod native_history_templates;
 mod native_ledger;
 mod native_ledger_storage;
@@ -34,7 +37,7 @@ pub(crate) mod schema;
 pub use native_baseline::{
     ConflictNativeAdmission, ConflictNativeAdmissionLimits, ConflictNativeAdmissionReport,
     ConflictNativeBaseline, ConflictNativeBaselineReport, ConflictNativeCreation,
-    ConflictNativeReadiness,
+    ConflictNativeExecution, ConflictNativeObservation, ConflictNativeReadiness,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -269,6 +272,9 @@ fn pins(header: &Header) -> Result<BTreeMap<(String, ContentId), u32>> {
 }
 
 fn bind(connection: &Connection, header: &Header, plan: &FileResolutionPlan) -> Result<()> {
+    if native_final_state::present(connection, header)? {
+        return native_final_state::exact_history(connection, header);
+    }
     let intent = &header.intent;
     let p = &intent.proof.payload;
     let state = |name: &str| -> Result<String> {
@@ -388,6 +394,13 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     expected.execute_batch(include_str!("migration-042.sql"))?;
     expected.execute_batch(include_str!("migration-043.sql"))?;
     expected.execute_batch(include_str!("migration-044.sql"))?;
+    expected.execute_batch(include_str!("migration-045.sql"))?;
+    expected.execute_batch(
+        "CREATE TABLE reference_reservation_objects(owner_id TEXT,content_id TEXT);
+         CREATE TRIGGER reference_reservation_pin_no_delete BEFORE DELETE ON reference_reservation_objects BEGIN SELECT RAISE(ABORT,'reference reservation release is unavailable'); END;"
+    )?;
+    expected.execute_batch(include_str!("migration-046.sql"))?;
+    expected.execute_batch(include_str!("migration-047.sql"))?;
     if objects(connection)? != objects(&expected)? {
         return Err(invalid(
             "conflict resolution exact schema/trigger/index differs",
@@ -549,8 +562,19 @@ pub(crate) fn obligations(
         .iter()
         .filter(|r| r.table() == "conflict_resolution_admissions")
         .collect();
-    if headers.len() > 1 {
-        return Err(invalid("multiple prospective conflict resolution owners"));
+    let mut active = 0;
+    for row in &headers {
+        let parent: Header = serde_json::from_str(&connection.query_row(
+            "SELECT header FROM main.conflict_resolution_admissions WHERE transaction_id=?1",
+            [row.primary_key()[0].as_str()],
+            |r| r.get::<_, String>(0),
+        )?)?;
+        if !native_cleanup_state::complete(connection, &parent)? {
+            active += 1;
+        }
+    }
+    if active > 1 {
+        return Err(invalid("multiple active conflict resolution owners"));
     }
     let mut expected = RowMap::new();
     for row in headers {
@@ -566,6 +590,9 @@ pub(crate) fn obligations(
         let plan = header.plan()?;
         bind(connection, &header, &plan)?;
         for (suffix, values) in expected_values(&header)? {
+            if suffix == "objects" && native_handoff_state::present(connection, &header)? {
+                continue;
+            }
             let (key, columns) = value_columns(suffix, &values)?;
             if expected.insert(key, columns).is_some() {
                 return Err(invalid("duplicate conflict admission row"));
@@ -594,12 +621,16 @@ pub(crate) fn obligations(
 
 impl Journal {
     pub fn require_no_conflict_resolution(&self) -> Result<()> {
-        if self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM main.conflict_resolution_admissions)",
-            [],
-            |r| r.get::<_, bool>(0),
-        )? {
-            return Err(invalid("prospective conflict resolution owns writer gate"));
+        let mut statement = self.connection.prepare(
+            "SELECT header FROM main.conflict_resolution_admissions ORDER BY transaction_id",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let parent: Header = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            if !native_cleanup_state::complete(&self.connection, &parent)? {
+                return Err(invalid("prospective conflict resolution owns writer gate"));
+            }
+            native_final_state::exact_history(&self.connection, &parent)?;
         }
         Ok(())
     }
@@ -625,7 +656,14 @@ impl Journal {
                 let crate::JournalStorageColumnValue::Text(json) = &column.value else {
                     return Err(invalid("conflict header expected text"));
                 };
-                serde_json::from_str::<Header>(json)?.receipt()
+                let header = serde_json::from_str::<Header>(json)?;
+                let mut receipt = header.receipt()?;
+                if native_final_state::present(&self.connection, &header)? {
+                    native_final_state::exact_history(&self.connection, &header)?;
+                    receipt.resolution_applied = true;
+                    receipt.worktree_materialized = true;
+                }
+                Ok(receipt)
             })
             .collect()
     }
@@ -707,6 +745,10 @@ impl Journal {
         ));
         if exists {
             for (suffix, values) in &candidate {
+                if *suffix == "objects" && native_handoff_state::present(&self.connection, &header)?
+                {
+                    continue;
+                }
                 let (key, columns) = value_columns(suffix, values)?;
                 if expected.get(&key) != Some(&columns) {
                     return Err(invalid("conflict duplicate admission differs").into());

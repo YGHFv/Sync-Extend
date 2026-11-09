@@ -191,7 +191,7 @@ pub(super) fn liabilities(owners: &Owners, rows: &[JournalStoredRow]) -> Result<
         }
     }
     for owner in &owners.references {
-        if owner.snapshot_handoff.is_none() {
+        if owner.snapshot_handoff.is_none() && owner.state != "transferred_to_conflict_history" {
             let id = owner.intent.owner_id.to_string();
             match owner.intent.scope.kind {
                 ReferenceOwnerKind::Download | ReferenceOwnerKind::Restore => {

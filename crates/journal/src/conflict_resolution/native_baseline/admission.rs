@@ -2,8 +2,14 @@
 use super::super::native_ledger::{NativeHeader, Residue, ResidueDirectory, ResidueFile};
 use super::super::native_ledger_storage;
 use super::*;
+mod cleanup;
 mod creators;
+mod disposition;
+mod final_commit;
+mod forward;
+mod handoff;
 pub use creators::{ConflictNativeCreation, ConflictNativeReadiness};
+pub use forward::{ConflictNativeExecution, ConflictNativeObservation};
 
 struct RetainedResidue {
     description: Residue,
@@ -157,6 +163,14 @@ impl RetainedResidue {
         owner: Option<&Path>,
     ) -> Result<()> {
         selected.verify_native_scope(owned_base)?;
+        self.verify_borrowed_scope(selected, owned_base, owner)
+    }
+    fn verify_borrowed_scope(
+        &self,
+        selected: &ConflictNativeBaseline,
+        owned_base: Option<FileKey>,
+        owner: Option<&Path>,
+    ) -> Result<()> {
         let mut expected: BTreeMap<PathBuf, BTreeSet<PathBuf>> = BTreeMap::new();
         if let Some(base) = &selected.base {
             expected.insert(base.path.clone(), BTreeSet::new());
