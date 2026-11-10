@@ -197,6 +197,15 @@ impl Journal {
 }
 
 impl crate::JournalReadView<'_> {
+    pub(crate) fn audit_original_provenance_capacity(
+        &self,
+        space: &SpaceId,
+        max: usize,
+        bounds: JournalCapacityLimits,
+    ) -> Result<CapacitySnapshot> {
+        self.capacity_snapshot(space, max, bounds, OwnerAudit::Initialized)
+    }
+
     pub(crate) fn audit_storage_capacity(
         &self,
         space: &SpaceId,
@@ -312,6 +321,8 @@ impl crate::JournalReadView<'_> {
             &row_hashes,
         ))?;
         let mut liabilities = ordinary::liabilities(&audited, &rows)?;
+        crate::original_provenance::audit(self.connection)?;
+        crate::original_page_inbox::audit(self.connection)?;
         liabilities
             .obligations
             .extend(crate::remote_rename::obligations(&rows, self.connection)?);

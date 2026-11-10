@@ -218,6 +218,8 @@ fn ordinary_scope(view: &JournalReadView<'_>, space: &SpaceId) -> Result<()> {
         "reference_reservations",
         "original_disposals",
         "rename_observations",
+        "original_operation_provenance",
+        "original_page_inbox",
     ]
     .into_iter()
     .map(|table| format!("EXISTS(SELECT 1 FROM main.{table} WHERE space_id!=?1)"))

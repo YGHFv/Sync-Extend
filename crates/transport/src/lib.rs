@@ -3,6 +3,14 @@ mod connection;
 mod identity;
 mod metadata_cycle;
 mod operation_batch;
+mod original_applied;
+mod original_content;
+mod original_page;
+mod resolution_wire;
+pub use resolution_wire::{
+    OriginalConflictOffer, OriginalConflictTargetReceipt, SignedOriginalConflictOffer,
+    SignedOriginalConflictTargetReceipt, MAX_RESOLUTION_WIRE_BYTES,
+};
 mod signed;
 mod tls;
 mod wire;
@@ -18,6 +26,15 @@ pub use metadata_cycle::{MetadataCycleHello, MAX_METADATA_CYCLE_ROUNDS};
 pub use operation_batch::{
     OperationBatchRequest, OperationReceiveReceipt, SignedOperationBatch,
     SignedOperationReceiveReceipt,
+};
+pub use original_applied::{OriginalPageAppliedReceipt, SignedOriginalPageAppliedReceipt};
+pub use original_content::{
+    OriginalContentRequest, SignedOriginalContentRequest, VerifiedOriginalContentOffer,
+    MAX_ORIGINAL_CONTENT_BYTES, MAX_ORIGINAL_CONTENT_CHUNKS,
+};
+pub use original_page::{
+    OriginalOperationPage, OriginalPageReceiveReceipt, SignedOriginalOperationPage,
+    SignedOriginalPageReceiveReceipt, MAX_ORIGINAL_PAGE_BYTES,
 };
 pub use signed::{Hello, Receipt, ReceiptState, SignedHello, SignedOperation, SignedReceipt};
 pub use wire::{FileOffer, FileRequest, FileResponse, SignedFileOffer, MAX_OFFER_BYTES};

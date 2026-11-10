@@ -38,7 +38,30 @@ mod mutation;
 mod native_file_view;
 #[cfg(windows)]
 mod native_publish;
+mod original_content;
+mod original_receive;
+pub use original_receive::OriginalMetadataReceive;
+mod original_applied;
+mod original_apply;
+mod original_conflict;
+#[cfg(windows)]
+mod original_conflict_wire;
+#[cfg(windows)]
+mod original_cycle;
+mod original_exchange;
+mod original_worker;
+pub use original_apply::{OriginalApplyResult, OriginalApplyState};
+#[cfg(windows)]
+pub use original_cycle::OriginalPairedCycle;
+#[cfg(windows)]
+pub use original_exchange::OriginalExchangeReceipt;
+pub use original_worker::{
+    original_worker_transport_retryable, OriginalPairedWorkerBudget, OriginalWorkerBudget,
+};
 mod original_retention;
+pub use original_content::{OriginalContentImport, OriginalContentPreparation};
+mod original_transfer;
+pub use original_transfer::OriginalContentPull;
 mod persisted_rename;
 mod publish;
 #[cfg(windows)]
@@ -107,6 +130,8 @@ pub enum ReconcileError {
     Journal(#[from] sync_extend_journal::JournalError),
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("authenticated transport error: {0}")]
+    Transport(#[from] sync_extend_transport::TransportError),
     #[error("safety check failed: {0}")]
     Invariant(&'static str),
     #[error("worktree changed during scanning; retry after writers settle")]

@@ -17,6 +17,15 @@ fn protocol(error: impl std::fmt::Display) -> TransportError {
     TransportError::Connection(error.to_string())
 }
 
+fn connect_error(error: quinn::ConnectionError) -> TransportError {
+    match error {
+        quinn::ConnectionError::Reset
+        | quinn::ConnectionError::TimedOut
+        | quinn::ConnectionError::ApplicationClosed(_) => protocol(error),
+        _ => TransportError::Authorization("QUIC protocol or TLS handshake refused"),
+    }
+}
+
 fn transport() -> Arc<quinn::TransportConfig> {
     let mut config = quinn::TransportConfig::default();
     config.max_concurrent_uni_streams(0u8.into());
@@ -63,7 +72,7 @@ impl Listener {
         let connection = tokio::time::timeout(IO_TIMEOUT, incoming)
             .await
             .map_err(|_| TransportError::Protocol("handshake timeout"))?
-            .map_err(protocol)?;
+            .map_err(connect_error)?;
         let (send, receive) = tokio::time::timeout(IO_TIMEOUT, connection.accept_bi())
             .await
             .map_err(|_| TransportError::Protocol("stream timeout"))?
@@ -113,7 +122,7 @@ impl Connection {
         let connection = tokio::time::timeout(IO_TIMEOUT, connecting)
             .await
             .map_err(|_| TransportError::Protocol("handshake timeout"))?
-            .map_err(protocol)?;
+            .map_err(connect_error)?;
         let (send, receive) = connection.open_bi().await.map_err(protocol)?;
         Self::establish(endpoint, connection, send, receive, identity, peer, true).await
     }
@@ -207,6 +216,16 @@ impl Connection {
         )?)
     }
 
+    /// A peer may perform a bounded native Final before its next control frame.
+    /// Length checks still precede allocation; ordinary frames retain 30s I/O.
+    pub async fn receive_json_after_application<T: DeserializeOwned>(&mut self) -> Result<T> {
+        Ok(serde_json::from_slice(
+            &self
+                .read_frame_with_timeout(CONTROL_FRAME, MAX_CONTROL_BYTES, Duration::from_secs(300))
+                .await?,
+        )?)
+    }
+
     pub async fn send_block(&mut self, expected: &ContentId, bytes: &[u8]) -> Result<()> {
         if bytes.is_empty() || ContentId::hash(bytes) != *expected {
             return Err(TransportError::Protocol("invalid outgoing block"));
@@ -248,7 +267,17 @@ impl Connection {
     }
 
     async fn read_frame(&mut self, kind: u8, maximum: usize) -> Result<Vec<u8>> {
-        tokio::time::timeout(IO_TIMEOUT, async {
+        self.read_frame_with_timeout(kind, maximum, IO_TIMEOUT)
+            .await
+    }
+
+    async fn read_frame_with_timeout(
+        &mut self,
+        kind: u8,
+        maximum: usize,
+        wait: Duration,
+    ) -> Result<Vec<u8>> {
+        tokio::time::timeout(wait, async {
             let mut header = [0u8; 5];
             self.receive
                 .read_exact(&mut header)

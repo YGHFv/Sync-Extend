@@ -96,6 +96,8 @@ impl JournalStorageInventory {
 pub(crate) fn tables() -> Vec<TableSpec> {
     [
         schema::TABLES,
+        crate::original_provenance::TABLES,
+        crate::original_page_inbox::TABLES,
         crate::tree_storage_inventory::schema::TABLES,
         crate::tree_native_storage::schema::TABLES,
         crate::tree_native_future::schema::TABLES,
@@ -162,6 +164,8 @@ impl Journal {
         crate::remote_delete::obligations(&rows, &self.connection)?;
         crate::remote_replace::obligations(&rows, &self.connection)?;
         crate::conflict_resolution::obligations(&rows, &self.connection)?;
+        crate::original_provenance::audit(&self.connection)?;
+        crate::original_page_inbox::audit(&self.connection)?;
         if rows
             .iter()
             .any(|row| row.table() == "native_publication_headers")

@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 48;
+const SCHEMA_VERSION: u32 = 50;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -36,6 +36,9 @@ pub use conflict_resolution::{
     EquivalentConflictHistory, ForeignConflictResolutionAdmission,
 };
 mod operation_batch;
+mod original_page_inbox;
+mod original_provenance;
+pub use original_page_inbox::OriginalPageEnvelope;
 mod read_view;
 use read_view::JournalReadView;
 mod native_publication;
@@ -83,6 +86,7 @@ pub struct Journal {
     database_path: std::path::PathBuf,
     max_storage_entries: usize,
     conflict_resolution_issuance: conflict_resolution::issuance::Gate,
+    original_operation_issuance: original_provenance::Gate,
     #[cfg(windows)]
     native_issuance: native_publication::issuance::Gate,
     #[cfg(windows)]
@@ -383,6 +387,19 @@ impl Journal {
             tx.execute_batch(include_str!("migration-048.sql"))?;
             tx.commit()?;
         }
+        if version < 49 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-049.sql"))?;
+            tx.commit()?;
+        }
+        if version < 50 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-050.sql"))?;
+            tx.commit()?;
+        }
+        original_provenance::validate_schema(&connection)?;
+        original_page_inbox::validate_schema(&connection)?;
+        let original_operation_issuance = original_provenance::Gate::register(&connection)?;
         conflict_resolution::validate_schema(&connection)?;
         let conflict_resolution_issuance =
             conflict_resolution::issuance::Gate::register(&connection)?;
@@ -406,6 +423,7 @@ impl Journal {
             database_path: std::fs::canonicalize(path)?,
             max_storage_entries,
             conflict_resolution_issuance,
+            original_operation_issuance,
             #[cfg(windows)]
             native_issuance,
             #[cfg(windows)]
@@ -1639,6 +1657,7 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
                 (SELECT count(*) FROM reference_snapshot_handoffs))
             + (SELECT count(*) FROM reference_reservation_objects)
             + (SELECT count(*) FROM rename_observations)
+            + (SELECT count(*) FROM original_operation_provenance)
             + (SELECT count(*) FROM original_disposals)
             + max((SELECT count(*) FROM original_disposals),
                 (SELECT count(*) FROM original_disposal_completions))
@@ -1691,6 +1710,9 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
                 FROM reference_reservations)
             + (SELECT coalesce(sum(length(CAST(observation AS BLOB))),0)
                 FROM rename_observations)
+            + (SELECT coalesce(sum(length(CAST(space_id AS BLOB))+length(CAST(origin_device_id AS BLOB))+8
+                +length(CAST(op_id AS BLOB))+length(CAST(proof_hash AS BLOB))+length(CAST(proof AS BLOB))),0)
+                FROM original_operation_provenance)
             + (SELECT coalesce(sum(length(CAST(intent AS BLOB))+4096),0)
                 FROM original_disposals)
             + (SELECT coalesce(sum(length(CAST(payload AS BLOB))+180),0) FROM operations)

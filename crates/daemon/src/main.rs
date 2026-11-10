@@ -22,6 +22,156 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run delayed paired original cycles; retained signed resolutions precede pages.
+    #[cfg(windows)]
+    RunOriginalCycle {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        address: std::net::SocketAddr,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
+        attempts: u32,
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=3600))]
+        delay_seconds: u32,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
+        rounds: u32,
+        #[arg(long)]
+        resolve_file_conflicts_at_ms: Option<u64>,
+    },
+    /// Serve one explicit bounded two-way original content/application cycle.
+    #[cfg(windows)]
+    ServeOriginalCycle {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
+        max_rounds: u32,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
+        attempts: u32,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=3600))]
+        delay_seconds: u32,
+        #[arg(long)]
+        allow_file_conflict_resolution: bool,
+    },
+    /// Exchange two-way originals and, only when opted in, one signed resolution.
+    #[cfg(windows)]
+    ExchangeOriginalCycle {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        address: std::net::SocketAddr,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
+        rounds: u32,
+        #[arg(long)]
+        resolve_file_conflicts_at_ms: Option<u64>,
+    },
+    /// Serve one complete own-resolver admission over authenticated QUIC.
+    #[cfg(windows)]
+    ServeOriginalConflict {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        transaction: String,
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+    },
+    /// Pull one exact foreign resolution, protecting content before native Final.
+    #[cfg(windows)]
+    PullOriginalConflict {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        address: std::net::SocketAddr,
+    },
+    /// Inspect complete signed originals; never synthesize foreign signatures.
+    OriginalConflictBundle {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Sign a proposal over complete retained originals without reserving sequence.
+    SignOriginalConflict {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        created_at_ms: u64,
+    },
+    /// Explicitly resolve complete retained flat-file originals through native gates.
+    #[cfg(windows)]
+    ResolveOriginalConflict {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        created_at_ms: u64,
+    },
+    /// Explicit bounded original file worker; one attempt, then delay, no bursts.
+    #[cfg(windows)]
+    RunOriginal {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        address: std::net::SocketAddr,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
+        attempts: u32,
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=3600))]
+        delay_seconds: u32,
+        /// Opt in to exact complete flat-file conflict preservation; explicit display time.
+        #[arg(long)]
+        resolve_file_conflicts_at_ms: Option<u64>,
+    },
+    /// Resume one original durable signed page offline through existing drivers.
+    #[cfg(windows)]
+    ResumeOriginal {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        request: String,
+    },
+    /// Serve a bounded number of explicitly paired original content/apply attempts.
+    #[cfg(windows)]
+    ServeOriginal {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=64))]
+        attempts: u32,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=3600))]
+        delay_seconds: u32,
+    },
+    /// Pull one original signed page, then explicitly receive/apply eligible files.
+    #[cfg(windows)]
+    PullOriginal {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        peer_device: String,
+        #[arg(long)]
+        address: std::net::SocketAddr,
+        #[arg(long, default_value_t = 0)]
+        after_sequence: u64,
+    },
+    /// Inspect exact durable signed pages with current approval and quota checks.
+    OriginalInbox {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..=64))]
+        max_pages: u32,
+    },
     /// Probe Linux/Android no-replace in a fresh private directory; preserve residues.
     ProbeNoReplace {
         #[arg(long)]
@@ -795,6 +945,396 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let local = LocalSpace::join_space(&data_dir, &root, &space.parse()?, limits.clone())?;
             print(&local.status()?)?;
+        }
+        #[cfg(windows)]
+        Command::ServeOriginalCycle {
+            data_dir,
+            peer_device,
+            listen,
+            max_rounds,
+            attempts,
+            delay_seconds,
+            allow_file_conflict_resolution,
+        } => {
+            let mut local = open(&data_dir)?;
+            let origin = peer_device.parse()?;
+            let peer = local.read_transport_peer(&origin)?;
+            let identity = local.transport_identity()?;
+            local.resume_original_paired_native_lineage(&origin)?;
+            local.scan_original_paired_worker()?;
+            let listener = sync_extend_transport::Listener::bind(listen, &identity, &peer)?;
+            print(
+                &serde_json::json!({"listening": listener.local_address()?, "max_original_rounds": max_rounds,
+                    "bounded_original_attempts": attempts, "post_attempt_delay_seconds": delay_seconds}),
+            )?;
+            for attempt in 1..=attempts {
+                if attempt > 1 {
+                    local.resume_original_paired_native_lineage(&origin)?;
+                    local.scan_original_paired_worker()?;
+                }
+                let current = local.read_transport_peer(&origin)?;
+                let action = async {
+                    let mut connection = listener.accept(&identity, &current).await?;
+                    let result = local
+                        .serve_original_paired_cycle(
+                            &mut connection,
+                            max_rounds,
+                            allow_file_conflict_resolution,
+                        )
+                        .await?;
+                    connection.finish().await?;
+                    Ok::<_, sync_extend_reconcile::ReconcileError>(result)
+                };
+                tokio::select! {
+                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    result = action => {
+                        match result {
+                            Ok(result) => print(&result)?,
+                            Err(sync_extend_reconcile::ReconcileError::Transport(error))
+                                if sync_extend_reconcile::original_worker_transport_retryable(&error) =>
+                            {
+                                eprintln!("syncd: paired original session disconnected; durable prefix retained: {error}");
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                }
+                tokio::select! {
+                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    _ = tokio::time::sleep(Duration::from_secs(u64::from(delay_seconds))) => {}
+                }
+            }
+        }
+        #[cfg(windows)]
+        Command::RunOriginalCycle {
+            data_dir,
+            peer_device,
+            address,
+            attempts,
+            delay_seconds,
+            rounds,
+            resolve_file_conflicts_at_ms,
+        } => {
+            let budget = sync_extend_reconcile::OriginalPairedWorkerBudget {
+                attempts,
+                delay_seconds,
+                rounds,
+            };
+            budget.validate()?;
+            let mut local = open(&data_dir)?;
+            let origin = peer_device.parse()?;
+            for attempt in 1..=attempts {
+                local.resume_original_paired_worker(&origin, resolve_file_conflicts_at_ms)?;
+                local.scan_original_paired_worker()?;
+                let peer = local.read_transport_peer(&origin)?;
+                let identity = local.transport_identity()?;
+                let action = async {
+                    let mut connection =
+                        sync_extend_transport::Connection::connect(address, &identity, &peer)
+                            .await?;
+                    let result = local
+                        .exchange_original_paired_cycle(
+                            &mut connection,
+                            rounds,
+                            resolve_file_conflicts_at_ms,
+                        )
+                        .await?;
+                    connection.finish().await?;
+                    Ok::<_, sync_extend_reconcile::ReconcileError>(result)
+                };
+                tokio::select! {
+                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    result = action => {
+                        match result {
+                            Ok(outcome) => {
+                                let pending = outcome.pulled.iter().chain(&outcome.served).any(|r|
+                                    r.received.is_some() && r.applied.is_none());
+                                print(&serde_json::json!({"attempt": attempt, "outcome": outcome}))?;
+                                if pending && resolve_file_conflicts_at_ms.is_none() {
+                                    return Err("paired original worker native safety refusal; explicit resolution required".into());
+                                }
+                            }
+                            Err(sync_extend_reconcile::ReconcileError::Transport(error))
+                                if sync_extend_reconcile::original_worker_transport_retryable(&error) =>
+                            {
+                                eprintln!("syncd: paired original worker disconnected; durable prefix retained: {error}");
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                }
+                tokio::select! {
+                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    _ = tokio::time::sleep(Duration::from_secs(u64::from(delay_seconds))) => {}
+                }
+            }
+        }
+        #[cfg(windows)]
+        Command::ExchangeOriginalCycle {
+            data_dir,
+            peer_device,
+            address,
+            rounds,
+            resolve_file_conflicts_at_ms,
+        } => {
+            let mut local = open(&data_dir)?;
+            let peer = local.read_transport_peer(&peer_device.parse()?)?;
+            let identity = local.transport_identity()?;
+            let mut connection =
+                sync_extend_transport::Connection::connect(address, &identity, &peer).await?;
+            let result = local
+                .exchange_original_paired_cycle(
+                    &mut connection,
+                    rounds,
+                    resolve_file_conflicts_at_ms,
+                )
+                .await?;
+            connection.finish().await?;
+            print(&result)?;
+        }
+        #[cfg(windows)]
+        Command::ServeOriginalConflict {
+            data_dir,
+            peer_device,
+            transaction,
+            listen,
+        } => {
+            let local = open(&data_dir)?;
+            let peer = local.read_transport_peer(&peer_device.parse()?)?;
+            let identity = local.transport_identity()?;
+            let listener = sync_extend_transport::Listener::bind(listen, &identity, &peer)?;
+            print(
+                &serde_json::json!({"listening": listener.local_address()?, "bounded_conflict_attempts": 1}),
+            )?;
+            let mut connection = listener.accept(&identity, &peer).await?;
+            let receipt = local
+                .serve_original_conflict_resolution(&mut connection, &transaction.parse()?)
+                .await?;
+            connection.finish().await?;
+            print(&receipt)?;
+        }
+        #[cfg(windows)]
+        Command::PullOriginalConflict {
+            data_dir,
+            peer_device,
+            address,
+        } => {
+            let mut local = open(&data_dir)?;
+            let peer = local.read_transport_peer(&peer_device.parse()?)?;
+            let identity = local.transport_identity()?;
+            let mut connection =
+                sync_extend_transport::Connection::connect(address, &identity, &peer).await?;
+            let receipt = local
+                .pull_original_conflict_resolution(&mut connection)
+                .await?;
+            connection.finish().await?;
+            print(&receipt)?;
+        }
+        Command::OriginalConflictBundle { data_dir } => {
+            print(&open(&data_dir)?.retained_original_conflict_bundle(
+                sync_extend_core_model::conflict_resolution::ResolutionLimits::default(),
+            )?)?;
+        }
+        Command::SignOriginalConflict {
+            data_dir,
+            created_at_ms,
+        } => {
+            print(&open(&data_dir)?.sign_retained_original_file_resolution(
+                created_at_ms,
+                sync_extend_core_model::conflict_resolution::ResolutionLimits::default(),
+            )?)?;
+        }
+        #[cfg(windows)]
+        Command::ResolveOriginalConflict {
+            data_dir,
+            created_at_ms,
+        } => {
+            print(&open(&data_dir)?.apply_retained_original_file_conflict(
+                created_at_ms,
+                sync_extend_core_model::conflict_resolution::ResolutionLimits::default(),
+            )?)?;
+        }
+        #[cfg(windows)]
+        Command::RunOriginal {
+            data_dir,
+            peer_device,
+            address,
+            attempts,
+            delay_seconds,
+            resolve_file_conflicts_at_ms,
+        } => {
+            let mut local = open(&data_dir)?;
+            let origin = peer_device.parse()?;
+            let budget = sync_extend_reconcile::OriginalWorkerBudget {
+                attempts,
+                delay_seconds,
+            };
+            budget.validate()?;
+            for attempt in 1..=attempts {
+                local.resume_original_worker_page_with_conflicts(
+                    &origin,
+                    resolve_file_conflicts_at_ms,
+                )?;
+                if local.original_worker_has_pending_native()? {
+                    return Err(
+                        "original worker pending native lineage; explicit scoped recovery required"
+                            .into(),
+                    );
+                }
+                let peer = local.read_transport_peer(&origin)?;
+                let identity = local.transport_identity()?;
+                let after = local.original_worker_after(&origin)?;
+                let action = async {
+                    match sync_extend_transport::Connection::connect(address, &identity, &peer)
+                        .await
+                    {
+                        Ok(mut connection) => {
+                            // A local refusal is not retried as a transport problem.
+                            let transfer = async {
+                                let outcome =
+                                    local.pull_original_exchange(&mut connection, after).await?;
+                                connection.finish().await?;
+                                Ok::<_, sync_extend_reconcile::ReconcileError>(outcome)
+                            }
+                            .await;
+                            let outcome = match transfer {
+                                Ok(outcome) => outcome,
+                                Err(sync_extend_reconcile::ReconcileError::Transport(error))
+                                    if sync_extend_reconcile::original_worker_transport_retryable(&error) =>
+                                {
+                                    eprintln!("syncd: original transfer disconnected; durable prefix retained: {error}");
+                                    return Ok(());
+                                }
+                                Err(error) => return Err(error.into()),
+                            };
+                            print(
+                                &serde_json::json!({"attempt": attempt, "after_applied": after, "outcome": outcome}),
+                            )?;
+                            if outcome.target_refusal.is_some() && outcome.received.is_some() {
+                                if let Some(time) = resolve_file_conflicts_at_ms {
+                                    let resolved = local.apply_retained_original_file_conflict(
+                                        time,
+                                        Default::default(),
+                                    )?;
+                                    print(&serde_json::json!({
+                                        "attempt": attempt, "local_conflict_resolution": resolved,
+                                        "peer_applied_acknowledged": false,
+                                        "requires_signed_resolution_exchange": true,
+                                    }))?;
+                                    return Ok(());
+                                }
+                                return Err::<(), Box<dyn std::error::Error>>("original worker native safety refusal; explicit resolution required".into());
+                            }
+                            Ok(())
+                        }
+                        Err(error)
+                            if sync_extend_reconcile::original_worker_transport_retryable(
+                                &error,
+                            ) =>
+                        {
+                            eprintln!("syncd: original worker connection unavailable: {error}");
+                            Ok(())
+                        }
+                        Err(error) => Err(error.into()),
+                    }
+                };
+                tokio::select! {
+                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    result = action => { result?; }
+                }
+                tokio::select! {
+                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    _ = tokio::time::sleep(Duration::from_secs(u64::from(delay_seconds))) => {}
+                }
+            }
+        }
+        #[cfg(windows)]
+        Command::ResumeOriginal { data_dir, request } => {
+            let mut local = open(&data_dir)?;
+            let request = request.parse()?;
+            let envelope = local
+                .original_content_inbox(64)?
+                .into_iter()
+                .find(|e| e.signed_page.page.request_id().ok().as_ref() == Some(&request))
+                .ok_or("original inbox request not found")?;
+            let received = local.receive_original_page(&request)?;
+            let mut applied = Vec::new();
+            for signed in &envelope.signed_page.page.operations {
+                applied.push(local.apply_original_operation(&request, &signed.operation.op_id)?);
+            }
+            print(&serde_json::json!({
+                "received": received,
+                "operations": applied,
+                "applied_receipt": local.original_applied_receipt(&request)?
+            }))?;
+        }
+        Command::OriginalInbox {
+            data_dir,
+            max_pages,
+        } => {
+            print(&open(&data_dir)?.original_content_inbox(max_pages as usize)?)?;
+        }
+        #[cfg(windows)]
+        Command::PullOriginal {
+            data_dir,
+            peer_device,
+            address,
+            after_sequence,
+        } => {
+            let mut local = open(&data_dir)?;
+            let peer = local.read_transport_peer(&peer_device.parse()?)?;
+            let identity = local.transport_identity()?;
+            let mut connection =
+                sync_extend_transport::Connection::connect(address, &identity, &peer).await?;
+            let outcome = local
+                .pull_original_exchange(&mut connection, after_sequence)
+                .await?;
+            connection.finish().await?;
+            print(&outcome)?;
+        }
+        #[cfg(windows)]
+        Command::ServeOriginal {
+            data_dir,
+            peer_device,
+            listen,
+            attempts,
+            delay_seconds,
+        } => {
+            let local = open(&data_dir)?;
+            let peer = local.read_transport_peer(&peer_device.parse()?)?;
+            let identity = local.transport_identity()?;
+            let listener = sync_extend_transport::Listener::bind(listen, &identity, &peer)?;
+            print(&serde_json::json!({
+                "listening": listener.local_address()?,
+                "paired_device": peer.device_id,
+                "bounded_original_attempts": attempts,
+                "post_attempt_delay_seconds": delay_seconds,
+                "unattended_worker": false,
+                "remote_backup_complete": false
+            }))?;
+            for attempt in 1..=attempts {
+                tokio::select! {
+                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    accepted = listener.accept(&identity, &peer) => {
+                        match accepted {
+                            Ok(mut connection) => {
+                                match local.serve_original_exchange(&mut connection).await {
+                                    Ok(outcome) => {
+                                        connection.finish().await?;
+                                        print(&serde_json::json!({"attempt": attempt, "outcome": outcome}))?;
+                                    }
+                                    Err(error) => eprintln!("syncd: original exchange refused; retained state: {error}"),
+                                }
+                            }
+                            Err(error) => eprintln!("syncd: original paired connection refused: {error}"),
+                        }
+                    }
+                }
+                tokio::select! {
+                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    _ = tokio::time::sleep(Duration::from_secs(u64::from(delay_seconds))) => {}
+                }
+            }
         }
         Command::PeerIdentity { data_dir } => {
             print(open(&data_dir)?.transport_identity()?.peer_identity())?;
