@@ -10,6 +10,11 @@ use sync_extend_core_model::{
     },
     ContentId, DeviceId, Operation, SpaceId,
 };
+mod equivalent;
+pub use equivalent::{
+    verify_equivalent_file_resolutions, verify_received_resolution_prefix,
+    EquivalentFileResolutions, ReceivedResolutionPrefix, MAX_EQUIVALENT_RESOLVERS,
+};
 
 const DOMAIN: &str = "SyncExtend signed canonical file resolution v1";
 

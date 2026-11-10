@@ -7,7 +7,11 @@ mod signed;
 mod tls;
 mod wire;
 
-pub use conflict_resolution::{FileResolutionPayload, SignedFileResolution};
+pub use conflict_resolution::{
+    verify_equivalent_file_resolutions, verify_received_resolution_prefix,
+    EquivalentFileResolutions, FileResolutionPayload, ReceivedResolutionPrefix,
+    SignedFileResolution, MAX_EQUIVALENT_RESOLVERS,
+};
 pub use connection::{Connection, Listener, MAX_BLOCK_BYTES, MAX_CONTROL_BYTES};
 pub use identity::{PeerIdentity, TransportIdentity};
 pub use metadata_cycle::{MetadataCycleHello, MAX_METADATA_CYCLE_ROUNDS};

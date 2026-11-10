@@ -13,6 +13,9 @@ use sync_extend_core_model::{
     VersionVector,
 };
 
+mod equivalent;
+mod foreign;
+pub use equivalent::EquivalentConflictHistory;
 pub(crate) mod issuance;
 mod native_binding;
 mod native_cleanup_state;
@@ -26,6 +29,7 @@ mod native_ledger_storage;
 mod native_template_schema;
 mod native_templates;
 mod proof;
+pub use foreign::ForeignConflictResolutionAdmission;
 pub use proof::{
     ConflictResolutionKey, ConflictResolutionPayload, ConflictResolutionProof,
     ConflictSignedOperation,
@@ -58,6 +62,8 @@ struct Header {
     intent: ConflictResolutionAdmissionIntent,
     original_states: BTreeMap<String, String>,
     target: Manifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    foreign: Option<foreign::ForeignScope>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -138,7 +144,7 @@ fn flat_baseline(baseline: &Manifest, originals: &[Operation]) -> Result<()> {
 impl Header {
     fn plan(&self) -> Result<FileResolutionPlan> {
         if self.format_version != 1
-            || self.transaction_id != transaction_id(&self.intent.proof)?
+            || self.transaction_id != self.expected_transaction_id()?
             || self.intent.worktree.is_empty()
             || self.intent.worktree.len() > 32 * 1024
             || self
@@ -194,6 +200,9 @@ impl Header {
             }
         }
         pins(self)?;
+        if let Some(scope) = &self.foreign {
+            scope.validate(self, &plan)?;
+        }
         Ok(plan)
     }
 
@@ -219,12 +228,28 @@ impl Header {
                 .into_iter()
                 .map(|(content_id, length)| ChunkRef { content_id, length })
                 .collect(),
-            signed_sequence_reserved: true,
+            signed_sequence_reserved: self.foreign.is_none(),
             original_signatures_retained: true,
             resolution_applied: false,
             worktree_materialized: false,
             release_available: false,
         })
+    }
+}
+
+impl Header {
+    fn expected_transaction_id(&self) -> Result<EntryId> {
+        match &self.foreign {
+            Some(scope) => foreign::transaction_id(&self.intent.proof, &scope.receiver_device),
+            None => transaction_id(&self.intent.proof),
+        }
+    }
+    fn receiver_device(&self) -> &sync_extend_core_model::DeviceId {
+        self.foreign
+            .as_ref()
+            .map_or(&self.intent.proof.payload.resolver_device, |scope| {
+                &scope.receiver_device
+            })
     }
 }
 
@@ -285,7 +310,7 @@ fn bind(connection: &Connection, header: &Header, plan: &FileResolutionPlan) -> 
         )?)
     };
     if state("space_id")? != p.space_id.as_str()
-        || state("device_id")? != p.resolver_device.as_str()
+        || state("device_id")? != header.receiver_device().as_str()
         || state("worktree")? != intent.worktree
     {
         return Err(invalid(
@@ -295,6 +320,9 @@ fn bind(connection: &Connection, header: &Header, plan: &FileResolutionPlan) -> 
     let view = crate::JournalReadView { connection };
     if view.current(&p.space_id)?.as_ref() != Some(&intent.baseline) {
         return Err(invalid("conflict admission current baseline changed"));
+    }
+    if let Some(scope) = &header.foreign {
+        return scope.bind(connection, header, plan);
     }
     // The complete local table, including pending rows, must equal the bundle.
     let count: i64 =
@@ -401,6 +429,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     )?;
     expected.execute_batch(include_str!("migration-046.sql"))?;
     expected.execute_batch(include_str!("migration-047.sql"))?;
+    expected.execute_batch(include_str!("migration-048.sql"))?;
     if objects(connection)? != objects(&expected)? {
         return Err(invalid(
             "conflict resolution exact schema/trigger/index differs",
@@ -457,15 +486,17 @@ fn expected_values(header: &Header) -> Result<Vec<(&'static str, Vec<Value>)>> {
         ],
     )];
     let receipt = header.receipt()?;
-    rows.push((
-        "sequences",
-        vec![
-            text(id),
-            text(p.resolver_device.as_str()),
-            Value::Integer(receipt.reserved_first_sequence as i64),
-            Value::Integer(receipt.reserved_last_sequence as i64),
-        ],
-    ));
+    if header.foreign.is_none() {
+        rows.push((
+            "sequences",
+            vec![
+                text(id),
+                text(p.resolver_device.as_str()),
+                Value::Integer(receipt.reserved_first_sequence as i64),
+                Value::Integer(receipt.reserved_last_sequence as i64),
+            ],
+        ));
+    }
     for (role, signed) in p
         .originals
         .iter()
@@ -556,6 +587,7 @@ pub(crate) fn obligations(
         .filter(|r| {
             r.table().starts_with("conflict_resolution_")
                 && !r.table().starts_with("conflict_resolution_native_")
+                && !r.table().starts_with("conflict_resolution_equivalent_")
         })
         .collect();
     let headers: Vec<_> = own
@@ -616,10 +648,36 @@ pub(crate) fn obligations(
     native_binding::audit(connection)?;
     // Schema42 admission has no future writer/Final authority or liability
     // reservation. Native capacity must be reserved separately before C4 effects.
-    native_ledger_storage::audit(rows, connection)
+    let obligations = native_ledger_storage::audit(rows, connection)?;
+    equivalent::audit(rows, connection)?;
+    Ok(obligations)
 }
 
 impl Journal {
+    /// Return only the independently validated immutable original envelope.
+    pub fn conflict_resolution_proof(
+        &self,
+        transaction: &EntryId,
+    ) -> Result<ConflictResolutionProof> {
+        let json: String = self.connection.query_row(
+            "SELECT header FROM main.conflict_resolution_admissions WHERE transaction_id=?1",
+            [transaction.as_str()],
+            |r| r.get(0),
+        )?;
+        if json.len() > crate::MAX_OPERATION_BYTES {
+            return Err(invalid("conflict retained envelope byte budget"));
+        }
+        let header: Header = serde_json::from_str(&json)?;
+        let plan = header.plan()?;
+        if header.transaction_id != *transaction || serde_json::to_string(&header)? != json {
+            return Err(invalid(
+                "conflict retained envelope canonical receipt differs",
+            ));
+        }
+        bind(&self.connection, &header, &plan)?;
+        Ok(header.intent.proof)
+    }
+
     pub fn require_no_conflict_resolution(&self) -> Result<()> {
         let mut statement = self.connection.prepare(
             "SELECT header FROM main.conflict_resolution_admissions ORDER BY transaction_id",
@@ -678,6 +736,18 @@ impl Journal {
     where
         E: From<crate::JournalError>,
     {
+        self.with_conflict_admission_scope(intent, false, inspect)
+    }
+
+    fn with_conflict_admission_scope<T, E>(
+        &self,
+        intent: &ConflictResolutionAdmissionIntent,
+        foreign: bool,
+        inspect: impl FnOnce(&ConflictResolutionAdmission) -> std::result::Result<T, E>,
+    ) -> std::result::Result<(CasAccessGuard, T, ConflictResolutionAdmission), E>
+    where
+        E: From<crate::JournalError>,
+    {
         if !self.connection.is_autocommit() {
             return Err(invalid("conflict admission refuses caller transaction").into());
         }
@@ -685,6 +755,18 @@ impl Journal {
         let plan = intent
             .proof
             .verify(&intent.approved_keys, ResolutionLimits::default())?;
+        let guard = self.acquire_cas_coordination()?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
+            .map_err(crate::JournalError::from)?;
+        let foreign_scope = if foreign {
+            Some(foreign::ForeignScope::capture(
+                &self.connection,
+                intent,
+                &plan,
+            )?)
+        } else {
+            None
+        };
         let original_states = p
             .originals
             .iter()
@@ -713,13 +795,15 @@ impl Journal {
                 .version_vector
                 .observe(op.payload.origin_device_id.clone(), op.payload.origin_seq);
         }
-        let header = Header {
+        let mut header = Header {
             format_version: 1,
             transaction_id: transaction_id(&intent.proof)?,
             intent: intent.clone(),
             original_states,
             target,
+            foreign: foreign_scope,
         };
+        header.transaction_id = header.expected_transaction_id()?;
         header.plan()?;
         if serde_json::to_vec(&header)
             .map_err(crate::JournalError::from)?
@@ -728,9 +812,6 @@ impl Journal {
         {
             return Err(invalid("conflict admission header byte budget").into());
         }
-        let guard = self.acquire_cas_coordination()?;
-        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)
-            .map_err(crate::JournalError::from)?;
         let bounds = storage_policy::capacity_limits(self.max_storage_entries)?;
         let before = self
             .read_view()

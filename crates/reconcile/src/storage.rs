@@ -668,7 +668,7 @@ fn sum_lengths<'a>(
     })
 }
 
-fn inventory_bytes(inventory: &Inventory) -> Result<u64> {
+pub(crate) fn inventory_bytes(inventory: &Inventory) -> Result<u64> {
     selected_inventory_bytes(inventory, |_| true)
 }
 

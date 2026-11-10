@@ -2,7 +2,7 @@
 use super::super::super::native_templates::{Cell, Dml};
 use super::*;
 
-fn row(table: &str, cells: &[Cell]) -> Result<(RowKey, RowValue)> {
+pub(super) fn row(table: &str, cells: &[Cell]) -> Result<(RowKey, RowValue)> {
     let specs = crate::storage_inventory::tables();
     let spec = specs
         .iter()

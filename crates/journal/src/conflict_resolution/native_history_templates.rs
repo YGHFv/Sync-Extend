@@ -353,41 +353,68 @@ pub(super) fn history_partition(
         }
     }
     let mut prior = observed.clone();
-    for signed in &p.resolving {
+    for (index, signed) in p.resolving.iter().enumerate() {
         let op = &signed.operation;
         let name = format!("history/resolve/{}", op.op_id);
-        builder.insert(
-            name.clone(),
-            "operations",
-            vec![
-                text(&op.op_id),
-                text(space),
-                text(&op.payload.origin_device_id),
-                Cell::Integer(op.payload.origin_seq),
-                text(encoded(op)?),
-                text("materialized"),
-            ],
-            vec![prior],
-        )?;
+        let values = vec![
+            text(&op.op_id),
+            text(space),
+            text(&op.payload.origin_device_id),
+            Cell::Integer(op.payload.origin_seq),
+            text(encoded(op)?),
+            text("materialized"),
+        ];
+        if header
+            .foreign
+            .as_ref()
+            .is_some_and(|scope| index < scope.received_resolving_operations)
+        {
+            let mut old = values.clone();
+            old[5] = text("received");
+            builder.update(
+                name.clone(),
+                "operations",
+                old,
+                values,
+                vec![prior],
+                TreeStorageCharge {
+                    rows: 0,
+                    logical_bytes: 4,
+                },
+            )?;
+        } else {
+            builder.insert(name.clone(), "operations", values, vec![prior])?;
+        }
         prior = name;
     }
     let cursor = format!("history/cursor/{}", p.resolver_device);
-    builder.update(
-        cursor.clone(),
-        "receive_cursors",
-        vec![
-            text(space),
-            text(&p.resolver_device),
-            Cell::Integer(plan.received_vector.get(&p.resolver_device)),
-        ],
-        vec![
-            text(space),
-            text(&p.resolver_device),
-            Cell::Integer(header.target.version_vector.get(&p.resolver_device)),
-        ],
-        vec![prior],
-        TreeStorageCharge::default(),
-    )?;
+    let before_cursor = header
+        .foreign
+        .as_ref()
+        .map_or(plan.received_vector.get(&p.resolver_device), |scope| {
+            scope.received_vector.get(&p.resolver_device)
+        });
+    let values = vec![
+        text(space),
+        text(&p.resolver_device),
+        Cell::Integer(header.target.version_vector.get(&p.resolver_device)),
+    ];
+    if header.foreign.is_some() && before_cursor == 0 {
+        builder.insert(cursor.clone(), "receive_cursors", values, vec![prior])?;
+    } else {
+        builder.update(
+            cursor.clone(),
+            "receive_cursors",
+            vec![
+                text(space),
+                text(&p.resolver_device),
+                Cell::Integer(before_cursor),
+            ],
+            values,
+            vec![prior],
+            TreeStorageCharge::default(),
+        )?;
+    }
     final_dependencies.push(cursor);
     let snapshot = format!("history/snapshot/{root}");
     if let Some(existing) = selection.row("snapshots", &[root.as_str()]) {

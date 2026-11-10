@@ -10,6 +10,26 @@ const fn c(name: &'static str, kind: ColumnKind, pk: usize) -> ColumnSpec {
 }
 pub(crate) const TABLES: &[TableSpec] = &[
     TableSpec {
+        name: "conflict_resolution_equivalent_histories",
+        columns: &[
+            c("transaction_id", ColumnKind::Text(32), 1),
+            c("base_transaction_id", ColumnKind::Text(32), 0),
+            c("receiver_device", ColumnKind::Text(64), 0),
+            c("resolver_device", ColumnKind::Text(64), 0),
+            c("target_root", ColumnKind::Text(64), 0),
+            c("record_hash", ColumnKind::Text(64), 0),
+            c("record", ColumnKind::Text(crate::MAX_OPERATION_BYTES), 0),
+        ],
+    },
+    TableSpec {
+        name: "conflict_resolution_equivalent_signatures",
+        columns: &[
+            c("transaction_id", ColumnKind::Text(32), 1),
+            c("op_id", ColumnKind::Text(64), 2),
+            c("proof", ColumnKind::Text(crate::MAX_OPERATION_BYTES), 0),
+        ],
+    },
+    TableSpec {
         name: "conflict_resolution_native_bindings",
         columns: &[
             c("transaction_id", ColumnKind::Text(32), 1),

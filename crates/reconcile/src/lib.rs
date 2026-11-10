@@ -1,6 +1,10 @@
 mod cleanup;
 mod conflict_admission;
-pub use conflict_admission::LocalConflictAdmission;
+#[cfg(windows)]
+mod conflict_native;
+pub use conflict_admission::{ForeignConflictAdmission, LocalConflictAdmission};
+#[cfg(windows)]
+pub use conflict_native::ConflictNativeResult;
 mod conflict_branches;
 pub use conflict_branches::ConflictBranchPreparation;
 mod delete;

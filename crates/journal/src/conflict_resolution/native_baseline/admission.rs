@@ -5,6 +5,7 @@ use super::*;
 mod cleanup;
 mod creators;
 mod disposition;
+mod equivalent_history;
 mod final_commit;
 mod forward;
 mod handoff;

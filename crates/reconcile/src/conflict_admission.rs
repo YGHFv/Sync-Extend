@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{conflict_resolution::ResolutionLimits, ChunkRef, DeviceId};
 use sync_extend_journal::{
     ConflictResolutionAdmission, ConflictResolutionAdmissionIntent, ConflictResolutionKey,
-    ConflictResolutionProof,
+    ConflictResolutionProof, ForeignConflictResolutionAdmission,
 };
 use sync_extend_transport::{PeerIdentity, SignedFileResolution, SignedOperation};
 
@@ -19,7 +19,151 @@ pub struct LocalConflictAdmission {
     pub remote_backup_complete: bool,
 }
 
+#[derive(Serialize)]
+pub struct ForeignConflictAdmission {
+    pub admission: ForeignConflictResolutionAdmission,
+    pub missing_chunks: Vec<ChunkRef>,
+    pub content_closed: bool,
+    pub resolution_applied: bool,
+    pub worktree_materialized: bool,
+    pub remote_backup_complete: bool,
+}
+
 impl LocalSpace {
+    /// Foreign envelopes authenticate against local approvals, never a wire key.
+    pub fn admit_foreign_signed_file_resolution(
+        &mut self,
+        signed: &SignedFileResolution,
+        limits: ResolutionLimits,
+    ) -> Result<ForeignConflictAdmission> {
+        self.verify_root()?;
+        if signed.payload.space_id != self.space_id
+            || signed.payload.resolver_device == self.device_id
+            || serde_json::to_vec(signed)?.len() > limits.max_bytes.min(16 * 1024 * 1024)
+        {
+            return Err(ReconcileError::Invariant(
+                "foreign conflict receiver/scope/budget",
+            ));
+        }
+        let origins: BTreeSet<_> = signed
+            .payload
+            .originals
+            .iter()
+            .map(|s| s.operation.payload.origin_device_id.clone())
+            .chain(std::iter::once(signed.payload.resolver_device.clone()))
+            .collect();
+        let approved = origins
+            .iter()
+            .map(|d| self.conflict_admission_peer(d))
+            .collect::<Result<Vec<_>>>()?;
+        let resolver = approved
+            .iter()
+            .find(|p| p.device_id == signed.payload.resolver_device)
+            .ok_or(ReconcileError::Invariant(
+                "foreign conflict resolver not approved",
+            ))?;
+        signed
+            .verify(resolver, &approved, limits)
+            .map_err(|_| ReconcileError::Invariant("foreign conflict signed proposal invalid"))?;
+        let proof: ConflictResolutionProof = serde_json::from_slice(&serde_json::to_vec(signed)?)?;
+        let baseline = self
+            .journal
+            .current(&self.space_id)?
+            .ok_or(ReconcileError::Invariant(
+                "foreign conflict requires applied baseline",
+            ))?;
+        let mut chunk_count = 0usize;
+        for signed in signed
+            .payload
+            .originals
+            .iter()
+            .chain(&signed.payload.resolving)
+        {
+            if let sync_extend_core_model::Change::Put { entry } = &signed.operation.payload.change
+            {
+                if let Some(file) = &entry.content {
+                    chunk_count = chunk_count
+                        .checked_add(file.chunks.len())
+                        .ok_or(ReconcileError::ResourceLimit("foreign conflict chunks"))?;
+                    if file.length > self.limits.max_file_bytes
+                        || chunk_count > self.limits.max_scan_chunks
+                    {
+                        return Err(ReconcileError::ResourceLimit(
+                            "foreign conflict content inventory",
+                        ));
+                    }
+                }
+            }
+        }
+        if signed.payload.resolving.len() > self.limits.max_scan_entries {
+            return Err(ReconcileError::ResourceLimit(
+                "foreign conflict projected files",
+            ));
+        }
+        let mut keys: Vec<_> = approved
+            .into_iter()
+            .map(|peer| ConflictResolutionKey {
+                device_id: peer.device_id,
+                public_key: peer.public_key,
+            })
+            .collect();
+        keys.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        let intent = ConflictResolutionAdmissionIntent {
+            proof,
+            approved_keys: keys,
+            baseline,
+            worktree: self
+                .worktree
+                .to_str()
+                .ok_or(ReconcileError::Invariant("foreign worktree UTF8"))?
+                .into(),
+            root_identity: self.root_identity.physical.clone(),
+        };
+        checkpoint("before_foreign_conflict_resolution_admission");
+        let (_guard, missing, admission) =
+            self.journal.with_foreign_conflict_resolution_admission(
+                &intent,
+                |receipt| -> Result<Vec<ChunkRef>> {
+                    self.verify_root()?;
+                    checkpoint("inside_foreign_conflict_resolution_admission");
+                    let missing = receipt
+                        .protected_chunks
+                        .iter()
+                        .filter(|chunk| self.cas.read(chunk).is_err())
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if missing.is_empty() {
+                        for signed in signed
+                            .payload
+                            .originals
+                            .iter()
+                            .chain(&signed.payload.resolving)
+                        {
+                            if let sync_extend_core_model::Change::Put { entry } =
+                                &signed.operation.payload.change
+                            {
+                                if let Some(file) = &entry.content {
+                                    self.cas.verify(file)?;
+                                }
+                            }
+                        }
+                    }
+                    self.verify_root()?;
+                    Ok(missing)
+                },
+            )?;
+        checkpoint("after_foreign_conflict_resolution_admission");
+        self.verify_root()?;
+        Ok(ForeignConflictAdmission {
+            content_closed: missing.is_empty(),
+            admission,
+            missing_chunks: missing,
+            resolution_applied: false,
+            worktree_materialized: false,
+            remote_backup_complete: false,
+        })
+    }
+
     fn conflict_admission_peer(&self, device: &DeviceId) -> Result<PeerIdentity> {
         if *device == self.device_id {
             Ok(self.transport_identity()?.peer_identity().clone())

@@ -17,10 +17,7 @@ pub(super) fn exact_history(connection: &Connection, parent: &Header) -> Result<
     let terminal = native_cleanup_state::complete(connection, parent)?;
     for (name, expected) in [
         ("space_id", parent.target.space_id.as_str()),
-        (
-            "device_id",
-            parent.intent.proof.payload.resolver_device.as_str(),
-        ),
+        ("device_id", parent.receiver_device().as_str()),
         ("worktree", parent.intent.worktree.as_str()),
     ] {
         let actual: String = connection.query_row(
