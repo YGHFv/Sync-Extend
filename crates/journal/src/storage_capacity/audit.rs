@@ -177,6 +177,52 @@ pub(super) fn local_commit_owners(
     Ok(audited)
 }
 
+pub(super) fn storage_receive_owners(
+    view: &JournalReadView<'_>,
+    space: &SpaceId,
+    max: usize,
+    tables: &[JournalStoredTable],
+) -> Result<Owners> {
+    if view.state("space_id")?.as_deref() != Some(space.as_str())
+        || view.state("device_id")?.is_none()
+        || view.state("worktree")?.is_some()
+        || view.state("storage_role")?.as_deref() != Some("storage-v1")
+    {
+        return Err(invalid(
+            "storage receive requires exact worktree-free initialized identity",
+        ));
+    }
+    let keys: Vec<String> = view
+        .connection
+        .prepare("SELECT key FROM main.local_state ORDER BY key")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if keys != ["device_id", "space_id", "storage_role"] {
+        return Err(invalid("storage receive exact role identity keys"));
+    }
+    // No client mutation owner may be accepted through the storage-only adapter.
+    const STORAGE_TABLES: &[&str] = &[
+        "local_state",
+        // Migration 008 creates this singleton even without a lease owner.
+        // ordinary::liabilities still audits its exact singleton inventory.
+        "read_lease_clock",
+        "operations",
+        "receive_cursors",
+        "original_operation_provenance",
+        "storage_page_handoffs",
+        "reference_reservations",
+        "reference_reservation_objects",
+        "cas_leases",
+    ];
+    if tables
+        .iter()
+        .any(|table| table.rows != 0 && !STORAGE_TABLES.contains(&table.table))
+    {
+        return Err(invalid("storage receive contains client/native owner"));
+    }
+    owners(view, space, max)
+}
+
 fn identityless_snapshots(
     view: &JournalReadView<'_>,
     space: &SpaceId,
@@ -220,6 +266,8 @@ fn ordinary_scope(view: &JournalReadView<'_>, space: &SpaceId) -> Result<()> {
         "rename_observations",
         "original_operation_provenance",
         "original_page_inbox",
+        "forwarded_page_inbox",
+        "storage_page_handoffs",
     ]
     .into_iter()
     .map(|table| format!("EXISTS(SELECT 1 FROM main.{table} WHERE space_id!=?1)"))

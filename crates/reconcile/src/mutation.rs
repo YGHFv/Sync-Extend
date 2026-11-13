@@ -77,6 +77,24 @@ impl LocalSpace {
         destination: Option<&PortablePath>,
         source: Option<&Path>,
     ) -> Result<Mutation> {
+        self.prepare_mutation_content(expected, path, destination, source, None)
+    }
+
+    pub(crate) fn prepare_mutation_content(
+        &mut self,
+        expected: &SnapshotId,
+        path: &PortablePath,
+        destination: Option<&PortablePath>,
+        source: Option<&Path>,
+        received_content: Option<FileManifest>,
+    ) -> Result<Mutation> {
+        if source.is_some() && received_content.is_some()
+            || destination.is_some() && received_content.is_some()
+        {
+            return Err(ReconcileError::Invariant(
+                "ambiguous mutation content source",
+            ));
+        }
         self.verify_root()?;
         self.require_no_mutation()?;
         if !self
@@ -130,6 +148,10 @@ impl LocalSpace {
             };
             destination_parent = Some(identity);
             action
+        } else if let Some(content) = received_content {
+            self.check_publication_limits(&content)?;
+            self.cas.verify(&content)?;
+            MutationAction::Replace { content }
         } else if let Some(source) = source {
             MutationAction::Replace {
                 content: self.import_source(source)?,

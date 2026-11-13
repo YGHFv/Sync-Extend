@@ -31,6 +31,7 @@ load_config() {
     listen=
     address=
     metadata_rounds=16
+    deployment_config=
     seen_enabled=false
     seen_worktree=false
     seen_interval=false
@@ -39,6 +40,7 @@ load_config() {
     seen_listen=false
     seen_address=false
     seen_rounds=false
+    seen_deployment=false
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in
             ''|'#'*) continue ;;
@@ -74,11 +76,15 @@ load_config() {
                 [ "$seen_rounds" = false ] || return 1
                 metadata_rounds=${line#metadata_rounds=}
                 seen_rounds=true ;;
+            deployment_config=*)
+                [ "$seen_deployment" = false ] || return 1
+                deployment_config=${line#deployment_config=}
+                seen_deployment=true ;;
             *) fail 'unknown config key'; return 1 ;;
         esac
     done < "$CONFIG"
     case "$enabled" in true|false) ;; *) return 1 ;; esac
-    case "$mode" in local|files|metadata-client|metadata-server) ;; *) return 1 ;; esac
+    case "$mode" in local|files|metadata-client|metadata-server|deployment) ;; *) return 1 ;; esac
     case "$metadata_rounds" in ''|*[!0-9]*) return 1 ;; esac
     [ "${#metadata_rounds}" -le 2 ] &&
         [ "$metadata_rounds" -ge 1 ] &&
@@ -87,7 +93,20 @@ load_config() {
     [ "${#scan_interval_secs}" -le 5 ] &&
         [ "$scan_interval_secs" -ge 1 ] &&
         [ "$scan_interval_secs" -le 86400 ] || return 1
+    if [ "$mode" = deployment ]; then
+        case "$deployment_config" in
+            "$STATE/"*) ;;
+            *) fail 'deployment config must be inside private module state'; return 1 ;;
+        esac
+        case "$deployment_config" in
+            *'/../'*|*'/./'*|*'//'*|*/..|*/.|*/)
+                fail 'deployment config path must be exact'; return 1 ;;
+        esac
+    elif [ "$seen_deployment" = true ]; then
+        fail 'deployment config requires explicit deployment mode'; return 1
+    fi
     [ "$enabled" = true ] || return 0
+    [ "$mode" != deployment ] || return 0
     if [ "$mode" != local ]; then
         [ "${#peer_device}" -eq 64 ] || return 1
         case "$peer_device" in *[!0-9a-f]*) return 1 ;; esac
@@ -100,6 +119,19 @@ load_config() {
         fi
     fi
     case "$worktree" in /*) ;; *) fail 'worktree must be absolute'; return 1 ;; esac
+}
+
+validate_deployment() {
+    [ -f "$deployment_config" ] && [ ! -L "$deployment_config" ] ||
+        { fail 'private deployment config is unavailable'; return 1; }
+    [ "$(wc -c < "$deployment_config")" -le 65536 ] ||
+        { fail 'deployment config exceeds 65536 bytes'; return 1; }
+    deployment_config=$(realpath "$deployment_config") || return 1
+    case "$deployment_config" in
+        "$STATE/"*) ;;
+        *) fail 'resolved deployment config left private state'; return 1 ;;
+    esac
+    chmod 600 "$deployment_config" || return 1
 }
 
 validate_worktree() {

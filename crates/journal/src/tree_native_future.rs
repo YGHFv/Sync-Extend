@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use sync_extend_core_model::{
     tree_native_action_layout::TreeNativeActionScope,
     tree_native_future_obligations::{
-        plan_tree_native_future_obligations, TreeNativeFutureGenerations, TreeNativeFutureLimits,
+        plan_tree_native_future_obligations_with_observation, TreeNativeFutureGenerations,
+        TreeNativeFutureLimits,
     },
     tree_restore_history::encode_history_record,
     tree_storage_capacity::{TreeStorageCharge, TreeStorageMetadataObligation},
@@ -61,6 +62,8 @@ struct Capacity {
     obligations: Vec<TreeStorageMetadataObligation>,
     new_charge: TreeStorageCharge,
     new_values_hash: ContentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prior_observation: Option<sync_extend_core_model::persisted_rename::RenameObservationMap>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -76,6 +79,7 @@ pub struct TreeNativeFutureAdmissionAudit {
     stored_rows: u64,
     stored_logical_bytes: u64,
     accounting: &'static str,
+    prior_observation: Option<sync_extend_core_model::persisted_rename::RenameObservationMap>,
 }
 impl TreeNativeFutureAdmissionAudit {
     pub fn request(&self) -> &TreeNativeFutureAdmissionRequest {
@@ -110,6 +114,11 @@ impl TreeNativeFutureAdmissionAudit {
     }
     pub fn accounting(&self) -> &str {
         self.accounting
+    }
+    pub(crate) fn prior_observation(
+        &self,
+    ) -> Option<&sync_extend_core_model::persisted_rename::RenameObservationMap> {
+        self.prior_observation.as_ref()
     }
     pub fn tree_future_component_reserved(&self) -> bool {
         true
@@ -183,12 +192,13 @@ fn derive(
     }
     let (projection, protocol, _) =
         crate::tree_native_storage::initial_layout(connection, p, prewrite.request(), max)?;
-    let plan = plan_tree_native_future_obligations(
+    let plan = plan_tree_native_future_obligations_with_observation(
         &projection.context(),
         &protocol,
         prewrite.intended(),
         &capacity.generations,
         capacity.request.layout_limits,
+        capacity.prior_observation.as_ref(),
     )?;
     let history = p
         .history_reservation
@@ -220,6 +230,7 @@ fn derive(
         stored_rows,
         stored_logical_bytes: 0,
         accounting: ACCOUNTING,
+        prior_observation: capacity.prior_observation.clone(),
     };
     let rows = values::rows(capacity, &report)?;
     report.stored_logical_bytes = rows.iter().try_fold(0, |sum, row| add(sum, row.bytes()?))?;
@@ -247,16 +258,7 @@ fn derive(
 }
 
 pub(crate) fn preflight_all(connection: &Connection, max: usize) -> Result<()> {
-    let nonempty = schema::EFFECT_TABLES
-        .iter()
-        .map(|table| format!("EXISTS(SELECT 1 FROM main.{})", table.name))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    if connection.query_row(&format!("SELECT {nonempty}"), [], |row| {
-        row.get::<_, bool>(0)
-    })? {
-        return Err(invalid("tree future native effects remain unavailable"));
-    }
+    crate::tree_native_effects::preflight(connection)?;
     let orphan: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM main.tree_native_future_admissions f
          LEFT JOIN main.tree_native_capacity_admissions p USING(transaction_id)
@@ -444,12 +446,15 @@ fn initial_capacity(
             .map(|&i| Ok((i, EntryId::random()?)))
             .collect::<sync_extend_core_model::Result<_>>()?,
     };
-    let plan = plan_tree_native_future_obligations(
+    let prior_observation =
+        crate::rename_observation::audit_observation(connection, &p.intent.scope.space_id, max)?;
+    let plan = plan_tree_native_future_obligations_with_observation(
         &context,
         &protocol,
         prewrite.intended(),
         &generations,
         request.layout_limits,
+        prior_observation.as_ref(),
     )?;
     Ok(Capacity {
         format_version: 1,
@@ -473,5 +478,6 @@ fn initial_capacity(
         obligations: plan.obligations().to_vec(),
         new_charge: plan.new_charge(),
         new_values_hash: hash(&plan.exact_new_values())?,
+        prior_observation,
     })
 }

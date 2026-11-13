@@ -1,0 +1,22 @@
+services:
+  sync:
+    image: ${SYNCEXTEND_IMAGE:?Set an exact image digest}
+    user: "65532:65532"
+    read_only: true
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+    stop_grace_period: 60s
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    volumes:
+      - type: bind
+        source: ${SYNCEXTEND_CONFIG:?Set the private configuration directory}
+        target: /config
+        read_only: true
+      - type: bind
+        source: ${SYNCEXTEND_STATE:?Set the existing private storage state directory}
+        target: /state

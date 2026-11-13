@@ -18,6 +18,12 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+fs2.workspace = true
+quick-xml = "=0.38.4"
+blake3.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-dpapi = "0.2.0"
 
 [lints]
 workspace = true

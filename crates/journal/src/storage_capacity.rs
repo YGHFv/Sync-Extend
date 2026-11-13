@@ -19,6 +19,7 @@ enum OwnerAudit {
     LeaseTransaction,
     HistoryTransaction,
     ReceiveTransaction,
+    StorageReceiveTransaction,
     LocalCommitTransaction,
 }
 
@@ -255,6 +256,19 @@ impl crate::JournalReadView<'_> {
         )
     }
 
+    pub(crate) fn audit_storage_receive_capacity(
+        &self,
+        space: &SpaceId,
+        bounds: JournalCapacityLimits,
+    ) -> Result<CapacitySnapshot> {
+        self.capacity_snapshot(
+            space,
+            sync_extend_core_model::limits::MAX_ENTRIES,
+            bounds,
+            OwnerAudit::StorageReceiveTransaction,
+        )
+    }
+
     pub(crate) fn audit_local_commit_capacity(
         &self,
         space: &SpaceId,
@@ -300,6 +314,9 @@ impl crate::JournalReadView<'_> {
             OwnerAudit::LeaseTransaction => audit::lease_owners(self, space, max, &tables)?,
             OwnerAudit::HistoryTransaction => audit::history_owners(self, space, max, &tables)?,
             OwnerAudit::ReceiveTransaction => audit::receive_owners(self, space, max, &tables)?,
+            OwnerAudit::StorageReceiveTransaction => {
+                audit::storage_receive_owners(self, space, max, &tables)?
+            }
             OwnerAudit::LocalCommitTransaction => {
                 audit::local_commit_owners(self, space, max, &tables)?
             }
@@ -323,6 +340,8 @@ impl crate::JournalReadView<'_> {
         let mut liabilities = ordinary::liabilities(&audited, &rows)?;
         crate::original_provenance::audit(self.connection)?;
         crate::original_page_inbox::audit(self.connection)?;
+        crate::forwarded_page_inbox::audit(self.connection)?;
+        crate::storage_page_handoff::audit(self.connection)?;
         liabilities
             .obligations
             .extend(crate::remote_rename::obligations(&rows, self.connection)?);

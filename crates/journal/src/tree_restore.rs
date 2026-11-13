@@ -224,8 +224,31 @@ impl Journal {
             ));
         }
         crate::tree_native_storage::preflight_all(&self.connection, max)?;
-        self.check_storage_metadata_limit(max)?;
-        self.read_view().audit_tree_restore_preparations(space, max)
+        let native_progress: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.tree_native_action_attempts)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !native_progress {
+            self.check_storage_metadata_limit(max)?;
+        }
+        let preparations = self
+            .read_view()
+            .audit_tree_restore_preparations(space, max)?;
+        crate::tree_native_effects::validate_all(&self.connection, &preparations, max)?;
+        if native_progress {
+            let capacity = self
+                .read_view()
+                .audit_local_commit_capacity(space, self.writer_capacity_limits(max)?)?;
+            if !capacity.report.within_accounted_limits()
+                || !capacity.report.coverage_gaps().is_empty()
+            {
+                return Err(JournalError::Invariant(
+                    "tree native exact capacity refused",
+                ));
+            }
+        }
+        Ok(preparations)
     }
 
     pub fn require_no_tree_restore(&self, space: &SpaceId, max: usize) -> Result<()> {
@@ -615,8 +638,24 @@ impl crate::JournalReadView<'_> {
                     Ok(time)
                 })
                 .transpose()?;
-            let active = cancelled_at_ms.is_none();
-            let prepared = intent.plan(self.connection, max, active)?;
+            let finalized: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.tree_native_final_commits WHERE transaction_id=?1)",
+                [&id], |row| row.get(0),
+            )?;
+            let cleaned: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.tree_native_cleanup_records WHERE transaction_id=?1 AND record_index=3)",
+                [&id], |row| row.get(0),
+            )?;
+            if cleaned && !finalized {
+                return Err(JournalError::Invariant("tree cleanup without actual Final"));
+            }
+            if finalized && cancelled_at_ms.is_some() {
+                return Err(JournalError::Invariant(
+                    "tree Final cannot coexist with cancellation",
+                ));
+            }
+            let active = cancelled_at_ms.is_none() && !cleaned;
+            let prepared = intent.plan(self.connection, max, active && !finalized)?;
             if prepared.json != json
                 || sql_integer(prepared.steps.len() as u64)? != row.get::<_, i64>(7)?
                 || sql_integer(prepared.reserved_rows)? != row.get::<_, i64>(8)?
@@ -663,7 +702,7 @@ impl crate::JournalReadView<'_> {
                     length FROM tree_restore_objects WHERE transaction_id=?1 ORDER BY content_id",
             )?;
             let mut pins = pins.query([&id])?;
-            if active {
+            if active && !finalized {
                 for (chunk, length) in &prepared.chunks {
                     let row = pins
                         .next()?
@@ -683,6 +722,8 @@ impl crate::JournalReadView<'_> {
                         ));
                     }
                 }
+            }
+            if active {
                 active_count += 1;
             }
             if pins.next()?.is_some() {
@@ -764,13 +805,21 @@ impl crate::JournalReadView<'_> {
             let mut preparation = TreeRestorePreparation {
                 intent,
                 steps: prepared.plan.steps().to_vec(),
-                state: if active { "prepared" } else { "cancelled" },
+                state: if cleaned {
+                    "native_cleaned"
+                } else if finalized {
+                    "native_finalized"
+                } else if active {
+                    "prepared"
+                } else {
+                    "cancelled"
+                },
                 cancelled_at_ms,
                 reserved_rows: prepared.reserved_rows,
                 reserved_metadata_bytes: prepared.reserved_bytes,
                 target_logical_bytes: prepared.plan.target_logical_bytes(),
                 retained_and_staging_bytes: prepared.plan.retained_and_staging_bytes(),
-                exact_input_pins_verified: active,
+                exact_input_pins_verified: active && !finalized,
                 writer_gate_held: active,
                 content_hashes_verified: false,
                 native_tree_verified: false,
@@ -808,6 +857,10 @@ impl crate::JournalReadView<'_> {
                 crate::tree_native_storage::audit(self.connection, &preparation, max)?;
             preparation.native_future_admission =
                 crate::tree_native_future::audit(self.connection, &preparation, max)?;
+            preparation.executor_available =
+                cfg!(windows) && preparation.native_future_admission.is_some();
+            preparation.final_handoff_capacity_verified =
+                preparation.native_future_admission.is_some();
             audits.push(preparation);
         }
         if actual_native_bindings as u64 != native_bindings as u64 {
@@ -819,6 +872,7 @@ impl crate::JournalReadView<'_> {
             return Err(JournalError::Invariant("multiple tree restore writers"));
         }
         crate::tree_coordinator_admission::audit_generations(self.connection, max)?;
+        crate::tree_native_effects::validate_all(self.connection, &audits, max)?;
         if active_count != 0 {
             require_no_ordinary_writer(self.connection, space)?;
         }

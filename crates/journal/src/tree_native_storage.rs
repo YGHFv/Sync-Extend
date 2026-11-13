@@ -190,7 +190,7 @@ pub(crate) fn initial_layout(
     validate_request(request, max)?;
     if request.transaction_id != p.intent.transaction_id
         || p.cancelled_at_ms.is_some()
-        || !p.writer_gate_held
+        || (!p.writer_gate_held && p.state != "native_cleaned")
         || p.owner_description
             .as_ref()
             .is_some_and(|d| !d.records.is_empty())
@@ -368,7 +368,8 @@ pub(crate) fn preflight_all(connection: &Connection, max: usize) -> Result<()> {
             LEFT JOIN main.tree_restore_coordinator_admissions a USING(transaction_id)
             WHERE a.transaction_id IS NULL
             OR (SELECT count(*) FROM main.tree_native_action_headers WHERE transaction_id=c.transaction_id)!=1
-            OR (SELECT count(*) FROM main.tree_native_action_records WHERE transaction_id=c.transaction_id)!=1)
+            OR NOT EXISTS(SELECT 1 FROM main.tree_native_action_records
+                WHERE transaction_id=c.transaction_id AND record_index=0))
         OR EXISTS(SELECT 1 FROM main.tree_native_action_headers h
             LEFT JOIN main.tree_native_capacity_admissions c USING(transaction_id) WHERE c.transaction_id IS NULL)
         OR EXISTS(SELECT 1 FROM main.tree_native_action_records r
@@ -389,8 +390,13 @@ fn require_exact(connection: &Connection, id: &EntryId, values: &StoredValues) -
         .collect::<Vec<_>>()
         .join(",");
     let mut statement = connection.prepare(&format!(
-        "SELECT {selected} FROM main.{} WHERE transaction_id=?1",
-        values.table
+        "SELECT {selected} FROM main.{} WHERE transaction_id=?1{}",
+        values.table,
+        if values.table == "tree_native_action_records" {
+            " AND record_index=0"
+        } else {
+            ""
+        }
     ))?;
     let mut rows = statement.query([id.as_str()])?;
     let row = rows

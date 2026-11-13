@@ -14,6 +14,13 @@ done
 private_state && load_config || exit 1
 [ "$enabled" = true ] || exit 0
 [ -x "$MODDIR/bin/syncd" ] && [ ! -L "$MODDIR/bin/syncd" ] || exit 1
+if [ "$mode" = deployment ]; then
+    validate_deployment || exit 1
+    "$MODDIR/bin/syncd" deployment-check --config "$deployment_config" || exit 1
+    # Role identities and pairings must be provisioned separately before boot.
+    # Execute the same daemon; no shell restart loop or implicit initialization.
+    exec "$MODDIR/bin/syncd" deployment-run --config "$deployment_config"
+fi
 attempt=0
 while [ ! -d "$worktree" ]; do
     attempt=$((attempt + 1))

@@ -10,3 +10,6 @@ mode=local
 # metadata_rounds=16
 peer_device=
 listen=
+# Use an explicitly provisioned foreground role instead of legacy module modes:
+# mode=deployment
+# deployment_config=/data/adb/sync-extend/deployment.json

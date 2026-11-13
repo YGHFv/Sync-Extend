@@ -176,6 +176,11 @@ impl LockedDirectory {
         key(&self.file)
     }
 
+    /// Read-only exact slot witness; this grants no creator or mutation authority.
+    pub fn matches_path(&self, path: &Path) -> io::Result<bool> {
+        directory_matches_path(&self.file, path)
+    }
+
     /// Require the retained directory to live on a fixed local NTFS volume.
     pub fn require_local_ntfs(&self, path: &Path) -> io::Result<()> {
         local_ntfs(&self.file, path)
@@ -214,6 +219,11 @@ impl LockedDirectoryMutation {
         key(&self.file)
     }
 
+    /// Check the held directory's current slot without releasing its original handle.
+    pub fn matches_path(&self, path: &Path) -> io::Result<bool> {
+        directory_matches_path(&self.file, path)
+    }
+
     pub fn require_case_insensitive(&self) -> io::Result<()> {
         require_case_insensitive(&self.file)
     }
@@ -234,6 +244,17 @@ impl LockedDirectoryMutation {
         self.require_case_insensitive()?;
         request_delete_on_close(&self.file)
     }
+}
+
+fn directory_matches_path(file: &File, path: &Path) -> io::Result<bool> {
+    let slot = OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    regular(&slot, true)?;
+    regular(file, true)?;
+    Ok(key(&slot)? == key(file)?)
 }
 
 fn require_case_insensitive(file: &File) -> io::Result<()> {

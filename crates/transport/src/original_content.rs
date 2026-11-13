@@ -86,6 +86,57 @@ impl SignedOriginalOperationPage {
 }
 
 impl VerifiedOriginalContentOffer {
+    /// Original operation signatures remain attached to the independent source;
+    /// content requests authorize only the current forwarding transport peer.
+    pub fn from_verified_forward(
+        page: &crate::VerifiedForwardedPage,
+        limits: &LocalLimits,
+    ) -> Result<Self> {
+        limits.validate()?;
+        let mut files = Vec::new();
+        let mut chunks = BTreeMap::new();
+        let mut logical = 0u64;
+        let mut references = 0usize;
+        for original in &page.page().operations {
+            let Change::Put { entry } = &original.operation.payload.change else {
+                continue;
+            };
+            let Some(file) = &entry.content else { continue };
+            logical = logical
+                .checked_add(file.length)
+                .filter(|count| *count <= limits.max_scan_bytes)
+                .ok_or(TransportError::Limit("forward offered logical bytes"))?;
+            references = references
+                .checked_add(file.chunks.len())
+                .filter(|count| *count <= limits.max_scan_chunks)
+                .ok_or(TransportError::Limit("forward offered references"))?;
+            if file.length > limits.max_file_bytes || files.len() >= limits.max_scan_entries {
+                return Err(TransportError::Limit("forward offered file bounds"));
+            }
+            for chunk in &file.chunks {
+                if chunks
+                    .insert(chunk.content_id.clone(), chunk.length)
+                    .is_some_and(|length| length != chunk.length)
+                {
+                    return Err(TransportError::Authorization(
+                        "forward chunk conflicting length",
+                    ));
+                }
+            }
+            files.push(file.clone());
+        }
+        Ok(Self {
+            space: page.page().space_id.clone(),
+            source: page.forwarder().device_id.clone(),
+            receiver: page.receiver().device_id.clone(),
+            binding: page.page().channel_binding.clone(),
+            request: page.request_id()?,
+            files,
+            chunks,
+            byte_limit: limits.max_staging_bytes.min(MAX_ORIGINAL_CONTENT_BYTES),
+        })
+    }
+
     pub fn from_original_conflict(
         signed: &crate::SignedOriginalConflictOffer,
         source: &PeerIdentity,

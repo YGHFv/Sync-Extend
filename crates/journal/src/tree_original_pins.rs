@@ -247,6 +247,22 @@ pub(crate) fn audit_originals(
     let mut pins = statement.query([preparation.transaction_id.as_str()])?;
     if cancelled.is_none() {
         for (index, closure) in projection.core.closures() {
+            let terminal: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.tree_native_original_terminals
+                 WHERE transaction_id=?1 AND step_index=?2)",
+                rusqlite::params![preparation.transaction_id.as_str(), *index as i64],
+                |row| row.get(0),
+            )?;
+            if terminal {
+                projection.audit.active_reference_count = projection
+                    .audit
+                    .active_reference_count
+                    .checked_sub(closure.len())
+                    .ok_or(JournalError::Invariant(
+                        "tree original terminal ref underflow",
+                    ))?;
+                continue;
+            }
             for (chunk, length) in closure {
                 let row = pins
                     .next()?

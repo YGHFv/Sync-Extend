@@ -95,8 +95,30 @@ impl LocalSpace {
             )?;
             checkpoint("after_original_page_inbox");
         }
+        let (reservations, missing, closed) =
+            self.reserve_original_offer_content(&page.page.operations, &offer)?;
+        self.verify_root()?;
+        Ok(OriginalContentPreparation {
+            page_request_id: request,
+            reservation: reservations.first().cloned(),
+            reservations,
+            missing_chunks: missing,
+            content_closed: closed,
+            signed_provenance_persisted: true,
+            signed_page_inbox_persisted: persisted,
+            operations_received: false,
+            worktree_materialized: false,
+            remote_backup_complete: false,
+        })
+    }
+
+    pub(crate) fn reserve_original_offer_content(
+        &mut self,
+        operations: &[sync_extend_transport::SignedOperation],
+        offer: &VerifiedOriginalContentOffer,
+    ) -> Result<(Vec<crate::ReferenceReservation>, Vec<ChunkRef>, bool)> {
         let mut reservations = Vec::new();
-        for signed in &page.page.operations {
+        for signed in operations {
             let Change::Put { entry } = &signed.operation.payload.change else {
                 continue;
             };
@@ -143,18 +165,7 @@ impl LocalSpace {
             }
         }
         self.verify_root()?;
-        Ok(OriginalContentPreparation {
-            page_request_id: request,
-            reservation: reservations.first().cloned(),
-            reservations,
-            missing_chunks: missing,
-            content_closed: closed,
-            signed_provenance_persisted: true,
-            signed_page_inbox_persisted: persisted,
-            operations_received: false,
-            worktree_materialized: false,
-            remote_backup_complete: false,
-        })
+        Ok((reservations, missing, closed))
     }
 
     /// Recover exact signed pages without peer-supplied reconstruction. Current
@@ -207,7 +218,24 @@ impl LocalSpace {
         request
             .verify_block(identity.peer_identity(), &offer, id, bytes)
             .map_err(|_| ReconcileError::Invariant("original exact requested block invalid"))?;
-        for signed in &page.page.operations {
+        self.ingest_verified_original_content(source, &page.page.operations, request, id, bytes)
+    }
+
+    pub(crate) fn ingest_verified_original_content(
+        &mut self,
+        source: &PeerIdentity,
+        operations: &[sync_extend_transport::SignedOperation],
+        request: &SignedOriginalContentRequest,
+        id: &ContentId,
+        bytes: &[u8],
+    ) -> Result<OriginalContentImport> {
+        self.verify_root()?;
+        if self.read_transport_peer(&source.device_id)? != *source {
+            return Err(ReconcileError::Invariant(
+                "original block current source approval changed",
+            ));
+        }
+        for signed in operations {
             let expected = sync_extend_journal::RemotePublicationProof {
                 public_key: source.public_key,
                 operation: signed.operation.clone(),
@@ -224,9 +252,7 @@ impl LocalSpace {
                 ));
             }
         }
-        let original = page
-            .page
-            .operations
+        let original = operations
             .iter()
             .find(|signed| {
                 matches!(&signed.operation.payload.change, Change::Put { entry }
@@ -296,7 +322,7 @@ impl LocalSpace {
     }
 }
 
-fn original_owner_id(
+pub(crate) fn original_owner_id(
     space: &SpaceId,
     receiver: &DeviceId,
     operation: &OperationId,

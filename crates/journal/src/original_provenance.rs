@@ -48,7 +48,12 @@ impl Drop for Permit {
 impl Gate {
     pub(crate) fn register(connection: &Connection) -> Result<Self> {
         let gate = Self::default();
-        for name in ["sync_original_operation_issue", "sync_original_page_issue"] {
+        for name in [
+            "sync_original_operation_issue",
+            "sync_original_page_issue",
+            "sync_forwarded_page_issue",
+            "sync_storage_handoff_issue",
+        ] {
             let state = gate.clone();
             connection.create_scalar_function(
                 name,

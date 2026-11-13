@@ -95,4 +95,37 @@ impl SignedOriginalPageAppliedReceipt {
         key.verify_strict(&digest, &signature)
             .map_err(|_| TransportError::Authorization("original applied signature invalid"))
     }
+    pub fn verify_forwarded(
+        &self,
+        target: &PeerIdentity,
+        page: &crate::ForwardedOperationPage,
+    ) -> Result<()> {
+        target.validate()?;
+        page.validate()?;
+        self.receipt.validate()?;
+        let last = page
+            .operations
+            .last()
+            .map_or(page.after_sequence, |s| s.operation.payload.origin_seq);
+        if self.receipt.space_id != target.space_id
+            || self.receipt.space_id != page.space_id
+            || self.receipt.device_id != target.device_id
+            || self.receipt.device_id != page.receiver_device
+            || self.receipt.origin_device != page.origin_device
+            || self.receipt.channel_binding != page.channel_binding
+            || self.receipt.request_id != page.request_id()?
+            || self.receipt.last_offered_sequence != last
+        {
+            return Err(TransportError::Authorization(
+                "original applied receipt exact request/target",
+            ));
+        }
+        let key = VerifyingKey::from_bytes(&target.public_key)
+            .map_err(|_| TransportError::Authorization("original applied target key"))?;
+        let signature = Signature::from_slice(&self.signature)
+            .map_err(|_| TransportError::Authorization("original applied signature width"))?;
+        let digest = blake3::derive_key(DOMAIN, &serde_json::to_vec(&self.receipt)?);
+        key.verify_strict(&digest, &signature)
+            .map_err(|_| TransportError::Authorization("original applied signature invalid"))
+    }
 }

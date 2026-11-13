@@ -32,6 +32,7 @@ mod remote_replay;
 mod transport_identity;
 pub use peer_pull::PeerFilePull;
 pub use remote_file::{RemoteFileChunkImport, RemoteFileMaterialization, RemoteFilePreparation};
+mod forwarded_content;
 mod move_file;
 mod mutation;
 #[cfg(windows)]
@@ -39,6 +40,7 @@ mod native_file_view;
 #[cfg(windows)]
 mod native_publish;
 mod original_content;
+pub use forwarded_content::ForwardedMetadataReceive;
 mod original_receive;
 pub use original_receive::OriginalMetadataReceive;
 mod original_applied;
@@ -87,8 +89,18 @@ mod scan;
 mod snapshot_pruning;
 mod snapshot_retention;
 mod storage;
+mod storage_node;
+pub use storage_node::{
+    StorageNode, StorageNodeStatus, StorageReceivedPage, StorageReceivedSnapshot,
+    StorageSnapshotStatus,
+};
+mod webdav;
+pub use webdav::{WebDavBaseline, WebDavCommit, WebDavRead};
 mod tree_final_observation;
+#[cfg(windows)]
+mod tree_native_owner;
 mod tree_restore_capture;
+mod tree_restore_pipeline;
 pub use delete::{DeleteResult, MutationResult};
 pub use diagnostics::Diagnostics;
 pub use gc_authorization::GcAuthorizationCheck;
@@ -102,7 +114,10 @@ pub use snapshot_retention::{RetentionReport, SnapshotLockResult, SnapshotRetent
 pub use storage::StorageReport;
 pub use sync_extend_journal::{ReferenceReservation, ReferenceReservationIntent};
 pub use tree_final_observation::{TreeFinalObservation, TreeFinalObservationReport};
+#[cfg(windows)]
+pub use tree_native_owner::{TreeNativeRestoreResult, TreeOwnerCreation, TreeOwnerReadiness};
 pub use tree_restore_capture::TreeRestoreCapture;
+pub use tree_restore_pipeline::TreeRestoreBudgets;
 
 use fs2::FileExt;
 use serde::Serialize;
@@ -732,7 +747,10 @@ impl LocalSpace {
                 .iter()
                 .filter(|p| p.native_reservation.is_some())
                 .count(),
-            tree_restore_execution_available: false,
+            tree_restore_execution_available: cfg!(windows)
+                && trees.iter().any(|preparation| {
+                    preparation.executor_available && preparation.writer_gate_held
+                }),
             tree_restore_owner_descriptions: trees
                 .iter()
                 .filter(|p| p.owner_description.is_some())
@@ -824,7 +842,7 @@ impl LocalSpace {
             }
         }
         for owner in self.reference_reservations()? {
-            if owner.snapshot_handoff.is_none() {
+            if owner.state == "reserved" {
                 for file in &owner.intent.scope.files {
                     self.cas.verify(file)?;
                 }

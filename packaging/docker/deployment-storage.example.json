@@ -1,0 +1,11 @@
+{
+  "format_version": 1,
+  "role": {
+    "kind": "storage",
+    "config": "/config/storage.json",
+    "forwarder": "/config/forwarder.json",
+    "max_sessions": 10000,
+    "session_timeout_secs": 300,
+    "between_sessions_secs": 1
+  }
+}

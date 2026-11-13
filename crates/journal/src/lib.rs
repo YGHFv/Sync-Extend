@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 50;
+const SCHEMA_VERSION: u32 = 57;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -35,10 +35,18 @@ pub use conflict_resolution::{
     ConflictResolutionPayload, ConflictResolutionProof, ConflictSignedOperation,
     EquivalentConflictHistory, ForeignConflictResolutionAdmission,
 };
+mod forwarded_page_inbox;
 mod operation_batch;
 mod original_page_inbox;
 mod original_provenance;
+mod tree_native_effects;
 pub use original_page_inbox::OriginalPageEnvelope;
+#[cfg(windows)]
+pub use tree_native_effects::owner::{
+    TreeNativeCleanupReceipt, TreeNativeExecution, TreeNativeExecutionFileView,
+    TreeNativeFinalized, TreeNativeObservation, TreeNativeOwnerCreation, TreeNativeOwnerFileView,
+    TreeNativeOwnerReadiness,
+};
 mod read_view;
 use read_view::JournalReadView;
 mod native_publication;
@@ -72,7 +80,10 @@ mod remote_delete;
 pub use remote_delete::{remote_delete_transaction, RemoteDeleteReceipt, RemoteDeleteStage};
 #[cfg(windows)]
 pub use remote_delete::{RemoteDeleteObservation, RemoteDeleteSource};
+mod storage_page_handoff;
 mod storage_policy;
+mod storage_traffic;
+pub use storage_traffic::StorageTrafficLedger;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiveOutcome {
@@ -87,6 +98,8 @@ pub struct Journal {
     max_storage_entries: usize,
     conflict_resolution_issuance: conflict_resolution::issuance::Gate,
     original_operation_issuance: original_provenance::Gate,
+    #[cfg(windows)]
+    tree_native_issuance: tree_native_effects::issuance::Gate,
     #[cfg(windows)]
     native_issuance: native_publication::issuance::Gate,
     #[cfg(windows)]
@@ -397,8 +410,49 @@ impl Journal {
             tx.execute_batch(include_str!("migration-050.sql"))?;
             tx.commit()?;
         }
+        if version < 51 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-051.sql"))?;
+            tx.commit()?;
+        }
+        if version < 52 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-052.sql"))?;
+            tx.commit()?;
+        }
+        if version < 53 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-053.sql"))?;
+            tx.commit()?;
+        }
+        if version < 54 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-054.sql"))?;
+            tx.commit()?;
+        }
+        if version < 55 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-055.sql"))?;
+            tx.commit()?;
+        }
+        if version < 56 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-056.sql"))?;
+            tx.commit()?;
+        }
+        if version < 57 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-057.sql"))?;
+            tx.commit()?;
+        }
+        storage_page_handoff::validate_schema(&connection)?;
+        tree_native_effects::validate_schema(&connection)?;
+        let tree_native_issuance = tree_native_effects::issuance::Gate::register(&connection)?;
+        #[cfg(not(windows))]
+        let _ = tree_native_issuance;
         original_provenance::validate_schema(&connection)?;
         original_page_inbox::validate_schema(&connection)?;
+        forwarded_page_inbox::validate_schema(&connection)?;
         let original_operation_issuance = original_provenance::Gate::register(&connection)?;
         conflict_resolution::validate_schema(&connection)?;
         let conflict_resolution_issuance =
@@ -425,6 +479,8 @@ impl Journal {
             conflict_resolution_issuance,
             original_operation_issuance,
             #[cfg(windows)]
+            tree_native_issuance,
+            #[cfg(windows)]
             native_issuance,
             #[cfg(windows)]
             remote_rename_issuance,
@@ -440,21 +496,47 @@ impl Journal {
     }
 
     pub fn initialize(&mut self, space: &SpaceId, device: &DeviceId, root: &str) -> Result<()> {
+        self.initialize_identity(
+            space,
+            &[
+                ("space_id", space.as_str()),
+                ("device_id", device.as_str()),
+                ("worktree", root),
+            ],
+        )
+    }
+
+    /// A storage identity has no worktree row or local file-authoring entry point.
+    pub fn initialize_storage(&mut self, space: &SpaceId, device: &DeviceId) -> Result<()> {
+        if self.state("worktree")?.is_some() {
+            return Err(JournalError::Invariant(
+                "client identity cannot become a storage identity",
+            ));
+        }
+        self.initialize_identity(
+            space,
+            &[
+                ("space_id", space.as_str()),
+                ("device_id", device.as_str()),
+                ("storage_role", "storage-v1"),
+            ],
+        )
+    }
+
+    fn initialize_identity(&mut self, space: &SpaceId, identity: &[(&str, &str)]) -> Result<()> {
         let bounds = storage_policy::capacity_limits(self.max_storage_entries)?;
-        if root.len() > MAX_OPERATION_BYTES {
+        if identity
+            .iter()
+            .any(|(_, value)| value.len() > MAX_OPERATION_BYTES)
+        {
             return Err(JournalError::Invariant("local root metadata limit"));
         }
         let tx =
             Transaction::new_unchecked(&self.connection, rusqlite::TransactionBehavior::Immediate)?;
         let view = self.read_view();
         let before = view.audit_history_capacity(space, bounds)?;
-        let identity = [
-            ("space_id", space.as_str()),
-            ("device_id", device.as_str()),
-            ("worktree", root),
-        ];
         let mut present = 0;
-        for (key, value) in identity {
+        for &(key, value) in identity {
             let old: Option<String> = tx
                 .query_row("SELECT value FROM local_state WHERE key=?1", [key], |row| {
                     row.get(0)
@@ -473,7 +555,7 @@ impl Journal {
             return Err(JournalError::Invariant("incomplete local identity"));
         }
         storage_policy::history::within(&before.report)?;
-        for (key, value) in identity {
+        for &(key, value) in identity {
             if tx.execute(
                 "INSERT OR IGNORE INTO local_state VALUES (?1, ?2)",
                 params![key, value],
@@ -483,7 +565,7 @@ impl Journal {
             }
         }
         let after = view.audit_history_capacity(space, bounds)?;
-        storage_policy::history::initialized(&before, &after, &identity)?;
+        storage_policy::history::initialized(&before, &after, identity)?;
         storage_policy::history::within(&after.report)?;
         tx.commit()?;
         Ok(())
@@ -1014,6 +1096,16 @@ impl Journal {
 
     // Trusted local transport only. Authentication must precede this API in M2.
     pub fn receive(&mut self, op: &Operation) -> Result<ReceiveOutcome> {
+        self.receive_inner(op, false)
+    }
+
+    /// Worktree-free storage still uses exact full inventory and receive projections.
+    /// Current origin authentication and durable envelope retention precede this API.
+    pub fn receive_storage(&mut self, op: &Operation) -> Result<ReceiveOutcome> {
+        self.receive_inner(op, true)
+    }
+
+    fn receive_inner(&mut self, op: &Operation, storage: bool) -> Result<ReceiveOutcome> {
         op.validate()?;
         let json = serde_json::to_string(op)?;
         if json.len() > MAX_OPERATION_BYTES || op.payload.origin_seq > i64::MAX as u64 {
@@ -1023,7 +1115,11 @@ impl Journal {
         let tx =
             Transaction::new_unchecked(&self.connection, rusqlite::TransactionBehavior::Immediate)?;
         let view = self.read_view();
-        let before = view.audit_receive_capacity(&op.payload.space_id, bounds)?;
+        let before = if storage {
+            view.audit_storage_receive_capacity(&op.payload.space_id, bounds)?
+        } else {
+            view.audit_receive_capacity(&op.payload.space_id, bounds)?
+        };
         storage_policy::receive::tree_gate(&before)?;
         if let Some(existing) = tx
             .query_row(
@@ -1065,7 +1161,11 @@ impl Journal {
             [op.op_id.as_str()],
             |r| r.get(0),
         )?;
-        let after = view.audit_receive_capacity(&op.payload.space_id, bounds)?;
+        let after = if storage {
+            view.audit_storage_receive_capacity(&op.payload.space_id, bounds)?
+        } else {
+            view.audit_receive_capacity(&op.payload.space_id, bounds)?
+        };
         let outcome = projection.receipt(&before, &after, op, &json, &state)?;
         tx.commit()?;
         Ok(outcome)
@@ -1654,7 +1754,8 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
             + (SELECT count(*) FROM gc_quarantines) + (SELECT 2*count(*) FROM gc_disposals)
             + (SELECT count(*) FROM reference_reservations)
             + max((SELECT count(*) FROM reference_reservations),
-                (SELECT count(*) FROM reference_snapshot_handoffs))
+                (SELECT count(*) FROM reference_snapshot_handoffs)
+                + (SELECT count(*) FROM storage_page_handoffs))
             + (SELECT count(*) FROM reference_reservation_objects)
             + (SELECT count(*) FROM rename_observations)
             + (SELECT count(*) FROM original_operation_provenance)

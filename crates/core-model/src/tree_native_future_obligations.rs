@@ -104,6 +104,24 @@ pub fn plan_tree_native_future_obligations(
     generations: &TreeNativeFutureGenerations,
     bounds: TreeNativeFutureLimits,
 ) -> Result<TreeNativeFuturePlan> {
+    plan_tree_native_future_obligations_with_observation(
+        context,
+        protocol,
+        initial,
+        generations,
+        bounds,
+        None,
+    )
+}
+
+pub fn plan_tree_native_future_obligations_with_observation(
+    context: &TreeCoordinatorContext<'_>,
+    protocol: &TreeNativeProtocolPlan,
+    initial: &TreeNativeActionLayoutRecord,
+    generations: &TreeNativeFutureGenerations,
+    bounds: TreeNativeFutureLimits,
+    prior_observation: Option<&crate::persisted_rename::RenameObservationMap>,
+) -> Result<TreeNativeFuturePlan> {
     if bounds.max_records > limits::MAX_ENTRIES
         || bounds.max_originals > limits::MAX_ENTRIES
         || bounds.max_reference_rows > limits::MAX_CHUNKS
@@ -213,7 +231,7 @@ pub fn plan_tree_native_future_obligations(
             fresh_observation_hash: ContentId::hash(b"private final sizing only"),
             intended_at_ms: i64::MAX as u64,
             committed_at_ms: i64::MAX as u64,
-            prior_observation: None,
+            prior_observation: prior_observation.cloned(),
         },
         TreeFinalTerminalLayoutLimits {
             max_records: bounds.max_records,

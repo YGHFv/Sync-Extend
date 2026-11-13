@@ -9,7 +9,7 @@ use crate::{
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
-    tree_native_future_obligations::plan_tree_native_future_obligations,
+    tree_native_future_obligations::plan_tree_native_future_obligations_with_observation,
     tree_storage_capacity::TreeStorageCharge,
     tree_storage_footprint::{TreeStorageColumnValue, TreeStorageRowValues, TreeStorageTable},
 };
@@ -130,12 +130,13 @@ pub(super) fn owners(
                 .ok_or(invalid("journal capacity prewrite missing"))?;
             let (projection, protocol, _) =
                 crate::tree_native_storage::initial_layout(connection, p, prewrite.request(), max)?;
-            let plan = plan_tree_native_future_obligations(
+            let plan = plan_tree_native_future_obligations_with_observation(
                 &projection.context(),
                 &protocol,
                 prewrite.intended(),
                 future.generations(),
                 future.request().layout_limits,
+                future.prior_observation(),
             )?;
             if plan.obligations() != future.obligations()
                 || plan.new_charge() != future.new_charge()
@@ -143,18 +144,38 @@ pub(super) fn owners(
             {
                 return Err(invalid("journal capacity immutable future projection"));
             }
+            let progress = crate::tree_native_effects::audit(connection, p, rows, max)?;
+            let mut remaining = plan.future_charge();
+            let mut seen_fulfilled = BTreeSet::new();
             for obligation in plan.obligations() {
                 let key = (
                     named_table(obligation.key.table)?,
                     obligation.key.key.as_slice(),
                 );
-                if inventory.contains_key(&key) {
-                    return Err(invalid(
-                        "journal capacity unexpected fulfilled native obligation",
-                    ));
+                if let Some(actual) = inventory.get(&key) {
+                    let owned = (actual.table().to_owned(), actual.primary_key().to_vec());
+                    if progress.fulfilled.get(&owned) != Some(&row_charge(actual))
+                        || actual.logical_bytes() > obligation.max_logical_bytes
+                        || !seen_fulfilled.insert(owned)
+                    {
+                        return Err(invalid("journal capacity unverified native fulfillment"));
+                    }
+                    remaining.rows = remaining
+                        .rows
+                        .checked_sub(1)
+                        .ok_or(invalid("journal capacity native row underflow"))?;
+                    remaining.logical_bytes = remaining
+                        .logical_bytes
+                        .checked_sub(obligation.max_logical_bytes)
+                        .ok_or(invalid("journal capacity native byte underflow"))?;
                 }
             }
-            owner.outstanding_metadata = plan.future_charge();
+            if seen_fulfilled.len() != progress.fulfilled.len() {
+                return Err(invalid(
+                    "journal capacity native fulfillment outside reservation",
+                ));
+            }
+            owner.outstanding_metadata = remaining;
             owner.reserved_new = plan.new_charge();
             for expected in plan.exact_new_values() {
                 if !expected.is_new_history() {
@@ -187,6 +208,13 @@ pub(super) fn owners(
                     .logical_bytes
                     .max(owner.actual_new.logical_bytes),
             };
+            let finalized: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.tree_native_final_commits WHERE transaction_id=?1)",
+                [p.intent.transaction_id.as_str()], |row| row.get(0),
+            )?;
+            if finalized {
+                owner.charged_new = owner.actual_new;
+            }
         }
         for row in &owner_rows {
             if row.columns().iter().any(|c| c.name == "reserved_rows") {
@@ -229,6 +257,7 @@ fn residual(
         // rows; the old B1 counters remain actual, separately reported values.
         "tree_restore_preparations" if covered => return Ok(TreeStorageCharge::default()),
         "tree_restore_histories" if covered => return Ok(TreeStorageCharge::default()),
+        "tree_restore_original_reservations" if covered => return Ok(TreeStorageCharge::default()),
         "tree_restore_preparations" => &[
             "tree_restore_preparations",
             "tree_restore_steps",

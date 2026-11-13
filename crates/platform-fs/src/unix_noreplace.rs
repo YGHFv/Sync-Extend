@@ -58,6 +58,46 @@ fn key(file: &File) -> io::Result<UnixFileKey> {
     })
 }
 
+/// Anonymous request staging with kernel lifetime cleanup. No named upload
+/// exists, including during creation or after an actual process kill.
+/// Unsupported filesystems fail before receiving bytes.
+pub fn create_anonymous_upload(parent: &Path) -> io::Result<File> {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = UnixDirectory::open(parent)?;
+    let metadata = directory.file.metadata()?;
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(unsupported(
+            "upload parent must have owner-only permissions",
+        ));
+    }
+    let name = CString::new(".").expect("fixed native component");
+    // SAFETY: retained parent and terminated fixed component; O_TMPFILE
+    // requires the supplied owner-only mode and returns one owned descriptor.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.file.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC | libc::O_EXCL,
+            0o600 as libc::mode_t,
+        )
+    };
+    let file = owned_descriptor(descriptor)?;
+    if file.metadata()?.nlink() != 0 || !file.metadata()?.is_file() {
+        return Err(unsupported("anonymous upload descriptor was linked"));
+    }
+    Ok(file)
+}
+
+/// Hold one exclusive owner on the exact state directory without creating a lock file.
+pub fn acquire_sidecar_owner(parent: &Path) -> io::Result<File> {
+    let directory = UnixDirectory::open(parent)?;
+    // SAFETY: a retained real directory descriptor; nonblocking advisory lock has no pointers.
+    if unsafe { libc::flock(directory.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(directory.file)
+}
+
 /// Retained real directory, with no symlinks followed at any component.
 /// Linux does not stop a native process from renaming this directory or its
 /// children; retaining a descriptor is not a namespace mutation lock.

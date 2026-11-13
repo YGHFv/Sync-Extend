@@ -347,7 +347,7 @@ impl LocalSpace {
             worker_reservation_records - worker_snapshot_handoff_records;
         let mut reserved = BTreeSet::new();
         for owner in owners {
-            if owner.snapshot_handoff.is_none() {
+            if owner.state == "reserved" {
                 for file in &owner.intent.scope.files {
                     refs.add(file, &mut reserved)?;
                 }
@@ -691,7 +691,7 @@ fn selected_inventory_bytes(
     sum_lengths(lengths.keys(), &lengths)
 }
 
-fn visit(
+pub(crate) fn visit(
     root: &Path,
     path: &Path,
     region: Region,

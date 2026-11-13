@@ -143,6 +143,20 @@ impl LocalSpace {
         entry_id: EntryId,
         native_only: bool,
     ) -> Result<EntryId> {
+        self.begin_content_selected_slot(path, content, source, id, entry_id, native_only, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_content_selected_slot(
+        &mut self,
+        path: PortablePath,
+        content: FileManifest,
+        source: Option<SnapshotId>,
+        id: EntryId,
+        entry_id: EntryId,
+        native_only: bool,
+        require_absent: bool,
+    ) -> Result<EntryId> {
         self.verify_root()?;
         self.check_publication_limits(&content)?;
         self.parent_for(&path)?;
@@ -155,7 +169,13 @@ impl LocalSpace {
             .values()
             .find(|entry| entry.path == path)
             .cloned();
-        let target_path = if requested_baseline.is_some() || self.occupied(&path)? {
+        let occupied = requested_baseline.is_some() || self.occupied(&path)?;
+        if require_absent && occupied {
+            return Err(ReconcileError::Invariant(
+                "requested publication slot became occupied",
+            ));
+        }
+        let target_path = if occupied {
             self.conflict_path(&path, &id, 0)?
         } else {
             path.clone()

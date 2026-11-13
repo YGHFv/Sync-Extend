@@ -54,9 +54,43 @@ impl LocalSpace {
                 "original native operation outside signed page",
             ))?
             .clone();
+        self.apply_verified_original_operation(request, operation, &envelope.source, &signed)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn apply_verified_original_operation(
+        &mut self,
+        request: &ContentId,
+        operation: &OperationId,
+        source: &sync_extend_transport::PeerIdentity,
+        signed: &sync_extend_transport::SignedOperation,
+    ) -> Result<OriginalApplyResult> {
+        self.verify_root()?;
+        if self.read_transport_peer(&source.device_id)? != *source
+            || &signed.operation.op_id != operation
+            || source.space_id != self.space_id
+            || source.device_id == self.device_id
+        {
+            return Err(ReconcileError::Invariant(
+                "original native current independent approval",
+            ));
+        }
         signed
-            .verify(&envelope.source)
+            .verify(source)
             .map_err(|_| ReconcileError::Invariant("original native individual signature"))?;
+        if self.journal.original_provenance(
+            &self.space_id,
+            &source.device_id,
+            signed.operation.payload.origin_seq,
+        )? != Some(sync_extend_journal::RemotePublicationProof {
+            public_key: source.public_key,
+            operation: signed.operation.clone(),
+            signature: signed.signature.clone(),
+        }) {
+            return Err(ReconcileError::Invariant(
+                "original native exact retained provenance",
+            ));
+        }
         let mut result = OriginalApplyResult {
             request_id: request.clone(),
             operation_id: operation.clone(),
@@ -82,7 +116,7 @@ impl LocalSpace {
                         .iter()
                         .any(|r| r.transaction_id == replacement)
                     {
-                        let native = self.apply_signed_remote_replace(&envelope.source, &signed)?;
+                        let native = self.apply_signed_remote_replace(source, signed)?;
                         result.native_cleanup_complete = native.receipt.native_cleanup_complete;
                         result.pending_reason = native.pending_reason;
                     } else {
@@ -91,7 +125,7 @@ impl LocalSpace {
                                 .as_str()[..32]
                                 .parse()?;
                         if self.journal.find_publication(&id)?.is_some() {
-                            let native = self.apply_signed_remote_put(&envelope.source, &signed)?;
+                            let native = self.apply_signed_remote_put(source, signed)?;
                             result.native_cleanup_complete = native.native_cleanup_complete;
                             result.pending_reason = native.pending_reason;
                         }
@@ -104,7 +138,7 @@ impl LocalSpace {
                         .iter()
                         .any(|r| r.transaction_id == id)
                     {
-                        let native = self.apply_signed_remote_delete(&envelope.source, &signed)?;
+                        let native = self.apply_signed_remote_delete(source, signed)?;
                         result.native_cleanup_complete = native.receipt.native_cleanup_complete;
                         result.pending_reason = native.pending_reason;
                     }
@@ -117,7 +151,7 @@ impl LocalSpace {
                         .any(|r| r.transaction_id == id && r.local_committed);
                 }
             }
-            let replay = self.replay_signed_remote_operation(&envelope.source, &signed)?;
+            let replay = self.replay_signed_remote_operation(source, signed)?;
             if replay.disposition != sync_extend_journal::RemoteReplayDisposition::AlreadyApplied {
                 return Err(ReconcileError::Invariant(
                     "original claimed applied history differs",
@@ -185,25 +219,25 @@ impl LocalSpace {
                     .iter()
                     .any(|r| r.transaction_id == replacement);
                 if existing_replace || baseline.entries.contains_key(&entry.entry_id) {
-                    let native = self.apply_signed_remote_replace(&envelope.source, &signed)?;
+                    let native = self.apply_signed_remote_replace(source, signed)?;
                     committed = native.receipt.local_committed;
                     result.native_cleanup_complete = native.receipt.native_cleanup_complete;
                     result.pending_reason = native.pending_reason;
                 } else {
-                    let native = self.apply_signed_remote_put(&envelope.source, &signed)?;
+                    let native = self.apply_signed_remote_put(source, signed)?;
                     committed = native.local_committed;
                     result.native_cleanup_complete = native.native_cleanup_complete;
                     result.pending_reason = native.pending_reason;
                 }
             }
             Change::Rename { .. } => {
-                let native = self.apply_signed_remote_rename(&envelope.source, &signed)?;
+                let native = self.apply_signed_remote_rename(source, signed)?;
                 committed = native.receipt.local_committed;
                 result.native_cleanup_complete = native.receipt.local_committed;
                 result.pending_reason = native.pending_reason;
             }
             Change::Delete { .. } => {
-                let native = self.apply_signed_remote_delete(&envelope.source, &signed)?;
+                let native = self.apply_signed_remote_delete(source, signed)?;
                 committed = native.receipt.local_committed;
                 result.native_cleanup_complete = native.receipt.native_cleanup_complete;
                 result.pending_reason = native.pending_reason;

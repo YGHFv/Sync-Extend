@@ -31,7 +31,7 @@ fn integer(name: &str, value: u64) -> JournalStorageColumn {
 pub(crate) fn initialized(
     before: &CapacitySnapshot,
     after: &CapacitySnapshot,
-    identity: &[(&str, &str); 3],
+    identity: &[(&str, &str)],
 ) -> Result<()> {
     let primary_keys: Vec<_> = identity.iter().map(|(key, _)| [key.to_string()]).collect();
     let mut remaining: BTreeMap<_, _> = after

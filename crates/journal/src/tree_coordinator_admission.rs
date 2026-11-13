@@ -101,7 +101,7 @@ pub(crate) fn project(
         || request.limits.max_reference_rows > max
         || request.limits.max_input_bytes > MAX_OPERATION_BYTES as u64
         || request.limits.max_encoded_bytes > MAX_OPERATION_BYTES as u64
-        || !p.writer_gate_held
+        || (!p.writer_gate_held && p.state != "native_cleaned")
         || p.cancelled_at_ms.is_some()
     {
         return Err(JournalError::Invariant(
@@ -155,13 +155,30 @@ pub(crate) fn project(
         &execution.identity,
         originals.request.limits,
     )?;
+    let mut remaining_references = 0usize;
+    for (&index, closure) in original_plan.closures() {
+        let released: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.tree_native_original_terminals
+             WHERE transaction_id=?1 AND step_index=?2)",
+            rusqlite::params![p.intent.transaction_id.as_str(), index as i64],
+            |row| row.get(0),
+        )?;
+        if !released {
+            remaining_references =
+                remaining_references
+                    .checked_add(closure.len())
+                    .ok_or(JournalError::Invariant(
+                        "tree admission remaining reference overflow",
+                    ))?;
+        }
+    }
     if originals.request.reserved_at_ms > request.input.admitted_at_ms
         || request.input.original_request_hash
             != ContentId::hash(&serde_json::to_vec(&originals.request)?)
         || original_plan.intents() != &originals.originals
         || original_plan.fingerprint() != &originals.fingerprint
         || !originals.exact_original_pins_verified
-        || originals.active_reference_count != original_plan.reference_rows()
+        || originals.active_reference_count != remaining_references
         || owner
             .records
             .iter()

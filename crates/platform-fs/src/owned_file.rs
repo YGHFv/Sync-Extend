@@ -76,6 +76,22 @@ impl LockedDirectory {
     pub fn create_new_file(&self, name: &str) -> io::Result<OwnedFileCreation> {
         create(&self.file, name)
     }
+
+    /// Kernel lifetime begins at exclusive CREATE, before any application code.
+    pub fn create_request_file(&self, name: &str) -> io::Result<OwnedFileCreation> {
+        let original_parent_key = key(&self.file)?;
+        let file = super::directory_create::create_request_file(&self.file, name)?;
+        let original_key = key(&file)?;
+        let created = OwnedFileCreation {
+            file,
+            parent: self.file.try_clone()?,
+            original_key,
+            original_parent_key,
+            created_component: name.into(),
+        };
+        created.original_creation()?.verify()?;
+        Ok(created)
+    }
 }
 
 impl LockedDirectoryMutation {

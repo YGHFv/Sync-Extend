@@ -1,6 +1,20 @@
 mod conflict_resolution;
 mod connection;
+mod forwarded_page;
+mod storage_delivery;
+mod storage_snapshot;
+pub use storage_delivery::{
+    assess_storage_retention, ForwardedAppliedEvidence, StoragePageDeliveryRecord,
+    VerifiedStoragePageDelivery,
+};
+pub use storage_snapshot::{
+    ForwardedSnapshotEnvelope, SignedStorageSnapshotReport, StorageSnapshotReport,
+};
 mod identity;
+pub use forwarded_page::{
+    ForwardStoreReceipt, ForwardStoreState, ForwardedOperationPage, ForwardedPageEnvelope,
+    SignedForwardStoreReceipt, SignedForwardedOperationPage, VerifiedForwardedPage,
+};
 mod metadata_cycle;
 mod operation_batch;
 mod original_applied;

@@ -65,8 +65,23 @@ pub(crate) fn tree_gate(before: &CapacitySnapshot) -> Result<()> {
         .filter(|row| row.table() == "tree_restore_cancellations")
         .map(JournalStoredRow::primary_key)
         .collect();
+    // CapacitySnapshot already verified the complete typed Final, original
+    // releases, cleanup record chain and exact values. Only its final cleanup
+    // record frees this historical preparation's ordinary writer gate.
+    let cleaned: BTreeSet<_> = before
+        .rows
+        .iter()
+        .filter(|row| row.table() == "tree_native_cleanup_records")
+        .filter(|row| row.primary_key().get(1).map(String::as_str) == Some("3"))
+        .filter_map(|row| row.primary_key().first())
+        .collect();
     if before.rows.iter().any(|row| {
-        row.table() == "tree_restore_preparations" && !cancelled.contains(row.primary_key())
+        row.table() == "tree_restore_preparations"
+            && !cancelled.contains(row.primary_key())
+            && !row
+                .primary_key()
+                .first()
+                .is_some_and(|id| cleaned.contains(id))
     }) {
         return Err(JournalError::Invariant(
             "prepared tree restore owns writer gate",

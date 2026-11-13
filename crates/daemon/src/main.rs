@@ -5,12 +5,24 @@ use sync_extend_core_model::{
     PortablePath,
 };
 use sync_extend_reconcile::LocalSpace;
+mod config_file;
+mod deployment;
+mod easytier;
+mod shutdown;
+mod storage;
+mod webdav;
+mod webdav_conditions;
+mod webdav_credentials;
+mod webdav_http;
+mod webdav_locks;
+mod webdav_upload;
+mod webdav_xml;
 
 #[derive(Parser)]
 #[command(
     name = "syncd",
     version,
-    about = "SyncExtend local alpha with explicitly paired QUIC file copy; automatic sync and WebDAV are not available"
+    about = "SyncExtend local alpha with explicit paired sync and opt-in authenticated local WebDAV"
 )]
 struct Cli {
     /// Apply a local limits JSON file to this invocation (not a retention/GC policy).
@@ -22,6 +34,246 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Enter the native Windows SCM dispatcher with an existing deployment identity.
+    #[cfg(windows)]
+    WindowsService {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Validate one explicit deployment role without creating an identity or starting services.
+    DeploymentCheck {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Run one preprovisioned role in this foreground process.
+    DeploymentRun {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Hand off one retained page owner using all explicitly required native target receipts.
+    StorageRetentionHandoff {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        evidence: PathBuf,
+    },
+    /// Assess exact retained page delivery under an explicit local retention policy.
+    StorageRetentionAssess {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        evidence: PathBuf,
+    },
+    /// Sign a forwarded applied receipt after complete fresh native and content observation.
+    StorageClientReceipt {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        request: String,
+    },
+    /// Pull a bounded original page through an approved storage peer into this client.
+    StorageClientPull {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        origin: PathBuf,
+        #[arg(long)]
+        address: std::net::SocketAddr,
+        #[arg(long)]
+        after_sequence: u64,
+    },
+    /// Resume one exact forwarded operation with the existing native transaction driver.
+    StorageClientApply {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        request: String,
+        #[arg(long)]
+        operation: String,
+    },
+    /// Forward retained individually signed originals from this paired client.
+    StoragePush {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        origin: PathBuf,
+        #[arg(long)]
+        storage: PathBuf,
+        #[arg(long)]
+        address: std::net::SocketAddr,
+        #[arg(long)]
+        after_sequence: u64,
+        /// Retained report signed by the original device, never the forwarder.
+        #[arg(long)]
+        snapshot_report: Option<PathBuf>,
+    },
+    /// Sign this device's current audited manifest for later authenticated forwarding.
+    StorageSnapshotReport {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Create a new explicit worktree-free storage identity and bounded quota ledger.
+    StorageInit {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Create a fresh private storage identity before independently exchanging approvals.
+    StorageProvision {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        space: String,
+    },
+    /// Initialize the exact provisioned identity with finalized local storage policy.
+    StorageInitProvisioned {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        expected_identity: PathBuf,
+    },
+    /// Report last-reported metadata/content completeness without applying files.
+    StorageStatus {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Export only this storage device's public pairing identity.
+    StorageIdentity {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Serve bounded consecutive authenticated sessions using one retained storage owner.
+    StorageRun {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        forwarder: PathBuf,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000000))]
+        max_sessions: u32,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86400))]
+        session_timeout_secs: u64,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        between_sessions_secs: u64,
+    },
+    /// Serve one explicitly approved forwarding peer and one bounded QUIC page.
+    StorageServe {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        forwarder: PathBuf,
+    },
+    /// Pull original signed data from an independently approved storage forwarder.
+    StoragePull {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        origin: PathBuf,
+        #[arg(long)]
+        address: std::net::SocketAddr,
+        #[arg(long)]
+        after_sequence: u64,
+    },
+    /// Verify both explicitly pinned local EasyTier binary hashes and versions.
+    EasytierCheck {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Run the opted-in fixed-version sidecar for an explicit bounded interval.
+    EasytierRun {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86400))]
+        seconds: u64,
+    },
+    /// Read actual peer routes without treating overlay peers as device identities.
+    EasytierObserve {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Run one bounded authenticated loopback gateway from local configuration.
+    WebdavServe {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Create random per-listener local credentials without displaying secrets.
+    WebdavCredentialsGenerate {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Display one password explicitly; output must not enter diagnostic logs.
+    WebdavCredentialShow {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        username: String,
+    },
+    /// Audit TREE transactions and exact retained preparations without executing.
+    TreeTransactions {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Prepare one bounded historical whole-tree restore, retaining input pins.
+    TreePrepare {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        baseline: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        transaction: String,
+        #[arg(long)]
+        budgets: PathBuf,
+    },
+    /// Explicitly admit the same TREE preparation; cancellation becomes fenced.
+    #[cfg(windows)]
+    TreeAdmit {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        transaction: String,
+        #[arg(long)]
+        budgets: PathBuf,
+        #[arg(long)]
+        allow_irreversible_admission: bool,
+    },
+    /// Create and seal only the exact admitted TREE owner; user tree unchanged.
+    #[cfg(windows)]
+    TreeCreateOwner {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        transaction: String,
+    },
+    /// Execute admitted TREE actions and NEW Final, then scoped original cleanup.
+    #[cfg(windows)]
+    TreeExecute {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        transaction: String,
+        #[arg(long)]
+        allow_non_atomic_tree: bool,
+    },
+    /// Resume exact TREE lineage; unresolved native attempts remain refused.
+    #[cfg(windows)]
+    TreeResume {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        transaction: String,
+        #[arg(long)]
+        allow_non_atomic_tree: bool,
+    },
     /// Run delayed paired original cycles; retained signed resolutions precede pages.
     #[cfg(windows)]
     RunOriginalCycle {
@@ -872,7 +1124,39 @@ fn main() -> ExitCode {
 
 #[inline(never)]
 fn run_cli() -> ExitCode {
-    let cli = Cli::parse();
+    let parsed = Cli::parse();
+    #[cfg(windows)]
+    if let Command::WindowsService { name, config } = &parsed.command {
+        let name = name.clone();
+        let config = config.clone();
+        let limits = parsed.limits.clone();
+        return match sync_extend_platform_fs::run_windows_service(&name, move |_reporter| {
+            let cli = deployment::expand(Cli {
+                limits,
+                command: Command::DeploymentRun { config },
+            })
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            runtime
+                .block_on(Box::pin(execute(cli)))
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        }) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("syncd: native service failed: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let cli = match deployment::expand(parsed) {
+        Ok(cli) => cli,
+        Err(error) => {
+            eprintln!("syncd: deployment validation failed: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build();
@@ -891,6 +1175,18 @@ fn run_cli() -> ExitCode {
     }
 }
 
+fn read_tree_budgets(
+    path: &std::path::Path,
+) -> Result<sync_extend_reconcile::TreeRestoreBudgets, Box<dyn std::error::Error>> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(65537).read_to_end(&mut bytes)?;
+    if bytes.len() > 65536 {
+        return Err("TREE budgets exceed 64 KiB".into());
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let limits: sync_extend_core_model::limits::LocalLimits = if let Some(path) = cli.limits {
         let file = std::fs::File::open(path)?;
@@ -906,6 +1202,313 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     limits.validate()?;
     let open = |data: &std::path::Path| LocalSpace::open(data)?.with_limits(limits.clone());
     match cli.command {
+        #[cfg(windows)]
+        Command::WindowsService { .. } => {
+            return Err("SCM command must use native dispatcher".into())
+        }
+        Command::DeploymentCheck { config } => {
+            let config = deployment::load(&config)?;
+            print(&serde_json::json!({
+                "configuration_valid": true, "role": config.role_name(),
+                "identity_created": false, "services_started": false,
+            }))?;
+        }
+        Command::DeploymentRun { .. } => {
+            return Err("deployment role was not expanded".into());
+        }
+        Command::StoragePush {
+            data_dir,
+            origin,
+            storage,
+            address,
+            after_sequence,
+            snapshot_report,
+        } => {
+            let origin = storage::load(&origin)?;
+            let peer = storage::load(&storage)?;
+            if let Some(path) = snapshot_report {
+                storage::push_with_snapshot(
+                    data_dir,
+                    origin,
+                    peer,
+                    address,
+                    after_sequence,
+                    Some(storage::load_snapshot_report(&path)?),
+                )
+                .await?;
+            } else {
+                storage::push(data_dir, origin, peer, address, after_sequence).await?;
+            }
+        }
+        Command::StorageSnapshotReport { data_dir } => {
+            print(&open(&data_dir)?.signed_storage_snapshot_report()?)?;
+        }
+        Command::StorageInit { config } => {
+            let config =
+                storage::load::<sync_extend_core_model::storage_node::StorageNodeConfig>(&config)?;
+            let node = sync_extend_reconcile::StorageNode::initialize(config)?;
+            print(&node.status()?)?;
+        }
+        Command::StorageProvision { data_dir, space } => {
+            print(&sync_extend_reconcile::StorageNode::provision_identity(
+                &data_dir,
+                space.parse()?,
+            )?)?;
+        }
+        Command::StorageInitProvisioned {
+            config,
+            expected_identity,
+        } => {
+            let config = storage::load(&config)?;
+            let expected = storage::load(&expected_identity)?;
+            let node =
+                sync_extend_reconcile::StorageNode::initialize_provisioned(config, &expected)?;
+            print(&node.status()?)?;
+        }
+        Command::StorageStatus { config } => {
+            let config =
+                storage::load::<sync_extend_core_model::storage_node::StorageNodeConfig>(&config)?;
+            print(&sync_extend_reconcile::StorageNode::open(config)?.status()?)?;
+        }
+        Command::StorageRetentionHandoff {
+            config,
+            policy,
+            evidence,
+        } => {
+            let node = sync_extend_reconcile::StorageNode::open(storage::load(&config)?)?;
+            let policy = storage::load(&policy)?;
+            let evidence = storage::load_retention_evidence(&evidence)?;
+            print(&serde_json::json!({
+                "handed_off": node.handoff_retained_page_delivery(&policy, &evidence)?,
+                "physical_deletion_executed": false,
+            }))?;
+        }
+        Command::StorageRetentionAssess {
+            config,
+            policy,
+            evidence,
+        } => {
+            let node = sync_extend_reconcile::StorageNode::open(storage::load(&config)?)?;
+            let policy = storage::load(&policy)?;
+            let evidence: Vec<sync_extend_transport::ForwardedAppliedEvidence> =
+                storage::load_retention_evidence(&evidence)?;
+            print(&node.assess_retained_page_delivery(&policy, &evidence)?)?;
+        }
+        Command::StorageClientReceipt { data_dir, request } => {
+            #[cfg(windows)]
+            {
+                print(&open(&data_dir)?.forwarded_applied_receipt(&request.parse()?)?)?;
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (data_dir, request);
+                return Err(
+                    "forwarded actual applied receipt requires the certified native platform"
+                        .into(),
+                );
+            }
+        }
+        Command::StorageClientPull {
+            data_dir,
+            source,
+            origin,
+            address,
+            after_sequence,
+        } => {
+            storage::client_pull(
+                data_dir,
+                storage::load(&source)?,
+                storage::load(&origin)?,
+                address,
+                after_sequence,
+                &limits,
+            )
+            .await?;
+        }
+        Command::StorageClientApply {
+            data_dir,
+            request,
+            operation,
+        } => {
+            #[cfg(windows)]
+            {
+                let mut local = LocalSpace::open_with_limits(&data_dir, limits.clone())?;
+                print(&local.apply_forwarded_operation(&request.parse()?, &operation.parse()?)?)?;
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (data_dir, request, operation);
+                return Err(
+                    "forwarded native client apply requires the certified platform driver".into(),
+                );
+            }
+        }
+        Command::StorageIdentity { config } => {
+            let config =
+                storage::load::<sync_extend_core_model::storage_node::StorageNodeConfig>(&config)?;
+            let node = sync_extend_reconcile::StorageNode::open(config)?;
+            print(node.transport_identity()?.peer_identity())?;
+        }
+        Command::StorageRun {
+            config,
+            forwarder,
+            max_sessions,
+            session_timeout_secs,
+            between_sessions_secs,
+        } => {
+            storage::run(
+                storage::load(&config)?,
+                storage::load(&forwarder)?,
+                max_sessions,
+                session_timeout_secs,
+                between_sessions_secs,
+            )
+            .await?;
+        }
+        Command::StorageServe { config, forwarder } => {
+            storage::serve(storage::load(&config)?, storage::load(&forwarder)?).await?;
+        }
+        Command::StoragePull {
+            config,
+            source,
+            origin,
+            address,
+            after_sequence,
+        } => {
+            storage::pull(
+                storage::load(&config)?,
+                storage::load(&source)?,
+                storage::load(&origin)?,
+                address,
+                after_sequence,
+            )
+            .await?;
+        }
+        Command::EasytierCheck { config } => easytier::check(&easytier::load(&config)?)?,
+        Command::EasytierObserve { config } => easytier::observe(&easytier::load(&config)?)?,
+        Command::EasytierRun { config, seconds } => {
+            let config = easytier::load(&config)?;
+            let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_shutdown = shutdown.clone();
+            let mut worker = tokio::task::spawn_blocking(move || {
+                easytier::run(config, seconds, worker_shutdown).map_err(|error| error.to_string())
+            });
+            tokio::select! {
+                result = &mut worker => { result?.map_err(std::io::Error::other)?; }
+                result = shutdown::requested() => {
+                    result?;
+                    shutdown.store(true, std::sync::atomic::Ordering::Release);
+                    worker.await?.map_err(std::io::Error::other)?;
+                }
+            }
+        }
+        Command::WebdavCredentialsGenerate { config } => {
+            let runtime = webdav::load(&config)?;
+            webdav_credentials::generate(&runtime.credentials, &runtime.listener)?;
+            print(&serde_json::json!({
+                "listener_id": runtime.listener.listener_id,
+                "credentials_created": true,
+                "accounts": runtime.listener.accounts.iter().map(|account|&account.username).collect::<Vec<_>>(),
+                "listener_started": false,
+            }))?;
+        }
+        Command::WebdavCredentialShow { config, username } => {
+            let runtime = webdav::load(&config)?;
+            let credentials =
+                webdav_credentials::Credentials::load(&runtime.credentials, &runtime.listener)?;
+            println!(
+                "{}",
+                credentials
+                    .password(&username)
+                    .ok_or("unknown local DAV account")?
+            );
+        }
+        Command::WebdavServe { config } => {
+            let runtime = webdav::load(&config)?;
+            let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_shutdown = shutdown.clone();
+            let dav_limits = limits.clone();
+            let mut worker = tokio::task::spawn_blocking(move || {
+                webdav::serve(runtime, dav_limits, worker_shutdown)
+                    .map_err(|error| error.to_string())
+            });
+            tokio::select! {
+                result = &mut worker => { result?.map_err(std::io::Error::other)?; }
+                result = shutdown::requested() => {
+                    result?;
+                    shutdown.store(true, std::sync::atomic::Ordering::Release);
+                    worker.await?.map_err(std::io::Error::other)?;
+                }
+            }
+        }
+        Command::TreeTransactions { data_dir } => {
+            print(&open(&data_dir)?.tree_restore_transactions()?)?;
+        }
+        Command::TreePrepare {
+            data_dir,
+            baseline,
+            target,
+            transaction,
+            budgets,
+        } => {
+            let budgets = read_tree_budgets(&budgets)?;
+            print(&open(&data_dir)?.prepare_tree_restore_pipeline(
+                &baseline.parse()?,
+                &target.parse()?,
+                transaction.parse()?,
+                &budgets,
+            )?)?;
+        }
+        #[cfg(windows)]
+        Command::TreeAdmit {
+            data_dir,
+            transaction,
+            budgets,
+            allow_irreversible_admission,
+        } => {
+            if !allow_irreversible_admission {
+                return Err("explicit irreversible TREE admission opt-in required".into());
+            }
+            print(&open(&data_dir)?.admit_tree_restore_pipeline(
+                &transaction.parse()?,
+                &read_tree_budgets(&budgets)?,
+            )?)?;
+        }
+        #[cfg(windows)]
+        Command::TreeCreateOwner {
+            data_dir,
+            transaction,
+        } => {
+            let local = open(&data_dir)?;
+            let transaction = transaction.parse()?;
+            let ready = local.seal_tree_owner(local.create_tree_owner(&transaction)?)?;
+            print(
+                &serde_json::json!({"transaction_id":transaction,"owner_ready":ready.owner_ready(),
+                "whole_tree_completed":false,"tree_atomic":false,"remote_backup_complete":false}),
+            )?;
+        }
+        #[cfg(windows)]
+        Command::TreeExecute {
+            data_dir,
+            transaction,
+            allow_non_atomic_tree,
+        } => {
+            if !allow_non_atomic_tree {
+                return Err("explicit non-atomic TREE execution opt-in required".into());
+            }
+            print(&open(&data_dir)?.restore_tree_native(&transaction.parse()?)?)?;
+        }
+        #[cfg(windows)]
+        Command::TreeResume {
+            data_dir,
+            transaction,
+            allow_non_atomic_tree,
+        } => {
+            if !allow_non_atomic_tree {
+                return Err("explicit non-atomic TREE resume opt-in required".into());
+            }
+            print(&open(&data_dir)?.resume_tree_native_restore(&transaction.parse()?)?)?;
+        }
         Command::ProbeNoReplace { parent } => {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             {
@@ -986,7 +1589,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     Ok::<_, sync_extend_reconcile::ReconcileError>(result)
                 };
                 tokio::select! {
-                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    shutdown = shutdown::requested() => { shutdown?; break; }
                     result = action => {
                         match result {
                             Ok(result) => print(&result)?,
@@ -1000,7 +1603,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 tokio::select! {
-                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    shutdown = shutdown::requested() => { shutdown?; break; }
                     _ = tokio::time::sleep(Duration::from_secs(u64::from(delay_seconds))) => {}
                 }
             }
@@ -1043,7 +1646,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     Ok::<_, sync_extend_reconcile::ReconcileError>(result)
                 };
                 tokio::select! {
-                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    shutdown = shutdown::requested() => { shutdown?; break; }
                     result = action => {
                         match result {
                             Ok(outcome) => {
@@ -1064,7 +1667,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 tokio::select! {
-                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    shutdown = shutdown::requested() => { shutdown?; break; }
                     _ = tokio::time::sleep(Duration::from_secs(u64::from(delay_seconds))) => {}
                 }
             }
@@ -1239,11 +1842,11 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 tokio::select! {
-                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    shutdown = shutdown::requested() => { shutdown?; break; }
                     result = action => { result?; }
                 }
                 tokio::select! {
-                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    shutdown = shutdown::requested() => { shutdown?; break; }
                     _ = tokio::time::sleep(Duration::from_secs(u64::from(delay_seconds))) => {}
                 }
             }
@@ -1314,7 +1917,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }))?;
             for attempt in 1..=attempts {
                 tokio::select! {
-                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    shutdown = shutdown::requested() => { shutdown?; break; }
                     accepted = listener.accept(&identity, &peer) => {
                         match accepted {
                             Ok(mut connection) => {
@@ -1331,7 +1934,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 tokio::select! {
-                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    shutdown = shutdown::requested() => { shutdown?; break; }
                     _ = tokio::time::sleep(Duration::from_secs(u64::from(delay_seconds))) => {}
                 }
             }
@@ -1366,6 +1969,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let peer = local.read_transport_peer(&device)?;
             let identity = local.transport_identity()?;
             let listener = sync_extend_transport::Listener::bind(listen, &identity, &peer)?;
+            shutdown::ready()?;
             print(&serde_json::json!({
                 "listening": listener.local_address()?,
                 "paired_device": device,
@@ -1373,7 +1977,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }))?;
             loop {
                 tokio::select! {
-                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    shutdown = shutdown::requested() => { shutdown?; break; }
                     result = listener.accept(&identity, &peer) => {
                         match result {
                             Ok(mut connection) => {
@@ -1424,7 +2028,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }))?;
             loop {
                 tokio::select! {
-                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    shutdown = shutdown::requested() => { shutdown?; break; }
                     result = listener.accept(&identity, &peer) => {
                         match result {
                             Ok(mut connection) => {
@@ -1639,7 +2243,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }))?;
             loop {
                 tokio::select! {
-                    shutdown = tokio::signal::ctrl_c() => { shutdown?; break; }
+                    shutdown = shutdown::requested() => { shutdown?; break; }
                     result = listener.accept(&identity, &peer) => {
                         match result {
                             Ok(mut connection) => {
@@ -1670,6 +2274,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut local = open(&data_dir)?;
             let peer = local.read_transport_peer(&peer_device.parse()?)?;
             let identity = local.transport_identity()?;
+            shutdown::ready()?;
             print(&serde_json::json!({
                 "role": "metadata_client",
                 "peer_device": peer.device_id,
@@ -1679,7 +2284,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "native_apply_enabled": false,
                 "automatic_file_sync": false,
             }))?;
-            let shutdown = tokio::signal::ctrl_c();
+            let shutdown = shutdown::requested();
             tokio::pin!(shutdown);
             loop {
                 // A local safety failure stops this worker; only transport
@@ -2087,7 +2692,8 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut local = open(&data_dir)?;
             let mut timer = tokio::time::interval(Duration::from_secs(scan_interval_secs));
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let shutdown = tokio::signal::ctrl_c();
+            shutdown::ready()?;
+            let shutdown = shutdown::requested();
             tokio::pin!(shutdown);
             loop {
                 tokio::select! {

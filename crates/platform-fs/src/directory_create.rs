@@ -158,13 +158,27 @@ fn create_new_directory_child(
 }
 
 pub(super) fn create_new_child(file: &File, name: &str, kind: NewChildKind) -> io::Result<File> {
+    create_new_child_lifetime(file, name, kind, false)
+}
+
+/// Request temporary uses FILE_DELETE_ON_CLOSE in the CREATE syscall itself.
+pub(super) fn create_request_file(file: &File, name: &str) -> io::Result<File> {
+    create_new_child_lifetime(file, name, NewChildKind::File, true)
+}
+
+fn create_new_child_lifetime(
+    file: &File,
+    name: &str,
+    kind: NewChildKind,
+    delete_on_close: bool,
+) -> io::Result<File> {
     use std::os::windows::io::FromRawHandle;
     use windows_sys::{
         Wdk::{
             Foundation::OBJECT_ATTRIBUTES,
             Storage::FileSystem::{
-                NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE,
-                FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+                NtCreateFile, FILE_CREATE, FILE_DELETE_ON_CLOSE, FILE_DIRECTORY_FILE,
+                FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
             },
         },
         Win32::{
@@ -238,7 +252,14 @@ pub(super) fn create_new_child(file: &File, name: &str, kind: NewChildKind) -> i
             FILE_ATTRIBUTE_NORMAL,
             share,
             FILE_CREATE,
-            options | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            options
+                | FILE_OPEN_REPARSE_POINT
+                | FILE_SYNCHRONOUS_IO_NONALERT
+                | if delete_on_close {
+                    FILE_DELETE_ON_CLOSE
+                } else {
+                    0
+                },
             ptr::null(),
             0,
         )

@@ -1,0 +1,8 @@
+{
+  "format_version": 1,
+  "role": {
+    "kind": "local_polling",
+    "data_dir": "/state/client",
+    "scan_interval_secs": 30
+  }
+}

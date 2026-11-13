@@ -4,7 +4,7 @@ use crate::{
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
     tree_restore::{plan_tree_restore, TreeRestorePlan},
     tree_restore_history::{
@@ -287,9 +287,101 @@ pub(crate) fn audit_history(
         ));
     }
     if cancelled_at_ms.is_none() {
-        audit_history_inputs(connection, preparation, &projected, max)?;
+        let finalized: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.tree_native_final_commits WHERE transaction_id=?1)",
+            [preparation.transaction_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if finalized {
+            audit_finalized_history_inputs(connection, preparation, &projected, max)?;
+        } else {
+            audit_history_inputs(connection, preparation, &projected, max)?;
+        }
     }
     Ok(Some(projected.audit))
+}
+
+fn audit_finalized_history_inputs(
+    connection: &Connection,
+    preparation: &TreeRestorePreparationIntent,
+    projection: &Projection,
+    max: usize,
+) -> Result<()> {
+    let mut seen = VersionVector::default();
+    let baseline = audit_snapshot(
+        connection,
+        &preparation.scope.space_id,
+        &preparation.scope.baseline_snapshot,
+    )?
+    .manifest;
+    let expected: BTreeMap<_, _> = projection
+        .plan
+        .operations()
+        .iter()
+        .map(|operation| (operation.op_id.clone(), operation))
+        .collect();
+    let mut statement = connection.prepare(
+        "SELECT op_id,space_id,origin_device_id,origin_seq,payload,state
+         FROM main.operations ORDER BY origin_device_id,origin_seq",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut count = 0usize;
+    let mut exact_new = BTreeSet::new();
+    let cleaned: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.tree_native_cleanup_records WHERE transaction_id=?1 AND record_index=3)",
+        [preparation.transaction_id.as_str()], |row| row.get(0),
+    )?;
+    while let Some(row) = rows.next()? {
+        count += 1;
+        if count > max {
+            return Err(JournalError::Invariant(
+                "tree Final historical operation bound",
+            ));
+        }
+        let raw: String = row.get(4)?;
+        let operation: Operation = serde_json::from_str(&raw)?;
+        operation.validate()?;
+        let p = &operation.payload;
+        if operation.op_id.as_str() != row.get::<_, String>(0)?
+            || p.space_id != preparation.scope.space_id
+            || p.space_id.as_str() != row.get::<_, String>(1)?
+            || p.origin_device_id.as_str() != row.get::<_, String>(2)?
+            || sql_integer(p.origin_seq)? != row.get::<_, i64>(3)?
+            || row.get::<_, String>(5)? != "materialized"
+            || p.origin_seq != seen.get(&p.origin_device_id) + 1
+        {
+            return Err(JournalError::Invariant(
+                "tree Final historical canonical operation mismatch",
+            ));
+        }
+        if let Some(expected) = expected.get(&operation.op_id) {
+            if *expected != &operation
+                || serde_json::to_vec(&operation)? != raw.as_bytes()
+                || !exact_new.insert(operation.op_id.clone())
+            {
+                return Err(JournalError::Invariant(
+                    "tree Final own NEW operation differs",
+                ));
+            }
+        } else if !cleaned
+            && (p.origin_seq > baseline.version_vector.get(&p.origin_device_id)
+                || !baseline.version_vector.dominates(&p.causal))
+        {
+            return Err(JournalError::Invariant(
+                "tree Final unexpected concurrent operation",
+            ));
+        }
+        seen.observe(p.origin_device_id.clone(), p.origin_seq);
+    }
+    if exact_new.len() != expected.len()
+        || (!cleaned && seen != projection.plan.manifest().version_vector)
+        || !seen.dominates(&projection.plan.manifest().version_vector)
+    {
+        return Err(JournalError::Invariant(
+            "tree Final original/NEW causal closure mismatch",
+        ));
+    }
+    Ok(())
 }
 
 impl Journal {
