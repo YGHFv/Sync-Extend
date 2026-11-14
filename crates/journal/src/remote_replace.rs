@@ -342,6 +342,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
         ))?;
     }
     expected.execute_batch(include_str!("migration-041.sql"))?;
+    expected.execute_batch(include_str!("remote_replace_retirement_fences.sql"))?;
     if objects(connection)? != objects(&expected)? {
         return Err(invalid("remote Replace schema/trigger/index differs"));
     }

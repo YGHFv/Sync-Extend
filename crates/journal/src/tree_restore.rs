@@ -253,6 +253,7 @@ impl Journal {
 
     pub fn require_no_tree_restore(&self, space: &SpaceId, max: usize) -> Result<()> {
         self.require_no_conflict_resolution()?;
+        crate::webdav_native::require_idle(&self.connection)?;
         let any: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM tree_restore_preparations)
              OR EXISTS(SELECT 1 FROM tree_restore_steps)

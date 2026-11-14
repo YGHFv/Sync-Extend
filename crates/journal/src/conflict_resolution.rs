@@ -430,6 +430,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     expected.execute_batch(include_str!("migration-046.sql"))?;
     expected.execute_batch(include_str!("migration-047.sql"))?;
     expected.execute_batch(include_str!("migration-048.sql"))?;
+    expected.execute_batch(include_str!("conflict_resolution_retirement_fences.sql"))?;
     if objects(connection)? != objects(&expected)? {
         return Err(invalid(
             "conflict resolution exact schema/trigger/index differs",

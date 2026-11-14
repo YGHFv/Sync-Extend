@@ -8,8 +8,11 @@ use sync_extend_reconcile::LocalSpace;
 mod config_file;
 mod deployment;
 mod easytier;
+mod management;
+mod management_credentials;
 mod shutdown;
 mod storage;
+mod storage_retirement_cli;
 mod webdav;
 mod webdav_conditions;
 mod webdav_credentials;
@@ -51,6 +54,68 @@ enum Command {
     DeploymentRun {
         #[arg(long)]
         config: PathBuf,
+    },
+    /// Query one separately authenticated local deployment health endpoint.
+    ManagementHealth {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Create a new listener-bound management credential file without displaying its token.
+    ManagementCredentialsGenerate {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Replace one exact snapshot owner using all explicit signed complete storage receipts.
+    StorageSnapshotHandoff {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        evidence: PathBuf,
+    },
+    /// Inspect exact handed-off storage content without releasing pins or disposing CAS.
+    StorageRetirementAssess {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        storage_id: String,
+    },
+    /// Inspect one exact retired storage chunk under retained readonly Windows handles.
+    #[cfg(windows)]
+    StorageRetirementInspect {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        storage_id: String,
+        #[arg(long)]
+        content_id: String,
+    },
+    /// Persist one explicitly supplied exact retirement request; no physical disposal.
+    StorageRetirementAdmit {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+    },
+    /// Audit retained storage retirement requests and cancellation state.
+    StorageRetirementAdmissions {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Cancel one exact durable fence before any physical owner activation.
+    StorageRetirementCancel {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        request_id: String,
+    },
+    /// Operate on one explicitly selected storage retirement request.
+    StorageRetirementPhysical {
+        #[arg(long)]
+        config: PathBuf,
+        #[command(subcommand)]
+        action: storage_retirement_cli::Action,
     },
     /// Hand off one retained page owner using all explicitly required native target receipts.
     StorageRetentionHandoff {
@@ -1131,7 +1196,7 @@ fn run_cli() -> ExitCode {
         let config = config.clone();
         let limits = parsed.limits.clone();
         return match sync_extend_platform_fs::run_windows_service(&name, move |_reporter| {
-            let cli = deployment::expand(Cli {
+            let (cli, _management) = deployment::prepare(Cli {
                 limits,
                 command: Command::DeploymentRun { config },
             })
@@ -1150,8 +1215,8 @@ fn run_cli() -> ExitCode {
             }
         };
     }
-    let cli = match deployment::expand(parsed) {
-        Ok(cli) => cli,
+    let (cli, _management) = match deployment::prepare(parsed) {
+        Ok(prepared) => prepared,
         Err(error) => {
             eprintln!("syncd: deployment validation failed: {error}");
             return ExitCode::FAILURE;
@@ -1216,6 +1281,50 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::DeploymentRun { .. } => {
             return Err("deployment role was not expanded".into());
         }
+        Command::ManagementHealth { config } => management::check(&config)?,
+        Command::ManagementCredentialsGenerate { config } => {
+            management::generate_credentials(&config)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "credentials_created": true,
+                    "secrets_displayed": false,
+                    "restart_required_for_activation": true
+                })
+            );
+        }
+        Command::StorageRetirementAssess { config, storage_id } => {
+            let node = sync_extend_reconcile::StorageNode::open(storage::load(&config)?)?;
+            print(&node.assess_retired_storage_content(&storage_id.parse()?)?)?;
+        }
+        #[cfg(windows)]
+        Command::StorageRetirementInspect {
+            config,
+            storage_id,
+            content_id,
+        } => {
+            let node = sync_extend_reconcile::StorageNode::open(storage::load(&config)?)?;
+            let inspection =
+                node.inspect_retired_storage_object(&storage_id.parse()?, &content_id.parse()?)?;
+            print(inspection.observation())?;
+        }
+        Command::StorageRetirementAdmit { config, request } => {
+            let request: sync_extend_core_model::storage_retirement::StorageRetirementRequest =
+                storage::load(&request)?;
+            let node = sync_extend_reconcile::StorageNode::open(storage::load(&config)?)?;
+            print(&node.admit_storage_retirement(&request)?)?;
+        }
+        Command::StorageRetirementAdmissions { config } => {
+            let node = sync_extend_reconcile::StorageNode::open(storage::load(&config)?)?;
+            print(&node.storage_retirement_admissions()?)?;
+        }
+        Command::StorageRetirementCancel { config, request_id } => {
+            let node = sync_extend_reconcile::StorageNode::open(storage::load(&config)?)?;
+            print(&node.cancel_storage_retirement(&request_id.parse()?)?)?;
+        }
+        Command::StorageRetirementPhysical { config, action } => {
+            storage_retirement_cli::run(&config, action)?;
+        }
         Command::StoragePush {
             data_dir,
             origin,
@@ -1269,6 +1378,21 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let config =
                 storage::load::<sync_extend_core_model::storage_node::StorageNodeConfig>(&config)?;
             print(&sync_extend_reconcile::StorageNode::open(config)?.status()?)?;
+        }
+        Command::StorageSnapshotHandoff {
+            config,
+            policy,
+            evidence,
+        } => {
+            let node = sync_extend_reconcile::StorageNode::open(storage::load(&config)?)?;
+            let policy = storage::load(&policy)?;
+            let evidence = storage::load_snapshot_handoff_evidence(&evidence)?;
+            print(&serde_json::json!({
+                "handed_off": node.handoff_retained_snapshot_storage(&policy, &evidence)?,
+                "physical_deletion_executed": false,
+                "native_applied": false,
+                "remote_backup_complete": false,
+            }))?;
         }
         Command::StorageRetentionHandoff {
             config,
@@ -2693,6 +2817,7 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut timer = tokio::time::interval(Duration::from_secs(scan_interval_secs));
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             shutdown::ready()?;
+            management::resources_deferred();
             let shutdown = shutdown::requested();
             tokio::pin!(shutdown);
             loop {
@@ -2701,8 +2826,14 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     _ = timer.tick() => {
                         local = tokio::task::spawn_blocking(move || {
                             match local.scan() {
-                                Ok(result) => { println!("{}", serde_json::to_string(&result).unwrap_or_default()); }
-                                Err(error) => { eprintln!("syncd: reconciliation deferred: {error}"); }
+                                Ok(result) => {
+                                    management::resources_ready();
+                                    println!("{}", serde_json::to_string(&result).unwrap_or_default());
+                                }
+                                Err(error) => {
+                                    management::resources_deferred();
+                                    eprintln!("syncd: reconciliation deferred: {error}");
+                                }
                             }
                             local
                         }).await?;

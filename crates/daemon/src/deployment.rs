@@ -12,11 +12,16 @@ pub fn load(path: &Path) -> Result<DeploymentConfig> {
     Ok(config)
 }
 
-pub fn expand(cli: Cli) -> Result<Cli> {
+pub fn prepare(cli: Cli) -> Result<(Cli, Option<super::management::ManagementGuard>)> {
     let Command::DeploymentRun { config } = &cli.command else {
-        return Ok(cli);
+        return Ok((cli, None));
     };
     let config = load(config)?;
+    let management = config
+        .management
+        .as_ref()
+        .map(|path| super::management::start(path, config.role_name()))
+        .transpose()?;
     let command = match config.role {
         DeploymentRole::LocalPolling {
             data_dir,
@@ -66,8 +71,11 @@ pub fn expand(cli: Cli) -> Result<Cli> {
             config: gateway_config,
         },
     };
-    Ok(Cli {
-        limits: cli.limits,
-        command,
-    })
+    Ok((
+        Cli {
+            limits: cli.limits,
+            command,
+        },
+        management,
+    ))
 }

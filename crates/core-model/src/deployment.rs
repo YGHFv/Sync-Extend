@@ -11,6 +11,8 @@ use std::{
 pub struct DeploymentConfig {
     pub format_version: u32,
     pub role: DeploymentRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub management: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -56,6 +58,9 @@ impl DeploymentConfig {
     pub fn validate(&self) -> Result<()> {
         if self.format_version != FORMAT_VERSION {
             return Err(ModelError::InvalidConfig("deployment format version"));
+        }
+        if self.management.as_ref().is_some_and(|value| !path(value)) {
+            return Err(ModelError::InvalidConfig("deployment management path"));
         }
         let valid = match &self.role {
             DeploymentRole::LocalPolling {

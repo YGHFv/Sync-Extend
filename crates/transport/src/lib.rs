@@ -3,6 +3,8 @@ mod connection;
 mod forwarded_page;
 mod storage_delivery;
 mod storage_snapshot;
+mod storage_snapshot_handoff;
+mod storage_snapshot_receipt;
 pub use storage_delivery::{
     assess_storage_retention, ForwardedAppliedEvidence, StoragePageDeliveryRecord,
     VerifiedStoragePageDelivery,
@@ -10,6 +12,11 @@ pub use storage_delivery::{
 pub use storage_snapshot::{
     ForwardedSnapshotEnvelope, SignedStorageSnapshotReport, StorageSnapshotReport,
 };
+pub use storage_snapshot_handoff::{
+    SnapshotStorageHandoffEvidence, SnapshotStorageHandoffPolicy, SnapshotStorageHandoffRecord,
+    VerifiedSnapshotStorageHandoff,
+};
+pub use storage_snapshot_receipt::{SignedStorageSnapshotReceipt, StorageSnapshotReceipt};
 mod identity;
 pub use forwarded_page::{
     ForwardStoreReceipt, ForwardStoreState, ForwardedOperationPage, ForwardedPageEnvelope,

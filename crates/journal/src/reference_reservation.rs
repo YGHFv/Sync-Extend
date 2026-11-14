@@ -221,6 +221,7 @@ impl Journal {
         };
         let replay = |owner: &ReferenceReservation| -> Result<bool> {
             if owner.state == "transferred_to_storage_target"
+                || owner.state == "transferred_to_snapshot_storage"
                 || owner.state == "transferred_to_conflict_history"
             {
                 return Err(JournalError::Invariant(
@@ -405,9 +406,12 @@ impl crate::JournalReadView<'_> {
                 )?;
             let storage_handoff =
                 crate::storage_page_handoff::reference_terminal(self.connection, &intent)?;
-            if conflict_handoff || storage_handoff {
+            let snapshot_storage_handoff =
+                crate::storage_snapshot_handoff::reference_terminal(self.connection, &intent)?;
+            if conflict_handoff || storage_handoff || snapshot_storage_handoff {
                 if (conflict_handoff as u8
                     + storage_handoff as u8
+                    + snapshot_storage_handoff as u8
                     + snapshot_handoff.is_some() as u8)
                     > 1
                 {
@@ -442,7 +446,9 @@ impl crate::JournalReadView<'_> {
             }
             owners.push(ReferenceReservation {
                 intent,
-                state: if storage_handoff {
+                state: if snapshot_storage_handoff {
+                    "transferred_to_snapshot_storage"
+                } else if storage_handoff {
                     "transferred_to_storage_target"
                 } else if conflict_handoff {
                     "transferred_to_conflict_history"

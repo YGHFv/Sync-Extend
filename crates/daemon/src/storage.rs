@@ -5,7 +5,7 @@ use sync_extend_core_model::{storage_node::StorageNodeConfig, ChunkRef, ContentI
 use sync_extend_reconcile::StorageNode;
 use sync_extend_transport::{
     Connection, ForwardedSnapshotEnvelope, Listener, PeerIdentity, SignedForwardStoreReceipt,
-    SignedForwardedOperationPage,
+    SignedForwardedOperationPage, SignedStorageSnapshotReceipt,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -30,6 +30,18 @@ pub fn load_retention_evidence(
         serde_json::from_slice(&bytes)?;
     if evidence.len() > 1024 {
         return Err("retention evidence target bound".into());
+    }
+    Ok(evidence)
+}
+
+pub fn load_snapshot_handoff_evidence(
+    path: &Path,
+) -> Result<Vec<sync_extend_transport::SnapshotStorageHandoffEvidence>> {
+    let bytes = super::config_file::read(path, sync_extend_transport::MAX_CONTROL_BYTES)?;
+    let evidence: Vec<sync_extend_transport::SnapshotStorageHandoffEvidence> =
+        serde_json::from_slice(&bytes)?;
+    if evidence.len() > 1024 {
+        return Err("snapshot handoff evidence target bound".into());
     }
     Ok(evidence)
 }
@@ -74,6 +86,7 @@ enum Response {
     },
     SnapshotStored {
         storage_id: ContentId,
+        receipt: SignedStorageSnapshotReceipt,
     },
     Chunk {
         storage_id: ContentId,
@@ -172,12 +185,13 @@ async fn serve_session(
                             connection.channel_binding(),
                         )?;
                         let snapshot_id = envelope.storage_id()?;
-                        snapshot_received = Some((snapshot_id.clone(), snapshot));
                         connection
                             .send_json(&Response::SnapshotStored {
-                                storage_id: snapshot_id,
+                                storage_id: snapshot_id.clone(),
+                                receipt: node.stored_snapshot_receipt(&snapshot)?,
                             })
                             .await?;
+                        snapshot_received = Some((snapshot_id, snapshot));
                     }
                     Request::SnapshotChunk { storage_id, chunk } => {
                         let (expected, snapshot) = snapshot_received
@@ -203,6 +217,7 @@ async fn serve_session(
                         connection
                             .send_json(&Response::SnapshotStored {
                                 storage_id: expected.clone(),
+                                receipt: node.stored_snapshot_receipt(snapshot)?,
                             })
                             .await?;
                     }
@@ -449,6 +464,7 @@ pub async fn pull(
             .await?;
         node.ingest_forwarded_chunk(&received, chunk, &bytes)?;
     }
+    let mut snapshot_storage_evidence = None;
     if let Some(envelope) = snapshot {
         let snapshot = node.receive_forwarded_snapshot(
             &envelope,
@@ -512,6 +528,10 @@ pub async fn pull(
                 .await?;
             node.ingest_snapshot_chunk(&snapshot, chunk, &bytes)?;
         }
+        snapshot_storage_evidence = Some(sync_extend_transport::SnapshotStorageHandoffEvidence {
+            envelope: *envelope,
+            signed_receipt: node.stored_snapshot_receipt(&snapshot)?,
+        });
     }
     connection
         .send_json(&Request::Finish {
@@ -525,10 +545,19 @@ pub async fn pull(
         return Err("storage final identity differs".into());
     }
     connection.finish().await?;
-    println!(
-        "{}",
-        serde_json::to_string(&node.stored_receipt(&received)?)?
-    );
+    let mut output = serde_json::to_value(node.stored_receipt(&received)?)?;
+    if let Some(evidence) = snapshot_storage_evidence {
+        let object = output
+            .as_object_mut()
+            .ok_or("storage pull receipt output type")?;
+        object.insert(
+            "snapshot_storage_evidence".to_owned(),
+            serde_json::to_value(evidence)?,
+        );
+        object.insert("native_applied".to_owned(), false.into());
+        object.insert("remote_backup_complete".to_owned(), false.into());
+    }
+    println!("{}", serde_json::to_string(&output)?);
     Ok(())
 }
 
@@ -717,6 +746,7 @@ pub async fn push_with_snapshot(
         };
         receipt.verify(&storage, &signed.page)?;
     }
+    let mut stored_snapshot_receipt = None;
     if let Some(report) = report {
         let envelope = StorageNode::local_forwarding_snapshot(
             &local,
@@ -731,13 +761,18 @@ pub async fn push_with_snapshot(
                 envelope: Box::new(envelope.clone()),
             })
             .await?;
-        let Response::SnapshotStored { storage_id } = connection.receive_json::<Response>().await?
+        let Response::SnapshotStored {
+            storage_id,
+            receipt,
+        } = connection.receive_json::<Response>().await?
         else {
             return Err("storage snapshot report response required".into());
         };
         if storage_id != snapshot_id {
             return Err("storage snapshot report response identity".into());
         }
+        receipt.verify(&storage, &envelope)?;
+        let mut snapshot_receipt = receipt;
         let mut snapshot_chunks = std::collections::BTreeMap::new();
         for file in envelope
             .signed_report
@@ -781,15 +816,20 @@ pub async fn push_with_snapshot(
                 })
                 .await?;
             connection.send_block(&chunk.content_id, &bytes).await?;
-            let Response::SnapshotStored { storage_id } =
-                connection.receive_json::<Response>().await?
+            let Response::SnapshotStored {
+                storage_id,
+                receipt,
+            } = connection.receive_json::<Response>().await?
             else {
                 return Err("storage snapshot chunk response required".into());
             };
             if storage_id != snapshot_id {
                 return Err("storage snapshot chunk response identity".into());
             }
+            receipt.verify(&storage, &envelope)?;
+            snapshot_receipt = receipt;
         }
+        stored_snapshot_receipt = Some(snapshot_receipt);
     }
     connection
         .send_json(&Request::Finish { storage_id: id })
@@ -799,6 +839,18 @@ pub async fn push_with_snapshot(
     };
     receipt.verify(&storage, &signed.page)?;
     connection.finish().await?;
-    println!("{}", serde_json::to_string(&receipt)?);
+    let mut output = serde_json::to_value(&receipt)?;
+    if let Some(snapshot_receipt) = stored_snapshot_receipt {
+        let object = output
+            .as_object_mut()
+            .ok_or("storage receipt output type")?;
+        object.insert(
+            "snapshot_stored_receipt".to_owned(),
+            serde_json::to_value(snapshot_receipt)?,
+        );
+        object.insert("native_applied".to_owned(), false.into());
+        object.insert("remote_backup_complete".to_owned(), false.into());
+    }
+    println!("{}", serde_json::to_string(&output)?);
     Ok(())
 }

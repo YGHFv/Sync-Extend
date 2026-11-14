@@ -230,6 +230,7 @@ impl Journal {
     }
 
     pub(crate) fn audit_gc_owners(&self, space: &SpaceId, max_entries: usize) -> Result<()> {
+        crate::webdav_native::audit(&self.connection)?;
         self.snapshot_audit(space, max_entries)?;
         self.current(space)?;
         self.read_leases(space, max_entries)?;
@@ -422,7 +423,10 @@ impl crate::JournalReadView<'_> {
 
     pub(crate) fn gc_protected(&self, id: &ContentId) -> Result<bool> {
         Ok(self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM snapshot_objects WHERE content_id=?1)
+            "SELECT EXISTS(SELECT 1 FROM main.webdav_native_objects o
+                LEFT JOIN main.webdav_native_cancellations c USING(transaction_id)
+                WHERE o.content_id=?1 AND c.transaction_id IS NULL)
+             OR EXISTS(SELECT 1 FROM snapshot_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM publication_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM remote_replace_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM conflict_resolution_native_history_objects WHERE content_id=?1)
@@ -430,6 +434,7 @@ impl crate::JournalReadView<'_> {
              OR EXISTS(SELECT 1 FROM mutation_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM read_lease_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM reference_reservation_objects WHERE content_id=?1)
+             OR EXISTS(SELECT 1 FROM tree_restore_original_objects WHERE content_id=?1)
              OR EXISTS(SELECT 1 FROM tree_restore_objects WHERE content_id=?1)",
             [id.as_str()],
             |r| r.get(0),

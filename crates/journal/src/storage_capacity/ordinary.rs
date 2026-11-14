@@ -72,7 +72,11 @@ fn execution_bytes(action: &MutationAction) -> Result<u64> {
     Ok(serde_json::to_vec(&width)?.len() as u64)
 }
 
-pub(super) fn liabilities(owners: &Owners, rows: &[JournalStoredRow]) -> Result<Liabilities> {
+pub(super) fn liabilities(
+    owners: &Owners,
+    rows: &[JournalStoredRow],
+    storage_originals: &BTreeSet<String>,
+) -> Result<Liabilities> {
     for row in rows.iter().filter(|r| r.table() == "publications") {
         if integer(row, "cleaned")? > 1 {
             return Err(invalid("journal capacity publication cleanup flag"));
@@ -275,7 +279,7 @@ pub(super) fn liabilities(owners: &Owners, rows: &[JournalStoredRow]) -> Result<
             80,
         );
     }
-    operations(rows, &mut out)?;
+    operations(rows, storage_originals, &mut out)?;
     out.obligations
         .sort_by(|a, b| (&a.family, &a.owner_key).cmp(&(&b.family, &b.owner_key)));
     out.gaps
@@ -283,7 +287,11 @@ pub(super) fn liabilities(owners: &Owners, rows: &[JournalStoredRow]) -> Result<
     Ok(out)
 }
 
-fn operations(rows: &[JournalStoredRow], out: &mut Liabilities) -> Result<()> {
+fn operations(
+    rows: &[JournalStoredRow],
+    storage_originals: &BTreeSet<String>,
+    out: &mut Liabilities,
+) -> Result<()> {
     let mut cursors = BTreeMap::new();
     let mut accepted: BTreeMap<(&str, &str), BTreeSet<u64>> = BTreeMap::new();
     let mut pending = BTreeMap::new();
@@ -320,7 +328,11 @@ fn operations(rows: &[JournalStoredRow], out: &mut Liabilities) -> Result<()> {
             }
             _ => return Err(invalid("journal capacity operation state")),
         };
-        if state != "materialized" {
+        // A storage node retains authenticated original history without a worktree.
+        // Pending causality and all client materialization liabilities remain open.
+        if state != "materialized"
+            && !(state == "received" && storage_originals.contains(row.primary_key()[0].as_str()))
+        {
             out.gap(
                 "received_operation",
                 row.primary_key()[0].clone(),

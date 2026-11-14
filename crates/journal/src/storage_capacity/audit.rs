@@ -210,6 +210,15 @@ pub(super) fn storage_receive_owners(
         "receive_cursors",
         "original_operation_provenance",
         "storage_page_handoffs",
+        "storage_snapshot_handoffs",
+        "storage_retirement_requests",
+        "storage_retirement_clock",
+        "storage_retirement_cancellations",
+        "storage_retirement_owner_activations",
+        "storage_retirement_owner_creations",
+        "storage_retirement_payload_events",
+        "storage_retirement_disposal_events",
+        "storage_retirement_terminal_events",
         "reference_reservations",
         "reference_reservation_objects",
         "cas_leases",
@@ -221,6 +230,50 @@ pub(super) fn storage_receive_owners(
         return Err(invalid("storage receive contains client/native owner"));
     }
     owners(view, space, max)
+}
+
+/// Only exact, signature-audited storage history closes the client apply gap.
+/// This proves retained metadata, never target native application or deletion.
+pub(super) fn storage_originals(
+    view: &JournalReadView<'_>,
+    space: &SpaceId,
+    max: usize,
+    tables: &[JournalStoredTable],
+    rows: &[crate::JournalStoredRow],
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut retained = std::collections::BTreeSet::new();
+    if view.state("storage_role")?.as_deref() != Some("storage-v1") {
+        return Ok(retained);
+    }
+    // Audit the complete role, exact identity keys and storage-only table set.
+    storage_receive_owners(view, space, max, tables)?;
+    let proofs = crate::original_provenance::audit(view.connection)?
+        .into_iter()
+        .map(|proof| (proof.operation.op_id.to_string(), proof.operation))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for row in rows.iter().filter(|row| row.table() == "operations") {
+        let Some(original) = proofs.get(super::ordinary::text(row, "op_id")?) else {
+            continue;
+        };
+        let operation: sync_extend_core_model::Operation =
+            serde_json::from_str(super::ordinary::text(row, "payload")?)?;
+        operation.validate()?;
+        if operation != *original
+            || operation.op_id.as_str() != super::ordinary::text(row, "op_id")?
+            || operation.payload.space_id.as_str() != super::ordinary::text(row, "space_id")?
+            || operation.payload.origin_device_id.as_str()
+                != super::ordinary::text(row, "origin_device_id")?
+            || operation.payload.origin_seq != super::ordinary::integer(row, "origin_seq")?
+        {
+            return Err(invalid(
+                "storage retained operation differs from original signature",
+            ));
+        }
+        if super::ordinary::text(row, "state")? == "received" {
+            retained.insert(operation.op_id.to_string());
+        }
+    }
+    Ok(retained)
 }
 
 fn identityless_snapshots(
@@ -268,6 +321,7 @@ fn ordinary_scope(view: &JournalReadView<'_>, space: &SpaceId) -> Result<()> {
         "original_page_inbox",
         "forwarded_page_inbox",
         "storage_page_handoffs",
+        "storage_snapshot_handoffs",
     ]
     .into_iter()
     .map(|table| format!("EXISTS(SELECT 1 FROM main.{table} WHERE space_id!=?1)"))

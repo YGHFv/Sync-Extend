@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 57;
+const SCHEMA_VERSION: u32 = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -82,8 +82,19 @@ pub use remote_delete::{remote_delete_transaction, RemoteDeleteReceipt, RemoteDe
 pub use remote_delete::{RemoteDeleteObservation, RemoteDeleteSource};
 mod storage_page_handoff;
 mod storage_policy;
+mod storage_retirement;
+mod storage_snapshot_handoff;
+pub use storage_retirement::disposal::StorageRetirementDisposalReport;
+#[cfg(windows)]
+pub use storage_retirement::owner::StorageRetirementOwnerCreation;
+pub use storage_retirement::owner::StorageRetirementOwnerReceipt;
+pub use storage_retirement::payload::StorageRetirementPayloadReport;
+pub use storage_retirement::terminal::StorageRetirementTerminalReport;
+pub use storage_retirement::StorageRetirementAdmission;
 mod storage_traffic;
 pub use storage_traffic::StorageTrafficLedger;
+mod webdav_native;
+pub use webdav_native::{WebDavNativeAdmission, WebDavNativeDescription};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiveOutcome {
@@ -98,6 +109,21 @@ pub struct Journal {
     max_storage_entries: usize,
     conflict_resolution_issuance: conflict_resolution::issuance::Gate,
     original_operation_issuance: original_provenance::Gate,
+    storage_retirement_issuance: storage_retirement::gate::Gate,
+    storage_retirement_cancellation: storage_retirement::gate::Gate,
+    webdav_native_description_issue: storage_retirement::gate::Gate,
+    webdav_native_object_issue: storage_retirement::gate::Gate,
+    webdav_native_cancel_issue: storage_retirement::gate::Gate,
+    #[cfg(windows)]
+    storage_retirement_owner_activation: storage_retirement::gate::Gate,
+    #[cfg(windows)]
+    storage_retirement_owner_receipt: storage_retirement::gate::Gate,
+    #[cfg(windows)]
+    storage_retirement_payload_issue: storage_retirement::gate::Gate,
+    #[cfg(windows)]
+    storage_retirement_disposal_issue: storage_retirement::gate::Gate,
+    #[cfg(windows)]
+    storage_retirement_terminal_issue: storage_retirement::gate::Gate,
     #[cfg(windows)]
     tree_native_issuance: tree_native_effects::issuance::Gate,
     #[cfg(windows)]
@@ -445,7 +471,92 @@ impl Journal {
             tx.execute_batch(include_str!("migration-057.sql"))?;
             tx.commit()?;
         }
+        if version < 58 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-058.sql"))?;
+            tx.commit()?;
+        }
+        if version < 59 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-059.sql"))?;
+            tx.commit()?;
+        }
+        if version < 60 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-060.sql"))?;
+            tx.commit()?;
+        }
+        if version < 61 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-061.sql"))?;
+            tx.commit()?;
+        }
+        if version < 62 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-062.sql"))?;
+            tx.commit()?;
+        }
+        if version < 63 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-063.sql"))?;
+            tx.commit()?;
+        }
+        if version < 64 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-064.sql"))?;
+            tx.commit()?;
+        }
+        webdav_native::schema::validate(&connection)?;
+        let webdav_native_description_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_description_issue",
+        )?;
+        let webdav_native_object_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_object_issue",
+        )?;
+        let webdav_native_cancel_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_cancel_issue",
+        )?;
+        storage_retirement::terminal_schema::validate(&connection)?;
+        #[cfg(windows)]
+        let storage_retirement_terminal_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_storage_retirement_terminal_issue",
+        )?;
+        storage_retirement::disposal_schema::validate(&connection)?;
+        #[cfg(windows)]
+        let storage_retirement_disposal_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_storage_retirement_disposal_issue",
+        )?;
+        storage_retirement::payload_schema::validate(&connection)?;
+        #[cfg(windows)]
+        let storage_retirement_payload_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_storage_retirement_payload_issue",
+        )?;
+        storage_retirement::schema::validate(&connection)?;
+        storage_retirement::owner_schema::validate(&connection)?;
+        #[cfg(windows)]
+        let storage_retirement_owner_activation = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_storage_retirement_owner_issue",
+        )?;
+        #[cfg(windows)]
+        let storage_retirement_owner_receipt = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_storage_retirement_owner_receipt",
+        )?;
+        let storage_retirement_issuance =
+            storage_retirement::gate::Gate::register(&connection, "sync_storage_retirement_issue")?;
+        let storage_retirement_cancellation = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_storage_retirement_cancel",
+        )?;
         storage_page_handoff::validate_schema(&connection)?;
+        storage_snapshot_handoff::validate_schema(&connection)?;
         tree_native_effects::validate_schema(&connection)?;
         let tree_native_issuance = tree_native_effects::issuance::Gate::register(&connection)?;
         #[cfg(not(windows))]
@@ -478,6 +589,21 @@ impl Journal {
             max_storage_entries,
             conflict_resolution_issuance,
             original_operation_issuance,
+            storage_retirement_issuance,
+            storage_retirement_cancellation,
+            webdav_native_description_issue,
+            webdav_native_object_issue,
+            webdav_native_cancel_issue,
+            #[cfg(windows)]
+            storage_retirement_owner_activation,
+            #[cfg(windows)]
+            storage_retirement_owner_receipt,
+            #[cfg(windows)]
+            storage_retirement_payload_issue,
+            #[cfg(windows)]
+            storage_retirement_disposal_issue,
+            #[cfg(windows)]
+            storage_retirement_terminal_issue,
             #[cfg(windows)]
             tree_native_issuance,
             #[cfg(windows)]
@@ -1077,6 +1203,10 @@ impl Journal {
              UNION SELECT content_id FROM reference_reservation_objects
              UNION SELECT content_id FROM conflict_resolution_native_history_objects
              UNION SELECT content_id FROM conflict_resolution_objects
+             UNION SELECT content_id FROM remote_replace_objects
+             UNION SELECT o.content_id FROM main.webdav_native_objects o
+                LEFT JOIN main.webdav_native_cancellations c USING(transaction_id)
+                WHERE c.transaction_id IS NULL
              UNION SELECT content_id FROM tree_restore_objects
              UNION SELECT content_id FROM tree_restore_original_objects ORDER BY content_id",
         )?;
@@ -1755,7 +1885,8 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
             + (SELECT count(*) FROM reference_reservations)
             + max((SELECT count(*) FROM reference_reservations),
                 (SELECT count(*) FROM reference_snapshot_handoffs)
-                + (SELECT count(*) FROM storage_page_handoffs))
+                + (SELECT count(*) FROM storage_page_handoffs)
+                + (SELECT count(*) FROM storage_snapshot_handoffs))
             + (SELECT count(*) FROM reference_reservation_objects)
             + (SELECT count(*) FROM rename_observations)
             + (SELECT count(*) FROM original_operation_provenance)
@@ -1906,6 +2037,21 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
     let (delete_rows, delete_bytes) = remote_delete::metadata_budget(connection)?;
     let (replace_rows, replace_bytes) = remote_replace::metadata_budget(connection)?;
     let (conflict_rows, conflict_bytes) = conflict_resolution::metadata_budget(connection)?;
+    let dav_tables = storage_inventory::reader::preflight(
+        connection,
+        webdav_native::schema::TABLES,
+        sync_extend_core_model::limits::MAX_ENTRIES,
+        sync_extend_core_model::limits::MAX_ENTRIES as u64 * 1024,
+    )?;
+    let dav_future = webdav_native::outstanding(connection)?;
+    let dav_rows = dav_tables.iter().try_fold(dav_future.rows, |sum, table| {
+        storage_inventory::reader::add(sum, table.rows)
+    })?;
+    let dav_bytes = dav_tables
+        .iter()
+        .try_fold(dav_future.logical_bytes, |sum, table| {
+            storage_inventory::reader::add(sum, table.logical_bytes)
+        })?;
     Ok((
         (rows as u64)
             .checked_add(actual_rows)
@@ -1914,6 +2060,7 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
             .and_then(|n| n.checked_add(delete_rows))
             .and_then(|n| n.checked_add(replace_rows))
             .and_then(|n| n.checked_add(conflict_rows))
+            .and_then(|n| n.checked_add(dav_rows))
             .ok_or(JournalError::Invariant("native budget row overflow"))?,
         (bytes as u64)
             .checked_add(actual_bytes)
@@ -1922,6 +2069,7 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
             .and_then(|n| n.checked_add(delete_bytes))
             .and_then(|n| n.checked_add(replace_bytes))
             .and_then(|n| n.checked_add(conflict_bytes))
+            .and_then(|n| n.checked_add(dav_bytes))
             .ok_or(JournalError::Invariant("native budget byte overflow"))?,
     ))
 }
@@ -2340,4 +2488,11 @@ impl crate::JournalReadView<'_> {
         }
         Ok(())
     }
+}
+
+fn sql_nonnegative(value: i64, index: usize) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+}
+fn sql_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    sql_nonnegative(row.get::<_, i64>(index)?, index)
 }

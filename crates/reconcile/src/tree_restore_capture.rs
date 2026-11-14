@@ -13,6 +13,23 @@ pub struct TreeRestoreCapture<'a, T> {
     inspection: T,
 }
 
+/// Live readonly observations for a DAV description. This lifetime never grants
+/// execution and its serialized description must be recaptured at admission.
+pub struct WebDavNativeCapture<'a> {
+    _local: &'a LocalSpace,
+    _guards: (CasAccessGuard, Box<dyn Send>),
+    description: sync_extend_journal::WebDavNativeDescription,
+}
+
+impl WebDavNativeCapture<'_> {
+    pub fn description(&self) -> &sync_extend_journal::WebDavNativeDescription {
+        &self.description
+    }
+    pub fn native_execution_admitted(&self) -> bool {
+        false
+    }
+}
+
 impl<T> TreeRestoreCapture<'_, T> {
     pub fn identity_plan(&self) -> &TreeIdentityPlan {
         &self.plan
@@ -32,6 +49,53 @@ impl<T> TreeRestoreCapture<'_, T> {
 }
 
 impl LocalSpace {
+    pub fn capture_webdav_native_description(
+        &self,
+        request: &sync_extend_core_model::webdav_mutation::WebDavMutationRequest,
+        bounds: sync_extend_core_model::webdav_native::WebDavNativeLimits,
+    ) -> Result<WebDavNativeCapture<'_>> {
+        self.verify_root()?;
+        self.capture_webdav_platform(request, bounds)
+    }
+
+    pub fn admit_webdav_native_description(
+        &self,
+        description: &sync_extend_journal::WebDavNativeDescription,
+    ) -> Result<sync_extend_journal::WebDavNativeAdmission> {
+        self.verify_root()?;
+        self.admit_webdav_platform(description)
+    }
+
+    pub fn cancel_webdav_native_description(
+        &self,
+        id: &sync_extend_core_model::EntryId,
+    ) -> Result<sync_extend_journal::WebDavNativeAdmission> {
+        self.verify_root()?;
+        Ok(self
+            .journal
+            .cancel_webdav_native_description(&self.space_id, id, crate::now_ms()?)?)
+    }
+
+    #[cfg(not(windows))]
+    fn capture_webdav_platform(
+        &self,
+        _request: &sync_extend_core_model::webdav_mutation::WebDavMutationRequest,
+        _bounds: sync_extend_core_model::webdav_native::WebDavNativeLimits,
+    ) -> Result<WebDavNativeCapture<'_>> {
+        Err(crate::ReconcileError::Invariant(
+            "native DAV capture requires Windows local NTFS",
+        ))
+    }
+
+    #[cfg(not(windows))]
+    fn admit_webdav_platform(
+        &self,
+        _description: &sync_extend_journal::WebDavNativeDescription,
+    ) -> Result<sync_extend_journal::WebDavNativeAdmission> {
+        Err(crate::ReconcileError::Invariant(
+            "native DAV capture requires Windows local NTFS",
+        ))
+    }
     pub fn describe_tree_native_protocol(
         &self,
         request: &sync_extend_journal::TreeNativeProtocolDescriptionRequest,
@@ -612,7 +676,284 @@ mod windows {
         Ok((guards, plan))
     }
 
+    struct DavGuards {
+        directories: Vec<Directory>,
+        files: Vec<CapturedFile>,
+        marker: GuardedReadFile,
+        marker_key: FileKey,
+        marker_path: PathBuf,
+        inventory: sync_extend_core_model::webdav_native::WebDavNativeInventory,
+    }
+
+    impl DavGuards {
+        fn verify(
+            &self,
+            local: &LocalSpace,
+            plan: &sync_extend_core_model::webdav_native::WebDavNativePlan,
+        ) -> Result<()> {
+            local.verify_root()?;
+            for directory in &self.directories {
+                directory.guard.require_case_insensitive()?;
+                if directory.guard.key()? != directory.key
+                    || filesystem::physical_identity(&directory.path)?
+                        != ContentId::hash(directory.key.to_string().as_bytes())
+                {
+                    return Err(ReconcileError::Unstable);
+                }
+            }
+            self.marker.verify_single_link()?;
+            let mut bytes = Vec::new();
+            let mut reader = self.marker.reader();
+            reader.seek(SeekFrom::Start(0))?;
+            reader.take(33).read_to_end(&mut bytes)?;
+            if bytes != local.space_id.as_str().as_bytes()
+                || self.marker.key()? != self.marker_key
+                || filesystem::physical_identity(&self.marker_path)?
+                    != ContentId::hash(self.marker_key.to_string().as_bytes())
+            {
+                return Err(ReconcileError::Unstable);
+            }
+            let expected = self
+                .inventory
+                .entries
+                .iter()
+                .map(|(path, entry)| (path.clone(), entry.kind))
+                .collect();
+            if namespace(&local.worktree, &local.limits, &expected)? != expected
+                || plan.inventory() != &self.inventory
+            {
+                return Err(ReconcileError::Unstable);
+            }
+            for file in &self.files {
+                verify_file(file)?;
+            }
+            for step in plan.steps() {
+                if matches!(
+                    step.slot,
+                    Some(sync_extend_core_model::webdav_native::WebDavNativeSlot::InitiallyAbsent)
+                ) {
+                    let path = match &step.action {
+                        sync_extend_core_model::webdav_native::WebDavNativeAction::CreateDirectory { entry }
+                        | sync_extend_core_model::webdav_native::WebDavNativeAction::PublishFile { entry } => &entry.path,
+                        _ => return Err(ReconcileError::Invariant("DAV absent action binding")),
+                    };
+                    match fs::symlink_metadata(local.worktree.join(path.as_str())) {
+                        Err(e) if matches!(e.raw_os_error(), Some(2 | 3)) => {}
+                        Err(e) => return Err(e.into()),
+                        Ok(_) => return Err(ReconcileError::Unstable),
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn capture_dav(
+        local: &LocalSpace,
+        request: &sync_extend_core_model::webdav_mutation::WebDavMutationRequest,
+        baseline: &Manifest,
+        bounds: sync_extend_core_model::webdav_native::WebDavNativeLimits,
+    ) -> Result<(DavGuards, sync_extend_journal::WebDavNativeDescription)> {
+        use sync_extend_core_model::{
+            webdav_mutation::plan_webdav_mutation,
+            webdav_native::{plan_webdav_native, WebDavNativeInventory},
+            ChunkRef,
+        };
+        let logical = plan_webdav_mutation(baseline, request)?;
+        if request.origin_device != local.device_id
+            || request.baseline != baseline.root()?
+            || baseline.space_id != local.space_id
+        {
+            return Err(ReconcileError::Unstable);
+        }
+        verify_budget(baseline, logical.manifest(), &local.limits)?;
+        let max = bounds.max_bindings.min(local.limits.max_storage_entries);
+        if max == 0 || bounds.max_bindings > sync_extend_core_model::limits::MAX_ENTRIES {
+            return Err(ReconcileError::ResourceLimit("DAV native handles"));
+        }
+        let mut directories = Vec::new();
+        let mut paths: Vec<_> = local
+            .worktree
+            .ancestors()
+            .filter(|p| p.is_absolute())
+            .collect();
+        paths.reverse();
+        for path in paths {
+            add_directory(&mut directories, path, max)?;
+        }
+        let root = directories.last().ok_or(ReconcileError::Unstable)?.key;
+        let marker_directory =
+            add_directory(&mut directories, &local.worktree.join(".sync-extend"), max)?;
+        let marker_path = local.worktree.join(".sync-extend/space-id");
+        let marker = GuardedReadFile::open(&marker_path)?;
+        let marker_key = marker.key()?;
+        let mut entries = BTreeMap::new();
+        let mut files = Vec::new();
+        let mut ordered: Vec<_> = baseline.entries.values().collect();
+        ordered.sort_by_key(|entry| (entry.kind != EntryKind::Directory, entry.path.clone()));
+        for entry in ordered {
+            if directories.len() + files.len() + 1 >= max {
+                return Err(ReconcileError::ResourceLimit("DAV native handles"));
+            }
+            let path = local.worktree.join(entry.path.as_str());
+            let key = match entry.kind {
+                EntryKind::Directory => add_directory(&mut directories, &path, max)?,
+                EntryKind::File => {
+                    let guard = GuardedReadFile::open(&path)?;
+                    let key = guard.key()?;
+                    let captured = CapturedFile {
+                        path,
+                        guard,
+                        key,
+                        content: entry.content.clone().ok_or(ReconcileError::Unstable)?,
+                    };
+                    verify_file(&captured)?;
+                    files.push(captured);
+                    key
+                }
+            };
+            entries.insert(
+                entry.path.clone(),
+                TreeNativeEntry {
+                    entry_id: entry.entry_id.clone(),
+                    kind: entry.kind,
+                    identity: native(key),
+                },
+            );
+        }
+        // Read raw retained CAS handles under the caller's CAS exclusion. Calling
+        // managed Cas::verify here would try to acquire a second shared session
+        // while admission already holds its exclusive session.
+        let mut chunks = BTreeMap::new();
+        for chunk in baseline
+            .entries
+            .values()
+            .chain(logical.manifest().entries.values())
+            .filter_map(|entry| entry.content.as_ref())
+            .flat_map(|file| &file.chunks)
+        {
+            if chunks
+                .insert(chunk.content_id.clone(), chunk.length)
+                .is_some_and(|length| length != chunk.length)
+            {
+                return Err(ReconcileError::Unstable);
+            }
+        }
+        let objects = local.data_dir.join("cas/objects");
+        let mut cas_directories = BTreeSet::new();
+        for (id, length) in chunks {
+            local.journal.require_cas_access(&id)?;
+            let path = objects.join(&id.as_str()[..2]).join(id.as_str());
+            let parent = path.parent().ok_or(ReconcileError::Unstable)?;
+            let mut chain: Vec<_> = parent.ancestors().filter(|p| p.is_absolute()).collect();
+            chain.reverse();
+            for ancestor in chain {
+                if !directories
+                    .iter()
+                    .any(|directory| directory.path == ancestor)
+                    && cas_directories.insert(ancestor.to_owned())
+                {
+                    add_directory(&mut directories, ancestor, max)?;
+                }
+            }
+            if directories.len() + files.len() + 1 >= max {
+                return Err(ReconcileError::ResourceLimit("DAV native CAS handles"));
+            }
+            let guard = GuardedReadFile::open(&path)?;
+            let key = guard.key()?;
+            let captured = CapturedFile {
+                path,
+                guard,
+                key,
+                content: FileManifest {
+                    format_version: sync_extend_core_model::FORMAT_VERSION,
+                    chunking: "fastcdc-2020-v1".into(),
+                    hash_algorithm: "blake3".into(),
+                    compression: "none".into(),
+                    content_id: id.clone(),
+                    length: u64::from(length),
+                    chunks: vec![ChunkRef {
+                        content_id: id,
+                        length,
+                    }],
+                },
+            };
+            verify_file(&captured)?;
+            files.push(captured);
+        }
+        let inventory = WebDavNativeInventory {
+            request_hash: logical.request_hash().clone(),
+            root: native(root),
+            marker_directory: native(marker_directory),
+            marker_file: native(marker_key),
+            entries,
+        };
+        let plan = plan_webdav_native(baseline, request, &inventory, bounds)?;
+        let guards = DavGuards {
+            directories,
+            files,
+            marker,
+            marker_key,
+            marker_path,
+            inventory: inventory.clone(),
+        };
+        guards.verify(local, &plan)?;
+        Ok((
+            guards,
+            sync_extend_journal::WebDavNativeDescription {
+                request: request.clone(),
+                inventory,
+                limits: bounds,
+            },
+        ))
+    }
+
     impl LocalSpace {
+        pub(super) fn capture_webdav_platform(
+            &self,
+            request: &sync_extend_core_model::webdav_mutation::WebDavMutationRequest,
+            bounds: sync_extend_core_model::webdav_native::WebDavNativeLimits,
+        ) -> Result<WebDavNativeCapture<'_>> {
+            self.require_no_mutation()?;
+            let cas = self.journal.acquire_cas_session()?;
+            let baseline = self.manifest()?.ok_or(ReconcileError::Unstable)?;
+            let (guards, description) = capture_dav(self, request, &baseline, bounds)?;
+            self.require_no_mutation()?;
+            if self.manifest()?.as_ref() != Some(&baseline) {
+                return Err(ReconcileError::Unstable);
+            }
+            Ok(WebDavNativeCapture {
+                _local: self,
+                _guards: (cas, Box::new(guards)),
+                description,
+            })
+        }
+
+        pub(super) fn admit_webdav_platform(
+            &self,
+            description: &sync_extend_journal::WebDavNativeDescription,
+        ) -> Result<sync_extend_journal::WebDavNativeAdmission> {
+            let (held, admission) = self.journal.with_webdav_native_description(
+                &self.space_id,
+                description,
+                crate::now_ms()?,
+                |plan| {
+                    let baseline = self.manifest()?.ok_or(ReconcileError::Unstable)?;
+                    let (guards, fresh) =
+                        capture_dav(self, &description.request, &baseline, description.limits)?;
+                    if fresh != *description {
+                        return Err(ReconcileError::Unstable);
+                    }
+                    checkpoint("webdav_native_description_captured");
+                    guards.verify(self, plan)?;
+                    Ok::<_, ReconcileError>(guards)
+                },
+            )?;
+            checkpoint("webdav_native_description_committed");
+            drop(held);
+            Ok(admission)
+        }
+
         pub(super) fn admit_tree_coordinator_platform(
             &self,
             request: &sync_extend_journal::TreeCoordinatorAdmissionRequest,

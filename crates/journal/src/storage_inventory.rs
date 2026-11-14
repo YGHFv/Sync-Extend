@@ -100,6 +100,13 @@ pub(crate) fn tables() -> Vec<TableSpec> {
         crate::original_page_inbox::TABLES,
         crate::forwarded_page_inbox::TABLES,
         crate::storage_page_handoff::TABLES,
+        crate::storage_snapshot_handoff::TABLES,
+        crate::storage_retirement::schema::TABLES,
+        crate::storage_retirement::owner_schema::TABLES,
+        crate::storage_retirement::payload_schema::TABLES,
+        crate::storage_retirement::disposal_schema::TABLES,
+        crate::storage_retirement::terminal_schema::TABLES,
+        crate::webdav_native::schema::TABLES,
         crate::tree_storage_inventory::schema::TABLES,
         crate::tree_native_storage::schema::TABLES,
         crate::tree_native_future::schema::TABLES,
@@ -151,6 +158,7 @@ impl Journal {
         )?;
         // The all-owner audit is deliberately after the whole-database preflight.
         let preparations = self.tree_restore_preparations(space, max)?;
+        crate::webdav_native::audit(&self.connection)?;
         crate::tree_native_effects::validate_all(&self.connection, &preparations, max)?;
         let mut rows = Vec::new();
         let mut logical_bytes = 0;
@@ -171,6 +179,7 @@ impl Journal {
         crate::original_page_inbox::audit(&self.connection)?;
         crate::forwarded_page_inbox::audit(&self.connection)?;
         crate::storage_page_handoff::audit(&self.connection)?;
+        crate::storage_snapshot_handoff::audit(&self.connection)?;
         if rows
             .iter()
             .any(|row| row.table() == "native_publication_headers")

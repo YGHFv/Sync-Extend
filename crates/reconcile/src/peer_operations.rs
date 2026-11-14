@@ -62,7 +62,8 @@ impl LocalSpace {
             .await
             .map_err(|_| ReconcileError::Invariant("operation batch response failed"))?;
         connection
-            .receive_json::<SignedOperationReceiveReceipt>()
+            // The receiver durably admits the bounded page before acknowledging it.
+            .receive_json_after_application::<SignedOperationReceiveReceipt>()
             .await
             .map_err(|_| ReconcileError::Invariant("operation receipt missing"))?
             .verify(

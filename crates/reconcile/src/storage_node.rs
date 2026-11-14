@@ -15,16 +15,16 @@ use sync_extend_core_model::{
 use sync_extend_journal::{Journal, ReferenceReservationIntent, RemotePublicationProof};
 use sync_extend_transport::{
     ForwardStoreReceipt, ForwardStoreState, ForwardedSnapshotEnvelope, PeerIdentity,
-    SignedForwardStoreReceipt, SignedForwardedOperationPage, SignedOperation, TransportIdentity,
-    VerifiedForwardedPage,
+    SignedForwardStoreReceipt, SignedForwardedOperationPage, SignedOperation,
+    SignedStorageSnapshotReceipt, StorageSnapshotReceipt, TransportIdentity, VerifiedForwardedPage,
 };
 
 pub struct StorageNode {
-    config: StorageNodeConfig,
-    device: DeviceId,
-    journal: Journal,
-    cas: Cas,
-    traffic: sync_extend_journal::StorageTrafficLedger,
+    pub(super) config: StorageNodeConfig,
+    pub(super) device: DeviceId,
+    pub(super) journal: Journal,
+    pub(super) cas: Cas,
+    pub(super) traffic: sync_extend_journal::StorageTrafficLedger,
     data_identity: crate::filesystem::PathIdentity,
     file_identities: Vec<(PathBuf, crate::filesystem::PathIdentity)>,
     #[cfg(windows)]
@@ -106,6 +106,48 @@ impl crate::LocalSpace {
 }
 
 impl StorageNode {
+    /// Replace only this exact snapshot owner after all explicit storage targets
+    /// signed complete durable content receipts. Physical CAS disposition is separate.
+    pub fn handoff_retained_snapshot_storage(
+        &self,
+        policy: &sync_extend_transport::SnapshotStorageHandoffPolicy,
+        evidence: &[sync_extend_transport::SnapshotStorageHandoffEvidence],
+    ) -> Result<bool> {
+        self.verify_storage()?;
+        policy.validate()?;
+        if policy.space_id != self.config.space_id
+            || policy.storage_device != self.device
+            || evidence.len() > 1024
+        {
+            return Err(ReconcileError::Invariant(
+                "snapshot handoff exact local policy scope",
+            ));
+        }
+        let retained = self
+            .traffic
+            .snapshots(&self.config, &self.device)?
+            .into_iter()
+            .find(|retained| {
+                retained.storage_id().ok().as_ref() == Some(&policy.storage_id)
+                    && evidence
+                        .first()
+                        .is_some_and(|item| item.envelope.signed_report == retained.signed_report)
+            })
+            .ok_or(ReconcileError::Invariant(
+                "snapshot handoff exact retained original report absent",
+            ))?;
+        let verified = sync_extend_transport::SnapshotStorageHandoffRecord {
+            policy: policy.clone(),
+            retained,
+            evidence: evidence.to_vec(),
+            handed_off_at_ms: now_ms()?,
+        }
+        .verify_current(&self.config, self.transport_identity()?.peer_identity())?;
+        self.journal
+            .handoff_storage_snapshot(&verified)
+            .map_err(ReconcileError::from)
+    }
+
     /// Explicit operator policy and all native target receipts allow only this
     /// retained original page's owner to hand off. Physical CAS bytes stay intact.
     pub fn handoff_retained_page_delivery(
@@ -1134,6 +1176,142 @@ impl StorageNode {
         Ok(())
     }
 
+    /// Report stored-only state from the exact retained report, owner and CAS audit.
+    pub fn stored_snapshot_receipt(
+        &self,
+        received: &StorageReceivedSnapshot,
+    ) -> Result<SignedStorageSnapshotReceipt> {
+        self.verify_storage()?;
+        let envelope = &received.envelope;
+        self.verify_approved_key(&envelope.origin, false)?;
+        self.verify_approved_key(&envelope.forwarder, true)?;
+        self.config.admits(
+            &envelope.origin.device_id,
+            &envelope.forwarder.device_id,
+            now_ms()?,
+        )?;
+        let identity = self.transport_identity()?;
+        envelope.verify(
+            &envelope.origin,
+            &envelope.forwarder,
+            identity.peer_identity(),
+            &envelope.channel_binding,
+        )?;
+        if !self
+            .traffic
+            .snapshots(&self.config, &self.device)?
+            .iter()
+            .any(|retained| {
+                retained.origin == envelope.origin
+                    && retained.receiver == envelope.receiver
+                    && retained.signed_report == envelope.signed_report
+            })
+        {
+            return Err(ReconcileError::Invariant(
+                "snapshot receipt exact retained report absent",
+            ));
+        }
+        let files = envelope
+            .signed_report
+            .report
+            .manifest
+            .entries
+            .values()
+            .filter_map(|entry| entry.content.clone())
+            .collect::<Vec<_>>();
+        if !files.is_empty() {
+            let storage_id = envelope.storage_id()?;
+            let expected: EntryId = storage_id.as_str()[..32].parse()?;
+            if received.owner.as_ref() != Some(&expected) {
+                return Err(ReconcileError::Invariant("snapshot receipt exact owner"));
+            }
+            let owner = self
+                .journal
+                .reference_reservations(&self.config.space_id, self.config.max_metadata_entries)?
+                .into_iter()
+                .find(|owner| owner.intent.owner_id == expected)
+                .ok_or(ReconcileError::Invariant(
+                    "snapshot receipt durable owner absent",
+                ))?;
+            if owner.state != "reserved"
+                || owner.intent.scope.kind != ReferenceOwnerKind::Restore
+                || owner.intent.scope.space_id != self.config.space_id
+                || owner.intent.scope.target_device.is_some()
+                || owner.intent.scope.files != files
+                || owner.intent.created_at_ms != 0
+            {
+                return Err(ReconcileError::Invariant(
+                    "snapshot receipt exact durable owner differs",
+                ));
+            }
+        } else if received.owner.is_some() {
+            return Err(ReconcileError::Invariant(
+                "empty snapshot receipt unexpected owner",
+            ));
+        }
+        let mut chunks = BTreeMap::new();
+        for file in &files {
+            for chunk in &file.chunks {
+                if chunks
+                    .insert(chunk.content_id.clone(), chunk.clone())
+                    .is_some_and(|old| old != *chunk)
+                {
+                    return Err(ReconcileError::Invariant(
+                        "snapshot receipt conflicting chunk lengths",
+                    ));
+                }
+            }
+        }
+        let mut verified_chunks = 0u32;
+        let mut verified_bytes = 0u64;
+        let protected = self.journal.protected_objects()?;
+        for chunk in chunks.values() {
+            if !protected.contains(&chunk.content_id) {
+                return Err(ReconcileError::Invariant(
+                    "snapshot receipt exact content pin missing",
+                ));
+            }
+            let guard = self.journal.acquire_cas_access(&chunk.content_id)?;
+            if self.cas.read(chunk).is_ok() {
+                verified_chunks =
+                    verified_chunks
+                        .checked_add(1)
+                        .ok_or(ReconcileError::ResourceLimit(
+                            "snapshot receipt chunk count",
+                        ))?;
+                verified_bytes = verified_bytes
+                    .checked_add(u64::from(chunk.length))
+                    .ok_or(ReconcileError::ResourceLimit("snapshot receipt byte count"))?;
+            }
+            drop(guard);
+        }
+        let complete = files.iter().all(|file| self.cas.verify(file).is_ok());
+        let state = if complete {
+            ForwardStoreState::ContentClosed
+        } else if verified_chunks == 0 {
+            ForwardStoreState::MetadataOnly
+        } else {
+            ForwardStoreState::PartialStaging
+        };
+        let signed = SignedStorageSnapshotReceipt::sign(
+            &identity,
+            StorageSnapshotReceipt {
+                protocol_version: PROTOCOL_VERSION,
+                space_id: self.config.space_id.clone(),
+                storage_device: self.device.clone(),
+                origin_device: envelope.origin.device_id.clone(),
+                storage_id: envelope.storage_id()?,
+                report_id: envelope.report_id()?,
+                channel_binding: envelope.channel_binding.clone(),
+                state,
+                verified_chunks,
+                verified_bytes,
+            },
+        )?;
+        signed.verify(identity.peer_identity(), envelope)?;
+        Ok(signed)
+    }
+
     pub fn stored_receipt(
         &self,
         received: &StorageReceivedPage,
@@ -1670,7 +1848,7 @@ impl StorageNode {
         Ok(())
     }
 
-    fn verify_storage(&self) -> Result<()> {
+    pub(super) fn verify_storage(&self) -> Result<()> {
         self.data_identity.verify(&self.config.data_dir)?;
         for (path, identity) in &self.file_identities {
             identity.verify(path)?;

@@ -337,11 +337,63 @@ impl crate::JournalReadView<'_> {
             &tables,
             &row_hashes,
         ))?;
-        let mut liabilities = ordinary::liabilities(&audited, &rows)?;
+        let storage_originals = audit::storage_originals(self, space, max, &tables, &rows)?;
+        let mut liabilities = ordinary::liabilities(&audited, &rows, &storage_originals)?;
+        let dav = crate::webdav_native::outstanding(self.connection)?;
+        if dav.rows != 0 {
+            liabilities.obligations.push(JournalCapacityObligation {
+                family: "webdav_native_description_cancellation",
+                owner_key: Vec::new(),
+                charge: dav,
+            });
+        }
+        let retirement = crate::storage_retirement::outstanding(self.connection)?;
+        let retirement_owner = crate::storage_retirement::owner::outstanding(self.connection)?;
+        let retirement_payload = crate::storage_retirement::payload::outstanding(self.connection)?;
+        let retirement_disposal =
+            crate::storage_retirement::disposal::outstanding(self.connection)?;
+        let retirement_terminal =
+            crate::storage_retirement::terminal::outstanding(self.connection)?;
+        if retirement_terminal.rows != 0 {
+            liabilities.obligations.push(JournalCapacityObligation {
+                family: "storage_retirement_restored_marker_terminal",
+                owner_key: Vec::new(),
+                charge: retirement_terminal,
+            });
+        }
+        if retirement_disposal.rows != 0 {
+            liabilities.obligations.push(JournalCapacityObligation {
+                family: "storage_retirement_delete_close_absence_terminal",
+                owner_key: Vec::new(),
+                charge: retirement_disposal,
+            });
+        }
+        if retirement_payload.rows != 0 {
+            liabilities.obligations.push(JournalCapacityObligation {
+                family: "storage_retirement_quarantine_restore_peak",
+                owner_key: Vec::new(),
+                charge: retirement_payload,
+            });
+        }
+        if retirement_owner.rows != 0 {
+            liabilities.obligations.push(JournalCapacityObligation {
+                family: "storage_retirement_original_owner_receipt",
+                owner_key: Vec::new(),
+                charge: retirement_owner,
+            });
+        }
+        if retirement.rows != 0 {
+            liabilities.obligations.push(JournalCapacityObligation {
+                family: "storage_retirement_cancellation_peak",
+                owner_key: Vec::new(),
+                charge: retirement,
+            });
+        }
         crate::original_provenance::audit(self.connection)?;
         crate::original_page_inbox::audit(self.connection)?;
         crate::forwarded_page_inbox::audit(self.connection)?;
         crate::storage_page_handoff::audit(self.connection)?;
+        crate::storage_snapshot_handoff::audit(self.connection)?;
         liabilities
             .obligations
             .extend(crate::remote_rename::obligations(&rows, self.connection)?);

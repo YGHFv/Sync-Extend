@@ -5,6 +5,7 @@ use std::io;
 pub fn ready() -> io::Result<()> {
     #[cfg(windows)]
     sync_extend_platform_fs::report_service_ready()?;
+    super::management::resources_ready();
     Ok(())
 }
 

@@ -179,6 +179,19 @@ impl Journal {
 
 impl crate::JournalReadView<'_> {
     pub(crate) fn require_cas_access(&self, content: &ContentId) -> Result<()> {
+        crate::storage_retirement::schema::validate(self.connection)?;
+        let storage_fenced: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM main.storage_retirement_requests r WHERE r.content_id=?1
+             AND NOT EXISTS(SELECT 1 FROM main.storage_retirement_cancellations c
+                 WHERE c.request_id=r.request_id))",
+            [content.as_str()],
+            |r| r.get(0),
+        )?;
+        if storage_fenced {
+            return Err(JournalError::Invariant(
+                "CAS object fenced by storage retirement",
+            ));
+        }
         let fenced: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM gc_executions e WHERE e.content_id=?1
                 AND NOT EXISTS (SELECT 1 FROM gc_execution_aborts WHERE execution_id=e.execution_id)

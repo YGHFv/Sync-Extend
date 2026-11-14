@@ -90,16 +90,28 @@ mod snapshot_pruning;
 mod snapshot_retention;
 mod storage;
 mod storage_node;
+mod storage_retirement;
+mod storage_retirement_disposal;
+mod storage_retirement_fence;
+mod storage_retirement_owner;
+mod storage_retirement_payload;
+mod storage_retirement_terminal;
 pub use storage_node::{
     StorageNode, StorageNodeStatus, StorageReceivedPage, StorageReceivedSnapshot,
     StorageSnapshotStatus,
 };
+pub use storage_retirement::StorageRetirementAssessment;
+mod storage_retirement_inspection;
+#[cfg(windows)]
+pub use storage_retirement_inspection::StorageRetirementInspection;
+pub use storage_retirement_inspection::StorageRetirementObjectObservation;
 mod webdav;
 pub use webdav::{WebDavBaseline, WebDavCommit, WebDavRead};
 mod tree_final_observation;
 #[cfg(windows)]
 mod tree_native_owner;
 mod tree_restore_capture;
+pub use tree_restore_capture::WebDavNativeCapture;
 mod tree_restore_pipeline;
 pub use delete::{DeleteResult, MutationResult};
 pub use diagnostics::Diagnostics;

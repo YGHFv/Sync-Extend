@@ -1,5 +1,6 @@
 {
   "format_version": 1,
+  "management": "/config/management.json",
   "role": {
     "kind": "local_polling",
     "data_dir": "/state/client",

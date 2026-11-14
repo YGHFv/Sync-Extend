@@ -32,7 +32,7 @@ $taskOutput=[IO.Path]::GetFullPath($Output)
 if (Test-Path -LiteralPath $taskOutput) {throw 'New bounded build-context directory required'}
 New-Item -ItemType Directory -Path $taskOutput|Out-Null
 Copy-Item -LiteralPath $taskBinary -Destination (Join-Path $taskOutput 'syncd')
-foreach ($taskName in @('Dockerfile','entrypoint.sh')) {
+foreach ($taskName in @('Dockerfile','entrypoint.sh','healthcheck.sh')) {
     $taskText=[IO.File]::ReadAllText((Join-Path $PSScriptRoot $taskName)).Replace("`r`n","`n")
     [IO.File]::WriteAllText((Join-Path $taskOutput $taskName),$taskText,[Text.UTF8Encoding]::new($false))
 }
