@@ -1236,6 +1236,46 @@ fn create_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+mod node_archive;
+#[cfg(windows)]
+pub use node_archive::{
+    ArchiveBounds, ArchiveRole, CapturedNodeArchive, CreatedNodeCurrentFile, CreatedNodeDataLocks,
+    CreatedNodeDirectorySet, CreatedNodeFileSet, CreatedNodeRestoreRoots, CreatedNodeSection,
+    CreatedNodeWorktreeMarker, FramedNodeArchive, InitializedNodeLedger, LedgerBounds,
+    NodeLedgerEvidence, NodeRestoreAttempt, NodeRestoreDirectory, NodeRestoreFile,
+    NodeRestoreLayout, NodeRestoreLedger, NodeRestoreMappedLayout, NodeRestoreSlot, NodeTargetRoot,
+    OriginalNodeCompletionEvidence, OriginalNodeCompletionManifest,
+    OriginalNodeCompletionObservation, OriginalNodeReadAssembly, OriginalNodeRestartClassification,
+    OriginalNodeWriteCloseFailure, OriginalNodeWriteClosed, OriginalNodeWriteFrameClassification,
+    OriginalNodeWriteOpenFailure, OriginalNodeWriteSession, OriginalRestoredLocalSpace,
+    PreparedOriginalNodeRestore, VerifiedNodeStateArchive,
+};
+
+#[cfg(windows)]
+impl From<rusqlite::Error> for ReconcileError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Journal(sync_extend_journal::JournalError::Sql(error))
+    }
+}
+
+#[cfg(windows)]
+mod original_managed_cas;
+
+#[cfg(windows)]
+pub use node_archive::ExplicitOriginalConfigMapping;
+
+#[cfg(windows)]
+mod explicit_credential_mapping;
+#[cfg(windows)]
+mod explicit_management_mapping;
+#[cfg(windows)]
+pub use explicit_credential_mapping::{
+    ExplicitWebDavCredentialMapping, InstalledExplicitWebDavCredential,
+};
+#[cfg(windows)]
+pub use explicit_management_mapping::ExplicitManagementCredentialMapping;
+
 #[cfg(not(windows))]
 fn acquire_lock(data: &Path) -> Result<File> {
     let path = data.join("writer.lock");
@@ -1249,4 +1289,178 @@ fn acquire_lock(data: &Path) -> Result<File> {
     fs2::FileExt::try_lock_exclusive(&file)
         .map_err(|_| ReconcileError::Invariant("another local writer is running"))?;
     Ok(file)
+}
+
+#[cfg(windows)]
+pub use node_archive::ReacquiredClosedNodeReadScope;
+
+#[cfg(windows)]
+pub use node_archive::ReacquiredClosedNodeLockedReadScope;
+
+#[cfg(windows)]
+pub use node_archive::FreshRecoveredNodeSqliteSession;
+
+#[cfg(windows)]
+pub use node_archive::FreshDurableRecoveredSession;
+
+#[cfg(windows)]
+pub use node_archive::FreshRecoveredNodeWalSession;
+
+#[cfg(windows)]
+pub use node_archive::RecoveredWalFrameClassification;
+
+#[cfg(windows)]
+pub use node_archive::FreshRecoveredNodeWalV2Session;
+
+#[cfg(windows)]
+pub use node_archive::RecoveredHistoryCloseClassification;
+
+// Private freshly reacquired native session. No Journal/CAS reference escapes.
+#[cfg(windows)]
+pub struct RecoveredLocalSpace {
+    session: node_archive::FreshRecoveredNodeWalV2Session,
+    closed: bool,
+}
+#[cfg(windows)]
+#[derive(Serialize)]
+pub struct RecoveredLocalSpaceStatus {
+    pub space_id: SpaceId,
+    pub device_id: DeviceId,
+    pub snapshot_id: SnapshotId,
+    pub entries: usize,
+    pub operations: usize,
+    pub snapshots: usize,
+    pub network_enabled: bool,
+}
+#[cfg(windows)]
+impl RecoveredLocalSpace {
+    pub(crate) fn from_reacquired_session(
+        session: node_archive::FreshRecoveredNodeWalV2Session,
+    ) -> Result<Self> {
+        session.verify()?;
+        Ok(Self {
+            session,
+            closed: false,
+        })
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        if self.closed {
+            return Err(ReconcileError::Invariant("recovered LocalSpace closed"));
+        }
+        self.session.verify()
+    }
+    pub fn manifest(&self) -> Result<Manifest> {
+        self.verify()?;
+        self.session.recovered_local_manifest()
+    }
+    pub fn operations(&self) -> Result<Vec<Operation>> {
+        self.verify()?;
+        self.session.recovered_local_operations()
+    }
+    pub fn snapshots(&self) -> Result<Vec<(SnapshotId, String)>> {
+        self.verify()?;
+        self.session.recovered_local_snapshots()
+    }
+    pub fn status(&self) -> Result<RecoveredLocalSpaceStatus> {
+        self.verify()?;
+        let manifest = self.manifest()?;
+        Ok(RecoveredLocalSpaceStatus {
+            space_id: manifest.space_id.clone(),
+            device_id: self.session.recovered_local_device_id()?,
+            snapshot_id: manifest.root()?,
+            entries: manifest.entries.len(),
+            operations: self.operations()?.len(),
+            snapshots: self.snapshots()?.len(),
+            network_enabled: false,
+        })
+    }
+    pub fn create_file(
+        &mut self,
+        path: &PortablePath,
+        bytes: &[u8],
+        timestamp: u64,
+    ) -> Result<SnapshotId> {
+        self.verify()?;
+        self.session
+            .create_recovered_file_from_bytes(path, bytes, timestamp)
+    }
+    pub fn copy_file(
+        &mut self,
+        path: &PortablePath,
+        source: &PortablePath,
+        timestamp: u64,
+    ) -> Result<SnapshotId> {
+        self.verify()?;
+        self.session
+            .create_recovered_file_from_existing_content(path, source, timestamp)
+    }
+    pub fn replace_file(
+        &mut self,
+        path: &PortablePath,
+        source: &PortablePath,
+        timestamp: u64,
+    ) -> Result<SnapshotId> {
+        self.verify()?;
+        self.session
+            .replace_recovered_file_from_existing_content(path, source, timestamp)
+    }
+    pub fn delete_file(&mut self, path: &PortablePath, timestamp: u64) -> Result<SnapshotId> {
+        self.verify()?;
+        self.session.delete_recovered_file(path, timestamp)
+    }
+    pub fn create_directory(&mut self,path:&PortablePath,timestamp:u64)->Result<SnapshotId> {
+        self.verify()?;self.session.create_recovered_directory(path,timestamp)
+    }
+    pub fn move_file(&mut self,source:&PortablePath,destination:&PortablePath,timestamp:u64)->Result<SnapshotId> {
+        self.verify()?;self.session.move_recovered_file(source,destination,timestamp)
+    }
+    pub fn replace_file_bytes(&mut self,path:&PortablePath,bytes:&[u8],timestamp:u64)->Result<SnapshotId> {
+        self.verify()?;self.session.replace_recovered_file_from_bytes(path,bytes,timestamp)
+    }
+    pub fn move_created_empty_directory(
+        &mut self,source:&PortablePath,destination:&PortablePath,timestamp:u64,
+    )->Result<SnapshotId>{
+        self.verify()?;
+        self.session.move_created_empty_recovered_directory(source,destination,timestamp)
+    }
+    pub fn delete_created_empty_directory(
+        &mut self,path:&PortablePath,timestamp:u64,
+    )->Result<SnapshotId>{
+        self.verify()?;
+        self.session.delete_created_empty_recovered_directory(path,timestamp)
+    }
+    pub fn history_binding(&self)->Result<node_archive::RecoveredLiveHistoryBinding>{
+        self.verify()?;self.session.recovered_live_history_binding()
+    }
+    /// A canonical explicit chain closes the exact current native session.
+    /// A failed close remains uncertain and cannot be retried as clean.
+    pub fn close(mut self) -> Result<PathBuf> {
+        self.verify()?;
+        self.closed = true;
+        self.session.close_recovered_history_for_chain8()
+    }
+}
+
+#[cfg(windows)]
+pub use node_archive::RecoveredLiveHistoryBinding;
+
+
+#[cfg(windows)]
+impl RecoveredLocalSpace {
+    /// Return bounded retained-row summaries from the immutable recovered image.
+    pub fn history_tables(
+        &self,
+    ) -> Result<sync_extend_journal::RecoveredHistoryTables> {
+        self.verify()?;
+        self.session.recovered_history_tables()
+    }
+
+    /// Return bounded summaries for every named original main table.
+    pub fn main_tables(
+        &self,
+    ) -> Result<sync_extend_journal::RecoveredMainTables> {
+        self.verify()?;
+        self.session.recovered_main_tables()
+    }
 }

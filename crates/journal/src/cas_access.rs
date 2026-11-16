@@ -86,10 +86,12 @@ impl CasAccessGuard {
         }
         #[cfg(windows)]
         {
-            use sync_extend_platform_fs::{verify_regular_file, FileKey};
+            use sync_extend_platform_fs::verify_regular_file;
             verify_regular_file(&self.file)?;
-            let named = File::open(&self.path)?;
-            if FileKey::from_file(&self.file)? != FileKey::from_file(&named)? {
+            // Observe only the named slot. File::open's default READ sharing
+            // conflicts with the retained original RW coordination handles.
+            // This metadata-only nonfollowing check grants no writer authority.
+            if !sync_extend_platform_fs::regular_file_matches_path(&self.file, &self.path)? {
                 return Err(JournalError::Invariant("CAS coordination identity changed"));
             }
         }
@@ -128,6 +130,61 @@ impl Journal {
     }
 
     pub(crate) fn acquire_cas_coordination(&self) -> Result<CasAccessGuard> {
+        #[cfg(windows)]
+        if self.original_restored_image.is_some() {
+            let original =
+                self.original_cas_coordination
+                    .as_ref()
+                    .ok_or(JournalError::Invariant(
+                        "restored Journal original CAS sentinel unbound",
+                    ))?;
+            self.verify_original_created_image()?;
+            return CasAccessGuard::shared_original(&self.database_path, original);
+        }
         CasAccessGuard::shared(&self.database_path)
+    }
+}
+
+// Included inside original cas_access.rs to reuse exact guard/verify/upgrade.
+impl CasAccessGuard {
+    #[cfg(windows)]
+    fn shared_original(
+        database: &Path,
+        original: &sync_extend_platform_fs::ReleasedOriginalCoordinationFile,
+    ) -> Result<Self> {
+        let parent = database
+            .parent()
+            .ok_or(JournalError::Invariant("original CAS parent absent"))?;
+        let path = parent.join("cas-access.lock");
+        original.verify(&path)?;
+        // The retained original CREATE parent has DELETE access and excludes
+        // a fresh read open that omits DELETE sharing. Duplicate its actual
+        // read-only witness without releasing the creator or reopening its path.
+        let mut directories = vec![original.retain_original_parent_directory(parent)?];
+        for ancestor in parent.ancestors().skip(1) {
+            let directory = sync_extend_platform_fs::LockedDirectory::open(ancestor)?;
+            directory.require_local_ntfs(ancestor)?;
+            directory.require_case_insensitive()?;
+            directories.push(directory);
+        }
+        let file = original.open_for_shared_coordination(&path)?;
+        file.try_lock_shared()
+            .map_err(|_| JournalError::Invariant("original CAS exclusive access running"))?;
+        let guard = Self {
+            file,
+            path,
+            _directories: directories,
+        };
+        guard.verify()?;
+        original.verify(&guard.path)?;
+        Ok(guard)
+    }
+}
+
+#[cfg(windows)]
+impl crate::OriginalJournalWriteTransition {
+    pub fn acquire_original_cas_session(&self) -> crate::Result<crate::CasAccessGuard> {
+        self.verify()?;
+        crate::CasAccessGuard::shared_original(&self.path, &self.cas)
     }
 }

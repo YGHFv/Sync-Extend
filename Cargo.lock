@@ -1075,6 +1075,7 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
  "libc",
+ "rusqlite",
  "windows-sys 0.61.2",
 ]
 
@@ -1087,6 +1088,7 @@ dependencies = [
  "file-id",
  "fs2",
  "getrandom 0.4.3",
+ "rusqlite",
  "same-file",
  "serde",
  "serde_json",

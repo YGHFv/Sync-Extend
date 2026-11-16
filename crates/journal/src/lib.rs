@@ -111,6 +111,16 @@ pub enum ReceiveOutcome {
 
 pub struct Journal {
     connection: Connection,
+    #[cfg(windows)]
+    original_restored_image: Option<sync_extend_platform_fs::ReleasedOriginalFileIdentity>,
+    #[cfg(windows)]
+    original_read_protection: Option<sync_extend_platform_fs::ReleasedOriginalReadFile>,
+    #[cfg(windows)]
+    original_coordination_observer: bool,
+    #[cfg(windows)]
+    original_main_handoff: Option<sync_extend_platform_fs::OriginalSqliteMainHandoff>,
+    #[cfg(windows)]
+    original_cas_coordination: Option<sync_extend_platform_fs::ReleasedOriginalCoordinationFile>,
     database_path: std::path::PathBuf,
     max_storage_entries: usize,
     conflict_resolution_issuance: conflict_resolution::issuance::Gate,
@@ -161,6 +171,86 @@ impl Journal {
 
     /// Configures converted writers before opening or migrating the database.
     pub fn open_with_storage_limit(path: &Path, max_storage_entries: usize) -> Result<Self> {
+        Self::open_with_identity_check(path, max_storage_entries, true, |_| Ok(()))
+    }
+
+    /// Consume the actual original object witness and retain it for the whole
+    /// Journal lifetime. Failure returns the live witness and preserves originals.
+    #[cfg(windows)]
+    pub fn reopen_original_created_image(
+        path: &Path,
+        max_storage_entries: usize,
+        original: sync_extend_platform_fs::ReleasedOriginalFileIdentity,
+    ) -> std::result::Result<
+        Self,
+        (
+            Box<sync_extend_platform_fs::ReleasedOriginalFileIdentity>,
+            JournalError,
+        ),
+    > {
+        let open = || -> Result<Self> {
+            original.verify()?;
+            if !original.matches_path(path)? {
+                return Err(JournalError::Invariant(
+                    "original Journal slot differs before reopen",
+                ));
+            }
+            Self::open_with_identity_check(path, max_storage_entries, false, |connection| {
+                let actual = sync_extend_platform_fs::sqlite_main_file_identity(connection)?;
+                if actual != original.key()? || !original.matches_path(path)? {
+                    return Err(JournalError::Invariant(
+                        "SQLite opened a foreign Journal original",
+                    ));
+                }
+                Ok(())
+            })
+        };
+        match open() {
+            Ok(mut journal) => {
+                journal.original_restored_image = Some(original);
+                Ok(journal)
+            }
+            Err(error) => Err((Box::new(original), error)),
+        }
+    }
+
+    /// Audit actual retained original object and SQLite's main file again.
+    /// No same-byte pathname or public numeric identity can establish continuity.
+    #[cfg(windows)]
+    pub fn verify_original_created_image(&self) -> Result<()> {
+        if let Some(protected) = &self.original_read_protection {
+            protected.verify_identity()?;
+            if !protected.matches_path(&self.database_path)? {
+                return Err(JournalError::Invariant(
+                    "protected original Journal named slot changed",
+                ));
+            }
+        }
+
+        let original = self
+            .original_restored_image
+            .as_ref()
+            .ok_or(JournalError::Invariant(
+                "Journal has no original restored image witness",
+            ))?;
+        original.verify()?;
+        if sync_extend_platform_fs::sqlite_main_file_identity(&self.connection)?
+            != original.key()?
+            || !original.matches_path(&self.database_path)?
+        {
+            return Err(JournalError::Invariant(
+                "opened Journal original identity changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn open_with_identity_check(
+        path: &Path,
+        max_storage_entries: usize,
+        allow_create: bool,
+        inspect: impl FnOnce(&Connection) -> Result<()>,
+    ) -> Result<Self> {
         storage_policy::validate(max_storage_entries)?;
         for ancestor in path.ancestors() {
             match std::fs::symlink_metadata(ancestor) {
@@ -180,11 +270,17 @@ impl Journal {
                 Err(e) => return Err(e.into()),
             }
         }
-        let mut connection = Connection::open(path)?;
-        // Reuse bounded SQL bytecode; every actual schema and row audit still runs.
-        // SQLite invalidates/reprepares statements when the actual schema changes.
+        let mut flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        if allow_create {
+            flags |= rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+        }
+        let mut connection = Connection::open_with_flags(path, flags)?;
+        // Original main identity is checked before any SQLite configuration,
+        // migration or schema/issuance installation can change the database.
+        inspect(&connection)?;
+        // Retain DEV32's bounded bytecode cache after the original identity check.
         connection.set_prepared_statement_cache_capacity(256);
-
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
@@ -648,6 +744,16 @@ impl Journal {
         let native_issuance = native_publication::issuance::register(&connection)?;
         Ok(Self {
             connection,
+            #[cfg(windows)]
+            original_restored_image: None,
+            #[cfg(windows)]
+            original_cas_coordination: None,
+            #[cfg(windows)]
+            original_read_protection: None,
+            #[cfg(windows)]
+            original_coordination_observer: false,
+            #[cfg(windows)]
+            original_main_handoff: None,
             database_path: std::fs::canonicalize(path)?,
             max_storage_entries,
             conflict_resolution_issuance,
@@ -2601,3 +2707,230 @@ fn sql_nonnegative(value: i64, index: usize) -> rusqlite::Result<u64> {
 fn sql_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     sql_nonnegative(row.get::<_, i64>(index)?, index)
 }
+
+mod recovered_history_tables;
+mod backup_image;
+#[cfg(windows)]
+pub use backup_image::CreatedJournalRestore;
+pub use backup_image::{JournalBackupImage, NodeInspectionBounds, PortableNodeImageScope};
+pub use recovered_history_tables::{
+    RecoveredHistoryTable, RecoveredHistoryTables, RecoveredMainTable, RecoveredMainTables,
+};
+
+#[cfg(windows)]
+mod original_coordination;
+
+#[cfg(windows)]
+mod original_image_rows;
+
+#[cfg(windows)]
+mod original_cas_coordination;
+
+#[cfg(windows)]
+mod original_readonly;
+
+#[cfg(windows)]
+mod original_completion;
+
+#[cfg(windows)]
+mod original_handoff;
+#[cfg(windows)]
+mod original_write_transition;
+#[cfg(windows)]
+pub use original_write_transition::{
+    OriginalJournalTransitionFailure, OriginalJournalWriteTransition,
+};
+
+pub use backup_image::{
+    DetachedOriginalNodeHistory, OriginalHistoryContentReference,
+    OriginalNodeHistoryMappingEvidence, RetainedOriginalNodeHistory,
+};
+
+#[cfg(windows)]
+impl Journal {
+    pub(crate) fn from_original_planning_memory(
+        connection: rusqlite::Connection,
+        path: &std::path::Path,
+        max_storage_entries: usize,
+    ) -> Result<Self> {
+        connection.set_prepared_statement_cache_capacity(256);
+        storage_policy::validate(max_storage_entries)?;
+        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Err(JournalError::Invariant("original planning current schema"));
+        }
+        webdav_native::schema::validate(&connection)?;
+        let webdav_native_execution_admission_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_execution_admission_issue",
+        )?;
+        let webdav_native_execution_record_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_execution_record_issue",
+        )?;
+        let webdav_native_execution_template_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_execution_template_issue",
+        )?;
+        let webdav_native_execution_binding_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_execution_binding_issue",
+        )?;
+        let webdav_native_execution_receipt_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_execution_receipt_issue",
+        )?;
+        let webdav_native_execution_manifest_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_execution_manifest_issue",
+        )?;
+        let webdav_original_final_row_issue =
+            webdav_native::final_row_gate::Gate::register(&connection)?;
+        // Non-Windows retains registration's callback-owned rejecting gate.
+        // There is no Windows native issuer on these targets.
+        #[cfg(not(windows))]
+        let _ = (
+            webdav_native_execution_template_issue,
+            webdav_native_execution_binding_issue,
+            webdav_native_execution_receipt_issue,
+            webdav_native_execution_manifest_issue,
+            webdav_original_final_row_issue,
+        );
+        let webdav_native_description_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_description_issue",
+        )?;
+        let webdav_native_object_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_object_issue",
+        )?;
+        let webdav_native_cancel_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_cancel_issue",
+        )?;
+        storage_retirement::terminal_schema::validate(&connection)?;
+        #[cfg(windows)]
+        let storage_retirement_terminal_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_storage_retirement_terminal_issue",
+        )?;
+        storage_retirement::disposal_schema::validate(&connection)?;
+        #[cfg(windows)]
+        let storage_retirement_disposal_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_storage_retirement_disposal_issue",
+        )?;
+        storage_retirement::payload_schema::validate(&connection)?;
+        #[cfg(windows)]
+        let storage_retirement_payload_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_storage_retirement_payload_issue",
+        )?;
+        storage_retirement::schema::validate(&connection)?;
+        storage_retirement::owner_schema::validate(&connection)?;
+        #[cfg(windows)]
+        let storage_retirement_owner_activation = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_storage_retirement_owner_issue",
+        )?;
+        #[cfg(windows)]
+        let storage_retirement_owner_receipt = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_storage_retirement_owner_receipt",
+        )?;
+        let storage_retirement_issuance =
+            storage_retirement::gate::Gate::register(&connection, "sync_storage_retirement_issue")?;
+        let storage_retirement_cancellation = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_storage_retirement_cancel",
+        )?;
+        storage_page_handoff::validate_schema(&connection)?;
+        storage_snapshot_handoff::validate_schema(&connection)?;
+        tree_native_effects::validate_schema(&connection)?;
+        let tree_native_issuance = tree_native_effects::issuance::Gate::register(&connection)?;
+        #[cfg(not(windows))]
+        let _ = tree_native_issuance;
+        original_provenance::validate_schema(&connection)?;
+        original_page_inbox::validate_schema(&connection)?;
+        forwarded_page_inbox::validate_schema(&connection)?;
+        let original_operation_issuance = original_provenance::Gate::register(&connection)?;
+        conflict_resolution::validate_schema(&connection)?;
+        let conflict_resolution_issuance =
+            conflict_resolution::issuance::Gate::register(&connection)?;
+        remote_replace::validate_schema(&connection)?;
+        let remote_replace_issuance = remote_replace::issuance::Gate::register(&connection)?;
+        #[cfg(not(windows))]
+        let _ = remote_replace_issuance;
+        remote_delete::validate_schema(&connection)?;
+        let remote_delete_issuance = remote_delete::issuance::Gate::register(&connection)?;
+        #[cfg(not(windows))]
+        let _ = remote_delete_issuance;
+        remote_rename::validate_schema(&connection)?;
+        let remote_rename_issuance = remote_rename::issuance::Gate::register(&connection)?;
+        #[cfg(not(windows))]
+        let _ = remote_rename_issuance;
+        native_publication::validate_schema(&connection)?;
+        #[cfg(windows)]
+        let native_issuance = native_publication::issuance::register(&connection)?;
+        Ok(Self {
+            connection,
+            #[cfg(windows)]
+            original_restored_image: None,
+            #[cfg(windows)]
+            original_cas_coordination: None,
+            #[cfg(windows)]
+            original_read_protection: None,
+            #[cfg(windows)]
+            original_coordination_observer: false,
+            #[cfg(windows)]
+            original_main_handoff: None,
+            database_path: path.to_path_buf(),
+            max_storage_entries,
+            conflict_resolution_issuance,
+            original_operation_issuance,
+            storage_retirement_issuance,
+            storage_retirement_cancellation,
+            webdav_native_description_issue,
+            webdav_native_object_issue,
+            webdav_native_cancel_issue,
+            webdav_native_execution_admission_issue,
+            webdav_native_execution_record_issue,
+            #[cfg(windows)]
+            webdav_native_execution_template_issue,
+            #[cfg(windows)]
+            webdav_native_execution_binding_issue,
+            #[cfg(windows)]
+            webdav_native_execution_receipt_issue,
+            #[cfg(windows)]
+            webdav_native_execution_manifest_issue,
+            #[cfg(windows)]
+            webdav_original_final_row_issue,
+            #[cfg(windows)]
+            storage_retirement_owner_activation,
+            #[cfg(windows)]
+            storage_retirement_owner_receipt,
+            #[cfg(windows)]
+            storage_retirement_payload_issue,
+            #[cfg(windows)]
+            storage_retirement_disposal_issue,
+            #[cfg(windows)]
+            storage_retirement_terminal_issue,
+            #[cfg(windows)]
+            tree_native_issuance,
+            #[cfg(windows)]
+            native_issuance,
+            #[cfg(windows)]
+            remote_rename_issuance,
+            #[cfg(windows)]
+            remote_delete_issuance,
+            #[cfg(windows)]
+            remote_replace_issuance,
+        })
+    }
+}
+
+#[cfg(windows)]
+pub use original_write_transition::RecoveredLocalHistoryPlan;
+
+#[cfg(windows)]
+pub use original_write_transition::RecoveredImmutableHistoryInventory;

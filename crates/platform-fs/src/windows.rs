@@ -26,7 +26,9 @@ pub use directory_create::OriginalDirectoryCreation;
 #[path = "owned_file.rs"]
 mod owned_file;
 pub use owned_file::{
-    OriginalFileCreation, OwnedFileCreation, PublishedOriginalFile, SealedOriginalFile,
+    FreshExclusiveSqliteFile, OriginalFileCreation, OwnedFileCreation, PublishedOriginalFile,
+    ReacquiredNodeFile, ReacquiredNodeLock, ReleasedOriginalCoordinationFile,
+    ReleasedOriginalFileIdentity, ReleasedOriginalReadFile, SealedOriginalFile,
 };
 
 fn key(file: &File) -> io::Result<FileKey> {
@@ -415,3 +417,112 @@ fn rename_no_replace(file: &File, destination: &Path) -> io::Result<()> {
     }
     Ok(())
 }
+
+#[path = "sqlite_native_identity.rs"]
+mod sqlite_native_identity;
+pub use sqlite_native_identity::sqlite_main_file_identity;
+
+impl GuardedReadFile {
+    /// Metadata-only non-following slot observation while the original read
+    /// exclusion remains held. This creates no new owner or creator grant.
+    pub fn matches_path(&self, path: &Path) -> io::Result<bool> {
+        self.verify_single_link()?;
+        regular_file_matches_path(&self.file, path)
+    }
+}
+
+/// Retain the exact held directory with reduced read rights. This is an
+/// observer, with no CREATE, rename or disposition method.
+pub struct RetainedWriterDirectory {
+    pub(crate) directory: LockedDirectory,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) key: FileKey,
+}
+
+fn retain_writer_directory(file: &File, path: &Path) -> io::Result<RetainedWriterDirectory> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::{Foundation::DuplicateHandle, System::Threading::GetCurrentProcess};
+    if !path.is_absolute() || !directory_matches_path(file, path)? {
+        return Err(invalid("original writer directory slot differs"));
+    }
+    regular(file, true)?;
+    require_case_insensitive(file)?;
+    local_ntfs(file, path)?;
+    let original_key = key(file)?;
+    let mut handle: HANDLE = ptr::null_mut();
+    // SAFETY: file is a live retained directory. The output receives one owned,
+    // noninherited READ-only duplicate; WRITE and DELETE are not requested.
+    let success = unsafe {
+        let process = GetCurrentProcess();
+        DuplicateHandle(
+            process,
+            file.as_raw_handle() as HANDLE,
+            process,
+            &mut handle,
+            GENERIC_READ,
+            0,
+            0,
+        )
+    };
+    if success == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful DuplicateHandle returned one new handle owned here.
+    let observed = unsafe { File::from_raw_handle(handle) };
+    regular(&observed, true)?;
+    if key(&observed)? != original_key || !directory_matches_path(&observed, path)? {
+        return Err(invalid("retained writer directory object differs"));
+    }
+    Ok(RetainedWriterDirectory {
+        directory: LockedDirectory { file: observed },
+        path: path.to_owned(),
+        key: original_key,
+    })
+}
+
+impl LockedDirectory {
+    /// Duplicate an existing directory guard; no pathname opens grant rights.
+    pub fn retain_writer_directory(&self, path: &Path) -> io::Result<RetainedWriterDirectory> {
+        retain_writer_directory(&self.file, path)
+    }
+}
+
+#[path = "sqlite_main_bytes.rs"]
+mod sqlite_main_bytes;
+#[path = "sqlite_wal_identity.rs"]
+mod sqlite_wal_identity;
+pub use sqlite_main_bytes::{sqlite_main_exact_bytes, sqlite_retain_actual_wal};
+pub use sqlite_wal_identity::sqlite_wal_file_identity;
+
+pub use owned_file::{
+    OriginalSqliteMainHandoff, OriginalSqliteMainHandoffFailure, OriginalSqliteSidecarHandoff,
+    OriginalSqliteSidecarHandoffFailure, OriginalSqliteSidecarKind,
+};
+
+#[path = "sqlite_original.rs"]
+mod sqlite_original;
+pub use sqlite_original::{
+    OriginalSqliteConnection, OriginalSqliteOpenFailure, OriginalSqliteQuery,
+    OriginalSqliteReadBudget, OriginalSqliteRows, OriginalSqliteStatement, OriginalSqliteValue,
+};
+
+#[path = "current_user_file.rs"]
+mod current_user_file;
+pub use current_user_file::verify_current_user_private_file;
+
+#[path = "fresh_native_sqlite.rs"]
+mod fresh_native_sqlite;
+pub use fresh_native_sqlite::FreshNativeSqliteConnection;
+
+#[path = "fresh_native_wal.rs"]
+mod fresh_native_wal;
+pub use fresh_native_wal::FreshNativeWalConnection;
+
+pub use owned_file::FreshRecoveredMutationFile;
+
+#[path = "sqlite_payload_allocation.rs"]
+mod sqlite_payload_allocation;
+pub use sqlite_payload_allocation::{
+    OriginalSqlitePayloadAllocation, OriginalSqlitePayloadAllocationBounds,
+    OriginalSqlitePayloadAllocationFailure,
+};

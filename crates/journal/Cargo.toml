@@ -13,7 +13,7 @@ sync-extend-core-model = { path = "../core-model" }
 sync-extend-transport = { path = "../transport" }
 blake3.workspace = true
 ed25519-dalek.workspace = true
-rusqlite = { workspace = true, features = ["functions", "cache"] }
+rusqlite = { workspace = true, features = ["functions", "cache", "backup", "serialize", "hooks", "limits"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

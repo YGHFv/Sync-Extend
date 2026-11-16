@@ -13,9 +13,12 @@ pub use unix_noreplace::{
 mod windows;
 #[cfg(windows)]
 pub use windows::{
-    regular_file_link_count, regular_file_matches_path, verify_regular_file, GuardedReadFile,
-    LockedDirectory, LockedDirectoryMutation, LockedFile, OriginalDirectoryCreation,
-    OriginalFileCreation, OwnedFileCreation, PublishedOriginalFile, SealedOriginalFile,
+    regular_file_link_count, regular_file_matches_path, sqlite_main_file_identity,
+    verify_regular_file, FreshExclusiveSqliteFile, GuardedReadFile, LockedDirectory,
+    LockedDirectoryMutation, LockedFile, OriginalDirectoryCreation, OriginalFileCreation,
+    OwnedFileCreation, PublishedOriginalFile, ReacquiredNodeFile, ReacquiredNodeLock,
+    ReleasedOriginalCoordinationFile, ReleasedOriginalFileIdentity, ReleasedOriginalReadFile,
+    RetainedWriterDirectory, SealedOriginalFile,
 };
 
 #[allow(unsafe_code)]
@@ -56,3 +59,36 @@ impl std::fmt::Display for FileKey {
         write!(f, "windows:{}:{}", self.volume, self.id)
     }
 }
+
+#[cfg(windows)]
+pub use windows::{sqlite_main_exact_bytes, sqlite_retain_actual_wal, sqlite_wal_file_identity};
+
+#[cfg(windows)]
+pub use windows::{
+    OriginalSqliteMainHandoff, OriginalSqliteMainHandoffFailure, OriginalSqliteSidecarHandoff,
+    OriginalSqliteSidecarHandoffFailure, OriginalSqliteSidecarKind,
+};
+
+#[cfg(windows)]
+pub use windows::{
+    OriginalSqliteConnection, OriginalSqliteOpenFailure, OriginalSqliteQuery,
+    OriginalSqliteReadBudget, OriginalSqliteRows, OriginalSqliteStatement, OriginalSqliteValue,
+};
+
+#[cfg(windows)]
+pub use windows::verify_current_user_private_file;
+
+#[cfg(windows)]
+pub use windows::FreshNativeSqliteConnection;
+
+#[cfg(windows)]
+pub use windows::FreshNativeWalConnection;
+
+#[cfg(windows)]
+pub use windows::FreshRecoveredMutationFile;
+
+#[cfg(windows)]
+pub use windows::{
+    OriginalSqlitePayloadAllocation, OriginalSqlitePayloadAllocationBounds,
+    OriginalSqlitePayloadAllocationFailure,
+};

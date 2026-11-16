@@ -145,8 +145,11 @@ fn local_ntfs_from_handle(file: &File) -> io::Result<()> {
 
 pub(super) enum NewChildKind {
     Directory,
+    RenameDestination,
     StagingDirectory,
     PublicationDirectory,
+    WorktreeMarkerDirectory,
+    RetainedMutationDirectory,
     File,
 }
 
@@ -186,6 +189,24 @@ fn create_new_child_lifetime(
     kind: NewChildKind,
     delete_on_close: bool,
 ) -> io::Result<File> {
+    create_new_child_security(file, name, kind, delete_on_close, None)
+}
+
+pub(super) fn create_new_current_user_file(file: &File, name: &str) -> io::Result<File> {
+    let security = super::current_user_file::CurrentUserSecurity::new()?;
+    let created =
+        create_new_child_security(file, name, NewChildKind::File, false, Some(&security))?;
+    super::current_user_file::verify_current_user_private_file(&created)?;
+    Ok(created)
+}
+
+fn create_new_child_security(
+    file: &File,
+    name: &str,
+    kind: NewChildKind,
+    delete_on_close: bool,
+    security: Option<&super::current_user_file::CurrentUserSecurity>,
+) -> io::Result<File> {
     use std::os::windows::io::FromRawHandle;
     use windows_sys::{
         Wdk::{
@@ -208,6 +229,10 @@ fn create_new_child_lifetime(
         if name != ".sync-tmp" {
             return Err(invalid("internal scaffold name differs"));
         }
+    } else if matches!(kind, NewChildKind::WorktreeMarkerDirectory) {
+        if name != ".sync-extend" {
+            return Err(invalid("fixed worktree marker name differs"));
+        }
     } else {
         validate_directory_component(name)?;
     }
@@ -216,7 +241,9 @@ fn create_new_child_lifetime(
     local_ntfs_from_handle(file)?;
     let parent_key = key(file)?;
     let (access, share, options, directory) = match kind {
-        NewChildKind::Directory | NewChildKind::StagingDirectory => (
+        NewChildKind::Directory
+        | NewChildKind::StagingDirectory
+        | NewChildKind::WorktreeMarkerDirectory => (
             GENERIC_READ | DELETE | SYNCHRONIZE,
             FILE_SHARE_READ,
             FILE_DIRECTORY_FILE,
@@ -227,6 +254,17 @@ fn create_new_child_lifetime(
         // This grants no native receipt or namespace membership authority.
         NewChildKind::PublicationDirectory => (
             GENERIC_READ | DELETE | SYNCHRONIZE,
+            FILE_SHARE_READ | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
+            FILE_DIRECTORY_FILE,
+            true,
+        ),
+        NewChildKind::RenameDestination => (
+            GENERIC_READ | DELETE | SYNCHRONIZE,
+            FILE_SHARE_READ | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
+            FILE_DIRECTORY_FILE,true,
+        ),
+        NewChildKind::RetainedMutationDirectory => (
+            GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
             FILE_SHARE_READ | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
             FILE_DIRECTORY_FILE,
             true,
@@ -256,7 +294,7 @@ fn create_new_child_lifetime(
         RootDirectory: file.as_raw_handle() as HANDLE,
         ObjectName: &unicode,
         Attributes: OBJ_CASE_INSENSITIVE,
-        SecurityDescriptor: ptr::null(),
+        SecurityDescriptor: security.map_or(ptr::null(), |held| held.pointer().cast()),
         SecurityQualityOfService: ptr::null(),
     };
     let mut status_block = IO_STATUS_BLOCK::default();
@@ -355,4 +393,50 @@ fn validate_directory_component(name: &str) -> io::Result<()> {
         return Err(invalid("reserved directory component"));
     }
     Ok(())
+}
+
+// Within directory_create.rs. No caller-selected reserved directory allowed.
+impl LockedDirectoryMutation {
+    /// Fixed worktree identity directory only. Caller activates its distinct
+    /// durable intent and retains actual root/ancestors before this CREATE.
+    pub fn create_new_worktree_marker_directory(&self) -> io::Result<Self> {
+        create_new_directory_child(
+            &self.file,
+            ".sync-extend",
+            NewChildKind::WorktreeMarkerDirectory,
+        )
+    }
+}
+
+impl OriginalDirectoryCreation<'_> {
+    /// Only an actual directory CREATE can supply this original observer.
+    pub fn retain_writer_directory(
+        &self,
+        path: &std::path::Path,
+    ) -> io::Result<super::RetainedWriterDirectory> {
+        self.verify()?;
+        super::retain_writer_directory(&self.creator.file, path)
+    }
+}
+
+impl LockedDirectory {
+    /// New isolated retention directory, with native add-file access for a
+    /// sealed original rename. It retains its own original CREATE lineage.
+    pub fn create_new_retained_mutation_directory(
+        &self,
+        name: &str,
+    ) -> io::Result<LockedDirectoryMutation> {
+        if !name.starts_with("node-retained-") {
+            return Err(invalid("retained mutation directory prefix required"));
+        }
+        create_new_directory_child(&self.file, name, NewChildKind::RetainedMutationDirectory)
+    }
+}
+
+impl LockedDirectory {
+    /// Explicit new namespace destination keeps the original CREATE and DELETE
+    /// sharing exclusion; relative native rename requires namespace WRITE sharing.
+    pub fn create_new_rename_destination(&self,name:&str)->io::Result<LockedDirectoryMutation>{
+        create_new_directory_child(&self.file,name,NewChildKind::RenameDestination)
+    }
 }

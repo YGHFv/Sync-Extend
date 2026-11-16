@@ -19,6 +19,7 @@ fs2.workspace = true
 getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rusqlite.workspace = true
 thiserror.workspace = true
 same-file = "1.0.6"
 file-id = "0.2.3"

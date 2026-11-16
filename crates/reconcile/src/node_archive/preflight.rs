@@ -1,0 +1,223 @@
+//! Whole source and ledger capacity checks before the first target root effect.
+use super::{
+    ArchiveRole, CreatedNodeRestoreRoots, LedgerBounds, NodeRestoreFile, NodeRestoreLayout,
+    NodeRestoreLedger, NodeRestoreMappedLayout, VerifiedNodeStateArchive,
+};
+use crate::{ReconcileError, Result};
+use std::path::{Path, PathBuf};
+use sync_extend_core_model::ContentId;
+use sync_extend_journal::{JournalBackupImage, NodeInspectionBounds};
+
+/// Owns the exact precomputed Journal mapping and source-derived layout.
+/// It carries no native CREATE or restart/adoption authority. Every actual
+/// CREATE still requires the independently live original external ledger.
+pub struct PreparedOriginalNodeRestore {
+    pub(super) archive_digest: ContentId,
+    pub(super) original: NodeRestoreLayout,
+    pub(super) mapped: NodeRestoreMappedLayout,
+    pub(super) journal: JournalBackupImage,
+    pub(super) worktree: PathBuf,
+    pub(super) data: PathBuf,
+    pub(super) required_file_bytes: u64,
+    pub(super) required_records: u64,
+    pub(super) required_intents: usize,
+    pub(super) reserved_record_bytes: u64,
+    pub(super) completion_manifest_reserve: u64,
+    pub(super) reserved_database_bytes: u64,
+    pub(super) ledger_bounds: LedgerBounds,
+}
+
+impl PreparedOriginalNodeRestore {
+    pub fn required_file_bytes(&self) -> u64 {
+        self.required_file_bytes
+    }
+    pub fn required_records(&self) -> u64 {
+        self.required_records
+    }
+    pub fn required_intents(&self) -> usize {
+        self.required_intents
+    }
+    pub fn original_layout(&self) -> &NodeRestoreLayout {
+        &self.original
+    }
+    pub fn mapped_layout(&self) -> &NodeRestoreMappedLayout {
+        &self.mapped
+    }
+    pub fn archive_digest(&self) -> &ContentId {
+        &self.archive_digest
+    }
+
+    /// No target filesystem effect occurs before the complete source mapping,
+    /// aggregate bytes and the exact live ledger's reserved capacity are checked.
+    /// Original partial roots remain intact if later native effects fail.
+    pub fn create_original_roots(
+        &self,
+        archive: &VerifiedNodeStateArchive,
+        ledger: &mut NodeRestoreLedger,
+    ) -> Result<CreatedNodeRestoreRoots> {
+        if archive.digest() != &self.archive_digest {
+            return Err(ReconcileError::Invariant(
+                "preflight root original archive differs",
+            ));
+        }
+        ledger.require_original_preflight_capacity(self)?;
+        ledger.prepare_durable_original_completion(self.completion_manifest_reserve)?;
+        archive.create_restore_roots(ledger, &self.worktree, &self.data)
+    }
+}
+
+impl VerifiedNodeStateArchive {
+    /// Performs only bounded source/memory work. Neither target path is opened,
+    /// created or modified. Unsupported native history and explicit configuration
+    /// roles refuse before external ledger or target CREATE.
+    pub fn prepare_original_node_restore(
+        &self,
+        worktree: &Path,
+        data: &Path,
+        inspection: NodeInspectionBounds,
+        max_creations: usize,
+        max_file_bytes: u64,
+        ledger_bounds: LedgerBounds,
+    ) -> Result<PreparedOriginalNodeRestore> {
+        ledger_bounds.validate().map_err(ReconcileError::from)?;
+        super::roots::split_target(worktree)?;
+        super::roots::split_target(data)?;
+        if worktree == data || worktree.starts_with(data) || data.starts_with(worktree) {
+            return Err(ReconcileError::Invariant(
+                "original restore target roots overlap",
+            ));
+        }
+        self.require_portable_restore_source(inspection)?;
+        let original =
+            self.current_node_restore_layout(inspection, max_creations, max_file_bytes)?;
+        let mapped = original.map_original_slots(max_creations)?;
+        let bytes =
+            self.archive
+                .section(&ArchiveRole::Journal)
+                .ok_or(ReconcileError::Invariant(
+                    "preflight original Journal absent",
+                ))?;
+        let digest = ContentId::hash(bytes);
+        let image = JournalBackupImage::from_current_node_image(
+            bytes.to_vec(),
+            digest.as_str(),
+            bytes.len(),
+            self.space(),
+            inspection,
+        )?;
+        let journal = image.mapped_portable_worktree_image(
+            self.space(),
+            self.original_worktree(),
+            worktree,
+            inspection,
+            usize::try_from(max_file_bytes.min(256 * 1024 * 1024))
+                .map_err(|_| ReconcileError::ResourceLimit("preflight Journal byte bound"))?,
+        )?;
+        // Layout already includes source Journal, marker, sections and all
+        // current files. Substitute the exact precomputed mapped Journal length.
+        let required_file_bytes = original
+            .required_file_bytes()
+            .checked_sub(bytes.len() as u64)
+            .and_then(|count| count.checked_add(journal.bytes().len() as u64))
+            .filter(|count| *count <= max_file_bytes && *count <= ledger_bounds.max_content_bytes)
+            .ok_or(ReconcileError::ResourceLimit(
+                "whole original mapped content before root CREATE",
+            ))?;
+        if !original
+            .files()
+            .iter()
+            .any(|file| matches!(file, NodeRestoreFile::Journal))
+        {
+            return Err(ReconcileError::Invariant("preflight Journal slot absent"));
+        }
+        // Two roots plus all derived directories/files; three additional empty
+        // writer/CAS sentinels are not represented by the original archive.
+        let required_intents = mapped
+            .directories()
+            .len()
+            .checked_add(mapped.files().len())
+            .and_then(|count| count.checked_add(5))
+            .filter(|count| *count <= max_creations && *count <= ledger_bounds.max_intents)
+            .ok_or(ReconcileError::ResourceLimit(
+                "whole original CREATE count before root CREATE",
+            ))?;
+        let required_records = (required_intents as u64)
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(mapped.files().len() as u64))
+            .filter(|count| *count <= ledger_bounds.max_records)
+            .ok_or(ReconcileError::ResourceLimit(
+                "whole original ledger transitions before root CREATE",
+            ))?;
+        // Each exact canonical row contains at most one 255-byte component,
+        // fixed hashes/keys, bounded counters and escaped JSON. 4096 bytes per
+        // record bounds even six-byte JSON escaping for every component byte.
+        // The completion repeats every relative component, including deep paths.
+        // Bound worst-case JSON escaping before schema or target effects.
+        let mut completion_manifest_reserve = 4096u64;
+        for target in [worktree, data] {
+            let path = target.to_str().filter(|value| value.len() <= 4096).ok_or(
+                ReconcileError::Invariant("completion beforeeffects exact UTF8 target path"),
+            )?;
+            completion_manifest_reserve = completion_manifest_reserve
+                .checked_add(path.len() as u64 * 6 + 32)
+                .ok_or(ReconcileError::ResourceLimit(
+                    "completion target path reservation overflow",
+                ))?;
+        }
+        // Fixed roots and three sentinels have fewer than two path components.
+        completion_manifest_reserve = completion_manifest_reserve.checked_add(5 * 4096).ok_or(
+            ReconcileError::ResourceLimit("completion fixedslot reservation overflow"),
+        )?;
+        for slot in mapped.directories().iter().chain(mapped.files()) {
+            let component_bytes = slot.components().iter().try_fold(0u64, |count, part| {
+                count
+                    .checked_add(part.len() as u64 * 6 + 4)
+                    .ok_or(ReconcileError::ResourceLimit(
+                        "completion escaped component reservation overflow",
+                    ))
+            })?;
+            completion_manifest_reserve = completion_manifest_reserve
+                .checked_add(component_bytes)
+                .and_then(|count| count.checked_add(4096))
+                .ok_or(ReconcileError::ResourceLimit(
+                    "completion fullobject reservation overflow",
+                ))?;
+        }
+        if completion_manifest_reserve > super::completion_codec::MAX_BYTES as u64 {
+            return Err(ReconcileError::ResourceLimit(
+                "completion whole canonical manifest budget before roots",
+            ));
+        }
+        let reserved_record_bytes = required_records
+            .checked_mul(4096)
+            .and_then(|count| count.checked_add(completion_manifest_reserve))
+            .filter(|count| *count <= ledger_bounds.max_record_bytes)
+            .ok_or(ReconcileError::ResourceLimit(
+                "whole original ledger JSON bytes before root CREATE",
+            ))?;
+        // Conservative room for payload pages, row headers and the fixed schema.
+        // Exact SQLite max_page_count is installed on the living ledger as well.
+        let reserved_database_bytes = reserved_record_bytes
+            .checked_mul(2)
+            .and_then(|count| count.checked_add(64 * 1024))
+            .filter(|count| *count <= ledger_bounds.max_database_bytes)
+            .ok_or(ReconcileError::ResourceLimit(
+                "whole original ledger physical budget before root CREATE",
+            ))?;
+        Ok(PreparedOriginalNodeRestore {
+            archive_digest: self.digest().clone(),
+            original,
+            mapped,
+            journal,
+            worktree: worktree.to_owned(),
+            data: data.to_owned(),
+            required_file_bytes,
+            required_records,
+            required_intents,
+            reserved_record_bytes,
+            completion_manifest_reserve,
+            reserved_database_bytes,
+            ledger_bounds,
+        })
+    }
+}

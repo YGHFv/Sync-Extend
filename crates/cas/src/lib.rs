@@ -37,11 +37,13 @@ pub struct Cas {
     access: Option<Box<CasAccess>>,
     coordinated_access: Option<Box<CoordinatedAccess>>,
     session_access: Option<Box<SessionAccess>>,
+    original_read_handoff: Option<Box<OriginalReadHandoff>>,
 }
 
 type CasAccess = dyn Fn(&ContentId) -> std::result::Result<(), String> + Send;
 type CoordinatedAccess = dyn Fn(&ContentId) -> std::result::Result<Box<dyn Send>, String> + Send;
 type SessionAccess = dyn Fn() -> std::result::Result<Box<dyn Send>, String> + Send;
+type OriginalReadHandoff = dyn Fn() -> std::result::Result<(), String> + Send;
 
 /// Cooperative process-lifetime exclusion, not a durable reference or authorization.
 pub struct CasSessionGuard {
@@ -50,6 +52,17 @@ pub struct CasSessionGuard {
 
 impl Cas {
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_layout(root, true)
+    }
+
+    /// Open only an existing original layout. Caller supplies and retains
+    /// independent original root/ancestor/file ownership during node assembly.
+    /// This does not adopt filesystem objects or mint recovery authority.
+    pub fn open_existing_layout(root: &Path) -> Result<Self> {
+        Self::open_layout(root, false)
+    }
+
+    fn open_layout(root: &Path, create: bool) -> Result<Self> {
         for ancestor in root.ancestors() {
             match fs::symlink_metadata(ancestor) {
                 Ok(metadata) if metadata.file_type().is_symlink() || is_reparse(&metadata) => {
@@ -60,8 +73,10 @@ impl Cas {
                 Err(e) => return Err(e.into()),
             }
         }
-        fs::create_dir_all(root.join("objects"))?;
-        fs::create_dir_all(root.join("tmp"))?;
+        if create {
+            fs::create_dir_all(root.join("objects"))?;
+            fs::create_dir_all(root.join("tmp"))?;
+        }
         for path in [root, &root.join("objects"), &root.join("tmp")] {
             let metadata = fs::symlink_metadata(path)?;
             if metadata.file_type().is_symlink() || !metadata.is_dir() || is_reparse(&metadata) {
@@ -73,9 +88,47 @@ impl Cas {
             access: None,
             coordinated_access: None,
             session_access: None,
+            original_read_handoff: None,
         })
     }
 
+    /// Assemble the original session callbacks without creating any scaffold.
+    /// Exact original directory identity retention is the node caller's contract.
+    pub fn open_existing_session_coordinated(
+        root: &Path,
+        access: impl Fn(&ContentId) -> std::result::Result<Box<dyn Send>, String> + Send + 'static,
+        session: impl Fn() -> std::result::Result<Box<dyn Send>, String> + Send + 'static,
+    ) -> Result<Self> {
+        let mut cas = Self::open_existing_layout(root)?;
+        cas.coordinated_access = Some(Box::new(access));
+        cas.session_access = Some(Box::new(session));
+        Ok(cas)
+    }
+
+    /// Original assembly retains a callback that can close its own readonly
+    /// Journal observers. This never replaces or removes CAS access fences.
+    pub fn open_existing_session_coordinated_with_read_handoff(
+        root: &Path,
+        access: impl Fn(&ContentId) -> std::result::Result<Box<dyn Send>, String> + Send + 'static,
+        session: impl Fn() -> std::result::Result<Box<dyn Send>, String> + Send + 'static,
+        handoff: impl Fn() -> std::result::Result<(), String> + Send + 'static,
+    ) -> Result<Self> {
+        let mut cas = Self::open_existing_session_coordinated(root, access, session)?;
+        cas.original_read_handoff = Some(Box::new(handoff));
+        Ok(cas)
+    }
+
+    /// Only the caller's owned original readers are closed. The retained
+    /// callbacks refuse all CAS access after handoff, including failed closes.
+    /// This does not return an uncoordinated layout or a native capability.
+    pub fn suspend_original_read_coordination(&mut self) -> Result<()> {
+        let close = self.original_read_handoff.as_ref().ok_or_else(|| {
+            CasError::AccessDeferred("original read handoff is absent or already consumed".into())
+        })?;
+        close().map_err(CasError::AccessDeferred)?;
+        drop(self.original_read_handoff.take());
+        Ok(())
+    }
     /// Install the managed journal fence check; not a concurrent access lease.
     pub fn open_managed(
         root: &Path,
@@ -318,4 +371,57 @@ pub fn is_reparse(metadata: &fs::Metadata) -> bool {
         let _ = metadata;
         false
     }
+}
+
+/// Bounded owned content plan. Chunking has no filesystem or Journal effects.
+/// The caller must publish every chunk under its own actual native protocol.
+pub struct BoundedContentPlan {
+    pub manifest: FileManifest,
+    pub chunks: Vec<(ChunkRef, Vec<u8>)>,
+}
+
+pub fn plan_bounded_content(
+    bytes: &[u8],
+    max_bytes: u64,
+    max_chunks: usize,
+) -> Result<BoundedContentPlan> {
+    if max_bytes == 0 || max_chunks == 0 || bytes.len() as u64 > max_bytes {
+        return Err(CasError::ResourceLimit(
+            "bounded original content bytes/chunks",
+        ));
+    }
+    let max_chunks = max_chunks.min(MAX_CHUNKS);
+    let mut chunks = Vec::new();
+    for chunk in StreamCDC::with_level_and_seed(
+        std::io::Cursor::new(bytes),
+        MIN_CHUNK,
+        AVG_CHUNK,
+        MAX_CHUNK,
+        Normalization::Level1,
+        0,
+    ) {
+        let chunk = chunk.map_err(|error| CasError::Chunking(error.to_string()))?;
+        if chunks.len() >= max_chunks {
+            return Err(CasError::ResourceLimit("bounded original content chunks"));
+        }
+        let reference = ChunkRef {
+            content_id: ContentId::hash(&chunk.data),
+            length: chunk.length as u32,
+        };
+        chunks.push((reference, chunk.data));
+    }
+    let manifest = FileManifest {
+        format_version: FORMAT_VERSION,
+        chunking: "fastcdc-2020-v1".into(),
+        hash_algorithm: "blake3".into(),
+        compression: "none".into(),
+        content_id: ContentId::hash(bytes),
+        length: bytes.len() as u64,
+        chunks: chunks
+            .iter()
+            .map(|(reference, _)| reference.clone())
+            .collect(),
+    };
+    manifest.validate()?;
+    Ok(BoundedContentPlan { manifest, chunks })
 }

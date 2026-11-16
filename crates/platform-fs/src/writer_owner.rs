@@ -136,3 +136,66 @@ impl WriterOwner {
         Ok(())
     }
 }
+
+impl WriterOwner {
+    /// Construct only from the actual live file CREATE and the complete retained
+    /// absolute directory chain. This does not acquire ownership from a path,
+    /// completed manifest, historical FileKey or serialized recovery receipt.
+    #[cfg(windows)]
+    pub fn from_original_creation(
+        directory: &Path,
+        original: crate::OriginalFileCreation<'_>,
+        chain: Vec<crate::RetainedWriterDirectory>,
+    ) -> io::Result<Self> {
+        if !directory.is_absolute() {
+            return Err(invalid("absolute original writer directory required"));
+        }
+        original.verify()?;
+        let ancestors: Vec<_> = directory
+            .ancestors()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if chain.len() != ancestors.len() {
+            return Err(invalid("complete original writer directory chain required"));
+        }
+        let parent_key = original.parent_key()?;
+        let mut directories = Vec::with_capacity(chain.len());
+        for (held, expected) in chain.into_iter().zip(ancestors) {
+            if held.path != expected
+                || held.directory.key()? != held.key
+                || !held.directory.matches_path(expected)?
+            {
+                return Err(invalid("original writer ancestor identity or slot differs"));
+            }
+            held.directory.require_case_insensitive()?;
+            held.directory.require_local_ntfs(expected)?;
+            directories.push(held.directory);
+        }
+        if directories
+            .last()
+            .ok_or_else(|| invalid("writer parent absent"))?
+            .key()?
+            != parent_key
+        {
+            return Err(invalid("original writer CREATE parent differs"));
+        }
+        let path = directory.join("writer.lock");
+        let file = original.retain_writer_sentinel()?;
+        let key = original.key()?;
+        if !crate::regular_file_matches_path(&file, &path)? {
+            return Err(invalid("original writer sentinel named slot differs"));
+        }
+        file.try_lock()
+            .map_err(|_| invalid("original writer lock is already held"))?;
+        let owner = Self {
+            file,
+            path,
+            key,
+            directories,
+        };
+        owner.verify(directory)?;
+        Ok(owner)
+    }
+}
