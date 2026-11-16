@@ -25,7 +25,9 @@ mod directory_create;
 pub use directory_create::OriginalDirectoryCreation;
 #[path = "owned_file.rs"]
 mod owned_file;
-pub use owned_file::{OriginalFileCreation, OwnedFileCreation};
+pub use owned_file::{
+    OriginalFileCreation, OwnedFileCreation, PublishedOriginalFile, SealedOriginalFile,
+};
 
 fn key(file: &File) -> io::Result<FileKey> {
     let mut info = FILE_ID_INFO::default();

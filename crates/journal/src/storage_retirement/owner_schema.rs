@@ -50,14 +50,25 @@ pub(crate) fn validate(connection: &Connection) -> Result<()> {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<_>>()?)
     }
-    let expected = Connection::open_in_memory()?;
-    expected.execute_batch(
-        "CREATE TABLE storage_retirement_requests(request_id TEXT);
-         CREATE TABLE storage_retirement_clock(singleton INTEGER,observed_at_ms INTEGER);
-         CREATE TABLE storage_retirement_cancellations(request_id TEXT);",
-    )?;
-    expected.execute_batch(include_str!("../migration-060.sql"))?;
-    expected.execute_batch("DROP TRIGGER storage_retirement_owner_cancel_refusal;")?;
+    static EXPECTED: std::sync::OnceLock<Vec<SchemaObject>> = std::sync::OnceLock::new();
+    if EXPECTED.get().is_none() {
+        let expected = Connection::open_in_memory()?;
+        expected.execute_batch(
+            "CREATE TABLE storage_retirement_requests(request_id TEXT);
+             CREATE TABLE storage_retirement_clock(singleton INTEGER,observed_at_ms INTEGER);
+             CREATE TABLE storage_retirement_cancellations(request_id TEXT);",
+        )?;
+        expected.execute_batch(include_str!("../migration-060.sql"))?;
+        expected.execute_batch("DROP TRIGGER storage_retirement_owner_cancel_refusal;")?;
+        let definitions = objects(&expected)?;
+        // The reference uses only this candidate's compiled SQL. A concurrent
+        // builder computes the same immutable definitions; actual schemas and
+        // TEMP shadows are never cached.
+        let _ = EXPECTED.set(definitions);
+    }
+    let expected = EXPECTED
+        .get()
+        .ok_or(JournalError::Invariant("compiled reference schema absent"))?;
     super::terminal_schema::validate(connection)?;
     let shadow: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM temp.sqlite_schema
@@ -66,7 +77,7 @@ pub(crate) fn validate(connection: &Connection) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
-    if shadow || objects(connection)? != objects(&expected)? {
+    if shadow || objects(connection)? != *expected {
         return Err(JournalError::Invariant(
             "storage retirement exact original owner schema",
         ));

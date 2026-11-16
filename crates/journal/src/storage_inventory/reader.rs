@@ -64,7 +64,7 @@ pub(crate) fn validate_schema(
     if version != SCHEMA_VERSION {
         return Err(invalid("storage inventory schema version"));
     }
-    let mut list = connection.prepare(&format!(
+    let mut list = connection.prepare_cached(&format!(
         "SELECT name,type,ncol,wr,strict FROM pragma_table_list
          WHERE schema='main' AND {} ORDER BY name",
         namespace.predicate()
@@ -85,7 +85,7 @@ pub(crate) fn validate_schema(
         {
             return Err(invalid("storage inventory table layout"));
         }
-        let mut info = connection.prepare(
+        let mut info = connection.prepare_cached(
             "SELECT cid,name,type,\"notnull\",dflt_value,pk,hidden
              FROM pragma_table_xinfo(?1,'main') ORDER BY cid",
         )?;
@@ -195,7 +195,7 @@ pub(crate) fn preflight(
                 format!("CASE {null}WHEN {} THEN {bytes} ELSE -1 END", validity(c))
             })
             .collect();
-        let mut statement = connection.prepare(&format!(
+        let mut statement = connection.prepare_cached(&format!(
             "SELECT {} FROM main.{}",
             expressions.join(","),
             table.name
@@ -320,7 +320,7 @@ pub(crate) fn read_table(
         .map(|c| format!("\"{}\"", c.name))
         .collect::<Vec<_>>()
         .join(",");
-    let mut statement = connection.prepare(&format!(
+    let mut statement = connection.prepare_cached(&format!(
         "SELECT {selected} FROM main.{} ORDER BY {order}",
         table.name
     ))?;

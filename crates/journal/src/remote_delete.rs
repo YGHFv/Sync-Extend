@@ -261,31 +261,40 @@ fn number(row: &JournalStoredRow, name: &str) -> Result<u64> {
 }
 pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     fn objects(db: &Connection) -> Result<Vec<(String, String, Option<String>)>> {
-        Ok(db.prepare("SELECT type,name,sql FROM main.sqlite_schema WHERE (name LIKE 'remote_delete_%' OR tbl_name LIKE 'remote_delete_%') AND name NOT LIKE 'remote_replace_%' AND name NOT LIKE 'conflict_resolution_%' ORDER BY type,name")?
+        Ok(db.prepare_cached("SELECT type,name,sql FROM main.sqlite_schema WHERE (name LIKE 'remote_delete_%' OR tbl_name LIKE 'remote_delete_%') AND name NOT LIKE 'remote_replace_%' AND name NOT LIKE 'conflict_resolution_%' ORDER BY type,name")?
             .query_map([],|r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?
             .collect::<std::result::Result<_,_>>()?)
     }
-    let expected = Connection::open_in_memory()?;
-    for table in [
-        "operations",
-        "current_manifests",
-        "snapshots",
-        "snapshot_objects",
-        "rename_observations",
-        "publications",
-        "mutations",
-        "local_state",
-        "tree_restore_preparations",
-        "snapshot_prunings",
-        "receive_cursors",
-        "remote_rename_headers",
-    ] {
-        expected.execute_batch(&format!(
-            "CREATE TABLE {table}(snapshot_id TEXT PRIMARY KEY);"
-        ))?;
+    static EXPECTED: std::sync::OnceLock<Vec<(String, String, Option<String>)>> =
+        std::sync::OnceLock::new();
+    if EXPECTED.get().is_none() {
+        let expected = Connection::open_in_memory()?;
+        for table in [
+            "operations",
+            "current_manifests",
+            "snapshots",
+            "snapshot_objects",
+            "rename_observations",
+            "publications",
+            "mutations",
+            "local_state",
+            "tree_restore_preparations",
+            "snapshot_prunings",
+            "receive_cursors",
+            "remote_rename_headers",
+        ] {
+            expected.execute_batch(&format!(
+                "CREATE TABLE {table}(snapshot_id TEXT PRIMARY KEY);"
+            ))?;
+        }
+        expected.execute_batch(include_str!("migration-040.sql"))?;
+        let definitions = objects(&expected)?;
+        let _ = EXPECTED.set(definitions);
     }
-    expected.execute_batch(include_str!("migration-040.sql"))?;
-    if objects(connection)? != objects(&expected)? {
+    let expected = EXPECTED.get().ok_or(crate::JournalError::Invariant(
+        "compiled reference catalog absent",
+    ))?;
+    if objects(connection)? != *expected {
         return Err(invalid("remote Delete schema/trigger/index differs"));
     }
     Ok(())

@@ -72,6 +72,8 @@ fn elements(bytes: &[u8], allow_text: bool) -> Result<Vec<(usize, String, String
         return Err(());
     }
     let mut reader = NsReader::from_reader(bytes);
+    // Bound namespace allocation before NsReader returns a Start/Empty event.
+    reader.resolver_mut().set_max_declarations_per_element(256);
     let mut depth = 0usize;
     let mut events = 0usize;
     let mut roots = 0usize;

@@ -76,9 +76,20 @@ pub(crate) fn validate(connection: &Connection) -> Result<()> {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<_>>()?)
     }
-    let expected = Connection::open_in_memory()?;
-    expected.execute_batch("CREATE TABLE snapshot_objects(content_id TEXT); CREATE TABLE publication_objects(content_id TEXT); CREATE TABLE mutation_objects(content_id TEXT); CREATE TABLE read_lease_objects(content_id TEXT); CREATE TABLE reference_reservation_objects(content_id TEXT); CREATE TABLE tree_restore_objects(content_id TEXT); CREATE TABLE tree_restore_original_objects(content_id TEXT); CREATE TABLE remote_replace_objects(content_id TEXT); CREATE TABLE conflict_resolution_objects(content_id TEXT); CREATE TABLE conflict_resolution_native_history_objects(content_id TEXT); CREATE TABLE gc_marks(content_id TEXT); CREATE TABLE gc_executions(content_id TEXT);")?;
-    expected.execute_batch(include_str!("../migration-059.sql"))?;
+    static EXPECTED: std::sync::OnceLock<Vec<SchemaObject>> = std::sync::OnceLock::new();
+    if EXPECTED.get().is_none() {
+        let expected = Connection::open_in_memory()?;
+        expected.execute_batch("CREATE TABLE snapshot_objects(content_id TEXT); CREATE TABLE publication_objects(content_id TEXT); CREATE TABLE mutation_objects(content_id TEXT); CREATE TABLE read_lease_objects(content_id TEXT); CREATE TABLE reference_reservation_objects(content_id TEXT); CREATE TABLE tree_restore_objects(content_id TEXT); CREATE TABLE tree_restore_original_objects(content_id TEXT); CREATE TABLE remote_replace_objects(content_id TEXT); CREATE TABLE conflict_resolution_objects(content_id TEXT); CREATE TABLE conflict_resolution_native_history_objects(content_id TEXT); CREATE TABLE gc_marks(content_id TEXT); CREATE TABLE gc_executions(content_id TEXT);")?;
+        expected.execute_batch(include_str!("../migration-059.sql"))?;
+        let definitions = objects(&expected)?;
+        // The reference uses only this candidate's compiled SQL. A concurrent
+        // builder computes the same immutable definitions; actual schemas and
+        // TEMP shadows are never cached.
+        let _ = EXPECTED.set(definitions);
+    }
+    let expected = EXPECTED
+        .get()
+        .ok_or(JournalError::Invariant("compiled reference schema absent"))?;
     let shadow: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM temp.sqlite_schema
          WHERE (instr(name,'storage_retirement_')=1 OR instr(tbl_name,'storage_retirement_')=1)
@@ -93,7 +104,7 @@ pub(crate) fn validate(connection: &Connection) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
-    if shadow || objects(connection)? != objects(&expected)? {
+    if shadow || objects(connection)? != *expected {
         return Err(JournalError::Invariant("storage retirement exact schema"));
     }
     Ok(())

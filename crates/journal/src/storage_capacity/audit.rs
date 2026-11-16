@@ -194,7 +194,7 @@ pub(super) fn storage_receive_owners(
     }
     let keys: Vec<String> = view
         .connection
-        .prepare("SELECT key FROM main.local_state ORDER BY key")?
+        .prepare_cached("SELECT key FROM main.local_state ORDER BY key")?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     if keys != ["device_id", "space_id", "storage_role"] {
@@ -335,7 +335,9 @@ fn ordinary_scope(view: &JournalReadView<'_>, space: &SpaceId) -> Result<()> {
     {
         return Err(invalid("journal capacity foreign ordinary row"));
     }
-    let mut foreign_keys = view.connection.prepare("PRAGMA main.foreign_key_check")?;
+    let mut foreign_keys = view
+        .connection
+        .prepare_cached("PRAGMA main.foreign_key_check")?;
     if foreign_keys.query([])?.next()?.is_some() {
         return Err(invalid("journal capacity orphan foreign key"));
     }

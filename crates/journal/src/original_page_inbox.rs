@@ -85,7 +85,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     type Object = (String, String, String, Option<String>);
     fn objects(connection: &Connection) -> Result<Vec<Object>> {
         Ok(connection
-            .prepare(
+            .prepare_cached(
                 "SELECT type,name,tbl_name,sql FROM main.sqlite_schema
                  WHERE instr(name,'original_page_inbox')=1 OR tbl_name='original_page_inbox'
                  ORDER BY type,name",
@@ -101,9 +101,17 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
         [],
         |row| row.get(0),
     )?;
-    let expected = Connection::open_in_memory()?;
-    expected.execute_batch(include_str!("migration-050.sql"))?;
-    if shadow || objects(connection)? != objects(&expected)? {
+    static EXPECTED: std::sync::OnceLock<Vec<Object>> = std::sync::OnceLock::new();
+    if EXPECTED.get().is_none() {
+        let expected = Connection::open_in_memory()?;
+        expected.execute_batch(include_str!("migration-050.sql"))?;
+        let definitions = objects(&expected)?;
+        let _ = EXPECTED.set(definitions);
+    }
+    let expected = EXPECTED.get().ok_or(crate::JournalError::Invariant(
+        "compiled reference catalog absent",
+    ))?;
+    if shadow || objects(connection)? != *expected {
         return Err(JournalError::Invariant(
             "original page inbox schema/trigger/index/TEMP",
         ));
@@ -120,7 +128,7 @@ pub(crate) fn audit(connection: &Connection) -> Result<Vec<OriginalPageEnvelope>
         crate::limits::MAX_ENTRIES as u64 * 1024,
     )?;
     let proofs = crate::original_provenance::audit(connection)?;
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT request_id,space_id,origin_device_id,receiver_device_id,after_sequence,
          last_sequence,tip_sequence,envelope_hash,envelope FROM main.original_page_inbox
          ORDER BY request_id",

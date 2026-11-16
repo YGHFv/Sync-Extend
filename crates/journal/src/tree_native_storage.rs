@@ -389,7 +389,7 @@ fn require_exact(connection: &Connection, id: &EntryId, values: &StoredValues) -
         .map(|c| format!("\"{}\"", c.name))
         .collect::<Vec<_>>()
         .join(",");
-    let mut statement = connection.prepare(&format!(
+    let mut statement = connection.prepare_cached(&format!(
         "SELECT {selected} FROM main.{} WHERE transaction_id=?1{}",
         values.table,
         if values.table == "tree_native_action_records" {

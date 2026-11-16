@@ -520,7 +520,7 @@ pub(crate) fn legacy_gate(connection: &rusqlite::Connection, id: &EntryId) -> Re
 pub(crate) fn validate_schema(connection: &rusqlite::Connection) -> Result<()> {
     type Objects = Vec<(String, String, Option<String>)>;
     fn objects(connection: &rusqlite::Connection) -> Result<Objects> {
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare_cached(
             "SELECT type,name,sql FROM main.sqlite_schema WHERE
              (name LIKE 'native_publication_%' OR tbl_name LIKE 'native_publication_%')
              AND name NOT LIKE 'conflict_resolution_%'
@@ -531,13 +531,21 @@ pub(crate) fn validate_schema(connection: &rusqlite::Connection) -> Result<()> {
             .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
     }
-    let expected = rusqlite::Connection::open_in_memory()?;
-    expected.execute_batch(include_str!("migration-034.sql"))?;
-    expected.execute_batch(include_str!("migration-035.sql"))?;
-    expected.execute_batch(include_str!("migration-036.sql"))?;
-    expected.execute_batch(include_str!("migration-037.sql"))?;
-    expected.execute_batch(include_str!("migration-038.sql"))?;
-    if objects(connection)? != objects(&expected)? {
+    static EXPECTED: std::sync::OnceLock<Objects> = std::sync::OnceLock::new();
+    if EXPECTED.get().is_none() {
+        let expected = rusqlite::Connection::open_in_memory()?;
+        expected.execute_batch(include_str!("migration-034.sql"))?;
+        expected.execute_batch(include_str!("migration-035.sql"))?;
+        expected.execute_batch(include_str!("migration-036.sql"))?;
+        expected.execute_batch(include_str!("migration-037.sql"))?;
+        expected.execute_batch(include_str!("migration-038.sql"))?;
+        let definitions = objects(&expected)?;
+        let _ = EXPECTED.set(definitions);
+    }
+    let expected = EXPECTED.get().ok_or(crate::JournalError::Invariant(
+        "compiled reference catalog absent",
+    ))?;
+    if objects(connection)? != *expected {
         return Err(invalid("native publication schema/trigger/index differs"));
     }
     Ok(())

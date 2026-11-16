@@ -347,6 +347,22 @@ impl crate::JournalReadView<'_> {
                 charge: dav,
             });
         }
+        let execution = crate::webdav_native::execution_outstanding(self.connection)?;
+        if execution.rows != 0 {
+            liabilities.obligations.push(JournalCapacityObligation {
+                family: "webdav_native_execution_future_records",
+                owner_key: Vec::new(),
+                charge: execution,
+            });
+        }
+        let internal = crate::webdav_native::manifest_audit::outstanding(self.connection)?;
+        if internal.rows != 0 {
+            liabilities.obligations.push(JournalCapacityObligation {
+                family: "webdav_native_internal_receipts_and_original_final_rows",
+                owner_key: Vec::new(),
+                charge: internal,
+            });
+        }
         let retirement = crate::storage_retirement::outstanding(self.connection)?;
         let retirement_owner = crate::storage_retirement::owner::outstanding(self.connection)?;
         let retirement_payload = crate::storage_retirement::payload::outstanding(self.connection)?;

@@ -353,8 +353,8 @@ fn bind(connection: &Connection, header: &Header, plan: &FileResolutionPlan) -> 
         }
     }
     let mut cursors = VersionVector::default();
-    let mut stmt =
-        connection.prepare("SELECT space_id,device_id,contiguous_seq FROM main.receive_cursors")?;
+    let mut stmt = connection
+        .prepare_cached("SELECT space_id,device_id,contiguous_seq FROM main.receive_cursors")?;
     let mut rows = stmt.query([])?;
     let mut seen = BTreeSet::new();
     while let Some(row) = rows.next()? {
@@ -388,50 +388,59 @@ fn bind(connection: &Connection, header: &Header, plan: &FileResolutionPlan) -> 
 
 pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     fn objects(db: &Connection) -> Result<Vec<(String, String, Option<String>)>> {
-        Ok(db.prepare("SELECT type,name,sql FROM main.sqlite_schema WHERE name LIKE 'conflict_resolution_%' OR tbl_name LIKE 'conflict_resolution_%' ORDER BY type,name")?
+        Ok(db.prepare_cached("SELECT type,name,sql FROM main.sqlite_schema WHERE name LIKE 'conflict_resolution_%' OR tbl_name LIKE 'conflict_resolution_%' ORDER BY type,name")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<std::result::Result<_, _>>()?)
     }
-    let expected = Connection::open_in_memory()?;
-    for table in [
-        "operations",
-        "receive_cursors",
-        "current_manifests",
-        "snapshots",
-        "snapshot_objects",
-        "rename_observations",
-        "local_state",
-        "publications",
-        "mutations",
-        "cleanup_plans",
-        "snapshot_prunings",
-        "tree_restore_preparations",
-        "tree_restore_histories",
-        "tree_restore_cancellations",
-        "remote_rename_headers",
-        "remote_delete_headers",
-        "remote_replace_headers",
-        "native_publication_headers",
-        "gc_marks",
-        "gc_executions",
-    ] {
-        expected.execute_batch(&format!(
-            "CREATE TABLE {table}(snapshot_id TEXT PRIMARY KEY);"
-        ))?;
+    static EXPECTED: std::sync::OnceLock<Vec<(String, String, Option<String>)>> =
+        std::sync::OnceLock::new();
+    if EXPECTED.get().is_none() {
+        let expected = Connection::open_in_memory()?;
+        for table in [
+            "operations",
+            "receive_cursors",
+            "current_manifests",
+            "snapshots",
+            "snapshot_objects",
+            "rename_observations",
+            "local_state",
+            "publications",
+            "mutations",
+            "cleanup_plans",
+            "snapshot_prunings",
+            "tree_restore_preparations",
+            "tree_restore_histories",
+            "tree_restore_cancellations",
+            "remote_rename_headers",
+            "remote_delete_headers",
+            "remote_replace_headers",
+            "native_publication_headers",
+            "gc_marks",
+            "gc_executions",
+        ] {
+            expected.execute_batch(&format!(
+                "CREATE TABLE {table}(snapshot_id TEXT PRIMARY KEY);"
+            ))?;
+        }
+        expected.execute_batch(include_str!("migration-042.sql"))?;
+        expected.execute_batch(include_str!("migration-043.sql"))?;
+        expected.execute_batch(include_str!("migration-044.sql"))?;
+        expected.execute_batch(include_str!("migration-045.sql"))?;
+        expected.execute_batch(
+            "CREATE TABLE reference_reservation_objects(owner_id TEXT,content_id TEXT);
+             CREATE TRIGGER reference_reservation_pin_no_delete BEFORE DELETE ON reference_reservation_objects BEGIN SELECT RAISE(ABORT,'reference reservation release is unavailable'); END;"
+        )?;
+        expected.execute_batch(include_str!("migration-046.sql"))?;
+        expected.execute_batch(include_str!("migration-047.sql"))?;
+        expected.execute_batch(include_str!("migration-048.sql"))?;
+        expected.execute_batch(include_str!("conflict_resolution_retirement_fences.sql"))?;
+        let definitions = objects(&expected)?;
+        let _ = EXPECTED.set(definitions);
     }
-    expected.execute_batch(include_str!("migration-042.sql"))?;
-    expected.execute_batch(include_str!("migration-043.sql"))?;
-    expected.execute_batch(include_str!("migration-044.sql"))?;
-    expected.execute_batch(include_str!("migration-045.sql"))?;
-    expected.execute_batch(
-        "CREATE TABLE reference_reservation_objects(owner_id TEXT,content_id TEXT);
-         CREATE TRIGGER reference_reservation_pin_no_delete BEFORE DELETE ON reference_reservation_objects BEGIN SELECT RAISE(ABORT,'reference reservation release is unavailable'); END;"
-    )?;
-    expected.execute_batch(include_str!("migration-046.sql"))?;
-    expected.execute_batch(include_str!("migration-047.sql"))?;
-    expected.execute_batch(include_str!("migration-048.sql"))?;
-    expected.execute_batch(include_str!("conflict_resolution_retirement_fences.sql"))?;
-    if objects(connection)? != objects(&expected)? {
+    let expected = EXPECTED.get().ok_or(crate::JournalError::Invariant(
+        "compiled reference catalog absent",
+    ))?;
+    if objects(connection)? != *expected {
         return Err(invalid(
             "conflict resolution exact schema/trigger/index differs",
         ));
@@ -680,7 +689,7 @@ impl Journal {
     }
 
     pub fn require_no_conflict_resolution(&self) -> Result<()> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT header FROM main.conflict_resolution_admissions ORDER BY transaction_id",
         )?;
         let mut rows = statement.query([])?;

@@ -117,7 +117,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     type Object = (String, String, String, Option<String>);
     fn objects(connection: &Connection) -> Result<Vec<Object>> {
         Ok(connection
-            .prepare(
+            .prepare_cached(
                 "SELECT type,name,tbl_name,sql FROM main.sqlite_schema
                  WHERE instr(name,'original_operation_provenance')=1
                     OR tbl_name='original_operation_provenance'
@@ -140,9 +140,17 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
             "original provenance TEMP shadow or trigger",
         ));
     }
-    let expected = Connection::open_in_memory()?;
-    expected.execute_batch(include_str!("migration-049.sql"))?;
-    if objects(connection)? != objects(&expected)? {
+    static EXPECTED: std::sync::OnceLock<Vec<Object>> = std::sync::OnceLock::new();
+    if EXPECTED.get().is_none() {
+        let expected = Connection::open_in_memory()?;
+        expected.execute_batch(include_str!("migration-049.sql"))?;
+        let definitions = objects(&expected)?;
+        let _ = EXPECTED.set(definitions);
+    }
+    let expected = EXPECTED.get().ok_or(crate::JournalError::Invariant(
+        "compiled reference catalog absent",
+    ))?;
+    if objects(connection)? != *expected {
         return Err(JournalError::Invariant(
             "original provenance exact table/trigger/index differs",
         ));
@@ -158,7 +166,7 @@ pub(crate) fn audit(connection: &Connection) -> Result<Vec<RemotePublicationProo
         crate::limits::MAX_ENTRIES,
         crate::limits::MAX_ENTRIES as u64 * 1024,
     )?;
-    let mut statement=connection.prepare("SELECT space_id,origin_device_id,origin_seq,op_id,proof_hash,proof FROM main.original_operation_provenance ORDER BY space_id,origin_device_id,origin_seq")?;
+    let mut statement=connection.prepare_cached("SELECT space_id,origin_device_id,origin_seq,op_id,proof_hash,proof FROM main.original_operation_provenance ORDER BY space_id,origin_device_id,origin_seq")?;
     let rows = statement
         .query_map([], |row| {
             (0..6)

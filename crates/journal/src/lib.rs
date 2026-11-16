@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 64;
+const SCHEMA_VERSION: u32 = 65;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -94,7 +94,13 @@ pub use storage_retirement::StorageRetirementAdmission;
 mod storage_traffic;
 pub use storage_traffic::StorageTrafficLedger;
 mod webdav_native;
-pub use webdav_native::{WebDavNativeAdmission, WebDavNativeDescription};
+pub use webdav_native::WebDavBudgetLimits;
+pub use webdav_native::{
+    WebDavDurableExecution, WebDavDurableExecutionLimits, WebDavNativeAdmission,
+    WebDavNativeDescription,
+};
+#[cfg(windows)]
+pub use webdav_native::{WebDavInventoryFileView, WebDavLiveAdmission};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReceiveOutcome {
@@ -114,6 +120,18 @@ pub struct Journal {
     webdav_native_description_issue: storage_retirement::gate::Gate,
     webdav_native_object_issue: storage_retirement::gate::Gate,
     webdav_native_cancel_issue: storage_retirement::gate::Gate,
+    webdav_native_execution_admission_issue: storage_retirement::gate::Gate,
+    webdav_native_execution_record_issue: storage_retirement::gate::Gate,
+    #[cfg(windows)]
+    webdav_native_execution_template_issue: storage_retirement::gate::Gate,
+    #[cfg(windows)]
+    webdav_native_execution_binding_issue: storage_retirement::gate::Gate,
+    #[cfg(windows)]
+    webdav_native_execution_receipt_issue: storage_retirement::gate::Gate,
+    #[cfg(windows)]
+    webdav_native_execution_manifest_issue: storage_retirement::gate::Gate,
+    #[cfg(windows)]
+    webdav_original_final_row_issue: webdav_native::final_row_gate::Gate,
     #[cfg(windows)]
     storage_retirement_owner_activation: storage_retirement::gate::Gate,
     #[cfg(windows)]
@@ -163,6 +181,10 @@ impl Journal {
             }
         }
         let mut connection = Connection::open(path)?;
+        // Reuse bounded SQL bytecode; every actual schema and row audit still runs.
+        // SQLite invalidates/reprepares statements when the actual schema changes.
+        connection.set_prepared_statement_cache_capacity(256);
+
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
@@ -506,7 +528,48 @@ impl Journal {
             tx.execute_batch(include_str!("migration-064.sql"))?;
             tx.commit()?;
         }
+        if version < 65 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-065.sql"))?;
+            tx.commit()?;
+        }
         webdav_native::schema::validate(&connection)?;
+        let webdav_native_execution_admission_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_execution_admission_issue",
+        )?;
+        let webdav_native_execution_record_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_execution_record_issue",
+        )?;
+        let webdav_native_execution_template_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_execution_template_issue",
+        )?;
+        let webdav_native_execution_binding_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_execution_binding_issue",
+        )?;
+        let webdav_native_execution_receipt_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_execution_receipt_issue",
+        )?;
+        let webdav_native_execution_manifest_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_webdav_native_execution_manifest_issue",
+        )?;
+        let webdav_original_final_row_issue =
+            webdav_native::final_row_gate::Gate::register(&connection)?;
+        // Non-Windows retains registration's callback-owned rejecting gate.
+        // There is no Windows native issuer on these targets.
+        #[cfg(not(windows))]
+        let _ = (
+            webdav_native_execution_template_issue,
+            webdav_native_execution_binding_issue,
+            webdav_native_execution_receipt_issue,
+            webdav_native_execution_manifest_issue,
+            webdav_original_final_row_issue,
+        );
         let webdav_native_description_issue = storage_retirement::gate::Gate::register(
             &connection,
             "sync_webdav_native_description_issue",
@@ -594,6 +657,18 @@ impl Journal {
             webdav_native_description_issue,
             webdav_native_object_issue,
             webdav_native_cancel_issue,
+            webdav_native_execution_admission_issue,
+            webdav_native_execution_record_issue,
+            #[cfg(windows)]
+            webdav_native_execution_template_issue,
+            #[cfg(windows)]
+            webdav_native_execution_binding_issue,
+            #[cfg(windows)]
+            webdav_native_execution_receipt_issue,
+            #[cfg(windows)]
+            webdav_native_execution_manifest_issue,
+            #[cfg(windows)]
+            webdav_original_final_row_issue,
             #[cfg(windows)]
             storage_retirement_owner_activation,
             #[cfg(windows)]
@@ -2043,7 +2118,37 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
         sync_extend_core_model::limits::MAX_ENTRIES,
         sync_extend_core_model::limits::MAX_ENTRIES as u64 * 1024,
     )?;
-    let dav_future = webdav_native::outstanding(connection)?;
+    let execution_tables = storage_inventory::reader::preflight(
+        connection,
+        webdav_native::execution_schema::TABLES,
+        sync_extend_core_model::limits::MAX_ENTRIES,
+        sync_extend_core_model::limits::MAX_ENTRIES as u64 * 1024,
+    )?;
+    let mut dav_tables = dav_tables;
+    dav_tables.extend(execution_tables);
+    dav_tables.extend(storage_inventory::reader::preflight(
+        connection,
+        webdav_native::receipt_schema::TABLES,
+        sync_extend_core_model::limits::MAX_ENTRIES,
+        sync_extend_core_model::limits::MAX_ENTRIES as u64 * 1024,
+    )?);
+    let cancellation = webdav_native::outstanding(connection)?;
+    let records = webdav_native::execution_outstanding(connection)?;
+    let internal = webdav_native::manifest_audit::outstanding(connection)?;
+    let execution = tree_storage_capacity::TreeStorageCharge {
+        rows: storage_inventory::reader::add(records.rows, internal.rows)?,
+        logical_bytes: storage_inventory::reader::add(
+            records.logical_bytes,
+            internal.logical_bytes,
+        )?,
+    };
+    let dav_future = tree_storage_capacity::TreeStorageCharge {
+        rows: storage_inventory::reader::add(cancellation.rows, execution.rows)?,
+        logical_bytes: storage_inventory::reader::add(
+            cancellation.logical_bytes,
+            execution.logical_bytes,
+        )?,
+    };
     let dav_rows = dav_tables.iter().try_fold(dav_future.rows, |sum, table| {
         storage_inventory::reader::add(sum, table.rows)
     })?;

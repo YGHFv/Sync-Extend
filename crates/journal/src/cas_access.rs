@@ -72,7 +72,7 @@ impl CasAccessGuard {
         self.verify()
     }
 
-    fn verify(&self) -> Result<()> {
+    pub(crate) fn verify(&self) -> Result<()> {
         let held = self.file.metadata()?;
         let named = fs::symlink_metadata(&self.path)?;
         if !held.is_file()

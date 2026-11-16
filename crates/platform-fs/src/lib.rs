@@ -15,7 +15,7 @@ mod windows;
 pub use windows::{
     regular_file_link_count, regular_file_matches_path, verify_regular_file, GuardedReadFile,
     LockedDirectory, LockedDirectoryMutation, LockedFile, OriginalDirectoryCreation,
-    OriginalFileCreation, OwnedFileCreation,
+    OriginalFileCreation, OwnedFileCreation, PublishedOriginalFile, SealedOriginalFile,
 };
 
 #[allow(unsafe_code)]
@@ -29,6 +29,13 @@ pub use pinned_program::PinnedProgram;
 #[allow(unsafe_code)]
 mod sidecar_config;
 pub use sidecar_config::SidecarConfig;
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod held_disk_space;
+#[cfg(windows)]
+pub use held_disk_space::{held_disk_space, HeldDiskSpace};
+mod writer_owner;
+pub use writer_owner::WriterOwner;
 
 #[cfg(windows)]
 #[allow(unsafe_code)]

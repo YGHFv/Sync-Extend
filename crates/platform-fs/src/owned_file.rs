@@ -142,3 +142,161 @@ impl OwnedFileCreation {
         request_delete_on_close(&self.file)
     }
 }
+
+/// No writer method; only a reduced-right duplicate of the actual original CREATE.
+/// Consuming the writable creator cannot close external cloned aliases; callers
+/// must not clone writer(). This type alone is not a durable Journal receipt.
+pub struct SealedOriginalFile {
+    file: File,
+    parent: File,
+    original_key: FileKey,
+    original_parent_key: FileKey,
+    created_component: String,
+}
+
+impl OwnedFileCreation {
+    /// Keep the same original file object continuously held while closing our
+    /// writable handle. No path lookup or reopen is used to obtain read rights.
+    pub fn seal_original(self) -> io::Result<SealedOriginalFile> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows_sys::Win32::{
+            Foundation::{DuplicateHandle, GENERIC_READ, HANDLE},
+            System::Threading::GetCurrentProcess,
+        };
+        self.verify_single_link()?;
+        self.file.sync_all()?;
+        let mut duplicate: HANDLE = std::ptr::null_mut();
+        // SAFETY: the pseudo-process handle is valid in this process; source
+        // owns a live File; duplicate is writable HANDLE output. Desired access
+        // is READ|DELETE only, inherit=false, options=0 cannot preserve WRITE.
+        let success = unsafe {
+            let process = GetCurrentProcess();
+            DuplicateHandle(
+                process,
+                self.file.as_raw_handle() as HANDLE,
+                process,
+                &mut duplicate,
+                GENERIC_READ | windows_sys::Win32::Storage::FileSystem::DELETE,
+                0,
+                0,
+            )
+        };
+        if success == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if duplicate.is_null() {
+            return Err(super::invalid("no sealed original handle"));
+        }
+        // SAFETY: successful DuplicateHandle transferred one new owned handle.
+        let file = unsafe { File::from_raw_handle(duplicate) };
+        let Self {
+            file: writable,
+            parent,
+            original_key,
+            original_parent_key,
+            created_component,
+        } = self;
+        let sealed = SealedOriginalFile {
+            file,
+            parent,
+            original_key,
+            original_parent_key,
+            created_component,
+        };
+        sealed.verify_original()?;
+        drop(writable);
+        sealed.verify_original()?;
+        Ok(sealed)
+    }
+}
+
+impl SealedOriginalFile {
+    pub fn reader(&self) -> &File {
+        &self.file
+    }
+    pub fn key(&self) -> io::Result<FileKey> {
+        self.verify_original()?;
+        Ok(self.original_key)
+    }
+    pub fn parent_key(&self) -> io::Result<FileKey> {
+        self.verify_original()?;
+        Ok(self.original_parent_key)
+    }
+    pub fn created_component(&self) -> &str {
+        &self.created_component
+    }
+    pub fn verify_original(&self) -> io::Result<()> {
+        regular(&self.file, false)?;
+        regular(&self.parent, true)?;
+        if key(&self.file)? != self.original_key || key(&self.parent)? != self.original_parent_key {
+            return Err(super::invalid("sealed original CREATE lineage changed"));
+        }
+        Ok(())
+    }
+    pub fn rename_no_replace(&self, destination: &Path) -> io::Result<()> {
+        self.verify_original()?;
+        rename_no_replace(&self.file, destination)
+    }
+    pub fn matches_path(&self, path: &Path) -> io::Result<bool> {
+        super::regular_file_matches_path(&self.file, path)
+    }
+    pub fn delete_on_close(&self) -> io::Result<()> {
+        self.verify_original()?;
+        request_delete_on_close(&self.file)
+    }
+}
+
+/// The same original sealed CREATE file, after releasing its historical owner parent.
+/// This retains read/delete exclusion and never reopens a pathname or regains write.
+pub struct PublishedOriginalFile {
+    file: File,
+    original_key: FileKey,
+    original_parent_key: FileKey,
+    created_component: String,
+}
+impl SealedOriginalFile {
+    pub fn release_creation_parent(self) -> io::Result<PublishedOriginalFile> {
+        self.verify_original()?;
+        let Self {
+            file,
+            parent,
+            original_key,
+            original_parent_key,
+            created_component,
+        } = self;
+        let result = PublishedOriginalFile {
+            file,
+            original_key,
+            original_parent_key,
+            created_component,
+        };
+        drop(parent);
+        result.verify_original()?;
+        Ok(result)
+    }
+}
+impl PublishedOriginalFile {
+    pub fn reader(&self) -> &File {
+        &self.file
+    }
+    pub fn key(&self) -> io::Result<FileKey> {
+        self.verify_original()?;
+        Ok(self.original_key)
+    }
+    pub fn original_parent_key(&self) -> FileKey {
+        self.original_parent_key
+    }
+    pub fn created_component(&self) -> &str {
+        &self.created_component
+    }
+    pub fn verify_original(&self) -> io::Result<()> {
+        regular(&self.file, false)?;
+        if key(&self.file)? != self.original_key {
+            return Err(super::invalid("original published CREATE file key changed"));
+        }
+        Ok(())
+    }
+    pub fn matches_path(&self, path: &Path) -> io::Result<bool> {
+        super::regular_file_matches_path(&self.file, path)
+    }
+}

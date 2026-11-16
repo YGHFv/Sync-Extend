@@ -57,6 +57,15 @@ impl OriginalDirectoryCreation<'_> {
 }
 
 impl LockedDirectory {
+    /// CREATE a held child parent for subsequent original file publication.
+    /// The kernel may open it for child rename; its own rename/delete remain
+    /// excluded. Membership is always checked by the private transaction issuer.
+    pub fn create_new_publication_directory(
+        &self,
+        name: &str,
+    ) -> io::Result<LockedDirectoryMutation> {
+        create_new_directory_child(&self.file, name, NewChildKind::PublicationDirectory)
+    }
     /// Create a new child through this exact retained parent handle.
     /// Caller must durably journal intent first and retain all root ancestors.
     /// Creation success alone is not durable restart-safe ownership.
@@ -72,6 +81,10 @@ impl LockedDirectory {
 }
 
 impl LockedDirectoryMutation {
+    /// Same original CREATE contract for a child of an already held parent.
+    pub fn create_new_publication_directory(&self, name: &str) -> io::Result<Self> {
+        create_new_directory_child(&self.file, name, NewChildKind::PublicationDirectory)
+    }
     /// Only an actual CREATE retains original lineage and the immediate parent.
     /// This is not recovery/adoption authority or an all-ancestors guard.
     pub fn original_creation(&self) -> io::Result<OriginalDirectoryCreation<'_>> {
@@ -133,6 +146,7 @@ fn local_ntfs_from_handle(file: &File) -> io::Result<()> {
 pub(super) enum NewChildKind {
     Directory,
     StagingDirectory,
+    PublicationDirectory,
     File,
 }
 
@@ -205,6 +219,15 @@ fn create_new_child_lifetime(
         NewChildKind::Directory | NewChildKind::StagingDirectory => (
             GENERIC_READ | DELETE | SYNCHRONIZE,
             FILE_SHARE_READ,
+            FILE_DIRECTORY_FILE,
+            true,
+        ),
+        // A destination directory must share WRITE for the kernel's child
+        // rename while withholding DELETE to retain its original parent slot.
+        // This grants no native receipt or namespace membership authority.
+        NewChildKind::PublicationDirectory => (
+            GENERIC_READ | DELETE | SYNCHRONIZE,
+            FILE_SHARE_READ | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
             FILE_DIRECTORY_FILE,
             true,
         ),

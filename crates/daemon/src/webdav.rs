@@ -21,6 +21,10 @@ use sync_extend_core_model::{
 };
 use sync_extend_reconcile::{LocalSpace, ReconcileError, WebDavBaseline, WebDavCommit};
 
+#[cfg(windows)]
+#[path = "webdav_collections.rs"]
+mod collections;
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Runtime {
@@ -28,6 +32,8 @@ pub struct Runtime {
     pub credentials: PathBuf,
     pub uploads: PathBuf,
     pub spaces: BTreeMap<SpaceId, PathBuf>,
+    #[cfg(windows)]
+    collection_limits: Option<collections::CollectionLimits>,
 }
 
 pub fn load(path: &Path) -> Result<Runtime, Box<dyn std::error::Error>> {
@@ -222,11 +228,27 @@ fn dispatch(
         return Err(501);
     }
     let data = runtime.spaces.get(&authorized.space_id).ok_or(403u16)?;
+    // Read and parse bounded XML metadata before opening LocalSpace.
+    // Authentication and path authorization above still run first; this keeps
+    // the original connection deadline from expiring during durable baseline work.
+    let lock_xml = if request.method == "LOCK" && request.content_length != 0 {
+        Some(body(request, stream)?)
+    } else {
+        None
+    };
+    if let Some(bytes) = lock_xml.as_deref() {
+        webdav_xml::exclusive_write_lock(bytes).map_err(|_| 400u16)?;
+    }
+    let propfind_properties = if request.method == "PROPFIND" {
+        let bytes = body(request, stream)?;
+        Some(webdav_xml::properties(&bytes).map_err(|_| 400u16)?)
+    } else {
+        None
+    };
     let mut local = LocalSpace::open_with_limits(data, limits.clone()).map_err(|_| 503u16)?;
     if local.space_id != authorized.space_id {
         return Err(503);
     }
-    local.recover_read_leases().map_err(core_status)?;
     let baseline = local.capture_webdav_baseline().map_err(core_status)?;
     let entry = find(&baseline, authorized.path.as_ref());
     if authorized.export_root && authorized.path.is_some() && entry.is_none() {
@@ -263,6 +285,24 @@ fn dispatch(
         && !locks.allowed(account, &authorized, &tokens, collection)
     {
         return Err(423);
+    }
+    #[cfg(windows)]
+    if matches!(
+        request.method.as_str(),
+        "MKCOL" | "DELETE" | "MOVE" | "COPY"
+    ) {
+        return collections::dispatch(
+            runtime,
+            limits,
+            locks,
+            account,
+            &authorized,
+            &tokens,
+            request,
+            &local,
+            baseline,
+            stream,
+        );
     }
     match request.method.as_str() {
         "OPTIONS" => {
@@ -366,8 +406,7 @@ fn dispatch(
             if !collection && entry.is_none() {
                 return Err(404);
             }
-            let body = body(request, stream)?;
-            let properties = webdav_xml::properties(&body).map_err(|_| 400u16)?;
+            let properties = propfind_properties.ok_or(400u16)?;
             let response = propfind(runtime, &authorized, &baseline, depth, &properties)?;
             http::response(
                 stream,
@@ -491,7 +530,6 @@ fn dispatch(
                 }
                 tokens[0].clone()
             } else {
-                webdav_xml::exclusive_write_lock(&body(request, stream)?).map_err(|_| 400u16)?;
                 let recursive = match request.header("depth").unwrap_or("infinity") {
                     "0" => false,
                     "infinity" => true,

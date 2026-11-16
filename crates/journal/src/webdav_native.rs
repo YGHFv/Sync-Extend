@@ -17,7 +17,39 @@ use sync_extend_core_model::{
     ContentId, DeviceId, SpaceId,
 };
 
+mod budget_manifest;
+mod cleanup_receipts;
+mod execution;
+pub(crate) mod execution_schema;
+mod final_history;
+pub(crate) mod final_row_gate;
+mod future_history;
+mod ordered_receipts;
+mod ordered_records;
+mod receipt_protocol;
+mod reference_handoff;
 pub(crate) mod schema;
+pub use budget_manifest::BudgetLimits as WebDavBudgetLimits;
+mod binding_audit;
+mod initial_binding;
+#[cfg(windows)]
+mod live_admission;
+pub(crate) mod manifest_audit;
+mod native_capacity;
+pub(crate) mod receipt_schema;
+#[cfg(windows)]
+pub use live_admission::{LiveDavAdmission as WebDavLiveAdmission, WebDavInventoryFileView};
+#[cfg(windows)]
+mod collection_kernel;
+#[cfg(windows)]
+mod collection_projection;
+#[cfg(windows)]
+mod held_collections;
+#[cfg(windows)]
+mod native_owner;
+#[cfg(windows)]
+mod retained;
+pub use execution::{WebDavDurableExecution, WebDavDurableExecutionLimits};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,7 +76,7 @@ fn invalid() -> JournalError {
 
 fn scope(connection: &Connection, space: &SpaceId, device: &DeviceId) -> Result<()> {
     let identity: Vec<(String, String)> = connection
-        .prepare("SELECT key,value FROM main.local_state ORDER BY key")?
+        .prepare_cached("SELECT key,value FROM main.local_state ORDER BY key")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     if identity.len() != 3
@@ -105,7 +137,7 @@ fn prepare(
                 |r| r.get(0),
             )
             .optional()?;
-        if current.as_deref() != Some(description.request.baseline.as_str()) {
+        if !final_history::current_baseline_matches(connection, description, current.as_deref())? {
             return Err(invalid());
         }
         ordinary_idle(connection, space)?;
@@ -146,7 +178,7 @@ fn prepare(
     Ok(Prepared { plan, json, chunks })
 }
 
-pub(crate) fn audit(connection: &Connection) -> Result<Vec<WebDavNativeAdmission>> {
+pub(super) fn audit_descriptions(connection: &Connection) -> Result<Vec<WebDavNativeAdmission>> {
     schema::validate(connection)?;
     preflight(
         connection,
@@ -171,7 +203,7 @@ pub(crate) fn audit(connection: &Connection) -> Result<Vec<WebDavNativeAdmission
             |r| crate::sql_u64(r, 0),
         )
         .optional()?;
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT transaction_id,space_id,baseline_snapshot,request_hash,plan_hash,
             admitted_at_ms,description,future_rows,future_bytes
          FROM main.webdav_native_admissions ORDER BY transaction_id",
@@ -189,7 +221,7 @@ pub(crate) fn audit(connection: &Connection) -> Result<Vec<WebDavNativeAdmission
             "SELECT cancelled_at_ms FROM main.webdav_native_cancellations WHERE transaction_id=?1",
             [&id], |r| crate::sql_u64(r, 0),
         ).optional()?;
-        let active = cancelled.is_none();
+        let active = cancelled.is_none() && !reference_handoff::terminal(connection, &id.parse()?)?;
         let prepared = prepare(connection, &description, &space, time, active)?;
         if description.request.transaction_id.as_str() != id
             || description.request.baseline.as_str() != row.get::<_, String>(2)?
@@ -203,7 +235,7 @@ pub(crate) fn audit(connection: &Connection) -> Result<Vec<WebDavNativeAdmission
         {
             return Err(invalid());
         }
-        let actual: BTreeMap<ContentId, u64> = connection.prepare(
+        let actual: BTreeMap<ContentId, u64> = connection.prepare_cached(
             "SELECT content_id,length FROM main.webdav_native_objects WHERE transaction_id=?1 ORDER BY content_id",
         )?.query_map([&id], |r| Ok((r.get::<_, String>(0)?, crate::sql_u64(r, 1)?)))?
             .map(|row| { let (id, length) = row?; Ok((id.parse()?, length)) })
@@ -227,6 +259,19 @@ pub(crate) fn audit(connection: &Connection) -> Result<Vec<WebDavNativeAdmission
         return Err(invalid());
     }
     Ok(result)
+}
+
+pub(crate) fn audit(connection: &Connection) -> Result<Vec<WebDavNativeAdmission>> {
+    let descriptions = audit_descriptions(connection)?;
+    let executions = execution::audit(connection)?;
+    manifest_audit::audit(connection, &descriptions, &executions)?;
+    Ok(descriptions)
+}
+
+pub(crate) fn execution_outstanding(
+    connection: &Connection,
+) -> Result<sync_extend_core_model::tree_storage_capacity::TreeStorageCharge> {
+    execution::outstanding(connection)
 }
 
 pub(crate) fn outstanding(
@@ -451,6 +496,12 @@ impl Journal {
         if time < old.admitted_at_ms {
             return Err(invalid());
         }
+        if execution::audit(&tx)?
+            .iter()
+            .any(|row| &row.transaction_id == id && !row.records.is_empty())
+        {
+            return Err(invalid());
+        }
         let bounds = self.writer_capacity_limits(self.max_storage_entries)?;
         let before = self.read_view().audit_original_provenance_capacity(
             space,
@@ -471,7 +522,17 @@ impl Journal {
             crate::limits::MAX_ENTRIES,
             bounds,
         )?;
-        unchanged(&before, &after)?;
+        execution::exact_insert(
+            &before,
+            &after,
+            "webdav_native_cancellations",
+            vec![id.to_string()],
+            vec![
+                crate::JournalStorageColumnValue::Text(id.to_string()),
+                crate::JournalStorageColumnValue::Integer(time),
+            ],
+            time,
+        )?;
         let accepted = audit(&tx)?
             .into_iter()
             .find(|row| &row.description.request.transaction_id == id)

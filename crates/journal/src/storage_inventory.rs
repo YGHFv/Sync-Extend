@@ -11,7 +11,7 @@ pub(crate) mod reader;
 mod schema;
 use reader::{add, hash, invalid, preflight, read_table, validate_schema, Namespace, TableSpec};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum JournalStorageColumnValue {
     Null,
@@ -107,6 +107,8 @@ pub(crate) fn tables() -> Vec<TableSpec> {
         crate::storage_retirement::disposal_schema::TABLES,
         crate::storage_retirement::terminal_schema::TABLES,
         crate::webdav_native::schema::TABLES,
+        crate::webdav_native::execution_schema::TABLES,
+        crate::webdav_native::receipt_schema::TABLES,
         crate::tree_storage_inventory::schema::TABLES,
         crate::tree_native_storage::schema::TABLES,
         crate::tree_native_future::schema::TABLES,

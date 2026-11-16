@@ -106,7 +106,11 @@ mod storage_retirement_inspection;
 pub use storage_retirement_inspection::StorageRetirementInspection;
 pub use storage_retirement_inspection::StorageRetirementObjectObservation;
 mod webdav;
+#[cfg(windows)]
+mod webdav_local_execution;
 pub use webdav::{WebDavBaseline, WebDavCommit, WebDavRead};
+#[cfg(windows)]
+pub use webdav_local_execution::{WebDavBudgetLimits, WebDavLocalExecution};
 mod tree_final_observation;
 #[cfg(windows)]
 mod tree_native_owner;
@@ -131,7 +135,6 @@ pub use tree_native_owner::{TreeNativeRestoreResult, TreeOwnerCreation, TreeOwne
 pub use tree_restore_capture::TreeRestoreCapture;
 pub use tree_restore_pipeline::TreeRestoreBudgets;
 
-use fs2::FileExt;
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
@@ -214,7 +217,13 @@ pub struct LocalSpace {
     journal: Journal,
     limits: LocalLimits,
     root_identity: filesystem::PathIdentity,
+    #[cfg(windows)]
+    _lock: sync_extend_platform_fs::WriterOwner,
+    #[cfg(not(windows))]
     _lock: File,
+    #[cfg(windows)]
+    _worktree_lock: sync_extend_platform_fs::WriterOwner,
+    #[cfg(not(windows))]
     _worktree_lock: File,
 }
 
@@ -1203,18 +1212,9 @@ fn read_marker(path: &Path) -> Result<SpaceId> {
     Ok(value.parse()?)
 }
 
-fn acquire_lock(data: &Path) -> Result<File> {
-    let path = data.join("writer.lock");
-    check_ancestors(&path)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    FileExt::try_lock_exclusive(&file)
-        .map_err(|_| ReconcileError::Invariant("another local writer is running"))?;
-    Ok(file)
+#[cfg(windows)]
+fn acquire_lock(data: &Path) -> Result<sync_extend_platform_fs::WriterOwner> {
+    Ok(sync_extend_platform_fs::WriterOwner::acquire(data)?)
 }
 
 fn create_private_directory(path: &Path) -> Result<()> {
@@ -1234,4 +1234,19 @@ fn create_private_directory(path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     fs::create_dir_all(path)?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn acquire_lock(data: &Path) -> Result<File> {
+    let path = data.join("writer.lock");
+    check_ancestors(&path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    fs2::FileExt::try_lock_exclusive(&file)
+        .map_err(|_| ReconcileError::Invariant("another local writer is running"))?;
+    Ok(file)
 }

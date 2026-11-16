@@ -38,7 +38,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     type SchemaObject = (String, String, String, Option<String>);
     fn objects(connection: &Connection) -> Result<Vec<SchemaObject>> {
         Ok(connection
-            .prepare(
+            .prepare_cached(
                 "SELECT type,name,tbl_name,sql FROM main.sqlite_schema
              WHERE instr(name,'storage_snapshot_handoffs')=1 OR tbl_name='storage_snapshot_handoffs'
              OR name='storage_snapshot_handoff_no_pin'
@@ -47,13 +47,21 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<_>>()?)
     }
-    let expected = Connection::open_in_memory()?;
-    expected.execute_batch(
-        "CREATE TABLE reference_reservation_objects(owner_id TEXT,content_id TEXT);
-         CREATE TRIGGER reference_reservation_pin_no_delete BEFORE DELETE
-         ON reference_reservation_objects BEGIN SELECT 1; END;",
-    )?;
-    expected.execute_batch(include_str!("migration-058.sql"))?;
+    static EXPECTED: std::sync::OnceLock<Vec<SchemaObject>> = std::sync::OnceLock::new();
+    if EXPECTED.get().is_none() {
+        let expected = Connection::open_in_memory()?;
+        expected.execute_batch(
+            "CREATE TABLE reference_reservation_objects(owner_id TEXT,content_id TEXT);
+             CREATE TRIGGER reference_reservation_pin_no_delete BEFORE DELETE
+             ON reference_reservation_objects BEGIN SELECT 1; END;",
+        )?;
+        expected.execute_batch(include_str!("migration-058.sql"))?;
+        let definitions = objects(&expected)?;
+        let _ = EXPECTED.set(definitions);
+    }
+    let expected = EXPECTED.get().ok_or(crate::JournalError::Invariant(
+        "compiled reference catalog absent",
+    ))?;
     let shadow: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM temp.sqlite_schema
          WHERE instr(name,'storage_snapshot_handoffs')=1 OR tbl_name='storage_snapshot_handoffs'
@@ -62,7 +70,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
-    if shadow || objects(connection)? != objects(&expected)? {
+    if shadow || objects(connection)? != *expected {
         return Err(invalid());
     }
     Ok(())
@@ -118,7 +126,7 @@ pub(crate) fn audit(connection: &Connection) -> Result<Vec<SnapshotStorageHandof
         crate::limits::MAX_ENTRIES,
         crate::limits::MAX_ENTRIES as u64 * 1024,
     )?;
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT owner_id,space_id,storage_id,record_hash,handed_off_at_ms,record
          FROM main.storage_snapshot_handoffs ORDER BY owner_id",
     )?;
@@ -269,7 +277,7 @@ impl Journal {
                 return Err(invalid());
             }
         }
-        let pins = tx.prepare(
+        let pins = tx.prepare_cached(
             "SELECT content_id FROM main.reference_reservation_objects WHERE owner_id=?1 ORDER BY content_id",
         )?.query_map([id.as_str()], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;

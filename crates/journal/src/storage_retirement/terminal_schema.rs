@@ -30,19 +30,30 @@ pub(crate) fn validate(connection: &Connection) -> Result<()> {
             ORDER BY type,name")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?
             .collect::<rusqlite::Result<_>>()?)
     }
-    let expected = Connection::open_in_memory()?;
-    expected.execute_batch("CREATE TABLE storage_retirement_requests(request_id TEXT);
-        CREATE TABLE storage_retirement_owner_creations(request_id TEXT);
-        CREATE TABLE storage_retirement_owner_activations(request_id TEXT);
-        CREATE TABLE storage_retirement_clock(singleton INTEGER,observed_at_ms INTEGER);
-        CREATE TABLE storage_retirement_payload_events(request_id TEXT);
-        CREATE TABLE storage_retirement_disposal_events(request_id TEXT);
-        CREATE TABLE storage_retirement_cancellations(request_id TEXT);
-        CREATE TRIGGER storage_retirement_owner_cancel_refusal BEFORE INSERT ON storage_retirement_cancellations BEGIN SELECT 1; END;")?;
-    expected.execute_batch(include_str!("../migration-063.sql"))?;
+    static EXPECTED: std::sync::OnceLock<Vec<SchemaObject>> = std::sync::OnceLock::new();
+    if EXPECTED.get().is_none() {
+        let expected = Connection::open_in_memory()?;
+        expected.execute_batch("CREATE TABLE storage_retirement_requests(request_id TEXT);
+            CREATE TABLE storage_retirement_owner_creations(request_id TEXT);
+            CREATE TABLE storage_retirement_owner_activations(request_id TEXT);
+            CREATE TABLE storage_retirement_clock(singleton INTEGER,observed_at_ms INTEGER);
+            CREATE TABLE storage_retirement_payload_events(request_id TEXT);
+            CREATE TABLE storage_retirement_disposal_events(request_id TEXT);
+            CREATE TABLE storage_retirement_cancellations(request_id TEXT);
+            CREATE TRIGGER storage_retirement_owner_cancel_refusal BEFORE INSERT ON storage_retirement_cancellations BEGIN SELECT 1; END;")?;
+        expected.execute_batch(include_str!("../migration-063.sql"))?;
+        let definitions = objects(&expected)?;
+        // The reference uses only this candidate's compiled SQL. A concurrent
+        // builder computes the same immutable definitions; actual schemas and
+        // TEMP shadows are never cached.
+        let _ = EXPECTED.set(definitions);
+    }
+    let expected = EXPECTED
+        .get()
+        .ok_or(JournalError::Invariant("compiled reference schema absent"))?;
     let shadow:bool=connection.query_row("SELECT EXISTS(SELECT 1 FROM temp.sqlite_schema
         WHERE instr(name,'storage_retirement_terminal_')=1 OR instr(tbl_name,'storage_retirement_terminal_')=1)",[],|r|r.get(0))?;
-    if shadow || objects(connection)? != objects(&expected)? {
+    if shadow || objects(connection)? != *expected {
         return Err(JournalError::Invariant(
             "storage retirement exact terminal schema",
         ));

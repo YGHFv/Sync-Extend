@@ -67,25 +67,39 @@ pub(crate) fn validate(connection: &Connection) -> Result<()> {
             WHERE instr(name,'webdav_native_')=1 OR instr(tbl_name,'webdav_native_')=1 ORDER BY type,name")?
             .query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<rusqlite::Result<_>>()?)
     }
-    let expected = Connection::open_in_memory()?;
-    expected.execute_batch(
-        "CREATE TABLE snapshots(snapshot_id TEXT);
-        CREATE TABLE current_manifests(space_id TEXT,snapshot_id TEXT);
-        CREATE TABLE operations(space_id TEXT);
-        CREATE TABLE publications(space_id TEXT);
-        CREATE TABLE mutations(space_id TEXT);
-        CREATE TABLE cleanup_plans(space_id TEXT,state TEXT);
-        CREATE TABLE snapshot_prunings(snapshot_id TEXT);
-        CREATE TABLE snapshot_objects(snapshot_id TEXT);",
-    )?;
-    expected.execute_batch(include_str!("../migration-064.sql"))?;
+    static EXPECTED: std::sync::OnceLock<Vec<SchemaObject>> = std::sync::OnceLock::new();
+    if EXPECTED.get().is_none() {
+        let expected = Connection::open_in_memory()?;
+        expected.execute_batch(
+            "CREATE TABLE snapshots(snapshot_id TEXT);
+            CREATE TABLE current_manifests(space_id TEXT,snapshot_id TEXT);
+            CREATE TABLE operations(space_id TEXT);
+            CREATE TABLE receive_cursors(space_id TEXT,device_id TEXT,contiguous_seq INTEGER);
+            CREATE TABLE rename_observations(space_id TEXT,snapshot_id TEXT,observation TEXT,observation_hash TEXT);
+            CREATE TABLE publications(space_id TEXT);
+            CREATE TABLE mutations(space_id TEXT);
+            CREATE TABLE cleanup_plans(space_id TEXT,state TEXT);
+            CREATE TABLE snapshot_prunings(snapshot_id TEXT);
+            CREATE TABLE snapshot_objects(snapshot_id TEXT);",
+        )?;
+        expected.execute_batch(include_str!("../migration-064.sql"))?;
+        expected.execute_batch(include_str!("../migration-065.sql"))?;
+        let definitions = objects(&expected)?;
+        // The reference uses only this candidate's compiled SQL. A concurrent
+        // builder computes the same immutable definitions; actual schemas and
+        // TEMP shadows are never cached.
+        let _ = EXPECTED.set(definitions);
+    }
+    let expected = EXPECTED
+        .get()
+        .ok_or(JournalError::Invariant("compiled reference schema absent"))?;
     let shadow: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM temp.sqlite_schema
         WHERE instr(name,'webdav_native_')=1 OR instr(tbl_name,'webdav_native_')=1)",
         [],
         |r| r.get(0),
     )?;
-    if shadow || objects(connection)? != objects(&expected)? {
+    if shadow || objects(connection)? != *expected {
         return Err(JournalError::Invariant(
             "exact retained DAV description schema",
         ));
