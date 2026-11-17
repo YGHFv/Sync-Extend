@@ -1225,6 +1225,7 @@ fn print(value: &impl serde::Serialize) -> Result<(), Box<dyn std::error::Error>
 }
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
     let parsed = Cli::parse();
     #[cfg(target_os = "linux")]
     let linux_owner = match linux_namespace::prepare(&parsed) {
@@ -1244,6 +1245,7 @@ fn main() -> ExitCode {
             .name("syncd-main".into())
             .stack_size(16 * 1024 * 1024)
             .spawn(move || {
+                let parsed = Cli::parse();
                 run_cli(
                     parsed,
                     #[cfg(target_os = "linux")]
