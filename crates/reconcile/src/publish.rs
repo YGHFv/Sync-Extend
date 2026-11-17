@@ -30,14 +30,20 @@ pub struct PublishResult {
 impl LocalSpace {
     pub fn publish_file(&mut self, source: &Path, path: PortablePath) -> Result<PublishResult> {
         self.recover()?;
+        let (source, observed) = self.observe_source(source)?;
         self.scan_without_recovery()?;
-        let content = self.import_source(source)?;
+        let content = self.import_observed_source(&source, observed)?;
         let id = self.begin_content(path, content, None)?;
         self.recover_transaction(&id)?;
         self.publication_result(&id)
     }
 
     pub(crate) fn import_source(&self, source: &Path) -> Result<FileManifest> {
+        let (source, observed) = self.observe_source(source)?;
+        self.import_observed_source(&source, observed)
+    }
+
+    pub(crate) fn observe_source(&self, source: &Path) -> Result<(PathBuf, ObservedFile)> {
         check_ancestors(source)?;
         let metadata = fs::symlink_metadata(source)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() || is_reparse(&metadata) {
@@ -69,16 +75,24 @@ impl LocalSpace {
         if observed.metadata.len() > self.limits.max_staging_bytes {
             return Err(ReconcileError::ResourceLimit("publication staging bytes"));
         }
+        Ok((source, observed))
+    }
+
+    pub(crate) fn import_observed_source(
+        &self,
+        source: &Path,
+        observed: ObservedFile,
+    ) -> Result<FileManifest> {
         checkpoint("after_publish_source_open");
         let content = self.cas.import_bounded(
             &observed.file,
             observed.metadata.len(),
             self.limits.max_scan_chunks,
         )?;
-        observed.verify(&source)?;
-        if content.length != metadata.len()
-            || metadata.modified()? != observed.file.metadata()?.modified()?
-            || !file_matches(&source, &content)?
+        observed.verify(source)?;
+        if content.length != observed.metadata.len()
+            || observed.metadata.modified()? != observed.file.metadata()?.modified()?
+            || !file_matches(source, &content)?
         {
             return Err(ReconcileError::Unstable);
         }

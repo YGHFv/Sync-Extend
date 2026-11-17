@@ -27,8 +27,9 @@ impl LocalSpace {
     ) -> Result<NativePublishResult> {
         // Do not let legacy recovery interpret a previously selected native intent.
         self.recover()?;
+        let (source, observed) = self.observe_source(source)?;
         self.scan_without_recovery()?;
-        let content = self.import_source(source)?;
+        let content = self.import_observed_source(&source, observed)?;
         let peak = content
             .length
             .checked_mul(17)
