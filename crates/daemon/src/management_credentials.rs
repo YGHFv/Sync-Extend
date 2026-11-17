@@ -1,5 +1,9 @@
 //! Explicit listener-local credentials with optional Windows current-user protection.
-use std::{fs, io::Write, path::Path};
+#[cfg(not(windows))]
+use std::fs;
+#[cfg(windows)]
+use std::io::{Read, Seek, SeekFrom};
+use std::{io::Write, path::Path};
 use sync_extend_core_model::{
     management::{ManagementConfig, TokenProtection},
     EntryId,
@@ -109,24 +113,54 @@ pub fn generate(config: &ManagementConfig) -> Result<()> {
         return Err("protected management credential exceeds bound".into());
     }
     #[cfg(windows)]
-    let _parents = parents(&config.token_file)?;
+    let locked_parents = parents(&config.token_file)?;
     #[cfg(not(windows))]
     parents(&config.token_file)?;
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(0);
+        // The token is created through the retained native parent handle so
+        // the kernel installs the current-user owner and protected DACL in
+        // the CREATE itself.  A pathname OpenOptions CREATE would inherit
+        // the directory DACL and leave a race before the security audit.
+        let parent = locked_parents
+            .first()
+            .ok_or("management credential parent required")?;
+        let component = config
+            .token_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("management credential filename required")?;
+        let mut file = parent.create_new_current_user_file(component)?;
+        file.original_creation()?.verify()?;
+        sync_extend_platform_fs::verify_current_user_private_file(file.reader())?;
+        file.writer().write_all(&bytes)?;
+        file.writer().sync_all()?;
+        file.writer().seek(SeekFrom::Start(0))?;
+        let mut readback = Vec::with_capacity(bytes.len());
+        file.reader()
+            .take(bytes.len() as u64 + 1)
+            .read_to_end(&mut readback)?;
+        if readback != bytes {
+            return Err("management credential CREATE readback differs".into());
+        }
+        sync_extend_platform_fs::verify_current_user_private_file(file.reader())?;
+        let sealed = file.seal_original()?;
+        sealed.verify_original()?;
+        sync_extend_platform_fs::verify_current_user_private_file(sealed.reader())?;
     }
-    #[cfg(unix)]
+    #[cfg(not(windows))]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&config.token_file)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
     }
-    let mut file = options.open(&config.token_file)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
     #[cfg(unix)]
     fs::File::open(
         config
