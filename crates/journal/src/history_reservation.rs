@@ -49,7 +49,7 @@ impl Stored {
         self.planned.validate()?;
         self.observations.validate(&self.planned, max)?;
         crate::sql_integer(self.timestamp)?;
-        if self.version != 1
+        if !matches!(self.version, 1 | 2 | 3)
             || self.operations.len() != 1
             || self.baseline.space_id != self.planned.space_id
         {
@@ -79,22 +79,51 @@ impl Stored {
                 != (sync_extend_core_model::Change::Put {
                     entry: entry.clone(),
                 })
-            || self.baseline.entries.contains_key(&entry.entry_id)
-            || self
-                .baseline
-                .entries
-                .values()
-                .any(|old| old.path.collision_key() == self.future_path.collision_key())
-            || self.planned.entries.len() != self.baseline.entries.len() + 1
-            || self
-                .baseline
-                .entries
-                .iter()
-                .any(|(id, old)| self.planned.entries.get(id) != Some(old))
         {
             return Err(JournalError::Invariant(
-                "reserved original complete CREATE plan",
+                "reserved original complete native PUT plan",
             ));
+        }
+        if matches!(self.version, 1 | 3) {
+            if self.baseline.entries.contains_key(&entry.entry_id)
+                || self
+                    .baseline
+                    .entries
+                    .values()
+                    .any(|old| old.path.collision_key() == self.future_path.collision_key())
+                || self.planned.entries.len() != self.baseline.entries.len() + 1
+                || self
+                    .baseline
+                    .entries
+                    .iter()
+                    .any(|(id, old)| self.planned.entries.get(id) != Some(old))
+            {
+                return Err(JournalError::Invariant(
+                    "reserved original complete CREATE plan",
+                ));
+            }
+        } else {
+            let original =
+                self.baseline
+                    .entries
+                    .get(&entry.entry_id)
+                    .ok_or(JournalError::Invariant(
+                        "reserved replacement original entry absent",
+                    ))?;
+            if original.path != entry.path
+                || original.kind != sync_extend_core_model::EntryKind::File
+                || entry.kind != sync_extend_core_model::EntryKind::File
+                || original.content.is_none()
+                || original.content == entry.content
+                || self.planned.entries.len() != self.baseline.entries.len()
+                || self.baseline.entries.iter().any(|(id, old)| {
+                    id != &entry.entry_id && self.planned.entries.get(id) != Some(old)
+                })
+            {
+                return Err(JournalError::Invariant(
+                    "reserved original complete REPLACE plan",
+                ));
+            }
         }
         let mut vector = self.baseline.version_vector.clone();
         if operation.payload.causal != vector
@@ -253,6 +282,78 @@ impl Journal {
         future_path: &PortablePath,
         max: usize,
     ) -> Result<OriginalLocalHistoryReservation> {
+        self.reserve_original_local_history_version(
+            baseline,
+            planned,
+            operations,
+            timestamp,
+            observations,
+            future_path,
+            max,
+            1,
+        )
+    }
+
+    /// A replacement remains a distinct full-plan contract. Version-one CREATE
+    /// reservations and their historical validation are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_original_local_history_replacement(
+        &mut self,
+        baseline: &Manifest,
+        planned: &Manifest,
+        operations: &[Operation],
+        timestamp: u64,
+        observations: &RenameObservationMap,
+        future_path: &PortablePath,
+        max: usize,
+    ) -> Result<OriginalLocalHistoryReservation> {
+        self.reserve_original_local_history_version(
+            baseline,
+            planned,
+            operations,
+            timestamp,
+            observations,
+            future_path,
+            max,
+            2,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_original_local_history_native_create(
+        &mut self,
+        baseline: &Manifest,
+        planned: &Manifest,
+        operations: &[Operation],
+        timestamp: u64,
+        observations: &RenameObservationMap,
+        future_path: &PortablePath,
+        max: usize,
+    ) -> Result<OriginalLocalHistoryReservation> {
+        self.reserve_original_local_history_version(
+            baseline,
+            planned,
+            operations,
+            timestamp,
+            observations,
+            future_path,
+            max,
+            3,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_original_local_history_version(
+        &mut self,
+        baseline: &Manifest,
+        planned: &Manifest,
+        operations: &[Operation],
+        timestamp: u64,
+        observations: &RenameObservationMap,
+        future_path: &PortablePath,
+        max: usize,
+        version: u32,
+    ) -> Result<OriginalLocalHistoryReservation> {
         let _original_cas_coordination = self.acquire_cas_coordination()?;
         let bounds = self.writer_capacity_limits(max)?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -272,7 +373,7 @@ impl Journal {
             ));
         }
         let stored = Stored {
-            version: 1,
+            version,
             attempt: EntryId::random()?,
             baseline: baseline.clone(),
             planned: planned.clone(),
@@ -284,7 +385,12 @@ impl Journal {
             ),
             observations: observations.clone(),
             future_path: future_path.clone(),
-            native_footprint: OriginalNativeCreateFootprint::plan(planned, future_path)?,
+            native_footprint: OriginalNativeCreateFootprint::plan_native(
+                baseline,
+                planned,
+                future_path,
+                version,
+            )?,
         };
         stored.validate(max)?;
         let exact_json = serde_json::to_string(&stored)?;
@@ -487,6 +593,9 @@ pub(crate) fn verify_original_capacity_context(
             != stored.observations.scope.local_root_identity
         || prior_observations.scope.platform_epoch != stored.observations.scope.platform_epoch
         || prior_observations.entries.iter().any(|original| {
+            if stored.version == 2 && original.observed.path == stored.future_path {
+                return false;
+            }
             !stored
                 .observations
                 .entries
@@ -611,7 +720,9 @@ mod phases;
 #[cfg(target_os = "linux")]
 pub use phases::OriginalNativePhaseObservationReceipt;
 
+mod linux_terminal;
 mod phase_evidence;
+pub use linux_terminal::{OriginalLinuxCleanupPermit, OriginalLinuxNativeFinalDiagnostic};
 #[allow(unused_imports)]
 pub(crate) use phase_evidence::{
     validate_connection as validate_native_phase_connection,

@@ -8,6 +8,10 @@ use sync_extend_reconcile::LocalSpace;
 mod config_file;
 mod deployment;
 mod easytier;
+#[cfg(target_os = "linux")]
+mod linux_namespace;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod local_control;
 mod management;
 mod management_credentials;
 #[cfg(windows)]
@@ -33,12 +37,28 @@ struct Cli {
     /// Apply a local limits JSON file to this invocation (not a retention/GC policy).
     #[arg(long, global = true)]
     limits: Option<PathBuf>,
+    /// Enable same-owner local lifecycle control using an existing private directory.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[arg(long, global = true)]
+    control_directory: Option<PathBuf>,
+    /// Hold an explicitly preformatted private Linux image and five metadata classes.
+    #[cfg(target_os = "linux")]
+    #[arg(long, global = true)]
+    linux_namespace_config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Query or stop the running same-owner daemon through kernel-authenticated control.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    LocalControl {
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(value_enum)]
+        action: LocalControlAction,
+    },
     /// Enter the native Windows SCM dispatcher with an existing deployment identity.
     #[cfg(windows)]
     WindowsService {
@@ -716,6 +736,20 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Audit the retained original Linux Final and exact outside-intent cleanup state.
+    #[cfg(target_os = "linux")]
+    LinuxNativeFinals {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Remove only one committed transaction's exact outside intent under a fresh owner.
+    #[cfg(target_os = "linux")]
+    CleanupLinuxNative {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        transaction: String,
+    },
     /// Audit one bounded metadata snapshot; report implementation and certification gaps.
     Diagnostics {
         #[arg(long)]
@@ -1164,6 +1198,14 @@ enum Command {
     },
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LocalControlAction {
+    Status,
+    Stop,
+    WaitStopped,
+}
+
 #[derive(Subcommand)]
 enum PrepareAction {
     Replace {
@@ -1183,24 +1225,46 @@ fn print(value: &impl serde::Serialize) -> Result<(), Box<dyn std::error::Error>
 }
 
 fn main() -> ExitCode {
-    // Bounded scan/protocol futures exceed the default Windows main-thread stack
-    // in debug builds. Use the same explicit bound on both delivery platforms.
-    let runner = std::thread::Builder::new()
-        .name("syncd-main".into())
-        .stack_size(16 * 1024 * 1024)
-        .spawn(run_cli);
-    match runner {
-        Ok(runner) => runner.join().unwrap_or(ExitCode::FAILURE),
+    let parsed = Cli::parse();
+    #[cfg(target_os = "linux")]
+    let linux_owner = match linux_namespace::prepare(&parsed) {
+        Ok(owner) => owner,
         Err(error) => {
-            eprintln!("syncd: runtime thread failed: {error}");
-            ExitCode::FAILURE
+            eprintln!("syncd: Linux owner preparation failed: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    #[cfg(target_os = "linux")]
+    return run_cli(parsed, linux_owner);
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Bounded scan/protocol futures exceed the default Windows main-thread stack
+        // in debug builds. Use the same explicit bound on both delivery platforms.
+        let runner = std::thread::Builder::new()
+            .name("syncd-main".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                run_cli(
+                    parsed,
+                    #[cfg(target_os = "linux")]
+                    linux_owner,
+                )
+            });
+        match runner {
+            Ok(runner) => runner.join().unwrap_or(ExitCode::FAILURE),
+            Err(error) => {
+                eprintln!("syncd: runtime thread failed: {error}");
+                ExitCode::FAILURE
+            }
         }
     }
 }
 
 #[inline(never)]
-fn run_cli() -> ExitCode {
-    let parsed = Cli::parse();
+fn run_cli(
+    parsed: Cli,
+    #[cfg(target_os = "linux")] mut linux_owner: Option<linux_namespace::LinuxDaemonOwner>,
+) -> ExitCode {
     #[cfg(windows)]
     if let Command::WindowsService { name, config } = &parsed.command {
         let name = name.clone();
@@ -1230,14 +1294,49 @@ fn run_cli() -> ExitCode {
         Ok(prepared) => prepared,
         Err(error) => {
             eprintln!("syncd: deployment validation failed: {error}");
+            #[cfg(target_os = "linux")]
+            if let Some(owner) = linux_owner {
+                if let Err(terminal) = owner.finish() {
+                    eprintln!("syncd: Linux validation terminal refused: {terminal}");
+                }
+            }
             return ExitCode::FAILURE;
         }
     };
+    #[cfg(target_os = "linux")]
+    if let (Some(owner), Command::Publish { data_dir, source, path }) =
+        (linux_owner.as_mut(), &cli.command)
+    {
+        // No runtime/thread exists: open SQLite/CAS and retain the full native
+        // plan, then launch original PREPARED helpers immediately before ARM.
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            if cli.control_directory.is_some() {
+                return Err("local control requires an explicit foreground service command".into());
+            }
+            let limits = read_local_limits(cli.limits.as_deref())?;
+            print(&owner.publish_before_runtime(data_dir, source, PortablePath::new(path.clone())?, limits)?)?;
+            Ok(())
+        })();
+        let outcome = match result { Ok(()) => ExitCode::SUCCESS, Err(error) => {
+            eprintln!("syncd: {error}"); ExitCode::FAILURE
+        }};
+        if let Some(owner) = linux_owner {
+            if let Err(error) = owner.finish() {
+                eprintln!("syncd: Linux original owner terminal refused: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+        return outcome;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build();
-    match runtime {
-        Ok(runtime) => match runtime.block_on(Box::pin(execute(cli))) {
+    let outcome = match runtime {
+        Ok(runtime) => match runtime.block_on(Box::pin(execute(
+            cli,
+            #[cfg(target_os = "linux")]
+            linux_owner.as_ref(),
+        ))) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("syncd: {error}");
@@ -1248,7 +1347,15 @@ fn run_cli() -> ExitCode {
             eprintln!("syncd: runtime failed: {error}");
             ExitCode::FAILURE
         }
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(owner) = linux_owner {
+        if let Err(error) = owner.finish() {
+            eprintln!("syncd: Linux original owner terminal refused: {error}");
+            return ExitCode::FAILURE;
+        }
     }
+    outcome
 }
 
 fn read_tree_budgets(
@@ -1263,8 +1370,8 @@ fn read_tree_budgets(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let limits: sync_extend_core_model::limits::LocalLimits = if let Some(path) = cli.limits {
+fn read_local_limits(path: Option<&std::path::Path>) -> Result<sync_extend_core_model::limits::LocalLimits, Box<dyn std::error::Error>> {
+    let limits: sync_extend_core_model::limits::LocalLimits = if let Some(path) = path {
         let file = std::fs::File::open(path)?;
         let mut bytes = Vec::new();
         file.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
@@ -1276,8 +1383,61 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Default::default()
     };
     limits.validate()?;
-    let open = |data: &std::path::Path| LocalSpace::open(data)?.with_limits(limits.clone());
+    Ok(limits)
+}
+
+async fn execute(
+    cli: Cli,
+    #[cfg(target_os = "linux")] linux_owner: Option<&linux_namespace::LinuxDaemonOwner>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let limits = read_local_limits(cli.limits.as_deref())?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let _local_control = if let Some(directory) = cli.control_directory {
+        if !matches!(
+            &cli.command,
+            Command::Run { .. }
+                | Command::DeploymentRun { .. }
+                | Command::EasytierRun { .. }
+                | Command::ServeFiles { .. }
+                | Command::ServeMetadata { .. }
+                | Command::RunMetadata { .. }
+                | Command::ServeOperations { .. }
+                | Command::WebdavServe { .. }
+                | Command::StorageRun { .. }
+        ) {
+            return Err("local control requires an explicit foreground service command".into());
+        }
+        Some(local_control::LocalControl::start(&directory)?)
+    } else {
+        None
+    };
+    let open = |data: &std::path::Path| {
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = linux_owner {
+            return owner.open(data, limits.clone());
+        }
+        LocalSpace::open(data)?.with_limits(limits.clone())
+    };
     match cli.command {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        Command::LocalControl { directory, action } => {
+            let action = match action {
+                LocalControlAction::Status => {
+                    sync_extend_platform_fs::LocalControlOperation::Status
+                }
+                LocalControlAction::Stop => sync_extend_platform_fs::LocalControlOperation::Stop,
+                LocalControlAction::WaitStopped => {
+                    let owner = sync_extend_platform_fs::LocalControlListener::bind(&directory)?;
+                    drop(owner);
+                    print(&serde_json::json!({
+                        "control_owner_terminal":true,
+                        "stale_pid_adopted":false,
+                    }))?;
+                    return Ok(());
+                }
+            };
+            print(&local_control::request(&directory, action)?)?;
+        }
         #[cfg(windows)]
         Command::WindowsService { .. } => {
             return Err("SCM command must use native dispatcher".into())
@@ -2469,6 +2629,12 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::Init { data_dir, root } => {
+            #[cfg(target_os = "linux")]
+            if let Some(owner) = linux_owner {
+                let local = owner.initialize(&data_dir, &root, limits.clone())?;
+                print(&local.status()?)?;
+                return Ok(());
+            }
             let local = LocalSpace::initialize_with_limits(&data_dir, &root, limits.clone())?;
             print(&local.status()?)?;
         }
@@ -2477,6 +2643,22 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Status { data_dir } => {
             print(&open(&data_dir)?.status()?)?;
+        }
+        #[cfg(target_os = "linux")]
+        Command::LinuxNativeFinals { data_dir } => {
+            print(&open(&data_dir)?.original_linux_native_finals()?)?;
+        }
+        #[cfg(target_os = "linux")]
+        Command::CleanupLinuxNative {
+            data_dir,
+            transaction,
+        } => {
+            let owner =
+                linux_owner.ok_or("explicit acquired Linux owner configuration is required")?;
+            print(
+                &open(&data_dir)?
+                    .cleanup_original_linux_native(&owner.owner, &transaction.parse()?)?,
+            )?;
         }
         Command::Diagnostics { data_dir } => {
             print(&open(&data_dir)?.diagnostics()?)?;
@@ -2713,6 +2895,10 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             source,
             path,
         } => {
+            #[cfg(target_os = "linux")]
+            if linux_owner.is_some() {
+                return Err("explicit Linux Publish must complete on the original pre-runtime owner".into());
+            }
             print(&open(&data_dir)?.publish_file(&source, PortablePath::new(path)?)?)?;
         }
         Command::Restore {

@@ -41,7 +41,7 @@ fn field<'a>(row: &'a JournalStoredRow, name: &str) -> Result<&'a str> {
     }
 }
 
-fn validate(
+pub(super) fn validate(
     key: &str,
     json: &str,
     stored: &Stored,

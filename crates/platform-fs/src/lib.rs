@@ -8,6 +8,30 @@ pub use unix_noreplace::{
     UnixFileKey,
 };
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(unsafe_code)]
+mod local_control;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use local_control::{
+    request_local_control, LocalControlConnection, LocalControlListener, LocalControlOperation,
+    LocalControlResponse,
+};
+
+#[cfg(target_os = "linux")]
+pub use unix_noreplace::{
+    HeldPrivateDirectory, HeldPrivateOriginal, HeldPrivateVolume, LinuxCleanupAbsenceObservation,
+    LinuxMetadataBudget, LinuxMetadataFileReceipt, LinuxMetadataLimits, LinuxMetadataReceipt,
+    LinuxMetadataVfs, LinuxNamespaceCapability, LinuxNativeAttempt, LinuxOutsideCleanupBoundary,
+    OriginalCreateAllocationObservation, OriginalCreateVacatedObservation, OriginalOutsideIntent,
+    OriginalPairFrozenObservation, OriginalPrivateMountTopologyObservation,
+    OriginalPrivateVolumeFile, OriginalRetainedVolumeFile, OutsidePrivateIntentOwner,
+    PreparedOriginalPairFreeze,
+};
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+mod linux_write_lease;
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows;
@@ -95,4 +119,14 @@ pub use windows::FreshRecoveredMutationFile;
 pub use windows::{
     OriginalSqlitePayloadAllocation, OriginalSqlitePayloadAllocationBounds,
     OriginalSqlitePayloadAllocationFailure,
+};
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+mod linux_guardian;
+#[cfg(target_os = "linux")]
+pub use linux_guardian::{
+    take_inherited_descriptor, OriginalPairTerminalRelease, OutsideGuardian, OutsideHelperChild,
+    OutsideHelperExitObservation, OutsideHelperProgram, OutsideHelperSession,
+    OutsidePreparationGate, OutsidePreparationPair, OutsideSupervisor, ThawObservation,
 };

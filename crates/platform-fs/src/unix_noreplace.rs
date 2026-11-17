@@ -98,6 +98,10 @@ pub fn acquire_sidecar_owner(parent: &Path) -> io::Result<File> {
     Ok(directory.file)
 }
 
+pub(crate) fn open_control_directory(parent: &Path) -> io::Result<File> {
+    Ok(UnixDirectory::open(parent)?.file)
+}
+
 /// Retained real directory, with no symlinks followed at any component.
 /// Linux does not stop a native process from renaming this directory or its
 /// children; retaining a descriptor is not a namespace mutation lock.
@@ -456,3 +460,22 @@ pub fn probe_no_replace(parent: &Path) -> io::Result<NoReplaceProbeReport> {
     }
     Ok(report)
 }
+
+#[cfg(target_os = "linux")]
+mod held_volume;
+#[cfg(target_os = "linux")]
+mod linux_metadata;
+#[cfg(target_os = "linux")]
+pub use held_volume::{
+    HeldPrivateDirectory, HeldPrivateOriginal, HeldPrivateVolume, LinuxCleanupAbsenceObservation,
+    LinuxNamespaceCapability, LinuxNativeAttempt, LinuxOutsideCleanupBoundary,
+    OriginalCreateAllocationObservation, OriginalCreateVacatedObservation, OriginalOutsideIntent,
+    OriginalPairFrozenObservation, OriginalPrivateMountTopologyObservation,
+    OriginalPrivateVolumeFile, OriginalRetainedVolumeFile, OutsidePrivateIntentOwner,
+    PreparedOriginalPairFreeze,
+};
+#[cfg(target_os = "linux")]
+pub use linux_metadata::{
+    LinuxMetadataBudget, LinuxMetadataFileReceipt, LinuxMetadataLimits, LinuxMetadataReceipt,
+    LinuxMetadataVfs,
+};

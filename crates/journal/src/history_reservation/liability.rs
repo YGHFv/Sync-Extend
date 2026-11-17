@@ -119,6 +119,9 @@ pub(crate) fn validate_rows(rows: &[JournalStoredRow]) -> Result<TreeStorageChar
                 "original native liability exact baseline snapshot differs",
             ));
         }
+        if super::linux_terminal::cleaned_rows(rows, &stored.attempt)? {
+            continue;
+        }
         charge.rows = charge
             .rows
             .checked_add(stored.native_footprint.phase_record_count + 2)
@@ -190,6 +193,9 @@ pub(crate) fn legacy_charge(connection: &rusqlite::Connection) -> Result<TreeSto
                 "original native liability legacy baseline differs",
             ));
         }
+        if super::linux_terminal::cleaned_connection(connection, &stored.attempt)? {
+            continue;
+        }
         charge.rows = charge
             .rows
             .checked_add(stored.native_footprint.phase_record_count + 3)
@@ -235,6 +241,9 @@ pub(crate) fn protected_content(
     for row in rows {
         let (key, json) = row?;
         let (_, stored) = parse(&key, &json)?;
+        if super::linux_terminal::cleaned_connection(connection, &stored.attempt)? {
+            continue;
+        }
         for content in stored
             .planned
             .entries

@@ -111,6 +111,8 @@ pub enum ReceiveOutcome {
 
 pub struct Journal {
     connection: Connection,
+    #[cfg(target_os = "linux")]
+    linux_metadata_vfs: Option<sync_extend_platform_fs::LinuxMetadataVfs>,
     original_local_history_issuer: std::sync::Arc<()>,
     #[cfg(windows)]
     original_restored_image: Option<sync_extend_platform_fs::ReleasedOriginalFileIdentity>,
@@ -271,15 +273,95 @@ impl Journal {
                 Err(e) => return Err(e.into()),
             }
         }
+        #[cfg(target_os = "linux")]
+        {
+            // A persistent metadata-owner sidecar means this database belongs to
+            // the physically reserved Linux metadata set.  Opening it through
+            // ordinary SQLite would bypass the held-descriptor VFS (and could
+            // create WAL/SHM files outside the five leased originals), so the
+            // caller must use `open_with_linux_metadata_budget` instead.
+            let component = path
+                .file_name()
+                .ok_or(JournalError::Invariant("database component required"))?;
+            let mut owner_component = component.to_os_string();
+            owner_component.push(".metadata-owner");
+            let owner_path = path.with_file_name(owner_component);
+            match std::fs::symlink_metadata(&owner_path) {
+                Ok(_) => {
+                    return Err(JournalError::Invariant(
+                        "Linux metadata-owned database requires held VFS",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         let mut flags =
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
         if allow_create {
             flags |= rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
         }
-        let mut connection = Connection::open_with_flags(path, flags)?;
+        let connection = Connection::open_with_flags(path, flags)?;
         // Original main identity is checked before any SQLite configuration,
         // migration or schema/issuance installation can change the database.
         inspect(&connection)?;
+        Self::initialize_connection(
+            path,
+            max_storage_entries,
+            connection,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+    }
+
+    /// Open through the physically reserved original-descriptor file layer.
+    /// It refuses disk temp/attached DB files and retains every metadata identity.
+    #[cfg(target_os = "linux")]
+    pub fn open_with_linux_metadata_budget(
+        budget: &sync_extend_platform_fs::LinuxMetadataBudget,
+        max_storage_entries: usize,
+    ) -> Result<Self> {
+        storage_policy::validate(max_storage_entries)?;
+        budget.verify()?;
+        let vfs = budget.register_vfs()?;
+        let connection = Connection::open_with_flags_and_vfs(
+            budget.database_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+            vfs.name(),
+        )?;
+        connection.pragma_update(None, "temp_store", "MEMORY")?;
+        connection.pragma_update(None, "mmap_size", 0)?;
+        connection.pragma_update(None, "cache_size", -4096)?;
+        vfs.verify()?;
+        Self::initialize_connection(
+            budget.database_path(),
+            max_storage_entries,
+            connection,
+            Some(vfs),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn linux_metadata_receipt(
+        &self,
+    ) -> Result<Option<sync_extend_platform_fs::LinuxMetadataReceipt>> {
+        self.linux_metadata_vfs
+            .as_ref()
+            .map(|vfs| vfs.receipt())
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    fn initialize_connection(
+        path: &Path,
+        max_storage_entries: usize,
+        mut connection: Connection,
+        #[cfg(target_os = "linux")] linux_metadata_vfs: Option<
+            sync_extend_platform_fs::LinuxMetadataVfs,
+        >,
+    ) -> Result<Self> {
         // Retain DEV32's bounded bytecode cache after the original identity check.
         connection.set_prepared_statement_cache_capacity(256);
         connection.busy_timeout(Duration::from_secs(5))?;
@@ -745,6 +827,8 @@ impl Journal {
         let native_issuance = native_publication::issuance::register(&connection)?;
         Ok(Self {
             connection,
+            #[cfg(target_os = "linux")]
+            linux_metadata_vfs,
             original_local_history_issuer: std::sync::Arc::new(()),
             #[cfg(windows)]
             original_restored_image: None,
@@ -2972,6 +3056,7 @@ pub use history_reservation::{
     OriginalLocalHistoryReservation, OriginalNativeCreateFootprint, OriginalNativePhaseChain,
     OriginalReservedHistoryCommitReceipt,
 };
+pub use history_reservation::{OriginalLinuxCleanupPermit, OriginalLinuxNativeFinalDiagnostic};
 mod recovered_attempt_diagnostics;
 mod recovered_retention;
 #[cfg(windows)]

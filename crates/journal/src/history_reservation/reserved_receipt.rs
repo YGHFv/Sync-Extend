@@ -28,6 +28,14 @@ impl OriginalReservedHistoryCommitReceipt {
     pub fn native_phase_chain(&self) -> &super::OriginalNativePhaseChain {
         &self.native_phase_chain
     }
+    pub(super) fn verify_original_issuer(&self, issuer: &std::sync::Arc<()>) -> crate::Result<()> {
+        if !std::sync::Arc::ptr_eq(issuer, &self._original_issuer) {
+            return Err(crate::JournalError::Invariant(
+                "original reserved receipt belongs to another Journal",
+            ));
+        }
+        Ok(())
+    }
     pub fn original_attempt(&self) -> &EntryId {
         &self.attempt
     }

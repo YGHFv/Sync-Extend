@@ -19,3 +19,7 @@ unsafe_code = "deny"
 [lints.clippy]
 all = "warn"
 undocumented_unsafe_blocks = "deny"
+
+[[bin]]
+name = "linux-frozen-guardian3587"
+path = "src/bin/linux-frozen-guardian3587.rs"

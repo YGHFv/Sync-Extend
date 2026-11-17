@@ -1,11 +1,23 @@
 //! Process termination used by foreground, KSU and container lifecycle paths.
 use std::io;
 
+#[cfg(unix)]
+async fn local_control_requested() {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    while !super::local_control::STOP_REQUESTED.load(std::sync::atomic::Ordering::Acquire) {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    std::future::pending::<()>().await;
+}
+
 /// Resource readiness is separate from parsing configuration and constructing a runtime.
 pub fn ready() -> io::Result<()> {
     #[cfg(windows)]
     sync_extend_platform_fs::report_service_ready()?;
     super::management::resources_ready();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    super::local_control::READY.store(true, std::sync::atomic::Ordering::Release);
     Ok(())
 }
 
@@ -20,6 +32,7 @@ pub async fn requested() -> io::Result<()> {
                 signal.ok_or_else(|| io::Error::other("termination signal stream closed"))?;
                 Ok(())
             }
+            _ = local_control_requested() => Ok(()),
         }
     }
     #[cfg(windows)]

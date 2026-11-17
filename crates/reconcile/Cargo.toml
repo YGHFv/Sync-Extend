@@ -28,5 +28,8 @@ file-id = "0.2.3"
 windows-dpapi = "0.2.0"
 sync-extend-platform-fs = { path = "../platform-fs" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+sync-extend-platform-fs = { path = "../platform-fs" }
+
 [lints]
 workspace = true

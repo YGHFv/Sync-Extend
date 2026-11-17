@@ -74,6 +74,10 @@ pub fn prepare(cli: Cli) -> Result<(Cli, Option<super::management::ManagementGua
     Ok((
         Cli {
             limits: cli.limits,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            control_directory: cli.control_directory,
+            #[cfg(target_os = "linux")]
+            linux_namespace_config: cli.linux_namespace_config,
             command,
         },
         management,

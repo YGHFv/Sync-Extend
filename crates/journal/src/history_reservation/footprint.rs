@@ -25,6 +25,54 @@ pub struct OriginalNativeCreateFootprint {
 }
 
 impl OriginalNativeCreateFootprint {
+    pub(super) fn plan_native(
+        baseline: &Manifest,
+        manifest: &Manifest,
+        path: &PortablePath,
+        version: u32,
+    ) -> Result<Self> {
+        let mut footprint = Self::plan(manifest, path)?;
+        if matches!(version, 2 | 3) {
+            footprint.format_version = version;
+            footprint.phase_record_count = 14;
+            footprint.metadata_peak_bytes = INTENT_LIMIT
+                .checked_mul(4)
+                .and_then(|bytes| bytes.checked_add(RECORD_LIMIT * footprint.phase_record_count))
+                .ok_or(JournalError::Invariant(
+                    "daemon native terminal metadata peak overflow",
+                ))?;
+            footprint.native_peak_bytes = footprint
+                .metadata_peak_bytes
+                .checked_add(footprint.payload_bytes)
+                .ok_or(JournalError::Invariant(
+                    "daemon native terminal peak overflow",
+                ))?;
+            footprint.native_peak_entries = 2 + footprint.phase_record_count;
+        }
+        if version == 2 {
+            let prior = baseline
+                .entries
+                .values()
+                .find(|entry| entry.path == *path)
+                .and_then(|entry| entry.content.as_ref())
+                .ok_or(JournalError::Invariant(
+                    "replacement native footprint prior file absent",
+                ))?;
+            if prior.length > PAYLOAD_LIMIT {
+                return Err(JournalError::Invariant(
+                    "replacement retained original byte limit",
+                ));
+            }
+            footprint.native_peak_bytes = footprint
+                .native_peak_bytes
+                .checked_add(prior.length)
+                .ok_or(JournalError::Invariant("replacement native peak overflow"))?;
+            footprint.native_peak_entries += 2;
+        } else if !matches!(version, 1 | 3) {
+            return Err(JournalError::Invariant("original native footprint version"));
+        }
+        Ok(footprint)
+    }
     pub(super) fn plan(manifest: &Manifest, path: &PortablePath) -> Result<Self> {
         let entry = manifest
             .entries
@@ -68,7 +116,14 @@ impl OriginalNativeCreateFootprint {
     }
 
     pub(super) fn validate(&self, stored: &Stored) -> Result<()> {
-        if *self != Self::plan(&stored.planned, &stored.future_path)? {
+        if *self
+            != Self::plan_native(
+                &stored.baseline,
+                &stored.planned,
+                &stored.future_path,
+                stored.version,
+            )?
+        {
             return Err(JournalError::Invariant(
                 "original native footprint differs from full manifest",
             ));

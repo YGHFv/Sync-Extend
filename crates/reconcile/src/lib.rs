@@ -198,6 +198,31 @@ fn managed_cas(data_dir: &Path) -> Result<Cas> {
     )?)
 }
 
+#[cfg(target_os = "linux")]
+fn managed_cas_with_linux_metadata(
+    data_dir: &Path,
+    budget: &sync_extend_platform_fs::LinuxMetadataBudget,
+    max_storage_entries: usize,
+) -> Result<Cas> {
+    let access_journal = Journal::open_with_linux_metadata_budget(budget, max_storage_entries)?;
+    let session_journal = Journal::open_with_linux_metadata_budget(budget, max_storage_entries)?;
+    Ok(Cas::open_session_coordinated(
+        &data_dir.join("cas"),
+        move |id| {
+            access_journal
+                .acquire_cas_access(id)
+                .map(|guard| -> Box<dyn Send> { Box::new(guard) })
+                .map_err(|error| error.to_string())
+        },
+        move || {
+            session_journal
+                .acquire_cas_session()
+                .map(|guard| -> Box<dyn Send> { Box::new(SessionGuard { _guard: guard }) })
+                .map_err(|error| error.to_string())
+        },
+    )?)
+}
+
 struct SessionGuard {
     _guard: sync_extend_journal::CasAccessGuard,
 }
@@ -217,6 +242,10 @@ pub struct LocalSpace {
     journal: Journal,
     limits: LocalLimits,
     root_identity: filesystem::PathIdentity,
+    #[cfg(target_os = "linux")]
+    linux_namespace: Option<std::sync::Arc<sync_extend_platform_fs::LinuxNamespaceCapability>>,
+    #[cfg(target_os = "linux")]
+    linux_metadata: Option<std::sync::Arc<sync_extend_platform_fs::LinuxMetadataBudget>>,
     #[cfg(windows)]
     _lock: sync_extend_platform_fs::WriterOwner,
     #[cfg(not(windows))]
@@ -298,6 +327,52 @@ impl LocalSpace {
         worktree: &Path,
         limits: LocalLimits,
     ) -> Result<Self> {
+        Self::initialize_impl(
+            data_dir,
+            worktree,
+            limits,
+            #[cfg(target_os = "linux")]
+            None,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+    }
+
+    /// The normal LocalSpace planner/index/CAS uses the same physically reserved
+    /// metadata VFS and the acquired private mount throughout this invocation.
+    #[cfg(target_os = "linux")]
+    pub fn initialize_with_linux_namespace_metadata(
+        data_dir: &Path,
+        worktree: &Path,
+        limits: LocalLimits,
+        owner: std::sync::Arc<sync_extend_platform_fs::LinuxNamespaceCapability>,
+        budget: std::sync::Arc<sync_extend_platform_fs::LinuxMetadataBudget>,
+    ) -> Result<Self> {
+        owner.verify()?;
+        budget.validate_namespace_owner(&owner)?;
+        if budget.database_path() != data_dir.join("journal.sqlite") {
+            return Err(ReconcileError::Invariant(
+                "Linux metadata contract belongs to another LocalSpace",
+            ));
+        }
+        let relative = worktree.strip_prefix(owner.mount_path()).map_err(|_| {
+            ReconcileError::Invariant("Linux LocalSpace is outside its acquired private mount")
+        })?;
+        owner.volume().directory(relative)?.verify()?;
+        Self::initialize_impl(data_dir, worktree, limits, Some(owner), Some(budget))
+    }
+
+    fn initialize_impl(
+        data_dir: &Path,
+        worktree: &Path,
+        limits: LocalLimits,
+        #[cfg(target_os = "linux")] linux_namespace: Option<
+            std::sync::Arc<sync_extend_platform_fs::LinuxNamespaceCapability>,
+        >,
+        #[cfg(target_os = "linux")] linux_metadata: Option<
+            std::sync::Arc<sync_extend_platform_fs::LinuxMetadataBudget>,
+        >,
+    ) -> Result<Self> {
         limits.validate()?;
         check_ancestors(worktree)?;
         check_ancestors(data_dir)?;
@@ -310,6 +385,16 @@ impl LocalSpace {
         let data_dir = fs::canonicalize(data_dir)?;
         validate_roots(&data_dir, &worktree)?;
         let lock = acquire_lock(&data_dir)?;
+        #[cfg(target_os = "linux")]
+        let mut journal = if let Some(budget) = &linux_metadata {
+            Journal::open_with_linux_metadata_budget(budget, limits.max_storage_entries)?
+        } else {
+            Journal::open_with_storage_limit(
+                &data_dir.join("journal.sqlite"),
+                limits.max_storage_entries,
+            )?
+        };
+        #[cfg(not(target_os = "linux"))]
         let mut journal = Journal::open_with_storage_limit(
             &data_dir.join("journal.sqlite"),
             limits.max_storage_entries,
@@ -349,6 +434,13 @@ impl LocalSpace {
                 .to_str()
                 .ok_or(ReconcileError::Invariant("non-UTF8 root"))?,
         )?;
+        #[cfg(target_os = "linux")]
+        let cas = if let Some(budget) = &linux_metadata {
+            managed_cas_with_linux_metadata(&data_dir, budget, limits.max_storage_entries)?
+        } else {
+            managed_cas(&data_dir)?
+        };
+        #[cfg(not(target_os = "linux"))]
         let cas = managed_cas(&data_dir)?;
         let worktree_lock = acquire_lock(&marker_directory)?;
         let root_identity = filesystem::PathIdentity::capture(&worktree)?;
@@ -361,6 +453,10 @@ impl LocalSpace {
             journal,
             limits,
             root_identity,
+            #[cfg(target_os = "linux")]
+            linux_namespace,
+            #[cfg(target_os = "linux")]
+            linux_metadata,
             _lock: lock,
             _worktree_lock: worktree_lock,
         })
@@ -371,6 +467,45 @@ impl LocalSpace {
     }
 
     pub fn open_with_limits(data_dir: &Path, limits: LocalLimits) -> Result<Self> {
+        Self::open_impl(
+            data_dir,
+            limits,
+            #[cfg(target_os = "linux")]
+            None,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+    }
+
+    /// Reopen the five original reserved metadata inodes under a fresh acquired
+    /// owner. The budget has already reacquired every lease before SQLite opens.
+    #[cfg(target_os = "linux")]
+    pub fn open_with_linux_namespace_metadata(
+        data_dir: &Path,
+        limits: LocalLimits,
+        owner: std::sync::Arc<sync_extend_platform_fs::LinuxNamespaceCapability>,
+        budget: std::sync::Arc<sync_extend_platform_fs::LinuxMetadataBudget>,
+    ) -> Result<Self> {
+        owner.verify()?;
+        budget.validate_namespace_owner(&owner)?;
+        if budget.database_path() != data_dir.join("journal.sqlite") {
+            return Err(ReconcileError::Invariant(
+                "reopened Linux metadata belongs to another LocalSpace",
+            ));
+        }
+        Self::open_impl(data_dir, limits, Some(owner), Some(budget))
+    }
+
+    fn open_impl(
+        data_dir: &Path,
+        limits: LocalLimits,
+        #[cfg(target_os = "linux")] linux_namespace: Option<
+            std::sync::Arc<sync_extend_platform_fs::LinuxNamespaceCapability>,
+        >,
+        #[cfg(target_os = "linux")] linux_metadata: Option<
+            std::sync::Arc<sync_extend_platform_fs::LinuxMetadataBudget>,
+        >,
+    ) -> Result<Self> {
         limits.validate()?;
         check_ancestors(data_dir)?;
         let data_dir = fs::canonicalize(data_dir)?;
@@ -378,6 +513,16 @@ impl LocalSpace {
         if !data_dir.join("journal.sqlite").is_file() {
             return Err(ReconcileError::Invariant("space is not initialized"));
         }
+        #[cfg(target_os = "linux")]
+        let journal = if let Some(budget) = &linux_metadata {
+            Journal::open_with_linux_metadata_budget(budget, limits.max_storage_entries)?
+        } else {
+            Journal::open_with_storage_limit(
+                &data_dir.join("journal.sqlite"),
+                limits.max_storage_entries,
+            )?
+        };
+        #[cfg(not(target_os = "linux"))]
         let journal = Journal::open_with_storage_limit(
             &data_dir.join("journal.sqlite"),
             limits.max_storage_entries,
@@ -394,6 +539,20 @@ impl LocalSpace {
             return Err(ReconcileError::Invariant("device public key mismatch"));
         }
         validate_roots(&data_dir, &worktree)?;
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = &linux_namespace {
+            let relative = worktree.strip_prefix(owner.mount_path()).map_err(|_| {
+                ReconcileError::Invariant("reopened Linux worktree is outside its acquired mount")
+            })?;
+            owner.volume().directory(relative)?.verify()?;
+        }
+        #[cfg(target_os = "linux")]
+        let cas = if let Some(budget) = &linux_metadata {
+            managed_cas_with_linux_metadata(&data_dir, budget, limits.max_storage_entries)?
+        } else {
+            managed_cas(&data_dir)?
+        };
+        #[cfg(not(target_os = "linux"))]
         let cas = managed_cas(&data_dir)?;
         let worktree_lock = acquire_lock(&worktree.join(".sync-extend"))?;
         let root_identity = filesystem::PathIdentity::capture(&worktree)?;
@@ -406,6 +565,10 @@ impl LocalSpace {
             journal,
             limits,
             root_identity,
+            #[cfg(target_os = "linux")]
+            linux_namespace,
+            #[cfg(target_os = "linux")]
+            linux_metadata,
             _lock: lock,
             _worktree_lock: worktree_lock,
         };
@@ -422,6 +585,23 @@ impl LocalSpace {
     }
 
     fn verify_root(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = &self.linux_namespace {
+            owner.verify()?;
+            let relative = self
+                .worktree
+                .strip_prefix(owner.mount_path())
+                .map_err(|_| {
+                    ReconcileError::Invariant("Linux LocalSpace escaped its acquired mount")
+                })?;
+            owner.volume().directory(relative)?.verify()?;
+            self.linux_metadata
+                .as_ref()
+                .ok_or(ReconcileError::Invariant(
+                    "Linux LocalSpace metadata capability absent",
+                ))?
+                .verify()?;
+        }
         self.root_identity.verify(&self.worktree)?;
         check_ancestors(&self.worktree)?;
         let metadata = fs::symlink_metadata(&self.worktree)?;
@@ -459,6 +639,67 @@ impl LocalSpace {
         self.require_no_mutation()?;
         let second = self.stable_scan()?;
         self.commit_scan(&second, None)
+    }
+
+    fn original_local_history_operations(
+        &self,
+        previous: &Manifest,
+        manifest: &mut Manifest,
+        timestamp: u64,
+    ) -> Result<Vec<Operation>> {
+        let mut changes = Vec::new();
+        for entry in manifest.entries.values() {
+            match previous.entries.get(&entry.entry_id) {
+                None => changes.push(Change::Put {
+                    entry: entry.clone(),
+                }),
+                Some(old) => {
+                    if old.path != entry.path {
+                        changes.push(Change::Rename {
+                            entry_id: entry.entry_id.clone(),
+                            path: entry.path.clone(),
+                        });
+                    }
+                    if old.kind != entry.kind || old.content != entry.content {
+                        changes.push(Change::Put {
+                            entry: entry.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        for id in previous.entries.keys() {
+            if !manifest.entries.contains_key(id) {
+                changes.push(Change::Delete {
+                    entry_id: id.clone(),
+                });
+            }
+        }
+        let mut operations = Vec::new();
+        for change in changes {
+            let seq = manifest
+                .version_vector
+                .get(&self.device_id)
+                .checked_add(1)
+                .ok_or(ReconcileError::Invariant("sequence exhausted"))?;
+            let op = Operation::new(OperationPayload {
+                format_version: FORMAT_VERSION,
+                space_id: self.space_id.clone(),
+                origin_device_id: self.device_id.clone(),
+                origin_seq: seq,
+                causal: manifest.version_vector.clone(),
+                change,
+                created_at_ms: timestamp,
+            })?;
+            if let Change::Delete { entry_id } = &op.payload.change {
+                manifest
+                    .tombstones
+                    .insert(entry_id.clone(), op.op_id.clone());
+            }
+            manifest.version_vector.observe(self.device_id.clone(), seq);
+            operations.push(op);
+        }
+        Ok(operations)
     }
 
     fn commit_scan(
@@ -1619,3 +1860,15 @@ impl RecoveredLocalSpace {
         Ok(result)
     }
 }
+
+mod planned_local_scan;
+pub use planned_local_scan::PlannedLocalCreateHistory;
+
+#[cfg(target_os = "linux")]
+mod linux_native;
+#[cfg(target_os = "linux")]
+mod native_final_observation;
+#[cfg(target_os = "linux")]
+pub use native_final_observation::{
+    observe_original_linux_native_final, OriginalLinuxNativeFinalObservation,
+};
