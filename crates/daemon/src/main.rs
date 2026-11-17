@@ -10,6 +10,8 @@ mod deployment;
 mod easytier;
 mod management;
 mod management_credentials;
+#[cfg(windows)]
+mod recovery;
 mod shutdown;
 mod storage;
 mod storage_retirement_cli;
@@ -718,6 +720,15 @@ enum Command {
     Diagnostics {
         #[arg(long)]
         data_dir: PathBuf,
+    },
+    /// Verify an explicit recovered node archive, or perform one bounded
+    /// recovered-local mutation and emit an immutable next descriptor.
+    #[cfg(windows)]
+    RecoveredLocal {
+        #[arg(long)]
+        descriptor: PathBuf,
+        #[command(subcommand)]
+        action: recovery::Action,
     },
     /// Audit local storage and references without importing, recovering or deleting.
     StorageReport {
@@ -2469,6 +2480,10 @@ async fn execute(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Diagnostics { data_dir } => {
             print(&open(&data_dir)?.diagnostics()?)?;
+        }
+        #[cfg(windows)]
+        Command::RecoveredLocal { descriptor, action } => {
+            recovery::run(&descriptor, action)?;
         }
         Command::StorageReport { data_dir } => {
             print(&open(&data_dir)?.storage_report()?)?;

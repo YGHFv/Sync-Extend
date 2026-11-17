@@ -70,6 +70,10 @@ pub use node_write_transition::OriginalNodeWriteFrameClassification;
 
 mod config_mapping;
 pub use config_mapping::ExplicitOriginalConfigMapping;
+#[cfg(windows)]
+mod acl_mapping;
+#[cfg(windows)]
+pub use acl_mapping::{ExplicitAclMappingEvidence, ExplicitOriginalAclMapping};
 
 mod config_install;
 
@@ -95,5 +99,7 @@ pub use node_write_transition::FreshRecoveredNodeWalV2Session;
 #[cfg(windows)]
 pub use node_write_transition::RecoveredHistoryCloseClassification;
 
+#[cfg(windows)]
+pub use node_write_transition::RecoveredHistoryOperation;
 #[cfg(windows)]
 pub use node_write_transition::RecoveredLiveHistoryBinding;

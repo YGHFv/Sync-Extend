@@ -111,6 +111,7 @@ pub enum ReceiveOutcome {
 
 pub struct Journal {
     connection: Connection,
+    original_local_history_issuer: std::sync::Arc<()>,
     #[cfg(windows)]
     original_restored_image: Option<sync_extend_platform_fs::ReleasedOriginalFileIdentity>,
     #[cfg(windows)]
@@ -744,6 +745,7 @@ impl Journal {
         let native_issuance = native_publication::issuance::register(&connection)?;
         Ok(Self {
             connection,
+            original_local_history_issuer: std::sync::Arc::new(()),
             #[cfg(windows)]
             original_restored_image: None,
             #[cfg(windows)]
@@ -799,6 +801,17 @@ impl Journal {
     }
 
     pub fn state(&self, key: &str) -> Result<Option<String>> {
+        let _original_state_snapshot = if self.connection.is_autocommit() {
+            Some(Transaction::new_unchecked(
+                &self.connection,
+                rusqlite::TransactionBehavior::Deferred,
+            )?)
+        } else {
+            None
+        };
+        history_reservation::validate_cancellation_connection(&self.connection)?;
+        history_reservation::validate_native_liability_connection(&self.connection)?;
+        history_reservation::validate_native_phase_connection(&self.connection)?;
         self.read_view().state(key)
     }
 
@@ -1394,7 +1407,15 @@ impl Journal {
         let ids: Vec<String> = statement
             .query_map([], |r| r.get(0))?
             .collect::<std::result::Result<_, _>>()?;
-        ids.into_iter().map(|id| Ok(id.parse()?)).collect()
+        let mut protected = ids
+            .into_iter()
+            .map(|id| id.parse())
+            .collect::<sync_extend_core_model::Result<std::collections::BTreeSet<ContentId>>>()?;
+        protected.extend(history_reservation::original_reserved_content(
+            &self.connection,
+        )?);
+        protected.extend(recovered_retention::active_pins(&self.connection)?);
+        Ok(protected.into_iter().collect())
     }
 
     pub fn check_storage_metadata_limit(&self, max_entries: usize) -> Result<()> {
@@ -2263,6 +2284,7 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
         .try_fold(dav_future.logical_bytes, |sum, table| {
             storage_inventory::reader::add(sum, table.logical_bytes)
         })?;
+    let original_history = history_reservation::original_reservation_legacy_charge(connection)?;
     Ok((
         (rows as u64)
             .checked_add(actual_rows)
@@ -2272,6 +2294,7 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
             .and_then(|n| n.checked_add(replace_rows))
             .and_then(|n| n.checked_add(conflict_rows))
             .and_then(|n| n.checked_add(dav_rows))
+            .and_then(|n| n.checked_add(original_history.rows))
             .ok_or(JournalError::Invariant("native budget row overflow"))?,
         (bytes as u64)
             .checked_add(actual_bytes)
@@ -2281,6 +2304,7 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
             .and_then(|n| n.checked_add(replace_bytes))
             .and_then(|n| n.checked_add(conflict_bytes))
             .and_then(|n| n.checked_add(dav_bytes))
+            .and_then(|n| n.checked_add(original_history.logical_bytes))
             .ok_or(JournalError::Invariant("native budget byte overflow"))?,
     ))
 }
@@ -2708,8 +2732,8 @@ fn sql_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     sql_nonnegative(row.get::<_, i64>(index)?, index)
 }
 
-mod recovered_history_tables;
 mod backup_image;
+mod recovered_history_tables;
 #[cfg(windows)]
 pub use backup_image::CreatedJournalRestore;
 pub use backup_image::{JournalBackupImage, NodeInspectionBounds, PortableNodeImageScope};
@@ -2874,6 +2898,7 @@ impl Journal {
         let native_issuance = native_publication::issuance::register(&connection)?;
         Ok(Self {
             connection,
+            original_local_history_issuer: std::sync::Arc::new(()),
             #[cfg(windows)]
             original_restored_image: None,
             #[cfg(windows)]
@@ -2934,3 +2959,24 @@ pub use original_write_transition::RecoveredLocalHistoryPlan;
 
 #[cfg(windows)]
 pub use original_write_transition::RecoveredImmutableHistoryInventory;
+
+// The live Journal and immutable recovery images share these typed history parsers.
+mod local_history_receipt;
+pub use local_history_receipt::LocalHistoryCommitReceipt;
+mod capacity_preflight;
+mod history_reservation;
+#[cfg(target_os = "linux")]
+pub use history_reservation::OriginalNativePhaseObservationReceipt;
+pub use history_reservation::{
+    OriginalHistoryCancellationReceipt, OriginalLocalHistoryAttemptDiagnostic,
+    OriginalLocalHistoryReservation, OriginalNativeCreateFootprint, OriginalNativePhaseChain,
+    OriginalReservedHistoryCommitReceipt,
+};
+mod recovered_attempt_diagnostics;
+mod recovered_retention;
+#[cfg(windows)]
+pub use original_write_transition::{RecoveredMetadataOutcome, RecoveredRetentionPlan};
+pub use recovered_retention::{
+    RecoveredRetentionAudit, RecoveredRetentionMapping, RecoveredRetentionRelease,
+    MAX_RECOVERED_PINS,
+};

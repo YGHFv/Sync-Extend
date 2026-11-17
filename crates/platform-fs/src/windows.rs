@@ -508,7 +508,7 @@ pub use sqlite_original::{
 
 #[path = "current_user_file.rs"]
 mod current_user_file;
-pub use current_user_file::verify_current_user_private_file;
+pub use current_user_file::{capture_current_user_private_acl, verify_current_user_private_file};
 
 #[path = "fresh_native_sqlite.rs"]
 mod fresh_native_sqlite;
@@ -516,7 +516,7 @@ pub use fresh_native_sqlite::FreshNativeSqliteConnection;
 
 #[path = "fresh_native_wal.rs"]
 mod fresh_native_wal;
-pub use fresh_native_wal::FreshNativeWalConnection;
+pub use fresh_native_wal::{FreshNativeRetentionLease, FreshNativeWalConnection};
 
 pub use owned_file::FreshRecoveredMutationFile;
 

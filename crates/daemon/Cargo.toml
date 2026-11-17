@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 sync-extend-core-model = { path = "../core-model" }
 sync-extend-reconcile = { path = "../reconcile" }
+sync-extend-journal = { path = "../journal" }
 sync-extend-transport = { path = "../transport" }
 sync-extend-platform-fs = { path = "../platform-fs" }
 clap.workspace = true

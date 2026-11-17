@@ -335,7 +335,11 @@ unsafe extern "C" fn delete(
     let owner = unsafe { policy(vfs) };
     // SAFETY: SQLite supplies a terminated name valid for this callback.
     let name = unsafe { CStr::from_ptr(name) };
-    let index = match owner.names.iter().position(|expected| normalized(name)==normalized(expected)) {
+    let index = match owner
+        .names
+        .iter()
+        .position(|expected| normalized(name) == normalized(expected))
+    {
         Some(index @ (1 | 2)) => index,
         _ => {
             owner.poisoned.set(true);
@@ -387,6 +391,23 @@ pub struct FreshNativeWalConnection {
     path: std::path::PathBuf,
     attempted: bool,
 }
+
+/// A live, non-serializable issuer retains the original four native handles.
+/// Persisted file keys and readonly catalogues cannot construct this object.
+pub struct FreshNativeRetentionLease {
+    policy: Rc<Policy>,
+    keys: [FileKey; 4],
+    generation: u32,
+}
+
+impl FreshNativeRetentionLease {
+    pub fn native_keys(&self) -> [FileKey; 4] {
+        self.keys
+    }
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+}
 impl FreshNativeWalConnection {
     pub fn open(
         path: &std::path::Path,
@@ -401,7 +422,9 @@ impl FreshNativeWalConnection {
             || limits.iter().sum::<u64>() > 512 * 1024 * 1024
             || limits[3] != 1024 * 1024
         {
-            return Err(io::Error::other("fresh native WAL SQLite exact path/bounds"));
+            return Err(io::Error::other(
+                "fresh native WAL SQLite exact path/bounds",
+            ));
         }
         let text = path
             .to_str()
@@ -425,7 +448,9 @@ impl FreshNativeWalConnection {
             ))? || file.parent_key()? != files[0].parent_key()?
                 || file.exact_bytes(limits[index])?.len() as u64 > limits[index]
             {
-                return Err(io::Error::other("fresh native WAL SQLite current file differs"));
+                return Err(io::Error::other(
+                    "fresh native WAL SQLite current file differs",
+                ));
             }
         }
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -469,7 +494,9 @@ impl FreshNativeWalConnection {
         registration.xNextSystemCall = None;
         // SAFETY: owner below retains table/name/policy and does not change default VFS.
         if unsafe { ffi::sqlite3_vfs_register(&mut *registration, 0) } != ffi::SQLITE_OK {
-            return Err(io::Error::other("fresh native WAL SQLite registration failed"));
+            return Err(io::Error::other(
+                "fresh native WAL SQLite registration failed",
+            ));
         }
         let mut owner = Self {
             connection: None,
@@ -541,7 +568,7 @@ impl FreshNativeWalConnection {
         ] {
             connection
                 .set_limit(category, value)
-                .map_err(|error|io::Error::other(format!("first session limits: {error}")))?;
+                .map_err(|error| io::Error::other(format!("first session limits: {error}")))?;
         }
         let started = std::time::Instant::now();
         let mut remaining = 100_000_000u64;
@@ -556,33 +583,35 @@ impl FreshNativeWalConnection {
                     false
                 }),
             )
-            .map_err(|error|io::Error::other(format!("first session vmguard: {error}")))?;
+            .map_err(|error| io::Error::other(format!("first session vmguard: {error}")))?;
         connection
             .busy_timeout(std::time::Duration::ZERO)
-            .map_err(|error|io::Error::other(format!("first session busy: {error}")))?;
+            .map_err(|error| io::Error::other(format!("first session busy: {error}")))?;
         connection
             .pragma_update(None, "temp_store", "MEMORY")
-            .map_err(|error|io::Error::other(format!("first session tempstore: {error}")))?;
+            .map_err(|error| io::Error::other(format!("first session tempstore: {error}")))?;
         connection
             .pragma_update(None, "synchronous", "FULL")
-            .map_err(|error|io::Error::other(format!("first session synchronous: {error}")))?;
+            .map_err(|error| io::Error::other(format!("first session synchronous: {error}")))?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
-            .map_err(|error|io::Error::other(format!("first session journalmode: {error}")))?;
+            .map_err(|error| io::Error::other(format!("first session journalmode: {error}")))?;
         connection
             .pragma_update(None, "locking_mode", "NORMAL")
-            .map_err(|error|io::Error::other(format!("first session lockingmode: {error}")))?;
-        connection.pragma_update(None, "wal_autocheckpoint", 0).map_err(|error|io::Error::other(format!("first session autocheckpoint: {error}")))?;
+            .map_err(|error| io::Error::other(format!("first session lockingmode: {error}")))?;
+        connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .map_err(|error| io::Error::other(format!("first session autocheckpoint: {error}")))?;
         connection
             .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|error|io::Error::other(format!("first session begin: {error}")))?;
+            .map_err(|error| io::Error::other(format!("first session begin: {error}")))?;
         let result=connection.execute(
             "UPDATE main.local_state SET value=?1 WHERE key='original_recovery_session' AND value=?2",
             [fresh,expected]);
         match result {
             Ok(1) => connection
                 .execute_batch("COMMIT")
-                .map_err(|error|io::Error::other(format!("first session commit: {error}")))?,
+                .map_err(|error| io::Error::other(format!("first session commit: {error}")))?,
             result => {
                 let _ = connection.execute_batch("ROLLBACK");
                 self.policy.poisoned.set(true);
@@ -591,7 +620,10 @@ impl FreshNativeWalConnection {
                 )));
             }
         }
-        eprintln!("R03_DIAG commit_fresh_session autocommit={}", connection.is_autocommit());
+        eprintln!(
+            "R03_DIAG commit_fresh_session autocommit={}",
+            connection.is_autocommit()
+        );
         self.verify()
     }
 }
@@ -617,7 +649,7 @@ impl FreshNativeWalConnection {
             Ok(()) => {
                 self.policy.shm.borrow_mut().take();
                 self.verify_closed_native_objects()
-            },
+            }
             Err((connection, error)) => {
                 self.connection = Some(connection);
                 self.policy.poisoned.set(true);
@@ -627,7 +659,9 @@ impl FreshNativeWalConnection {
     }
     pub fn verify_closed_native_objects(&self) -> io::Result<()> {
         if self.connection.is_some() || self.policy.poisoned.get() {
-            return Err(io::Error::other("fresh native WAL actual close not confirmed"));
+            return Err(io::Error::other(
+                "fresh native WAL actual close not confirmed",
+            ));
         }
         for (index, file) in self.policy.files.iter().enumerate() {
             file.verify()?;
@@ -639,11 +673,11 @@ impl FreshNativeWalConnection {
                 return Err(io::Error::other("fresh closed native file slot changed"));
             }
         }
-        let rollback=self.policy.files[2].exact_bytes(self.policy.limits[2])?;
+        let rollback = self.policy.files[2].exact_bytes(self.policy.limits[2])?;
         if !self.policy.files[1]
             .exact_bytes(self.policy.limits[1])?
             .is_empty()
-            || (!rollback.is_empty() && rollback.get(..8)!=Some(&[0;8]))
+            || (!rollback.is_empty() && rollback.get(..8) != Some(&[0; 8]))
         {
             return Err(io::Error::other(
                 "fresh actual close nonhot sidecars required",
@@ -660,11 +694,15 @@ impl FreshNativeWalConnection {
 use std::os::windows::io::AsRawHandle;
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE},
-    Storage::FileSystem::{LockFileEx, UnlockFileEx, LOCKFILE_FAIL_IMMEDIATELY, LOCKFILE_EXCLUSIVE_LOCK},
+    Storage::FileSystem::{
+        LockFileEx, UnlockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    },
     System::{
+        Memory::{
+            CreateFileMappingW, FlushViewOfFile, MapViewOfFile, UnmapViewOfFile, FILE_MAP_WRITE,
+            MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
+        },
         IO::OVERLAPPED,
-        Memory::{CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FlushViewOfFile,
-            FILE_MAP_WRITE, PAGE_READWRITE, MEMORY_MAPPED_VIEW_ADDRESS},
     },
 };
 struct ShmMapping {
@@ -681,142 +719,269 @@ impl Drop for ShmMapping {
         }
     }
 }
-unsafe extern "C" fn shm_map(file: *mut ffi::sqlite3_file, page: i32, size: i32,
-    extend: i32, out: *mut *mut std::ffi::c_void) -> i32 {
-    if out.is_null() { return ffi::SQLITE_IOERR_SHMMAP; }
-    // SAFETY: SQLite provides one output pointer and initialized NativeIo.
-    unsafe { *out=ptr::null_mut(); }
-    // SAFETY: callback lifetime keeps Policy and all acquired objects live.
-    let (owner,index)=unsafe { state(file) };
-    if index!=0 || page<0 || size!=32768 || page>=32 || extend < 0
-        || owner.poisoned.get() || owner.files[3].verify().is_err() {
-        owner.poisoned.set(true);return ffi::SQLITE_IOERR_SHMMAP;
+unsafe extern "C" fn shm_map(
+    file: *mut ffi::sqlite3_file,
+    page: i32,
+    size: i32,
+    extend: i32,
+    out: *mut *mut std::ffi::c_void,
+) -> i32 {
+    if out.is_null() {
+        return ffi::SQLITE_IOERR_SHMMAP;
     }
-    let mut mapping=owner.shm.borrow_mut();
+    // SAFETY: SQLite provides one output pointer and initialized NativeIo.
+    unsafe {
+        *out = ptr::null_mut();
+    }
+    // SAFETY: callback lifetime keeps Policy and all acquired objects live.
+    let (owner, index) = unsafe { state(file) };
+    if index != 0
+        || page < 0
+        || size != 32768
+        || page >= 32
+        || extend < 0
+        || owner.poisoned.get()
+        || owner.files[3].verify().is_err()
+    {
+        owner.poisoned.set(true);
+        return ffi::SQLITE_IOERR_SHMMAP;
+    }
+    let mut mapping = owner.shm.borrow_mut();
     if mapping.is_none() {
-        let current=match owner.files[3].native_file().metadata() {
-            Ok(value)=>value.len(),Err(_)=>return ffi::SQLITE_IOERR_SHMSIZE,
+        let current = match owner.files[3].native_file().metadata() {
+            Ok(value) => value.len(),
+            Err(_) => return ffi::SQLITE_IOERR_SHMSIZE,
         };
-        if current==0 && extend==0 {return ffi::SQLITE_OK;}
-        if current>owner.limits[3] || (current<owner.limits[3] && extend==0) {
+        if current == 0 && extend == 0 {
+            return ffi::SQLITE_OK;
+        }
+        if current > owner.limits[3] || (current < owner.limits[3] && extend == 0) {
             return ffi::SQLITE_IOERR_SHMSIZE;
         }
-        if current<owner.limits[3] && owner.files[3].native_file().set_len(owner.limits[3]).is_err() {
-            owner.poisoned.set(true);return ffi::SQLITE_FULL;
+        if current < owner.limits[3]
+            && owner.files[3]
+                .native_file()
+                .set_len(owner.limits[3])
+                .is_err()
+        {
+            owner.poisoned.set(true);
+            return ffi::SQLITE_FULL;
         }
         // SAFETY: share0 acquired file remains held; mapping is unnamed and
         // bounded to this exact 1MiB object. No path resolution or reopen occurs.
-        let section=unsafe {CreateFileMappingW(owner.files[3].native_file().as_raw_handle() as HANDLE,
-            ptr::null(),PAGE_READWRITE,0,owner.limits[3] as u32,ptr::null())};
-        if section.is_null() {owner.poisoned.set(true);return ffi::SQLITE_IOERR_SHMMAP;}
+        let section = unsafe {
+            CreateFileMappingW(
+                owner.files[3].native_file().as_raw_handle() as HANDLE,
+                ptr::null(),
+                PAGE_READWRITE,
+                0,
+                owner.limits[3] as u32,
+                ptr::null(),
+            )
+        };
+        if section.is_null() {
+            owner.poisoned.set(true);
+            return ffi::SQLITE_IOERR_SHMMAP;
+        }
         // SAFETY: live bounded section; full view starts at aligned offset zero.
-        let view=unsafe {MapViewOfFile(section,FILE_MAP_WRITE,0,0,owner.limits[3] as usize)};
+        let view =
+            unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, owner.limits[3] as usize) };
         if view.Value.is_null() {
             // SAFETY: only successful CreateFileMapping transferred this handle.
-            unsafe {CloseHandle(section);}
-            owner.poisoned.set(true);return ffi::SQLITE_IOERR_SHMMAP;
+            unsafe {
+                CloseHandle(section);
+            }
+            owner.poisoned.set(true);
+            return ffi::SQLITE_IOERR_SHMMAP;
         }
-        *mapping=Some(ShmMapping{section,view});
+        *mapping = Some(ShmMapping { section, view });
     }
-    let Some(value)=mapping.as_ref() else {return ffi::SQLITE_IOERR_SHMMAP;};
+    let Some(value) = mapping.as_ref() else {
+        return ffi::SQLITE_IOERR_SHMMAP;
+    };
     // SAFETY: page is in 0..32, size fixed32768; pointer remains inside retained view.
-    unsafe {*out=value.view.Value.cast::<u8>().add(page as usize*32768).cast();}
+    unsafe {
+        *out = value
+            .view
+            .Value
+            .cast::<u8>()
+            .add(page as usize * 32768)
+            .cast();
+    }
     ffi::SQLITE_OK
 }
-unsafe extern "C" fn shm_lock(file: *mut ffi::sqlite3_file, offset:i32, count:i32, flags:i32)->i32 {
+unsafe extern "C" fn shm_lock(
+    file: *mut ffi::sqlite3_file,
+    offset: i32,
+    count: i32,
+    flags: i32,
+) -> i32 {
     // SAFETY: initialized SQLite callback, Policy retains native SHM file.
-    let (owner,index)=unsafe {state(file)};
-    let valid=flags==(ffi::SQLITE_SHM_LOCK|ffi::SQLITE_SHM_SHARED)
-        || flags==(ffi::SQLITE_SHM_LOCK|ffi::SQLITE_SHM_EXCLUSIVE)
-        || flags==(ffi::SQLITE_SHM_UNLOCK|ffi::SQLITE_SHM_SHARED)
-        || flags==(ffi::SQLITE_SHM_UNLOCK|ffi::SQLITE_SHM_EXCLUSIVE);
-    if index!=0 || offset<0 || count<1 || offset.checked_add(count).is_none_or(|n|n>8)
-        || !valid || owner.poisoned.get() || owner.files[3].verify().is_err() {
+    let (owner, index) = unsafe { state(file) };
+    let valid = flags == (ffi::SQLITE_SHM_LOCK | ffi::SQLITE_SHM_SHARED)
+        || flags == (ffi::SQLITE_SHM_LOCK | ffi::SQLITE_SHM_EXCLUSIVE)
+        || flags == (ffi::SQLITE_SHM_UNLOCK | ffi::SQLITE_SHM_SHARED)
+        || flags == (ffi::SQLITE_SHM_UNLOCK | ffi::SQLITE_SHM_EXCLUSIVE);
+    if index != 0
+        || offset < 0
+        || count < 1
+        || offset.checked_add(count).is_none_or(|n| n > 8)
+        || !valid
+        || owner.poisoned.get()
+        || owner.files[3].verify().is_err()
+    {
         return ffi::SQLITE_IOERR_SHMLOCK;
     }
-    let handle=owner.files[3].native_file().as_raw_handle() as HANDLE;
-    for slot in offset..offset+count {
-        let mut position=OVERLAPPED::default();
+    let handle = owner.files[3].native_file().as_raw_handle() as HANDLE;
+    for slot in offset..offset + count {
+        let mut position = OVERLAPPED::default();
         // SAFETY: this union field is the synchronous low byte offset.
-        position.Anonymous.Anonymous.Offset=120+slot as u32;
-        let bit=1u8<<slot;
+        position.Anonymous.Anonymous.Offset = 120 + slot as u32;
+        let bit = 1u8 << slot;
         if flags & ffi::SQLITE_SHM_LOCK != 0 {
-            if owner.shm_lock_bits.get() & bit != 0 {return ffi::SQLITE_IOERR_SHMLOCK;}
-            let options=LOCKFILE_FAIL_IMMEDIATELY |
-                if flags & ffi::SQLITE_SHM_EXCLUSIVE != 0 {LOCKFILE_EXCLUSIVE_LOCK}else{0};
-            // SAFETY: live exact handle, one byte, synchronous sized OVERLAPPED.
-            if unsafe {LockFileEx(handle,options,0,1,0,&mut position)}==0 {
-                owner.poisoned.set(true);return ffi::SQLITE_BUSY;
+            if owner.shm_lock_bits.get() & bit != 0 {
+                return ffi::SQLITE_IOERR_SHMLOCK;
             }
-            owner.shm_lock_bits.set(owner.shm_lock_bits.get()|bit);
+            let options = LOCKFILE_FAIL_IMMEDIATELY
+                | if flags & ffi::SQLITE_SHM_EXCLUSIVE != 0 {
+                    LOCKFILE_EXCLUSIVE_LOCK
+                } else {
+                    0
+                };
+            // SAFETY: live exact handle, one byte, synchronous sized OVERLAPPED.
+            if unsafe { LockFileEx(handle, options, 0, 1, 0, &mut position) } == 0 {
+                owner.poisoned.set(true);
+                return ffi::SQLITE_BUSY;
+            }
+            owner.shm_lock_bits.set(owner.shm_lock_bits.get() | bit);
         } else {
-            if owner.shm_lock_bits.get() & bit == 0 {return ffi::SQLITE_IOERR_SHMLOCK;}
+            if owner.shm_lock_bits.get() & bit == 0 {
+                return ffi::SQLITE_IOERR_SHMLOCK;
+            }
             // SAFETY: exact byte lock previously acquired on this same handle.
-            if unsafe {UnlockFileEx(handle,0,1,0,&mut position)}==0 {
-                owner.poisoned.set(true);return ffi::SQLITE_IOERR_SHMLOCK;
+            if unsafe { UnlockFileEx(handle, 0, 1, 0, &mut position) } == 0 {
+                owner.poisoned.set(true);
+                return ffi::SQLITE_IOERR_SHMLOCK;
             }
             owner.shm_lock_bits.set(owner.shm_lock_bits.get() & !bit);
         }
     }
     ffi::SQLITE_OK
 }
-unsafe extern "C" fn shm_barrier(_file:*mut ffi::sqlite3_file) {
+unsafe extern "C" fn shm_barrier(_file: *mut ffi::sqlite3_file) {
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }
-unsafe extern "C" fn shm_unmap(file:*mut ffi::sqlite3_file,_delete:i32)->i32 {
+unsafe extern "C" fn shm_unmap(file: *mut ffi::sqlite3_file, _delete: i32) -> i32 {
     // SAFETY: initialized main IO callback, actual mapping remains retained.
-    let (owner,index)=unsafe {state(file)};
-    if index!=0 || owner.files[3].verify().is_err() {return ffi::SQLITE_IOERR_SHMOPEN;}
-    if let Some(mapping)=owner.shm.borrow().as_ref() {
+    let (owner, index) = unsafe { state(file) };
+    if index != 0 || owner.files[3].verify().is_err() {
+        return ffi::SQLITE_IOERR_SHMOPEN;
+    }
+    if let Some(mapping) = owner.shm.borrow().as_ref() {
         // SAFETY: retained view covers exactly the bounded mapped file.
-        if unsafe {FlushViewOfFile(mapping.view.Value,owner.limits[3] as usize)}==0 {
-            owner.poisoned.set(true);return ffi::SQLITE_IOERR_FSYNC;
+        if unsafe { FlushViewOfFile(mapping.view.Value, owner.limits[3] as usize) } == 0 {
+            owner.poisoned.set(true);
+            return ffi::SQLITE_IOERR_FSYNC;
         }
     }
     ffi::SQLITE_OK
 }
 impl FreshNativeWalConnection {
-    pub fn checkpoint_wal(&mut self)->io::Result<()> {
+    /// Return counters from this same live SQLite connection.  A verification
+    /// cache must bind these counters in addition to exact native file bytes;
+    /// a stable main database hash alone does not prove that the live WAL
+    /// connection has not changed.
+    pub fn verification_change_counters(&self) -> io::Result<Option<(u64, u64)>> {
+        let connection = match self.connection.as_ref() {
+            Some(connection) => {
+                self.verify()?;
+                connection
+            }
+            None => {
+                self.verify_closed_native_objects()?;
+                return Ok(None);
+            }
+        };
+        let data_version: i64 = connection
+            .pragma_query_value(Some("main"), "data_version", |row| row.get(0))
+            .map_err(|error| io::Error::other(format!("native WAL data_version: {error}")))?;
+        let data_version = u64::try_from(data_version)
+            .map_err(|_| io::Error::other("native WAL data_version negative"))?;
+        Ok(Some((data_version, connection.total_changes())))
+    }
+
+    pub fn checkpoint_wal(&mut self) -> io::Result<()> {
         self.verify()?;
-        let row:(i64,i64,i64)=self.connection.as_ref()
-            .ok_or_else(||io::Error::other("actual WAL connection closed"))?
-            .query_row("PRAGMA main.wal_checkpoint(TRUNCATE)",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
-            .map_err(|error|io::Error::other(format!("native WAL checkpoint: {error}")))?;
-        if row.0!=0 || row.1!=row.2 || !self.policy.files[1].exact_bytes(self.policy.limits[1])?.is_empty() {
-            self.policy.poisoned.set(true);return Err(io::Error::other("actual WAL checkpoint incomplete"));
+        let row: (i64, i64, i64) = self
+            .connection
+            .as_ref()
+            .ok_or_else(|| io::Error::other("actual WAL connection closed"))?
+            .query_row("PRAGMA main.wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|error| io::Error::other(format!("native WAL checkpoint: {error}")))?;
+        if row.0 != 0
+            || row.1 != row.2
+            || !self.policy.files[1]
+                .exact_bytes(self.policy.limits[1])?
+                .is_empty()
+        {
+            self.policy.poisoned.set(true);
+            return Err(io::Error::other("actual WAL checkpoint incomplete"));
         }
         self.verify()
     }
-    pub fn exact_sidecar_bytes(&self,index:usize)->io::Result<Vec<u8>> {
-        self.verify()?;
-        if !(1..=3).contains(&index) {return Err(io::Error::other("actual WAL sidecar index"));}
+    pub fn exact_sidecar_bytes(&self, index: usize) -> io::Result<Vec<u8>> {
+        if !(1..=3).contains(&index) {
+            return Err(io::Error::other("actual WAL sidecar index"));
+        }
+        if self.connection.is_some() {
+            self.verify()?;
+        } else {
+            self.verify_closed_native_objects()?;
+        }
         self.policy.files[index].exact_bytes(self.policy.limits[index])
     }
-    pub fn shm_mapping_active(&self)->io::Result<bool> {
-        self.verify()?;Ok(self.policy.shm.borrow().is_some())
+    pub fn shm_mapping_active(&self) -> io::Result<bool> {
+        self.verify()?;
+        Ok(self.policy.shm.borrow().is_some())
     }
 }
 
 impl FreshNativeWalConnection {
     /// SQLite itself switches a checkpointed actual main to standalone format.
     /// No header bytes are fabricated or normalized by the caller.
-    pub fn checkpoint_to_standalone(&mut self)->io::Result<()> {
+    pub fn checkpoint_to_standalone(&mut self) -> io::Result<()> {
         self.checkpoint_wal()?;
-        let mode:String=self.connection.as_ref().ok_or_else(||io::Error::other("actual WAL closed"))?
-            .query_row("PRAGMA main.journal_mode=PERSIST",[],|row|row.get(0))
-            .map_err(|error|io::Error::other(format!("native standalone mode: {error}")))?;
+        let mode: String = self
+            .connection
+            .as_ref()
+            .ok_or_else(|| io::Error::other("actual WAL closed"))?
+            .query_row("PRAGMA main.journal_mode=PERSIST", [], |row| row.get(0))
+            .map_err(|error| io::Error::other(format!("native standalone mode: {error}")))?;
         if !mode.eq_ignore_ascii_case("persist")
-            || self.policy.files[0].exact_bytes(self.policy.limits[0])?.get(18..20)!=Some(&[1,1])
-            || !self.policy.files[1].exact_bytes(self.policy.limits[1])?.is_empty() {
+            || self.policy.files[0]
+                .exact_bytes(self.policy.limits[0])?
+                .get(18..20)
+                != Some(&[1, 1])
+            || !self.policy.files[1]
+                .exact_bytes(self.policy.limits[1])?
+                .is_empty()
+        {
             self.policy.poisoned.set(true);
-            return Err(io::Error::other("actual SQLite standalone checkpoint not confirmed"));
+            return Err(io::Error::other(
+                "actual SQLite standalone checkpoint not confirmed",
+            ));
         }
         // This budget belongs to the completed first session commit/checkpoint.
         // Leaving its elapsed wall clock attached would poison unrelated later
         // bounded history calls. Each history row/DML audit installs its own
         // original VM guard; remove this completed guard only after checkpoint.
-        self.connection.as_mut().ok_or_else(||io::Error::other("checkpoint connection closed"))?
-            .progress_handler(0,None::<fn()->bool>).map_err(io::Error::other)?;
+        self.connection
+            .as_mut()
+            .ok_or_else(|| io::Error::other("checkpoint connection closed"))?
+            .progress_handler(0, None::<fn() -> bool>)
+            .map_err(io::Error::other)?;
         self.verify()
     }
 }
@@ -826,93 +991,229 @@ impl FreshNativeWalConnection {
     /// admission, fresh exclusive native acquisition, and durable new intent.
     /// The SHM native identity is retained. This is a new recorded native effect.
     pub fn open_after_explicit_shm_epoch(
-        path:&std::path::Path,files:[FreshExclusiveSqliteFile;4],limits:[u64;4],
-        expected_shm:(&str,&[u8]),
-    )->io::Result<Self> {
-        if !path.is_absolute() || path.file_name().and_then(|n|n.to_str())!=Some("journal.sqlite")
-            || limits.iter().any(|n|!(512..=256*1024*1024).contains(n))
-            || limits.iter().sum::<u64>()>512*1024*1024 || limits[3]!=1024*1024 {
+        path: &std::path::Path,
+        files: [FreshExclusiveSqliteFile; 4],
+        limits: [u64; 4],
+        expected_shm: (&str, &[u8]),
+    ) -> io::Result<Self> {
+        if !path.is_absolute()
+            || path.file_name().and_then(|n| n.to_str()) != Some("journal.sqlite")
+            || limits
+                .iter()
+                .any(|n| !(512..=256 * 1024 * 1024).contains(n))
+            || limits.iter().sum::<u64>() > 512 * 1024 * 1024
+            || limits[3] != 1024 * 1024
+        {
             return Err(io::Error::other("new SHM epoch exact bounded path"));
         }
-        for (index,file) in files.iter().enumerate() {
+        for (index, file) in files.iter().enumerate() {
             file.verify()?;
-            let expected=path.with_file_name(["journal.sqlite","journal.sqlite-wal","journal.sqlite-journal","journal.sqlite-shm"][index]);
-            if !file.matches_path(&expected)? || file.parent_key()?!=files[0].parent_key()? {
+            let expected = path.with_file_name(
+                [
+                    "journal.sqlite",
+                    "journal.sqlite-wal",
+                    "journal.sqlite-journal",
+                    "journal.sqlite-shm",
+                ][index],
+            );
+            if !file.matches_path(&expected)? || file.parent_key()? != files[0].parent_key()? {
                 return Err(io::Error::other("new SHM epoch exact four native slots"));
             }
             file.exact_bytes(limits[index])?;
         }
-        if files[0].exact_bytes(limits[0])?.get(18..20)!=Some(&[1,1])
-            || !files[1].exact_bytes(limits[1])?.is_empty() {
-            return Err(io::Error::other("new SHM epoch requires independently standalone checkpoint"));
+        if files[0].exact_bytes(limits[0])?.get(18..20) != Some(&[1, 1])
+            || !files[1].exact_bytes(limits[1])?.is_empty()
+        {
+            return Err(io::Error::other(
+                "new SHM epoch requires independently standalone checkpoint",
+            ));
         }
-        let shm=&files[3];
-        if shm.key()?.to_string()!=expected_shm.0
-            || shm.exact_bytes(1024*1024)?!=expected_shm.1
-            || shm.native_file().metadata()?.len()!=1024*1024
+        let shm = &files[3];
+        if shm.key()?.to_string() != expected_shm.0
+            || shm.exact_bytes(1024 * 1024)? != expected_shm.1
+            || shm.native_file().metadata()?.len() != 1024 * 1024
             || !shm.matches_path(&path.with_file_name("journal.sqlite-shm"))?
-            || shm.parent_key()?!=files[0].parent_key()?
-            || limits[3]!=1024*1024 {
-            return Err(io::Error::other("new SHM epoch exact exclusive previous object required"));
+            || shm.parent_key()? != files[0].parent_key()?
+            || limits[3] != 1024 * 1024
+        {
+            return Err(io::Error::other(
+                "new SHM epoch exact exclusive previous object required",
+            ));
         }
-        let zero=[0u8;65536];
+        let zero = [0u8; 65536];
         for index in 0..16 {
-            let mut offset=0;
-            while offset<zero.len() {
-                let count=shm.native_file().seek_write(&zero[offset..],index*65536+offset as u64)?;
-                if count==0 {return Err(io::Error::other("new SHM epoch short native write"));}
-                offset+=count;
+            let mut offset = 0;
+            while offset < zero.len() {
+                let count = shm
+                    .native_file()
+                    .seek_write(&zero[offset..], index * 65536 + offset as u64)?;
+                if count == 0 {
+                    return Err(io::Error::other("new SHM epoch short native write"));
+                }
+                offset += count;
             }
         }
-        shm.native_file().sync_all()?;shm.verify()?;
-        if shm.exact_bytes(1024*1024)?.iter().any(|byte|*byte!=0) {
-            return Err(io::Error::other("new SHM epoch exact zero index confirmation"));
+        shm.native_file().sync_all()?;
+        shm.verify()?;
+        if shm.exact_bytes(1024 * 1024)?.iter().any(|byte| *byte != 0) {
+            return Err(io::Error::other(
+                "new SHM epoch exact zero index confirmation",
+            ));
         }
-        Self::open(path,files,limits)
+        Self::open(path, files, limits)
     }
 }
 
 impl FreshNativeWalConnection {
-    pub fn held_shm_bytes(&self)->io::Result<Vec<u8>> {
+    pub fn held_shm_bytes(&self) -> io::Result<Vec<u8>> {
         self.policy.files[3].verify()?;
-        self.policy.files[3].exact_bytes(1024*1024)
+        self.policy.files[3].exact_bytes(1024 * 1024)
     }
-    pub fn all_native_keys(&self)->io::Result<[FileKey;4]> {
-        self.policy.files.each_ref().map(|file|file.key()).into_iter().collect::<io::Result<Vec<_>>>()?.try_into().map_err(|_|io::Error::other("four held native keys"))
+    pub fn all_native_keys(&self) -> io::Result<[FileKey; 4]> {
+        self.policy
+            .files
+            .each_ref()
+            .map(|file| file.key())
+            .into_iter()
+            .collect::<io::Result<Vec<_>>>()?
+            .try_into()
+            .map_err(|_| io::Error::other("four held native keys"))
     }
 }
 
-
 impl FreshNativeWalConnection {
+    pub fn issue_retention_lease(&self, generation: u32) -> io::Result<FreshNativeRetentionLease> {
+        self.verify()?;
+        if !self.attempted || self.connection.is_none() || generation >= 64 {
+            return Err(io::Error::other(
+                "retention requires a committed live native session",
+            ));
+        }
+        Ok(FreshNativeRetentionLease {
+            policy: Rc::clone(&self.policy),
+            keys: self.all_native_keys()?,
+            generation,
+        })
+    }
+
+    pub fn verify_retention_lease(&self, lease: &FreshNativeRetentionLease) -> io::Result<()> {
+        self.verify()?;
+        if !self.attempted
+            || self.connection.is_none()
+            || !Rc::ptr_eq(&self.policy, &lease.policy)
+            || self.all_native_keys()? != lease.keys
+        {
+            return Err(io::Error::other(
+                "retention issuer is not this live native owner",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Only the fresh metadata adapter can widen the ordinary-history DML
+    /// family. All complete before/after rows are compared in BEGIN IMMEDIATE.
+    pub fn execute_retention_metadata(
+        &mut self,
+        lease: &FreshNativeRetentionLease,
+        statements: &[super::OriginalSqliteStatement],
+        queries: &[super::OriginalSqliteQuery],
+        before: &[super::OriginalSqliteRows],
+        after: &[super::OriginalSqliteRows],
+        budget: super::OriginalSqliteReadBudget,
+        gc_mark: bool,
+    ) -> io::Result<()> {
+        self.verify_retention_lease(lease)?;
+        if statements.len() > 1024
+            || statements
+                .iter()
+                .try_fold(0usize, |n, s| {
+                    n.checked_add(
+                        s.sql.len()
+                            + s.parameters
+                                .iter()
+                                .map(|v| match v {
+                                    super::OriginalSqliteValue::Text(v) => v.len(),
+                                    super::OriginalSqliteValue::Blob(v) => v.len(),
+                                    _ => 8,
+                                })
+                                .sum::<usize>(),
+                    )
+                })
+                .is_none_or(|n| n > 1024 * 1024)
+        {
+            return Err(io::Error::other(
+                "retention complete metadata transition budget",
+            ));
+        }
+        let connection = self
+            .connection
+            .as_ref()
+            .ok_or_else(|| io::Error::other("retention connection closed"))?;
+        let result = super::sqlite_original::execute_fresh_retention_metadata(
+            connection, statements, queries, before, after, budget, gc_mark,
+        );
+        if result.is_err() {
+            self.policy.poisoned.set(true);
+        }
+        result?;
+        self.checkpoint_to_standalone()?;
+        self.verify_retention_lease(lease)
+    }
+
     /// Exact whole-row transition; private native connection never escapes.
     pub fn execute_planned_history(
-        &mut self,statements:&[super::OriginalSqliteStatement],
-        queries:&[super::OriginalSqliteQuery],before:&[super::OriginalSqliteRows],
-        after:&[super::OriginalSqliteRows],budget:super::OriginalSqliteReadBudget,
-    )->io::Result<()> {
+        &mut self,
+        statements: &[super::OriginalSqliteStatement],
+        queries: &[super::OriginalSqliteQuery],
+        before: &[super::OriginalSqliteRows],
+        after: &[super::OriginalSqliteRows],
+        budget: super::OriginalSqliteReadBudget,
+    ) -> io::Result<()> {
         self.verify()?;
-        if !self.attempted {return Err(io::Error::other("fresh history committed session required"));}
-        let size=statements.iter().try_fold(0u64,|sum,row| {
-            if row.sql.is_empty() || row.sql.len()>65536 || row.parameters.len()>1024 || row.sql.contains('\0') {
+        if !self.attempted {
+            return Err(io::Error::other("fresh history committed session required"));
+        }
+        let size = statements.iter().try_fold(0u64, |sum, row| {
+            if row.sql.is_empty()
+                || row.sql.len() > 65536
+                || row.parameters.len() > 1024
+                || row.sql.contains('\0')
+            {
                 return Err(io::Error::other("fresh history bounded SQL"));
             }
-            row.parameters.iter().try_fold(sum+row.sql.len() as u64,|sum,value| {
-                let size=match value {
-                    super::OriginalSqliteValue::Null=>0,
-                    super::OriginalSqliteValue::Integer(_)|super::OriginalSqliteValue::Real(_)=>8,
-                    super::OriginalSqliteValue::Text(s)=>s.len(),
-                    super::OriginalSqliteValue::Blob(b)=>b.len(),
-                };
-                sum.checked_add(size as u64).ok_or_else(||io::Error::other("fresh history SQL aggregate"))
-            })
+            row.parameters
+                .iter()
+                .try_fold(sum + row.sql.len() as u64, |sum, value| {
+                    let size = match value {
+                        super::OriginalSqliteValue::Null => 0,
+                        super::OriginalSqliteValue::Integer(_)
+                        | super::OriginalSqliteValue::Real(_) => 8,
+                        super::OriginalSqliteValue::Text(s) => s.len(),
+                        super::OriginalSqliteValue::Blob(b) => b.len(),
+                    };
+                    sum.checked_add(size as u64)
+                        .ok_or_else(|| io::Error::other("fresh history SQL aggregate"))
+                })
         })?;
-        if size>1024*1024 {return Err(io::Error::other("fresh history encoded transition budget"));}
-        let connection=self.connection.as_ref().ok_or_else(||io::Error::other("fresh history connection closed"))?;
-        eprintln!("R03_DIAG execute_planned_history before helper autocommit={}", connection.is_autocommit());
+        if size > 1024 * 1024 {
+            return Err(io::Error::other("fresh history encoded transition budget"));
+        }
+        let connection = self
+            .connection
+            .as_ref()
+            .ok_or_else(|| io::Error::other("fresh history connection closed"))?;
+        eprintln!(
+            "R03_DIAG execute_planned_history before helper autocommit={}",
+            connection.is_autocommit()
+        );
         // Existing private VFS already retains all native objects and denies
         // namespace deletion; the original authorizer restricts every DML family.
-        let result=super::sqlite_original::execute_fresh_planned_history(connection,statements,queries,before,after,budget);
-        if result.is_err() {self.policy.poisoned.set(true);}
+        let result = super::sqlite_original::execute_fresh_planned_history(
+            connection, statements, queries, before, after, budget,
+        );
+        if result.is_err() {
+            self.policy.poisoned.set(true);
+        }
         result?;
         self.checkpoint_to_standalone()?;
         self.verify()

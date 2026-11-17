@@ -46,6 +46,12 @@ impl VerifiedNodeStateArchive {
     pub fn bytes(&self) -> &[u8] {
         self.archive.bytes()
     }
+
+    pub(crate) fn journal_bytes(&self) -> Result<&[u8]> {
+        self.archive
+            .section(&ArchiveRole::Journal)
+            .ok_or(ReconcileError::Invariant("node Journal image absent"))
+    }
 }
 
 impl FramedNodeArchive {

@@ -76,11 +76,15 @@ pub use windows::{
 };
 
 #[cfg(windows)]
+pub use windows::capture_current_user_private_acl;
+#[cfg(windows)]
 pub use windows::verify_current_user_private_file;
 
 #[cfg(windows)]
 pub use windows::FreshNativeSqliteConnection;
 
+#[cfg(windows)]
+pub use windows::FreshNativeRetentionLease;
 #[cfg(windows)]
 pub use windows::FreshNativeWalConnection;
 

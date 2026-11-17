@@ -261,7 +261,8 @@ fn create_new_child_security(
         NewChildKind::RenameDestination => (
             GENERIC_READ | DELETE | SYNCHRONIZE,
             FILE_SHARE_READ | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE,
-            FILE_DIRECTORY_FILE,true,
+            FILE_DIRECTORY_FILE,
+            true,
         ),
         NewChildKind::RetainedMutationDirectory => (
             GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
@@ -436,7 +437,7 @@ impl LockedDirectory {
 impl LockedDirectory {
     /// Explicit new namespace destination keeps the original CREATE and DELETE
     /// sharing exclusion; relative native rename requires namespace WRITE sharing.
-    pub fn create_new_rename_destination(&self,name:&str)->io::Result<LockedDirectoryMutation>{
-        create_new_directory_child(&self.file,name,NewChildKind::RenameDestination)
+    pub fn create_new_rename_destination(&self, name: &str) -> io::Result<LockedDirectoryMutation> {
+        create_new_directory_child(&self.file, name, NewChildKind::RenameDestination)
     }
 }

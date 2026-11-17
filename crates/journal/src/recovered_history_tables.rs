@@ -105,12 +105,15 @@ impl JournalBackupImage {
             )?;
             let (history_tables, stored_rows, stored_logical_bytes) =
                 summarize_original_tables(&audit.rows, bounds, false)?;
-            let tables: Vec<_> = history_tables.into_iter().map(|table| RecoveredMainTable {
-                table: table.table,
-                stored_rows: table.retained_rows,
-                stored_logical_bytes: table.retained_logical_bytes,
-                original_rows_digest: table.original_rows_digest,
-            }).collect();
+            let tables: Vec<_> = history_tables
+                .into_iter()
+                .map(|table| RecoveredMainTable {
+                    table: table.table,
+                    stored_rows: table.retained_rows,
+                    stored_logical_bytes: table.retained_logical_bytes,
+                    original_rows_digest: table.original_rows_digest,
+                })
+                .collect();
             let encoded = serde_json::to_vec(&tables)?;
             if encoded.len() as u64 > bounds.capacity.max_logical_bytes {
                 return Err(JournalError::Invariant(
@@ -139,66 +142,72 @@ fn summarize_original_tables(
     bounds: NodeInspectionBounds,
     exclude_runtime: bool,
 ) -> Result<(Vec<RecoveredHistoryTable>, u64, u64)> {
-let mut catalog = BTreeMap::new();
-for spec in crate::storage_inventory::tables() {
-    if exclude_runtime && matches!(
-        spec.name,
-        "local_state" | "current_manifests" | "receive_cursors"
-    ) {
-        continue;
+    let mut catalog = BTreeMap::new();
+    for spec in crate::storage_inventory::tables() {
+        if exclude_runtime
+            && matches!(
+                spec.name,
+                "local_state" | "current_manifests" | "receive_cursors"
+            )
+        {
+            continue;
+        }
+        let mut digest = blake3::Hasher::new();
+        digest.update(b"sync-extend.recovered-history-table.v1");
+        digest.update(&(spec.name.len() as u64).to_le_bytes());
+        digest.update(spec.name.as_bytes());
+        if catalog.insert(spec.name, (0u64, 0u64, digest)).is_some() {
+            return Err(JournalError::Invariant(
+                "recovered table original catalog duplicate",
+            ));
+        }
     }
-    let mut digest = blake3::Hasher::new();
-    digest.update(b"sync-extend.recovered-history-table.v1");
-    digest.update(&(spec.name.len() as u64).to_le_bytes());
-    digest.update(spec.name.as_bytes());
-    if catalog.insert(spec.name, (0u64, 0u64, digest)).is_some() {
-        return Err(JournalError::Invariant(
-            "recovered table original catalog duplicate",
-        ));
-    }
-}
-let mut retained_rows = 0u64;
-let mut retained_logical_bytes = 0u64;
-for row in rows {
-    if exclude_runtime && matches!(
-        row.table(),
-        "local_state" | "current_manifests" | "receive_cursors"
-    ) {
-        continue;
-    }
-    let (count, bytes, digest) = catalog.get_mut(row.table()).ok_or(
-        JournalError::Invariant("recovered table original catalog row absent"),
-    )?;
-    retained_rows = retained_rows
-        .checked_add(1)
-        .filter(|count| *count <= bounds.capacity.max_rows)
-        .ok_or(JournalError::Invariant(
-            "recovered table original total row bound",
+    let mut retained_rows = 0u64;
+    let mut retained_logical_bytes = 0u64;
+    for row in rows {
+        if exclude_runtime
+            && matches!(
+                row.table(),
+                "local_state" | "current_manifests" | "receive_cursors"
+            )
+        {
+            continue;
+        }
+        let (count, bytes, digest) = catalog.get_mut(row.table()).ok_or(
+            JournalError::Invariant("recovered table original catalog row absent"),
+        )?;
+        retained_rows = retained_rows
+            .checked_add(1)
+            .filter(|count| *count <= bounds.capacity.max_rows)
+            .ok_or(JournalError::Invariant(
+                "recovered table original total row bound",
+            ))?;
+        retained_logical_bytes = retained_logical_bytes
+            .checked_add(row.logical_bytes())
+            .filter(|bytes| *bytes <= bounds.capacity.max_logical_bytes)
+            .ok_or(JournalError::Invariant(
+                "recovered table original total byte bound",
+            ))?;
+        *count = count.checked_add(1).ok_or(JournalError::Invariant(
+            "recovered table original table row overflow",
         ))?;
-    retained_logical_bytes = retained_logical_bytes
-        .checked_add(row.logical_bytes())
-        .filter(|bytes| *bytes <= bounds.capacity.max_logical_bytes)
-        .ok_or(JournalError::Invariant(
-            "recovered table original total byte bound",
-        ))?;
-    *count = count.checked_add(1).ok_or(JournalError::Invariant(
-        "recovered table original table row overflow",
-    ))?;
-    *bytes = bytes.checked_add(row.logical_bytes()).ok_or(
-        JournalError::Invariant("recovered table original table byte overflow"),
-    )?;
-    // The original audit fingerprint includes table, exact primary
-    // key and typed column values. Values are not emitted here.
-    digest.update(row.fingerprint().as_str().as_bytes());
-}
-let tables: Vec<_> = catalog
-    .into_iter()
-    .map(|(table, (count, bytes, digest))| RecoveredHistoryTable {
-        table: table.into(),
-        retained_rows: count,
-        retained_logical_bytes: bytes,
-        original_rows_digest: ContentId::from_hasher(&digest),
-    })
-    .collect();
+        *bytes = bytes
+            .checked_add(row.logical_bytes())
+            .ok_or(JournalError::Invariant(
+                "recovered table original table byte overflow",
+            ))?;
+        // The original audit fingerprint includes table, exact primary
+        // key and typed column values. Values are not emitted here.
+        digest.update(row.fingerprint().as_str().as_bytes());
+    }
+    let tables: Vec<_> = catalog
+        .into_iter()
+        .map(|(table, (count, bytes, digest))| RecoveredHistoryTable {
+            table: table.into(),
+            retained_rows: count,
+            retained_logical_bytes: bytes,
+            original_rows_digest: ContentId::from_hasher(&digest),
+        })
+        .collect();
     Ok((tables, retained_rows, retained_logical_bytes))
 }

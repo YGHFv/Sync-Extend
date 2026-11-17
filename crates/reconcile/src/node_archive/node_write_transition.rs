@@ -1674,17 +1674,26 @@ impl super::VerifiedNodeStateArchive {
                         && path == data
                         && matches!(
                             name.as_str(),
-                            "journal.sqlite" | "journal.sqlite-wal" | "journal.sqlite-journal" | "journal.sqlite-shm"
+                            "journal.sqlite"
+                                | "journal.sqlite-wal"
+                                | "journal.sqlite-journal"
+                                | "journal.sqlite-shm"
                         ) {
                         RecoveredFileProtection::Sqlite(
                             held.reacquire_existing_sqlite_exclusive_file(&name)?,
                         )
                     } else if path.starts_with(worktree)
                         && !path.starts_with(worktree.join(".sync-extend"))
-                        && fresh_evidence.and_then(|e|e.history_admission.as_ref()).is_some_and(|a|a.mutation_requested) {
-                        RecoveredFileProtection::Mutation(held.reacquire_existing_node_mutation_file(&name)?)
+                        && fresh_evidence
+                            .and_then(|e| e.history_admission.as_ref())
+                            .is_some_and(|a| a.mutation_requested)
+                    {
+                        RecoveredFileProtection::Mutation(
+                            held.reacquire_existing_node_mutation_file(&name)?,
+                        )
                     } else {
-                        let file: ReacquiredNodeFile=held.reacquire_existing_node_read_file(&name)?;
+                        let file: ReacquiredNodeFile =
+                            held.reacquire_existing_node_read_file(&name)?;
                         RecoveredFileProtection::Read(file)
                     };
                     aggregate_bytes = aggregate_bytes
@@ -1734,19 +1743,28 @@ impl super::VerifiedNodeStateArchive {
             || Some(wal.file.key()?.to_string()) != closed.wal
             || Some(rollback.file.key()?.to_string()) != closed.rollback
             || wal.bytes != 0
-            || (rollback.bytes != 0 && rollback.file.exact_bytes(rollback.bytes)?.get(..8) != Some(&[0;8]))
+            || (rollback.bytes != 0
+                && rollback.file.exact_bytes(rollback.bytes)?.get(..8) != Some(&[0; 8]))
             || files
                 .iter()
-                .any(|file| file.path == data.join("journal.sqlite-shm")) && fresh_evidence.is_none_or(|e|e.wal_shm.is_none())
+                .any(|file| file.path == data.join("journal.sqlite-shm"))
+                && fresh_evidence.is_none_or(|e| e.wal_shm.is_none())
         {
             return Err(ReconcileError::Invariant(
                 "recovery exact main and nonhot sidecar scope required",
             ));
         }
-        if let Some((expected_key,expected_digest))=fresh_evidence.and_then(|e|e.wal_shm.as_ref()) {
-            let shm=files.iter().find(|f|f.path==data.join("journal.sqlite-shm"))
+        if let Some((expected_key, expected_digest)) =
+            fresh_evidence.and_then(|e| e.wal_shm.as_ref())
+        {
+            let shm = files
+                .iter()
+                .find(|f| f.path == data.join("journal.sqlite-shm"))
                 .ok_or(ReconcileError::Invariant("WAL2 held SHM absent"))?;
-            if shm.file.key()?.to_string()!=*expected_key || shm.digest!=*expected_digest || shm.bytes!=1024*1024 {
+            if shm.file.key()?.to_string() != *expected_key
+                || shm.digest != *expected_digest
+                || shm.bytes != 1024 * 1024
+            {
                 return Err(ReconcileError::Invariant("WAL2 exact SHM key bytes"));
             }
         }
@@ -1774,14 +1792,18 @@ impl super::VerifiedNodeStateArchive {
                 && evidence.keys == keys
                 && evidence.rows == rows
                 && evidence.main == ContentId::hash(&bytes)
-                && if let Some(admission)=&evidence.history_admission {
-                    Some(admission.original_rows.clone())==closed.actual_rows
-                        && admission.final_rows==rows
-                        && admission.final_root==manifest_root_from_recovered_image(&image,self.space(),bounds)?
+                && if let Some(admission) = &evidence.history_admission {
+                    Some(admission.original_rows.clone()) == closed.actual_rows
+                        && admission.final_rows == rows
+                        && admission.final_root
+                            == manifest_root_from_recovered_image(&image, self.space(), bounds)?
                 } else {
                     Some(image.recovered_session_preserved_rows_digest(
-                        self.space(),bounds,&scope.session,&evidence.fresh,
-                    )?)==closed.actual_rows
+                        self.space(),
+                        bounds,
+                        &scope.session,
+                        &evidence.fresh,
+                    )?) == closed.actual_rows
                 }
         } else {
             Some(rows.clone()) == closed.actual_rows
@@ -1874,7 +1896,7 @@ impl super::VerifiedNodeStateArchive {
                 | "journal.sqlite"
                 | "journal.sqlite-wal"
                 | "journal.sqlite-journal"] => {}
-                ["journal.sqlite-shm"] if fresh_evidence.is_some_and(|e|e.wal_shm.is_some()) => {}
+                ["journal.sqlite-shm"] if fresh_evidence.is_some_and(|e| e.wal_shm.is_some()) => {}
                 ["cas", "objects", prefix, id]
                     if id.len() == 64 && *prefix == &id[..2] && file.digest.as_str() == *id => {}
                 _ => return Err(ReconcileError::Invariant("recovery foreign data file")),
@@ -2212,24 +2234,36 @@ impl RecoveredFileProtection {
             Self::Created(file) => {
                 use std::os::windows::fs::FileExt;
                 file.verify_original()?;
-                let length=file.reader().metadata()?.len();
-                if length>bound {return Err(std::io::Error::other("created content bounded bytes"));}
-                let mut bytes=vec![0u8;length as usize];let mut offset=0;
-                while offset<bytes.len() {let n=file.reader().seek_read(&mut bytes[offset..],offset as u64)?;
-                    if n==0 {return Err(std::io::Error::other("created content short read"));}offset+=n;}
+                let length = file.reader().metadata()?.len();
+                if length > bound {
+                    return Err(std::io::Error::other("created content bounded bytes"));
+                }
+                let mut bytes = vec![0u8; length as usize];
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    let n = file
+                        .reader()
+                        .seek_read(&mut bytes[offset..], offset as u64)?;
+                    if n == 0 {
+                        return Err(std::io::Error::other("created content short read"));
+                    }
+                    offset += n;
+                }
                 Ok(bytes)
-            },
+            }
             Self::Mutation(file) => file.exact_bytes(bound),
             Self::Read(file) => file.exact_bytes(bound),
             Self::Sqlite(file) => file.exact_bytes(bound),
         }
     }
-    fn metadata(&self)->std::io::Result<std::fs::Metadata> {
+    fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
         match self {
-            Self::Mutation(file)=>file.metadata(),
-            Self::Created(file)=>file.reader().metadata(),
-            Self::Read(file)=>file.metadata(),
-            Self::Sqlite(_)=>Err(std::io::Error::other("native SQLite not ordinary scan file")),
+            Self::Mutation(file) => file.metadata(),
+            Self::Created(file) => file.reader().metadata(),
+            Self::Read(file) => file.metadata(),
+            Self::Sqlite(_) => Err(std::io::Error::other(
+                "native SQLite not ordinary scan file",
+            )),
         }
     }
     fn acquire_fresh_coordination_lock(
@@ -2496,7 +2530,8 @@ impl FreshDurableRecoveredSession {
             keys,
             rows,
             main: ContentId::hash(&bytes),
-            wal_shm: None,history_admission:None,
+            wal_shm: None,
+            history_admission: None,
         };
         let payload = serde_json::to_vec(&record)?;
         if payload.len() > 65536 || self.next >= 4 {
@@ -2693,7 +2728,8 @@ impl super::VerifiedNodeStateArchive {
                 ));
             }
             let record: FreshSessionRecord = serde_json::from_slice(payload)?;
-            if record.wal_shm.is_some() || !matches!(record.version, 1 | 2)
+            if record.wal_shm.is_some()
+                || !matches!(record.version, 1 | 2)
                 || (record.version == 1 && record.predecessor_frames.is_some())
                 || record.archive != *self.digest()
                 || record.previous == record.fresh
@@ -3138,11 +3174,19 @@ impl FreshRecoveredNodeWalSession {
     fn record(&mut self, phase: &str, rows: Option<ContentId>) -> Result<()> {
         self.verify_objects()?;
         let value = serde_json::to_vec(&(
-            1u32, self.next, phase, &self.archive, &self.original_frames,
-            &self.previous, &self.fresh, rows,
+            1u32,
+            self.next,
+            phase,
+            &self.archive,
+            &self.original_frames,
+            &self.previous,
+            &self.fresh,
+            rows,
         ))?;
         if value.len() > 65536 || self.next >= 4 {
-            return Err(ReconcileError::ResourceLimit("recovered WAL evidence bound"));
+            return Err(ReconcileError::ResourceLimit(
+                "recovered WAL evidence bound",
+            ));
         }
         let digest = ContentId::hash(&value);
         let mut frame = Vec::new();
@@ -3151,9 +3195,17 @@ impl FreshRecoveredNodeWalSession {
         frame.extend_from_slice(self.previous_record.as_str().as_bytes());
         frame.extend_from_slice(digest.as_str().as_bytes());
         frame.extend_from_slice(&value);
-        if self.frames.reader().metadata()?.len().checked_add(frame.len() as u64)
-            .is_none_or(|bytes|bytes>256*1024) {
-            return Err(ReconcileError::ResourceLimit("recovered WAL aggregate evidence"));
+        if self
+            .frames
+            .reader()
+            .metadata()?
+            .len()
+            .checked_add(frame.len() as u64)
+            .is_none_or(|bytes| bytes > 256 * 1024)
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered WAL aggregate evidence",
+            ));
         }
         self.poisoned = true;
         self.frames.writer().write_all(&frame)?;
@@ -3173,48 +3225,62 @@ impl FreshRecoveredNodeWalSession {
             self.native.exact_main_bytes()?
         };
         let image = sync_extend_journal::JournalBackupImage::from_current_node_image(
-            bytes.clone(), ContentId::hash(&bytes).as_str(), bytes.len(),
-            &self.space, self.bounds,
+            bytes.clone(),
+            ContentId::hash(&bytes).as_str(),
+            bytes.len(),
+            &self.space,
+            self.bounds,
         )?;
         let rows = if self.committed {
             image.recovered_session_preserved_rows_digest(
-                &self.space,self.bounds,&self.previous,&self.fresh)?
+                &self.space,
+                self.bounds,
+                &self.previous,
+                &self.fresh,
+            )?
         } else {
-            image.closed_node_complete_rows_digest(&self.space,self.bounds)?
+            image.closed_node_complete_rows_digest(&self.space, self.bounds)?
         };
         if rows != self.before_rows {
-            return Err(ReconcileError::Invariant("recovered WAL other catalog rows changed"));
+            return Err(ReconcileError::Invariant(
+                "recovered WAL other catalog rows changed",
+            ));
         }
         Ok(())
     }
     pub fn commit_fresh_session(&mut self) -> Result<SpaceId> {
         self.verify()?;
         if self.attempted || self.next != 1 {
-            return Err(ReconcileError::Invariant("recovered WAL single intended attempt"));
+            return Err(ReconcileError::Invariant(
+                "recovered WAL single intended attempt",
+            ));
         }
         self.attempted = true;
         self.poisoned = true;
-        self.native.commit_fresh_session(self.previous.as_str(),self.fresh.as_str())?;
+        self.native
+            .commit_fresh_session(self.previous.as_str(), self.fresh.as_str())?;
         crate::fault::checkpoint("recovered_wal_actual_commit_before_checkpoint");
         self.native.checkpoint_to_standalone()?;
         self.committed = true;
         self.poisoned = false;
         self.verify()?;
-        self.record("committed_checkpointed",Some(self.before_rows.clone()))?;
+        self.record("committed_checkpointed", Some(self.before_rows.clone()))?;
         Ok(self.fresh.clone())
     }
     pub fn close_completed(&mut self) -> Result<PathBuf> {
         self.verify()?;
         if !self.committed || self.closed || self.next != 2 {
-            return Err(ReconcileError::Invariant("recovered WAL close requires checkpoint"));
+            return Err(ReconcileError::Invariant(
+                "recovered WAL close requires checkpoint",
+            ));
         }
-        self.record("close_intended",Some(self.before_rows.clone()))?;
+        self.record("close_intended", Some(self.before_rows.clone()))?;
         self.poisoned = true;
         self.native.close_connection_retaining_native_objects()?;
         self.closed = true;
         self.poisoned = false;
         self.verify()?;
-        self.record("closed",Some(self.before_rows.clone()))?;
+        self.record("closed", Some(self.before_rows.clone()))?;
         Ok(self.path.clone())
     }
 }
@@ -3232,50 +3298,98 @@ impl super::VerifiedNodeStateArchive {
         ledger_bounds: super::LedgerBounds,
     ) -> Result<FreshRecoveredNodeWalSession> {
         let mut read = self.reacquire_closed_node_locked_scope_internal(
-            worktree,data,write_frames,restore_ledger,bounds,ledger_bounds,true,None,
+            worktree,
+            data,
+            write_frames,
+            restore_ledger,
+            bounds,
+            ledger_bounds,
+            true,
+            None,
         )?;
         read.verify()?;
-        let frame = read.read.files.iter().find(|file|file.path==write_frames)
-            .ok_or(ReconcileError::Invariant("recovered WAL original frame absent"))?;
+        let frame = read
+            .read
+            .files
+            .iter()
+            .find(|file| file.path == write_frames)
+            .ok_or(ReconcileError::Invariant(
+                "recovered WAL original frame absent",
+            ))?;
         let bytes = frame.file.exact_bytes(frame.bytes)?;
-        let size = u32::from_le_bytes(bytes[16..20].try_into()
-            .map_err(|_|ReconcileError::Invariant("recovered WAL original scope size"))?) as usize;
-        let scope: OriginalWriteScope = serde_json::from_slice(&bytes[84..84+size])?;
+        let size = u32::from_le_bytes(
+            bytes[16..20]
+                .try_into()
+                .map_err(|_| ReconcileError::Invariant("recovered WAL original scope size"))?,
+        ) as usize;
+        let scope: OriginalWriteScope = serde_json::from_slice(&bytes[84..84 + size])?;
         scope.validate()?;
-        let total = scope.max_main_bytes.checked_add(scope.max_wal_bytes)
-            .and_then(|n|n.checked_add(scope.max_rollback_bytes))
-            .and_then(|n|n.checked_add(1024*1024))
-            .ok_or(ReconcileError::ResourceLimit("recovered WAL preeffect aggregate budget"))?;
-        if total>512*1024*1024 {
-            return Err(ReconcileError::ResourceLimit("recovered WAL preeffect aggregate budget"));
+        let total = scope
+            .max_main_bytes
+            .checked_add(scope.max_wal_bytes)
+            .and_then(|n| n.checked_add(scope.max_rollback_bytes))
+            .and_then(|n| n.checked_add(1024 * 1024))
+            .ok_or(ReconcileError::ResourceLimit(
+                "recovered WAL preeffect aggregate budget",
+            ))?;
+        if total > 512 * 1024 * 1024 {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered WAL preeffect aggregate budget",
+            ));
         }
-        let fresh=SpaceId::random()?;
-        let external=write_frames.parent()
+        let fresh = SpaceId::random()?;
+        let external = write_frames
+            .parent()
             .ok_or(ReconcileError::Invariant("recovered WAL external absent"))?;
-        let held=read.read.directories.iter().find(|dir|dir.path==external)
-            .ok_or(ReconcileError::Invariant("recovered WAL held external absent"))?;
+        let held = read
+            .read
+            .directories
+            .iter()
+            .find(|dir| dir.path == external)
+            .ok_or(ReconcileError::Invariant(
+                "recovered WAL held external absent",
+            ))?;
         // Current explicit external membership, held under all acquired
         // original coordination locks, is checked before any new CREATE.
         for (count, entry) in std::fs::read_dir(external)?.enumerate() {
-            if u64::try_from(count).map_err(|_|ReconcileError::ResourceLimit("recovered WAL member counter overflow"))? >= ledger_bounds.max_records {
-                return Err(ReconcileError::ResourceLimit("recovered WAL external member bound"));
+            if u64::try_from(count).map_err(|_| {
+                ReconcileError::ResourceLimit("recovered WAL member counter overflow")
+            })? >= ledger_bounds.max_records
+            {
+                return Err(ReconcileError::ResourceLimit(
+                    "recovered WAL external member bound",
+                ));
             }
-            let entry=entry?;
-            let component=entry.file_name().into_string()
-                .map_err(|_|ReconcileError::Invariant("recovered WAL external component"))?;
+            let entry = entry?;
+            let component = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ReconcileError::Invariant("recovered WAL external component"))?;
             if component.starts_with("node-recovered-wal-") {
-                return Err(ReconcileError::Invariant("recovered WAL prior attempt requires explicit recovery"));
+                return Err(ReconcileError::Invariant(
+                    "recovered WAL prior attempt requires explicit recovery",
+                ));
             }
         }
-        let name=format!("node-recovered-wal-{fresh}");
-        let mut owner=held.file.create_new_file(&(name.clone()+".owner"))?;
-        owner.writer().write_all(&serde_json::to_vec(&(1u32,self.digest(),&fresh))?)?;
+        let name = format!("node-recovered-wal-{fresh}");
+        let mut owner = held.file.create_new_file(&(name.clone() + ".owner"))?;
+        owner
+            .writer()
+            .write_all(&serde_json::to_vec(&(1u32, self.digest(), &fresh))?)?;
         owner.writer().sync_all()?;
-        let mut frames=held.file.create_new_file(&(name.clone()+".frames"))?;
+        let mut frames = held.file.create_new_file(&(name.clone() + ".frames"))?;
         frames.writer().write_all(b"SYNC-RECOVERED-WAL1\n")?;
-        let intended=serde_json::to_vec(&(1u32,0u32,"intended",self.digest(),
-            ContentId::hash(&bytes),&scope.session,&fresh,Option::<ContentId>::None))?;
-        let mut envelope=Vec::new();
+        let intended = serde_json::to_vec(&(
+            1u32,
+            0u32,
+            "intended",
+            self.digest(),
+            ContentId::hash(&bytes),
+            &scope.session,
+            &fresh,
+            Option::<ContentId>::None,
+        ))?;
+        let mut envelope = Vec::new();
         envelope.extend_from_slice(&0u32.to_le_bytes());
         envelope.extend_from_slice(&(intended.len() as u32).to_le_bytes());
         envelope.extend_from_slice(ContentId::hash(&[]).as_str().as_bytes());
@@ -3284,35 +3398,76 @@ impl super::VerifiedNodeStateArchive {
         frames.writer().write_all(&envelope)?;
         frames.writer().sync_all()?;
         crate::fault::checkpoint("recovered_wal_actual_intended_before_shm_create");
-        let mut native_files=Vec::new();
-        for name in ["journal.sqlite","journal.sqlite-wal","journal.sqlite-journal"] {
-            let index=read.read.files.iter().position(|file|file.path==data.join(name))
-                .ok_or(ReconcileError::Invariant("recovered WAL native file absent"))?;
-            let evidence=read.read.files.remove(index);
-            let RecoveredFileProtection::Sqlite(file)=evidence.file else {
-                return Err(ReconcileError::Invariant("recovered WAL exclusive file required"));
+        let mut native_files = Vec::new();
+        for name in [
+            "journal.sqlite",
+            "journal.sqlite-wal",
+            "journal.sqlite-journal",
+        ] {
+            let index = read
+                .read
+                .files
+                .iter()
+                .position(|file| file.path == data.join(name))
+                .ok_or(ReconcileError::Invariant(
+                    "recovered WAL native file absent",
+                ))?;
+            let evidence = read.read.files.remove(index);
+            let RecoveredFileProtection::Sqlite(file) = evidence.file else {
+                return Err(ReconcileError::Invariant(
+                    "recovered WAL exclusive file required",
+                ));
             };
             native_files.push(file);
         }
-        let held=read.read.directories.iter().find(|dir|dir.path==data)
+        let held = read
+            .read
+            .directories
+            .iter()
+            .find(|dir| dir.path == data)
             .ok_or(ReconcileError::Invariant("recovered WAL held data absent"))?;
-        let shm=held.file.create_new_file("journal.sqlite-shm")?.into_fresh_sqlite_shm()?;
+        let shm = held
+            .file
+            .create_new_file("journal.sqlite-shm")?
+            .into_fresh_sqlite_shm()?;
         native_files.push(shm);
-        read.read.expected_membership.get_mut(data)
+        read.read
+            .expected_membership
+            .get_mut(data)
             .ok_or(ReconcileError::Invariant("recovered WAL membership absent"))?
             .insert("journal.sqlite-shm".into());
-        let native=sync_extend_platform_fs::FreshNativeWalConnection::open(
+        let native = sync_extend_platform_fs::FreshNativeWalConnection::open(
             &data.join("journal.sqlite"),
-            native_files.try_into().map_err(|_|ReconcileError::Invariant("recovered WAL four files"))?,
-            [scope.max_main_bytes,scope.max_wal_bytes,scope.max_rollback_bytes,1024*1024],
+            native_files
+                .try_into()
+                .map_err(|_| ReconcileError::Invariant("recovered WAL four files"))?,
+            [
+                scope.max_main_bytes,
+                scope.max_wal_bytes,
+                scope.max_rollback_bytes,
+                1024 * 1024,
+            ],
         )?;
-        let before_rows=read.read.rows.clone();
-        let result=FreshRecoveredNodeWalSession {
-            read,native,frames,owner,path:external.join(name+".frames"),bounds,
-            space:self.space().clone(),previous:scope.session,fresh,before_rows,
-            archive:self.digest().clone(),original_frames:ContentId::hash(&bytes),
-            next:1,previous_record:ContentId::hash(&envelope),
-            attempted:false,committed:false,closed:false,poisoned:false,
+        let before_rows = read.read.rows.clone();
+        let result = FreshRecoveredNodeWalSession {
+            read,
+            native,
+            frames,
+            owner,
+            path: external.join(name + ".frames"),
+            bounds,
+            space: self.space().clone(),
+            previous: scope.session,
+            fresh,
+            before_rows,
+            archive: self.digest().clone(),
+            original_frames: ContentId::hash(&bytes),
+            next: 1,
+            previous_record: ContentId::hash(&envelope),
+            attempted: false,
+            committed: false,
+            closed: false,
+            poisoned: false,
         };
         result.verify()?;
         Ok(result)
@@ -3327,137 +3482,255 @@ pub struct RecoveredWalFrameClassification {
     pub cleanup_authority: bool,
 }
 impl super::VerifiedNodeStateArchive {
-    pub fn classify_recovered_wal_frames(&self,bytes:&[u8])->RecoveredWalFrameClassification {
-        type Record=(u32,u32,String,ContentId,ContentId,SpaceId,SpaceId,Option<ContentId>);
-        let inspect=||->Result<(String,u32)> {
-            const HEADER:&[u8]=b"SYNC-RECOVERED-WAL1\n";
-            if !bytes.starts_with(HEADER) || bytes.len()>256*1024 {
+    pub fn classify_recovered_wal_frames(&self, bytes: &[u8]) -> RecoveredWalFrameClassification {
+        type Record = (
+            u32,
+            u32,
+            String,
+            ContentId,
+            ContentId,
+            SpaceId,
+            SpaceId,
+            Option<ContentId>,
+        );
+        let inspect = || -> Result<(String, u32)> {
+            const HEADER: &[u8] = b"SYNC-RECOVERED-WAL1\n";
+            if !bytes.starts_with(HEADER) || bytes.len() > 256 * 1024 {
                 return Err(ReconcileError::Invariant("WAL frame exact header/bounds"));
             }
-            let mut offset=HEADER.len();
-            let mut next=0u32;
-            let mut previous=ContentId::hash(&[]);
-            let mut original:Option<Record>=None;
-            let mut rows=None;
-            while offset<bytes.len() {
-                let prefix=bytes.get(offset..offset+136)
+            let mut offset = HEADER.len();
+            let mut next = 0u32;
+            let mut previous = ContentId::hash(&[]);
+            let mut original: Option<Record> = None;
+            let mut rows = None;
+            while offset < bytes.len() {
+                let prefix = bytes
+                    .get(offset..offset + 136)
                     .ok_or(ReconcileError::Invariant("WAL truncated frame prefix"))?;
-                let index=u32::from_le_bytes(prefix[..4].try_into()
-                    .map_err(|_|ReconcileError::Invariant("WAL index bytes"))?);
-                let length=u32::from_le_bytes(prefix[4..8].try_into()
-                    .map_err(|_|ReconcileError::Invariant("WAL length bytes"))?) as usize;
-                if index!=next || next>=4 || length>65536
-                    || prefix[8..72]!=*previous.as_str().as_bytes() {
+                let index = u32::from_le_bytes(
+                    prefix[..4]
+                        .try_into()
+                        .map_err(|_| ReconcileError::Invariant("WAL index bytes"))?,
+                );
+                let length = u32::from_le_bytes(
+                    prefix[4..8]
+                        .try_into()
+                        .map_err(|_| ReconcileError::Invariant("WAL length bytes"))?,
+                ) as usize;
+                if index != next
+                    || next >= 4
+                    || length > 65536
+                    || prefix[8..72] != *previous.as_str().as_bytes()
+                {
                     return Err(ReconcileError::Invariant("WAL exact frame order"));
                 }
-                let end=offset.checked_add(136+length)
+                let end = offset
+                    .checked_add(136 + length)
                     .ok_or(ReconcileError::ResourceLimit("WAL frame arithmetic"))?;
-                let payload=bytes.get(offset+136..end)
+                let payload = bytes
+                    .get(offset + 136..end)
                     .ok_or(ReconcileError::Invariant("WAL truncated payload"))?;
-                if ContentId::hash(payload).as_str().as_bytes()!=&prefix[72..136] {
+                if ContentId::hash(payload).as_str().as_bytes() != &prefix[72..136] {
                     return Err(ReconcileError::Invariant("WAL exact payload digest"));
                 }
-                let record:Record=serde_json::from_slice(payload)?;
-                if record.0!=1 || record.1!=next || record.3!=*self.digest()
-                    || record.5==record.6
-                    || record.2!=["intended","committed_checkpointed","close_intended","closed"][next as usize]
-                    || record.7.is_none()!=(next==0)
-                    || serde_json::to_vec(&record)?!=payload {
+                let record: Record = serde_json::from_slice(payload)?;
+                if record.0 != 1
+                    || record.1 != next
+                    || record.3 != *self.digest()
+                    || record.5 == record.6
+                    || record.2
+                        != [
+                            "intended",
+                            "committed_checkpointed",
+                            "close_intended",
+                            "closed",
+                        ][next as usize]
+                    || record.7.is_none() != (next == 0)
+                    || serde_json::to_vec(&record)? != payload
+                {
                     return Err(ReconcileError::Invariant("WAL exact canonical record"));
                 }
-                if let Some(first)=&original {
-                    if record.3!=first.3 || record.4!=first.4 || record.5!=first.5 || record.6!=first.6 {
+                if let Some(first) = &original {
+                    if record.3 != first.3
+                        || record.4 != first.4
+                        || record.5 != first.5
+                        || record.6 != first.6
+                    {
                         return Err(ReconcileError::Invariant("WAL scope changed across frames"));
                     }
-                } else {original=Some(record.clone());}
-                if let Some(current)=&record.7 {
-                    if rows.as_ref().is_some_and(|value|value!=current) {
-                        return Err(ReconcileError::Invariant("WAL rows changed after checkpoint"));
-                    }
-                    rows=Some(current.clone());
+                } else {
+                    original = Some(record.clone());
                 }
-                previous=ContentId::hash(&bytes[offset..end]);
-                offset=end;next+=1;
+                if let Some(current) = &record.7 {
+                    if rows.as_ref().is_some_and(|value| value != current) {
+                        return Err(ReconcileError::Invariant(
+                            "WAL rows changed after checkpoint",
+                        ));
+                    }
+                    rows = Some(current.clone());
+                }
+                previous = ContentId::hash(&bytes[offset..end]);
+                offset = end;
+                next += 1;
             }
-            let state=match next {
-                0=>"header_only_evidence",
-                1=>"intended_evidence",
-                2=>"checkpointed_evidence",
-                3=>"close_intended_evidence",
-                4=>"closed_evidence",
-                _=>return Err(ReconcileError::Invariant("WAL excess frames")),
+            let state = match next {
+                0 => "header_only_evidence",
+                1 => "intended_evidence",
+                2 => "checkpointed_evidence",
+                3 => "close_intended_evidence",
+                4 => "closed_evidence",
+                _ => return Err(ReconcileError::Invariant("WAL excess frames")),
             };
-            Ok((state.into(),next))
+            Ok((state.into(), next))
         };
         match inspect() {
-            Ok((state,complete_frames))=>RecoveredWalFrameClassification {
-                state,complete_frames,native_authority:false,cleanup_authority:false,
+            Ok((state, complete_frames)) => RecoveredWalFrameClassification {
+                state,
+                complete_frames,
+                native_authority: false,
+                cleanup_authority: false,
             },
-            Err(_)=>RecoveredWalFrameClassification {
-                state:"refused_evidence".into(),complete_frames:0,
-                native_authority:false,cleanup_authority:false,
+            Err(_) => RecoveredWalFrameClassification {
+                state: "refused_evidence".into(),
+                complete_frames: 0,
+                native_authority: false,
+                cleanup_authority: false,
             },
         }
     }
 }
 
-
-#[derive(Clone,Serialize,Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecoveredWalV2Record {
-    version:u32,index:u32,phase:String,archive:ContentId,original_frames:ContentId,
-    previous:SpaceId,fresh:SpaceId,predecessor:Option<ContentId>,
-    worktree:String,data:String,keys:[String;4],rows:ContentId,main:ContentId,shm:ContentId,
+    version: u32,
+    index: u32,
+    phase: String,
+    archive: ContentId,
+    original_frames: ContentId,
+    previous: SpaceId,
+    fresh: SpaceId,
+    predecessor: Option<ContentId>,
+    worktree: String,
+    data: String,
+    keys: [String; 4],
+    rows: ContentId,
+    main: ContentId,
+    shm: ContentId,
 }
-fn recovered_wal_v2_records(bytes:&[u8])->Result<Vec<RecoveredWalV2Record>> {
-    const HEADER:&[u8]=b"SYNC-RECOVERED-WAL2\n";
-    if !bytes.starts_with(HEADER) || bytes.len()>256*1024 {
+fn recovered_wal_v2_records(bytes: &[u8]) -> Result<Vec<RecoveredWalV2Record>> {
+    const HEADER: &[u8] = b"SYNC-RECOVERED-WAL2\n";
+    if !bytes.starts_with(HEADER) || bytes.len() > 256 * 1024 {
         return Err(ReconcileError::Invariant("WAL2 exact bounded header"));
     }
-    let prefix=bytes.get(HEADER.len()..HEADER.len()+4).ok_or(ReconcileError::Invariant("WAL2 intent prefix"))?;
-    let length=u32::from_le_bytes(prefix.try_into().map_err(|_|ReconcileError::Invariant("WAL2 intent length"))?) as usize;
-    if length>65536 {return Err(ReconcileError::ResourceLimit("WAL2 intent bound"));}
-    let start=HEADER.len()+4;
-    let intent=bytes.get(start..start+length).ok_or(ReconcileError::Invariant("WAL2 incomplete intent"))?;
-    let admitted:(u32,ContentId,ContentId,SpaceId,SpaceId)=serde_json::from_slice(intent)?;
-    if admitted.0!=2 || admitted.3==admitted.4 || serde_json::to_vec(&admitted)?!=intent {
+    let prefix = bytes
+        .get(HEADER.len()..HEADER.len() + 4)
+        .ok_or(ReconcileError::Invariant("WAL2 intent prefix"))?;
+    let length = u32::from_le_bytes(
+        prefix
+            .try_into()
+            .map_err(|_| ReconcileError::Invariant("WAL2 intent length"))?,
+    ) as usize;
+    if length > 65536 {
+        return Err(ReconcileError::ResourceLimit("WAL2 intent bound"));
+    }
+    let start = HEADER.len() + 4;
+    let intent = bytes
+        .get(start..start + length)
+        .ok_or(ReconcileError::Invariant("WAL2 incomplete intent"))?;
+    let admitted: (u32, ContentId, ContentId, SpaceId, SpaceId) = serde_json::from_slice(intent)?;
+    if admitted.0 != 2 || admitted.3 == admitted.4 || serde_json::to_vec(&admitted)? != intent {
         return Err(ReconcileError::Invariant("WAL2 canonical intent"));
     }
-    let mut offset=start+length;let mut previous=ContentId::hash(intent);let mut result=Vec::new();
-    while offset<bytes.len() {
-        let prefix=bytes.get(offset..offset+136).ok_or(ReconcileError::Invariant("WAL2 truncated envelope"))?;
-        let index=u32::from_le_bytes(prefix[..4].try_into().map_err(|_|ReconcileError::Invariant("WAL2 index"))?);
-        let size=u32::from_le_bytes(prefix[4..8].try_into().map_err(|_|ReconcileError::Invariant("WAL2 size"))?) as usize;
-        if index as usize!=result.len() || index>=4 || size>65536 || prefix[8..72]!=*previous.as_str().as_bytes() {
+    let mut offset = start + length;
+    let mut previous = ContentId::hash(intent);
+    let mut result = Vec::new();
+    while offset < bytes.len() {
+        let prefix = bytes
+            .get(offset..offset + 136)
+            .ok_or(ReconcileError::Invariant("WAL2 truncated envelope"))?;
+        let index = u32::from_le_bytes(
+            prefix[..4]
+                .try_into()
+                .map_err(|_| ReconcileError::Invariant("WAL2 index"))?,
+        );
+        let size = u32::from_le_bytes(
+            prefix[4..8]
+                .try_into()
+                .map_err(|_| ReconcileError::Invariant("WAL2 size"))?,
+        ) as usize;
+        if index as usize != result.len()
+            || index >= 4
+            || size > 65536
+            || prefix[8..72] != *previous.as_str().as_bytes()
+        {
             return Err(ReconcileError::Invariant("WAL2 order bounds chain"));
         }
-        let payload=bytes.get(offset+136..offset+136+size).ok_or(ReconcileError::Invariant("WAL2 payload truncated"))?;
-        let record:RecoveredWalV2Record=serde_json::from_slice(payload)?;
-        if record.version!=2 || record.index!=index || record.archive!=admitted.1
-            || record.original_frames!=admitted.2 || record.previous!=admitted.3 || record.fresh!=admitted.4
-            || record.phase!=["intended","committed_checkpointed","close_intended","closed"][index as usize]
-            || serde_json::to_vec(&record)?!=payload || ContentId::hash(payload).as_str().as_bytes()!=&prefix[72..136] {
+        let payload = bytes
+            .get(offset + 136..offset + 136 + size)
+            .ok_or(ReconcileError::Invariant("WAL2 payload truncated"))?;
+        let record: RecoveredWalV2Record = serde_json::from_slice(payload)?;
+        if record.version != 2
+            || record.index != index
+            || record.archive != admitted.1
+            || record.original_frames != admitted.2
+            || record.previous != admitted.3
+            || record.fresh != admitted.4
+            || record.phase
+                != [
+                    "intended",
+                    "committed_checkpointed",
+                    "close_intended",
+                    "closed",
+                ][index as usize]
+            || serde_json::to_vec(&record)? != payload
+            || ContentId::hash(payload).as_str().as_bytes() != &prefix[72..136]
+        {
             return Err(ReconcileError::Invariant("WAL2 exact canonical record"));
         }
-        if let Some(first)=result.first() {
-            let first:&RecoveredWalV2Record=first;
-            if record.keys!=first.keys || record.worktree!=first.worktree || record.data!=first.data
-                || record.predecessor!=first.predecessor {
-                return Err(ReconcileError::Invariant("WAL2 native binding changed across records"));
+        if let Some(first) = result.first() {
+            let first: &RecoveredWalV2Record = first;
+            if record.keys != first.keys
+                || record.worktree != first.worktree
+                || record.data != first.data
+                || record.predecessor != first.predecessor
+            {
+                return Err(ReconcileError::Invariant(
+                    "WAL2 native binding changed across records",
+                ));
             }
         }
-        if index>=2 {
-            let checkpoint:&RecoveredWalV2Record=&result[1];
-            if record.rows!=checkpoint.rows || record.main!=checkpoint.main || record.shm!=checkpoint.shm {
-                return Err(ReconcileError::Invariant("WAL2 checkpoint bytes changed after commit"));
+        if index >= 2 {
+            let checkpoint: &RecoveredWalV2Record = &result[1];
+            if record.rows != checkpoint.rows
+                || record.main != checkpoint.main
+                || record.shm != checkpoint.shm
+            {
+                return Err(ReconcileError::Invariant(
+                    "WAL2 checkpoint bytes changed after commit",
+                ));
             }
         }
-        offset+=136+size;previous=ContentId::hash(&bytes[offset-136-size..offset]);result.push(record);
+        offset += 136 + size;
+        previous = ContentId::hash(&bytes[offset - 136 - size..offset]);
+        result.push(record);
     }
-    if result.len()!=4 {return Err(ReconcileError::Invariant("WAL2 actual closed terminal required"));}
+    if result.len() != 4 {
+        return Err(ReconcileError::Invariant(
+            "WAL2 actual closed terminal required",
+        ));
+    }
     Ok(result)
 }
 // Explicit freshly locked closed-node WAL protocol; no historical owner issuance.
+#[derive(Clone, Eq, PartialEq)]
+struct RecoveredVerificationKey {
+    main: ContentId,
+    sidecars: [ContentId; 3],
+    connection_counters: Option<(u64, u64)>,
+    expected_rows: ContentId,
+    committed: bool,
+}
 pub struct FreshRecoveredNodeWalV2Session {
     read: ReacquiredClosedNodeLockedReadScope,
     native: sync_extend_platform_fs::FreshNativeWalConnection,
@@ -3478,25 +3751,29 @@ pub struct FreshRecoveredNodeWalV2Session {
     closed: bool,
     poisoned: bool,
     predecessor: Option<ContentId>,
-    native_keys: [String;4],
+    native_keys: [String; 4],
     history_count: u32,
-    new_content_bytes:u64,
-    new_file_bytes:u64,
-    manifest_entry_limit:usize,
-    retained_receipts:std::collections::BTreeMap<String,ReacquiredFile>,
-    retained_receipt_bytes:u64,
-    history_baseline:Vec<u8>,
-    retained_history_evidence:Vec<ReacquiredFile>,
-    history_chain_parent:Option<HistoryRestartObject>,
-    history_chain_depth:u32,
-    history_retained_originals:Vec<HistoryRetainedOriginal>,
-    history_retained_directories:Vec<(PathBuf,sync_extend_platform_fs::LockedDirectory)>,
-    retained_mutations:Vec<RecoveredRetainedMutation>,
-    mutation_requested:bool,
-    created_work_directories:std::collections::BTreeMap<PathBuf,sync_extend_platform_fs::LockedDirectoryMutation>,
-    new_cas_bytes:u64,
-    new_cas_objects:usize,
-    new_cas_buckets:std::collections::BTreeMap<PathBuf,RecoveredCasBucket>,
+    metadata_count: u32,
+    retained_metadata_receipts: Vec<live_retention::RecoveredMetadataReceiptProof>,
+    new_content_bytes: u64,
+    new_file_bytes: u64,
+    manifest_entry_limit: usize,
+    retained_receipts: std::collections::BTreeMap<String, ReacquiredFile>,
+    retained_receipt_bytes: u64,
+    history_baseline: Vec<u8>,
+    retained_history_evidence: Vec<ReacquiredFile>,
+    history_chain_parent: Option<HistoryRestartObject>,
+    history_chain_depth: u32,
+    history_retained_originals: Vec<HistoryRetainedOriginal>,
+    history_retained_directories: Vec<(PathBuf, sync_extend_platform_fs::LockedDirectory)>,
+    retained_mutations: Vec<RecoveredRetainedMutation>,
+    mutation_requested: bool,
+    created_work_directories:
+        std::collections::BTreeMap<PathBuf, sync_extend_platform_fs::LockedDirectoryMutation>,
+    new_cas_bytes: u64,
+    new_cas_objects: usize,
+    new_cas_buckets: std::collections::BTreeMap<PathBuf, RecoveredCasBucket>,
+    verified_main: std::cell::RefCell<Option<RecoveredVerificationKey>>,
 }
 impl FreshRecoveredNodeWalV2Session {
     fn verify_objects(&self) -> Result<()> {
@@ -3504,23 +3781,45 @@ impl FreshRecoveredNodeWalV2Session {
             return Err(ReconcileError::Invariant("recovered WAL uncertain"));
         }
         self.read.verify()?;
-        for (path,bucket) in &self.new_cas_buckets {bucket.verify_exact(path)?;}
-        for (path,directory) in &self.created_work_directories {directory.original_creation()?.verify()?;if !directory.matches_path(path)? {return Err(ReconcileError::Invariant("created work directory key or slot"));}}
-        for retained in &self.retained_mutations {retained.verify()?;}
-        for (path,directory) in &self.history_retained_directories {
-            if !directory.matches_path(path)? {return Err(ReconcileError::Invariant("retained mutation directory changed"));}
+        for (path, bucket) in &self.new_cas_buckets {
+            bucket.verify_exact(path)?;
+        }
+        for (path, directory) in &self.created_work_directories {
+            directory.original_creation()?.verify()?;
+            if !directory.matches_path(path)? {
+                return Err(ReconcileError::Invariant(
+                    "created work directory key or slot",
+                ));
+            }
+        }
+        for retained in &self.retained_mutations {
+            retained.verify()?;
+        }
+        for (path, directory) in &self.history_retained_directories {
+            if !directory.matches_path(path)? {
+                return Err(ReconcileError::Invariant(
+                    "retained mutation directory changed",
+                ));
+            }
         }
         for evidence in &self.retained_history_evidence {
             evidence.file.verify()?;
-            if !evidence.file.matches_path(&evidence.path)? || ContentId::hash(&evidence.file.exact_bytes(evidence.bytes)?)!=evidence.digest {
-                return Err(ReconcileError::Invariant("history retained closure bytes or identity"));
+            if !evidence.file.matches_path(&evidence.path)?
+                || ContentId::hash(&evidence.file.exact_bytes(evidence.bytes)?) != evidence.digest
+            {
+                return Err(ReconcileError::Invariant(
+                    "history retained closure bytes or identity",
+                ));
             }
         }
         for receipt in self.retained_receipts.values() {
             receipt.file.verify()?;
             if !receipt.file.matches_path(&receipt.path)?
-                || ContentId::hash(&receipt.file.exact_bytes(receipt.bytes)?)!=receipt.digest {
-                return Err(ReconcileError::Invariant("recovered held receipt identity or bytes changed"));
+                || ContentId::hash(&receipt.file.exact_bytes(receipt.bytes)?) != receipt.digest
+            {
+                return Err(ReconcileError::Invariant(
+                    "recovered held receipt identity or bytes changed",
+                ));
             }
         }
         self.frames.original_creation()?.verify()?;
@@ -3534,24 +3833,42 @@ impl FreshRecoveredNodeWalV2Session {
     }
     fn record(&mut self, phase: &str, rows: Option<ContentId>) -> Result<()> {
         self.verify_objects()?;
-        let bytes=if self.closed {self.native.exact_closed_main_bytes()?}
-            else {self.native.exact_main_bytes()?};
-        let image=sync_extend_journal::JournalBackupImage::from_current_node_image(
-            bytes.clone(),ContentId::hash(&bytes).as_str(),bytes.len(),&self.space,self.bounds)?;
-        let record=RecoveredWalV2Record {
-            version:2,index:self.next,phase:phase.into(),archive:self.archive.clone(),
-            original_frames:self.original_frames.clone(),previous:self.previous.clone(),fresh:self.fresh.clone(),
-            predecessor:self.predecessor.clone(),worktree:self.read.read.worktree.to_string_lossy().into(),
-            data:self.read.read.data.to_string_lossy().into(),keys:self.native_keys.clone(),
-            rows:image.closed_node_complete_rows_digest(&self.space,self.bounds)?,
-            main:ContentId::hash(&bytes),shm:ContentId::hash(&self.native.held_shm_bytes()?),
+        let bytes = if self.closed {
+            self.native.exact_closed_main_bytes()?
+        } else {
+            self.native.exact_main_bytes()?
         };
-        if (self.next==0)!=rows.is_none() {
+        let image = sync_extend_journal::JournalBackupImage::from_current_node_image(
+            bytes.clone(),
+            ContentId::hash(&bytes).as_str(),
+            bytes.len(),
+            &self.space,
+            self.bounds,
+        )?;
+        let record = RecoveredWalV2Record {
+            version: 2,
+            index: self.next,
+            phase: phase.into(),
+            archive: self.archive.clone(),
+            original_frames: self.original_frames.clone(),
+            previous: self.previous.clone(),
+            fresh: self.fresh.clone(),
+            predecessor: self.predecessor.clone(),
+            worktree: self.read.read.worktree.to_string_lossy().into(),
+            data: self.read.read.data.to_string_lossy().into(),
+            keys: self.native_keys.clone(),
+            rows: image.closed_node_complete_rows_digest(&self.space, self.bounds)?,
+            main: ContentId::hash(&bytes),
+            shm: ContentId::hash(&self.native.held_shm_bytes()?),
+        };
+        if (self.next == 0) != rows.is_none() {
             return Err(ReconcileError::Invariant("WAL2 explicit record phase"));
         }
-        let value=serde_json::to_vec(&record)?;
+        let value = serde_json::to_vec(&record)?;
         if value.len() > 65536 || self.next >= 4 {
-            return Err(ReconcileError::ResourceLimit("recovered WAL evidence bound"));
+            return Err(ReconcileError::ResourceLimit(
+                "recovered WAL evidence bound",
+            ));
         }
         let digest = ContentId::hash(&value);
         let mut frame = Vec::new();
@@ -3560,9 +3877,17 @@ impl FreshRecoveredNodeWalV2Session {
         frame.extend_from_slice(self.previous_record.as_str().as_bytes());
         frame.extend_from_slice(digest.as_str().as_bytes());
         frame.extend_from_slice(&value);
-        if self.frames.reader().metadata()?.len().checked_add(frame.len() as u64)
-            .is_none_or(|bytes|bytes>256*1024) {
-            return Err(ReconcileError::ResourceLimit("recovered WAL aggregate evidence"));
+        if self
+            .frames
+            .reader()
+            .metadata()?
+            .len()
+            .checked_add(frame.len() as u64)
+            .is_none_or(|bytes| bytes > 256 * 1024)
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered WAL aggregate evidence",
+            ));
         }
         self.poisoned = true;
         self.frames.writer().write_all(&frame)?;
@@ -3572,8 +3897,8 @@ impl FreshRecoveredNodeWalV2Session {
         self.poisoned = false;
         Ok(())
     }
-    pub fn verify(&self) -> Result<()> {
-        self.verify_objects()?;
+    fn verification_key(&self) -> Result<(Vec<u8>, RecoveredVerificationKey)> {
+        let counters = self.native.verification_change_counters()?;
         // The committed main is checked only after the actual checkpoint. An
         // uncheckpointed WAL main is never inspected as a standalone database.
         let bytes = if self.closed {
@@ -3581,50 +3906,112 @@ impl FreshRecoveredNodeWalV2Session {
         } else {
             self.native.exact_main_bytes()?
         };
+        let main_digest = ContentId::hash(&bytes);
+        let sidecar_digests = [1usize, 2, 3]
+            .map(|index| {
+                self.native
+                    .exact_sidecar_bytes(index)
+                    .map(|bytes| ContentId::hash(&bytes))
+            })
+            .into_iter()
+            .collect::<std::io::Result<Vec<_>>>()?
+            .try_into()
+            .map_err(|_| ReconcileError::Invariant("recovered WAL sidecar digest count"))?;
+        if self.native.verification_change_counters()? != counters {
+            return Err(ReconcileError::Invariant(
+                "recovered WAL verification capture changed",
+            ));
+        }
+        Ok((
+            bytes,
+            RecoveredVerificationKey {
+                main: main_digest,
+                sidecars: sidecar_digests,
+                connection_counters: counters,
+                expected_rows: self.before_rows.clone(),
+                committed: self.committed,
+            },
+        ))
+    }
+    pub fn verify(&self) -> Result<()> {
+        self.verify_objects()?;
+        let (bytes, cache_key) = self.verification_key()?;
+        // Native identities, retained evidence and all file bytes were checked
+        // above. A live cache hit additionally binds all sidecars and the
+        // same-connection SQLite counters; a closed session has no mutable
+        // connection and is checked through its held native handles.
+        if self.verified_main.borrow().as_ref() == Some(&cache_key) {
+            if self.verification_key()?.1 != cache_key {
+                return Err(ReconcileError::Invariant(
+                    "recovered WAL verification cache capture changed",
+                ));
+            }
+            return Ok(());
+        }
         let image = sync_extend_journal::JournalBackupImage::from_current_node_image(
-            bytes.clone(), ContentId::hash(&bytes).as_str(), bytes.len(),
-            &self.space, self.bounds,
+            bytes.clone(),
+            cache_key.main.as_str(),
+            bytes.len(),
+            &self.space,
+            self.bounds,
         )?;
         let rows = if self.committed {
             image.recovered_session_preserved_rows_digest(
-                &self.space,self.bounds,&self.previous,&self.fresh)?
+                &self.space,
+                self.bounds,
+                &self.previous,
+                &self.fresh,
+            )?
         } else {
-            image.closed_node_complete_rows_digest(&self.space,self.bounds)?
+            image.closed_node_complete_rows_digest(&self.space, self.bounds)?
         };
         if rows != self.before_rows {
-            return Err(ReconcileError::Invariant("recovered WAL other catalog rows changed"));
+            return Err(ReconcileError::Invariant(
+                "recovered WAL other catalog rows changed",
+            ));
         }
+        if self.verification_key()?.1 != cache_key {
+            return Err(ReconcileError::Invariant(
+                "recovered WAL verification files or connection changed",
+            ));
+        }
+        *self.verified_main.borrow_mut() = Some(cache_key);
         Ok(())
     }
     pub fn commit_fresh_session(&mut self) -> Result<SpaceId> {
         self.verify()?;
         if self.attempted || self.next != 1 {
-            return Err(ReconcileError::Invariant("recovered WAL single intended attempt"));
+            return Err(ReconcileError::Invariant(
+                "recovered WAL single intended attempt",
+            ));
         }
         self.attempted = true;
         self.poisoned = true;
-        self.native.commit_fresh_session(self.previous.as_str(),self.fresh.as_str())?;
+        self.native
+            .commit_fresh_session(self.previous.as_str(), self.fresh.as_str())?;
         crate::fault::checkpoint("recovered_wal2_actual_commit_before_checkpoint");
         self.native.checkpoint_to_standalone()?;
-        self.history_baseline=self.native.exact_main_bytes()?;
+        self.history_baseline = self.native.exact_main_bytes()?;
         self.committed = true;
         self.poisoned = false;
         self.verify()?;
-        self.record("committed_checkpointed",Some(self.before_rows.clone()))?;
+        self.record("committed_checkpointed", Some(self.before_rows.clone()))?;
         Ok(self.fresh.clone())
     }
     pub fn close_completed(&mut self) -> Result<PathBuf> {
         self.verify()?;
         if !self.committed || self.closed || self.next != 2 {
-            return Err(ReconcileError::Invariant("recovered WAL close requires checkpoint"));
+            return Err(ReconcileError::Invariant(
+                "recovered WAL close requires checkpoint",
+            ));
         }
-        self.record("close_intended",Some(self.before_rows.clone()))?;
+        self.record("close_intended", Some(self.before_rows.clone()))?;
         self.poisoned = true;
         self.native.close_connection_retaining_native_objects()?;
         self.closed = true;
         self.poisoned = false;
         self.verify()?;
-        self.record("closed",Some(self.before_rows.clone()))?;
+        self.record("closed", Some(self.before_rows.clone()))?;
         crate::fault::checkpoint("recovered_wal2_closed_after_terminal_sync");
         Ok(self.path.clone())
     }
@@ -3643,310 +4030,729 @@ impl super::VerifiedNodeStateArchive {
         ledger_bounds: super::LedgerBounds,
     ) -> Result<FreshRecoveredNodeWalV2Session> {
         let mut read = self.reacquire_closed_node_locked_scope_internal(
-            worktree,data,write_frames,restore_ledger,bounds,ledger_bounds,true,None,
+            worktree,
+            data,
+            write_frames,
+            restore_ledger,
+            bounds,
+            ledger_bounds,
+            true,
+            None,
         )?;
         read.verify()?;
-        let frame = read.read.files.iter().find(|file|file.path==write_frames)
-            .ok_or(ReconcileError::Invariant("recovered WAL original frame absent"))?;
+        let frame = read
+            .read
+            .files
+            .iter()
+            .find(|file| file.path == write_frames)
+            .ok_or(ReconcileError::Invariant(
+                "recovered WAL original frame absent",
+            ))?;
         let bytes = frame.file.exact_bytes(frame.bytes)?;
-        let size = u32::from_le_bytes(bytes[16..20].try_into()
-            .map_err(|_|ReconcileError::Invariant("recovered WAL original scope size"))?) as usize;
-        let scope: OriginalWriteScope = serde_json::from_slice(&bytes[84..84+size])?;
+        let size = u32::from_le_bytes(
+            bytes[16..20]
+                .try_into()
+                .map_err(|_| ReconcileError::Invariant("recovered WAL original scope size"))?,
+        ) as usize;
+        let scope: OriginalWriteScope = serde_json::from_slice(&bytes[84..84 + size])?;
         scope.validate()?;
-        let total = scope.max_main_bytes.checked_add(scope.max_wal_bytes)
-            .and_then(|n|n.checked_add(scope.max_rollback_bytes))
-            .and_then(|n|n.checked_add(1024*1024))
-            .ok_or(ReconcileError::ResourceLimit("recovered WAL preeffect aggregate budget"))?;
-        if total>512*1024*1024 {
-            return Err(ReconcileError::ResourceLimit("recovered WAL preeffect aggregate budget"));
+        let total = scope
+            .max_main_bytes
+            .checked_add(scope.max_wal_bytes)
+            .and_then(|n| n.checked_add(scope.max_rollback_bytes))
+            .and_then(|n| n.checked_add(1024 * 1024))
+            .ok_or(ReconcileError::ResourceLimit(
+                "recovered WAL preeffect aggregate budget",
+            ))?;
+        if total > 512 * 1024 * 1024 {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered WAL preeffect aggregate budget",
+            ));
         }
-        let fresh=SpaceId::random()?;
-        let external=write_frames.parent()
+        let fresh = SpaceId::random()?;
+        let external = write_frames
+            .parent()
             .ok_or(ReconcileError::Invariant("recovered WAL external absent"))?;
-        let held=read.read.directories.iter().find(|dir|dir.path==external)
-            .ok_or(ReconcileError::Invariant("recovered WAL held external absent"))?;
+        let held = read
+            .read
+            .directories
+            .iter()
+            .find(|dir| dir.path == external)
+            .ok_or(ReconcileError::Invariant(
+                "recovered WAL held external absent",
+            ))?;
         // Current explicit external membership, held under all acquired
         // original coordination locks, is checked before any new CREATE.
         for (count, entry) in std::fs::read_dir(external)?.enumerate() {
-            if u64::try_from(count).map_err(|_|ReconcileError::ResourceLimit("recovered WAL member counter overflow"))? >= ledger_bounds.max_records {
-                return Err(ReconcileError::ResourceLimit("recovered WAL external member bound"));
+            if u64::try_from(count).map_err(|_| {
+                ReconcileError::ResourceLimit("recovered WAL member counter overflow")
+            })? >= ledger_bounds.max_records
+            {
+                return Err(ReconcileError::ResourceLimit(
+                    "recovered WAL external member bound",
+                ));
             }
-            let entry=entry?;
-            let component=entry.file_name().into_string()
-                .map_err(|_|ReconcileError::Invariant("recovered WAL external component"))?;
-            if component.starts_with("node-recovered-wal-") || component.starts_with("node-recovered-history-") || component.starts_with("node-recovered-file-") || component.starts_with("node-recovered-cas-") {
-                return Err(ReconcileError::Invariant("recovered WAL prior attempt requires explicit recovery"));
+            let entry = entry?;
+            let component = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ReconcileError::Invariant("recovered WAL external component"))?;
+            if component.starts_with("node-recovered-wal-")
+                || component.starts_with("node-recovered-history-")
+                || component.starts_with("node-recovered-file-")
+                || component.starts_with("node-recovered-cas-")
+            {
+                return Err(ReconcileError::Invariant(
+                    "recovered WAL prior attempt requires explicit recovery",
+                ));
             }
         }
-        let name=format!("node-recovered-wal-{fresh}");
-        let mut owner=held.file.create_new_file(&(name.clone()+".owner"))?;
-        owner.writer().write_all(&serde_json::to_vec(&(2u32,self.digest(),&fresh))?)?;
+        let name = format!("node-recovered-wal-{fresh}");
+        let mut owner = held.file.create_new_file(&(name.clone() + ".owner"))?;
+        owner
+            .writer()
+            .write_all(&serde_json::to_vec(&(2u32, self.digest(), &fresh))?)?;
         owner.writer().sync_all()?;
-        let mut frames=held.file.create_new_file(&(name.clone()+".frames"))?;
+        let mut frames = held.file.create_new_file(&(name.clone() + ".frames"))?;
         frames.writer().write_all(b"SYNC-RECOVERED-WAL2\n")?;
         frames.writer().sync_all()?;
         // Intent is recorded before the native SHM CREATE. This v2 header is
         // deliberately insufficient for restart if any following action fails.
-        let before_native=serde_json::to_vec(&(2u32,self.digest(),ContentId::hash(&bytes),&scope.session,&fresh))?;
-        frames.writer().write_all(&(before_native.len() as u32).to_le_bytes())?;
-        frames.writer().write_all(&before_native)?;frames.writer().sync_all()?;
+        let before_native = serde_json::to_vec(&(
+            2u32,
+            self.digest(),
+            ContentId::hash(&bytes),
+            &scope.session,
+            &fresh,
+        ))?;
+        frames
+            .writer()
+            .write_all(&(before_native.len() as u32).to_le_bytes())?;
+        frames.writer().write_all(&before_native)?;
+        frames.writer().sync_all()?;
         crate::fault::checkpoint("recovered_wal2_actual_intended_before_shm_create");
-        let mut native_files=Vec::new();
-        for name in ["journal.sqlite","journal.sqlite-wal","journal.sqlite-journal"] {
-            let index=read.read.files.iter().position(|file|file.path==data.join(name))
-                .ok_or(ReconcileError::Invariant("recovered WAL native file absent"))?;
-            let evidence=read.read.files.remove(index);
-            let RecoveredFileProtection::Sqlite(file)=evidence.file else {
-                return Err(ReconcileError::Invariant("recovered WAL exclusive file required"));
+        let mut native_files = Vec::new();
+        for name in [
+            "journal.sqlite",
+            "journal.sqlite-wal",
+            "journal.sqlite-journal",
+        ] {
+            let index = read
+                .read
+                .files
+                .iter()
+                .position(|file| file.path == data.join(name))
+                .ok_or(ReconcileError::Invariant(
+                    "recovered WAL native file absent",
+                ))?;
+            let evidence = read.read.files.remove(index);
+            let RecoveredFileProtection::Sqlite(file) = evidence.file else {
+                return Err(ReconcileError::Invariant(
+                    "recovered WAL exclusive file required",
+                ));
             };
             native_files.push(file);
         }
-        let held=read.read.directories.iter().find(|dir|dir.path==data)
+        let held = read
+            .read
+            .directories
+            .iter()
+            .find(|dir| dir.path == data)
             .ok_or(ReconcileError::Invariant("recovered WAL held data absent"))?;
-        let shm=held.file.create_new_file("journal.sqlite-shm")?.into_fresh_sqlite_shm()?;
+        let shm = held
+            .file
+            .create_new_file("journal.sqlite-shm")?
+            .into_fresh_sqlite_shm()?;
         native_files.push(shm);
-        read.read.expected_membership.get_mut(data)
+        read.read
+            .expected_membership
+            .get_mut(data)
             .ok_or(ReconcileError::Invariant("recovered WAL membership absent"))?
             .insert("journal.sqlite-shm".into());
-        let native=sync_extend_platform_fs::FreshNativeWalConnection::open(
+        let native = sync_extend_platform_fs::FreshNativeWalConnection::open(
             &data.join("journal.sqlite"),
-            native_files.try_into().map_err(|_|ReconcileError::Invariant("recovered WAL four files"))?,
-            [scope.max_main_bytes,scope.max_wal_bytes,scope.max_rollback_bytes,1024*1024],
+            native_files
+                .try_into()
+                .map_err(|_| ReconcileError::Invariant("recovered WAL four files"))?,
+            [
+                scope.max_main_bytes,
+                scope.max_wal_bytes,
+                scope.max_rollback_bytes,
+                1024 * 1024,
+            ],
         )?;
-        let native_keys=native.all_native_keys()?.map(|key|key.to_string());
-        let before_rows=read.read.rows.clone();
-        let mut result=FreshRecoveredNodeWalV2Session {
-            created_work_directories:std::collections::BTreeMap::new(),read,native,frames,owner,path:external.join(name+".frames"),bounds,
-            space:self.space().clone(),previous:scope.session,fresh,before_rows,
-            archive:self.digest().clone(),original_frames:ContentId::hash(&bytes),
-            next:0,previous_record:ContentId::hash(&before_native),
-            attempted:false,committed:false,closed:false,poisoned:false,predecessor:None,native_keys,history_count:0,new_content_bytes:0,new_file_bytes:0,manifest_entry_limit:bounds.max_entries,retained_receipts:std::collections::BTreeMap::new(),retained_receipt_bytes:0,history_baseline:Vec::new(),history_chain_parent:None,history_chain_depth:0,history_retained_originals:Vec::new(),history_retained_directories:Vec::new(),retained_history_evidence:Vec::new(),retained_mutations:Vec::new(),mutation_requested:false,new_cas_bytes:0,new_cas_objects:0,new_cas_buckets:std::collections::BTreeMap::new(),
+        let native_keys = native.all_native_keys()?.map(|key| key.to_string());
+        let before_rows = read.read.rows.clone();
+        let mut result = FreshRecoveredNodeWalV2Session {
+            created_work_directories: std::collections::BTreeMap::new(),
+            read,
+            native,
+            frames,
+            owner,
+            path: external.join(name + ".frames"),
+            bounds,
+            space: self.space().clone(),
+            previous: scope.session,
+            fresh,
+            before_rows,
+            archive: self.digest().clone(),
+            original_frames: ContentId::hash(&bytes),
+            next: 0,
+            previous_record: ContentId::hash(&before_native),
+            attempted: false,
+            committed: false,
+            closed: false,
+            poisoned: false,
+            predecessor: None,
+            native_keys,
+            history_count: 0,
+            metadata_count: 0,
+            retained_metadata_receipts: Vec::new(),
+            new_content_bytes: 0,
+            new_file_bytes: 0,
+            manifest_entry_limit: bounds.max_entries,
+            retained_receipts: std::collections::BTreeMap::new(),
+            retained_receipt_bytes: 0,
+            history_baseline: Vec::new(),
+            history_chain_parent: None,
+            history_chain_depth: 0,
+            history_retained_originals: Vec::new(),
+            history_retained_directories: Vec::new(),
+            retained_history_evidence: Vec::new(),
+            retained_mutations: Vec::new(),
+            mutation_requested: false,
+            new_cas_bytes: 0,
+            new_cas_objects: 0,
+            new_cas_buckets: std::collections::BTreeMap::new(),
+            verified_main: std::cell::RefCell::new(None),
         };
-        result.record("intended",None)?;
+        result.record("intended", None)?;
         result.verify()?;
         Ok(result)
     }
 }
-
 
 impl super::VerifiedNodeStateArchive {
     /// Closed evidence is admission data; all current native objects, roots,
     /// original ledger and predecessor owners are explicitly reacquired.
     #[allow(clippy::too_many_arguments)]
     pub fn reacquire_fresh_closed_node_wal_v2_session(
-        &self,worktree:&std::path::Path,data:&std::path::Path,
-        original_frames:&std::path::Path,restore_ledger:&std::path::Path,
-        recovered_frames:&std::path::Path,bounds:sync_extend_journal::NodeInspectionBounds,
-        ledger_bounds:super::LedgerBounds,
-    )->Result<FreshRecoveredNodeWalV2Session> {
-        let parent=original_frames.parent().ok_or(ReconcileError::Invariant("WAL2 external parent"))?;
-        if recovered_frames.parent()!=Some(parent) || recovered_frames==original_frames {
-            return Err(ReconcileError::Invariant("WAL2 distinct exact external frame"));
+        &self,
+        worktree: &std::path::Path,
+        data: &std::path::Path,
+        original_frames: &std::path::Path,
+        restore_ledger: &std::path::Path,
+        recovered_frames: &std::path::Path,
+        bounds: sync_extend_journal::NodeInspectionBounds,
+        ledger_bounds: super::LedgerBounds,
+    ) -> Result<FreshRecoveredNodeWalV2Session> {
+        let parent = original_frames
+            .parent()
+            .ok_or(ReconcileError::Invariant("WAL2 external parent"))?;
+        if recovered_frames.parent() != Some(parent) || recovered_frames == original_frames {
+            return Err(ReconcileError::Invariant(
+                "WAL2 distinct exact external frame",
+            ));
         }
-        let ancestors=super::external::hold_ancestors(parent)?;
-        let held=&ancestors.last().ok_or(ReconcileError::Invariant("WAL2 external held parent"))?.1;
-        let mut path=recovered_frames.to_path_buf();let mut chain=Vec::new();let mut all_names=std::collections::BTreeSet::new();
-        let mut terminal:Option<RecoveredWalV2Record>=None;let mut current_digest=None;
-        let mut newer:Option<RecoveredWalV2Record>=None;let mut aggregate=0u64;
+        let ancestors = super::external::hold_ancestors(parent)?;
+        let held = &ancestors
+            .last()
+            .ok_or(ReconcileError::Invariant("WAL2 external held parent"))?
+            .1;
+        let mut path = recovered_frames.to_path_buf();
+        let mut chain = Vec::new();
+        let mut all_names = std::collections::BTreeSet::new();
+        let mut terminal: Option<RecoveredWalV2Record> = None;
+        let mut current_digest = None;
+        let mut newer: Option<RecoveredWalV2Record> = None;
+        let mut aggregate = 0u64;
         loop {
-            if chain.len()>=64 {return Err(ReconcileError::ResourceLimit("WAL2 closed chain count"));}
-            let component=path.file_name().and_then(|v|v.to_str()).ok_or(ReconcileError::Invariant("WAL2 frame name"))?;
-            if !all_names.insert(component.to_owned()) {return Err(ReconcileError::Invariant("WAL2 chain cycle"));}
-            let file=held.reacquire_existing_node_read_file(component)?;
-            let bytes=file.exact_bytes(256*1024)?;
-            aggregate=aggregate.checked_add(bytes.len() as u64).filter(|n|*n<=4*1024*1024)
-                .ok_or(ReconcileError::ResourceLimit("WAL2 held evidence aggregate"))?;
-            let records=recovered_wal_v2_records(&bytes)?;
-            let old=records.last().ok_or(ReconcileError::Invariant("WAL2 terminal absent"))?.clone();
-            if old.archive!=*self.digest() || old.worktree!=worktree.to_string_lossy() || old.data!=data.to_string_lossy()
-                || component!=format!("node-recovered-wal-{}.frames",old.fresh) {
-                return Err(ReconcileError::Invariant("WAL2 exact terminal external scope"));
+            if chain.len() >= 64 {
+                return Err(ReconcileError::ResourceLimit("WAL2 closed chain count"));
             }
-            let digest=ContentId::hash(&bytes);
-            if let Some(newer)=&newer {
-                if newer.predecessor.as_ref()!=Some(&digest) || newer.previous!=old.fresh || newer.keys!=old.keys {
+            let component = path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .ok_or(ReconcileError::Invariant("WAL2 frame name"))?;
+            if !all_names.insert(component.to_owned()) {
+                return Err(ReconcileError::Invariant("WAL2 chain cycle"));
+            }
+            let file = held.reacquire_existing_node_read_file(component)?;
+            let bytes = file.exact_bytes(256 * 1024)?;
+            aggregate = aggregate
+                .checked_add(bytes.len() as u64)
+                .filter(|n| *n <= 4 * 1024 * 1024)
+                .ok_or(ReconcileError::ResourceLimit(
+                    "WAL2 held evidence aggregate",
+                ))?;
+            let records = recovered_wal_v2_records(&bytes)?;
+            let old = records
+                .last()
+                .ok_or(ReconcileError::Invariant("WAL2 terminal absent"))?
+                .clone();
+            if old.archive != *self.digest()
+                || old.worktree != worktree.to_string_lossy()
+                || old.data != data.to_string_lossy()
+                || component != format!("node-recovered-wal-{}.frames", old.fresh)
+            {
+                return Err(ReconcileError::Invariant(
+                    "WAL2 exact terminal external scope",
+                ));
+            }
+            let digest = ContentId::hash(&bytes);
+            if let Some(newer) = &newer {
+                if newer.predecessor.as_ref() != Some(&digest)
+                    || newer.previous != old.fresh
+                    || newer.keys != old.keys
+                {
                     return Err(ReconcileError::Invariant("WAL2 linked predecessor differs"));
                 }
-            } else {terminal=Some(old.clone());current_digest=Some(digest.clone());}
-            let owner_name=format!("node-recovered-wal-{}.owner",old.fresh);
+            } else {
+                terminal = Some(old.clone());
+                current_digest = Some(digest.clone());
+            }
+            let owner_name = format!("node-recovered-wal-{}.owner", old.fresh);
             all_names.insert(owner_name.clone());
-            let owner=held.reacquire_existing_node_read_file(&owner_name)?;
-            let owner_bytes=owner.exact_bytes(65536)?;
-            if owner_bytes!=serde_json::to_vec(&(2u32,self.digest(),&old.fresh))? {
+            let owner = held.reacquire_existing_node_read_file(&owner_name)?;
+            let owner_bytes = owner.exact_bytes(65536)?;
+            if owner_bytes != serde_json::to_vec(&(2u32, self.digest(), &old.fresh))? {
                 return Err(ReconcileError::Invariant("WAL2 exact owner"));
             }
-            let owner_lock=owner.acquire_fresh_coordination_lock(false)?;
-            chain.push((ReacquiredExternalEvidence {path:path.clone(),file,digest,bytes:bytes.len() as u64},
-                ReacquiredExternalEvidence {path:parent.join(owner_name),file:owner,digest:ContentId::hash(&owner_bytes),bytes:owner_bytes.len() as u64},
-                owner_lock));
-            if let Some(predecessor)=&old.predecessor {
-                let mut found=None;
-                for (count,item) in std::fs::read_dir(parent)?.enumerate() {
-                    if count as u64>=ledger_bounds.max_records {return Err(ReconcileError::ResourceLimit("WAL2 predecessor search bound"));}
-                    let item=item?;let name=item.file_name().into_string().map_err(|_|ReconcileError::Invariant("WAL2 external name"))?;
-                    if name.starts_with("node-recovered-wal-") && name.ends_with(".frames") && !all_names.contains(&name) {
-                        let candidate=held.reacquire_existing_node_read_file(&name)?;
-                        if ContentId::hash(&candidate.exact_bytes(256*1024)?)==*predecessor {
-                            if found.is_some() {return Err(ReconcileError::Invariant("WAL2 duplicate predecessor"));}
-                            found=Some(parent.join(name));
+            let owner_lock = owner.acquire_fresh_coordination_lock(false)?;
+            chain.push((
+                ReacquiredExternalEvidence {
+                    path: path.clone(),
+                    file,
+                    digest,
+                    bytes: bytes.len() as u64,
+                },
+                ReacquiredExternalEvidence {
+                    path: parent.join(owner_name),
+                    file: owner,
+                    digest: ContentId::hash(&owner_bytes),
+                    bytes: owner_bytes.len() as u64,
+                },
+                owner_lock,
+            ));
+            if let Some(predecessor) = &old.predecessor {
+                let mut found = None;
+                for (count, item) in std::fs::read_dir(parent)?.enumerate() {
+                    if count as u64 >= ledger_bounds.max_records {
+                        return Err(ReconcileError::ResourceLimit(
+                            "WAL2 predecessor search bound",
+                        ));
+                    }
+                    let item = item?;
+                    let name = item
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| ReconcileError::Invariant("WAL2 external name"))?;
+                    if name.starts_with("node-recovered-wal-")
+                        && name.ends_with(".frames")
+                        && !all_names.contains(&name)
+                    {
+                        let candidate = held.reacquire_existing_node_read_file(&name)?;
+                        if ContentId::hash(&candidate.exact_bytes(256 * 1024)?) == *predecessor {
+                            if found.is_some() {
+                                return Err(ReconcileError::Invariant(
+                                    "WAL2 duplicate predecessor",
+                                ));
+                            }
+                            found = Some(parent.join(name));
                         }
                     }
                 }
-                path=found.ok_or(ReconcileError::Invariant("WAL2 predecessor missing"))?;
-                newer=Some(old);
-            } else {break;}
+                path = found.ok_or(ReconcileError::Invariant("WAL2 predecessor missing"))?;
+                newer = Some(old);
+            } else {
+                break;
+            }
         }
-        if chain.len()>=64 || aggregate.checked_add(256*1024).is_none_or(|n|n>4*1024*1024) {
-            return Err(ReconcileError::ResourceLimit("WAL2 next session preCREATE evidence budget"));
+        if chain.len() >= 64
+            || aggregate
+                .checked_add(256 * 1024)
+                .is_none_or(|n| n > 4 * 1024 * 1024)
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "WAL2 next session preCREATE evidence budget",
+            ));
         }
-        for (count,item) in std::fs::read_dir(parent)?.enumerate() {
-            if count as u64>=ledger_bounds.max_records {return Err(ReconcileError::ResourceLimit("WAL2 membership bound"));}
-            let name=item?.file_name().into_string().map_err(|_|ReconcileError::Invariant("WAL2 member name"))?;
-            if name.starts_with("node-recovered-history-") || name.starts_with("node-recovered-file-") || name.starts_with("node-recovered-cas-") || (name.starts_with("node-recovered-wal-") && !all_names.contains(&name)) {
+        for (count, item) in std::fs::read_dir(parent)?.enumerate() {
+            if count as u64 >= ledger_bounds.max_records {
+                return Err(ReconcileError::ResourceLimit("WAL2 membership bound"));
+            }
+            let name = item?
+                .file_name()
+                .into_string()
+                .map_err(|_| ReconcileError::Invariant("WAL2 member name"))?;
+            if name.starts_with("node-recovered-history-")
+                || name.starts_with("node-recovered-file-")
+                || name.starts_with("node-recovered-cas-")
+                || (name.starts_with("node-recovered-wal-") && !all_names.contains(&name))
+            {
                 return Err(ReconcileError::Invariant("WAL2 unresolved foreign attempt"));
             }
         }
-        let terminal=terminal.ok_or(ReconcileError::Invariant("WAL2 terminal"))?;
-        let original_name=original_frames.file_name().and_then(|v|v.to_str()).ok_or(ReconcileError::Invariant("WAL2 original name"))?;
-        let original=held.reacquire_existing_node_read_file(original_name)?;
-        let bytes=original.exact_bytes(1024*1024)?;
-        if ContentId::hash(&bytes)!=terminal.original_frames {
-            return Err(ReconcileError::Invariant("WAL2 exact original frame digest"));
+        let terminal = terminal.ok_or(ReconcileError::Invariant("WAL2 terminal"))?;
+        let original_name = original_frames
+            .file_name()
+            .and_then(|v| v.to_str())
+            .ok_or(ReconcileError::Invariant("WAL2 original name"))?;
+        let original = held.reacquire_existing_node_read_file(original_name)?;
+        let bytes = original.exact_bytes(1024 * 1024)?;
+        if ContentId::hash(&bytes) != terminal.original_frames {
+            return Err(ReconcileError::Invariant(
+                "WAL2 exact original frame digest",
+            ));
         }
-        let length=u32::from_le_bytes(bytes[16..20].try_into().map_err(|_|ReconcileError::Invariant("WAL2 original length"))?) as usize;
-        let scope:OriginalWriteScope=serde_json::from_slice(&bytes[84..84+length])?;
-        let earliest=chain.last().ok_or(ReconcileError::Invariant("WAL2 earliest chain"))?;
-        let first=recovered_wal_v2_records(&earliest.0.file.exact_bytes(earliest.0.bytes)?)?;
-        if first[0].previous!=scope.session {return Err(ReconcileError::Invariant("WAL2 original previous session"));}
+        let length = u32::from_le_bytes(
+            bytes[16..20]
+                .try_into()
+                .map_err(|_| ReconcileError::Invariant("WAL2 original length"))?,
+        ) as usize;
+        let scope: OriginalWriteScope = serde_json::from_slice(&bytes[84..84 + length])?;
+        let earliest = chain
+            .last()
+            .ok_or(ReconcileError::Invariant("WAL2 earliest chain"))?;
+        let first = recovered_wal_v2_records(&earliest.0.file.exact_bytes(earliest.0.bytes)?)?;
+        if first[0].previous != scope.session {
+            return Err(ReconcileError::Invariant("WAL2 original previous session"));
+        }
         drop(original);
-        let admission=FreshSessionRecord {
-            version:2,phase:"closed".into(),archive:self.digest().clone(),original_frames:ContentId::hash(&bytes),
-            original_completion:scope.completion.clone(),predecessor_frames:None,
-            previous:scope.session.clone(),fresh:terminal.fresh.clone(),worktree:terminal.worktree.clone(),
-            data:terminal.data.clone(),keys:terminal.keys[..3].to_vec().try_into().map_err(|_|ReconcileError::Invariant("WAL2 three keys"))?,
-            rows:terminal.rows.clone(),main:terminal.main.clone(),wal_shm:Some((terminal.keys[3].clone(),terminal.shm.clone())),history_admission:None,
+        let admission = FreshSessionRecord {
+            version: 2,
+            phase: "closed".into(),
+            archive: self.digest().clone(),
+            original_frames: ContentId::hash(&bytes),
+            original_completion: scope.completion.clone(),
+            predecessor_frames: None,
+            previous: scope.session.clone(),
+            fresh: terminal.fresh.clone(),
+            worktree: terminal.worktree.clone(),
+            data: terminal.data.clone(),
+            keys: terminal.keys[..3]
+                .to_vec()
+                .try_into()
+                .map_err(|_| ReconcileError::Invariant("WAL2 three keys"))?,
+            rows: terminal.rows.clone(),
+            main: terminal.main.clone(),
+            wal_shm: Some((terminal.keys[3].clone(), terminal.shm.clone())),
+            history_admission: None,
         };
-        let mut read=self.reacquire_closed_node_locked_scope_internal(worktree,data,original_frames,
-            restore_ledger,bounds,ledger_bounds,true,Some(&admission))?;
-        for (frames,owner,lock) in chain {read.external.push(frames);read.external.push(owner);read.locks.push(lock);}
+        let mut read = self.reacquire_closed_node_locked_scope_internal(
+            worktree,
+            data,
+            original_frames,
+            restore_ledger,
+            bounds,
+            ledger_bounds,
+            true,
+            Some(&admission),
+        )?;
+        for (frames, owner, lock) in chain {
+            read.external.push(frames);
+            read.external.push(owner);
+            read.locks.push(lock);
+        }
         read.verify()?;
-        let fresh=SpaceId::random()?;let name=format!("node-recovered-wal-{fresh}");
-        let mut owner=held.create_new_file(&(name.clone()+".owner"))?;
-        owner.writer().write_all(&serde_json::to_vec(&(2u32,self.digest(),&fresh))?)?;owner.writer().sync_all()?;
-        let mut frames=held.create_new_file(&(name.clone()+".frames"))?;
+        let fresh = SpaceId::random()?;
+        let name = format!("node-recovered-wal-{fresh}");
+        let mut owner = held.create_new_file(&(name.clone() + ".owner"))?;
+        owner
+            .writer()
+            .write_all(&serde_json::to_vec(&(2u32, self.digest(), &fresh))?)?;
+        owner.writer().sync_all()?;
+        let mut frames = held.create_new_file(&(name.clone() + ".frames"))?;
         frames.writer().write_all(b"SYNC-RECOVERED-WAL2\n")?;
-        let intent=serde_json::to_vec(&(2u32,self.digest(),ContentId::hash(&bytes),&terminal.fresh,&fresh))?;
-        frames.writer().write_all(&(intent.len() as u32).to_le_bytes())?;
-        frames.writer().write_all(&intent)?;frames.writer().sync_all()?;
+        let intent = serde_json::to_vec(&(
+            2u32,
+            self.digest(),
+            ContentId::hash(&bytes),
+            &terminal.fresh,
+            &fresh,
+        ))?;
+        frames
+            .writer()
+            .write_all(&(intent.len() as u32).to_le_bytes())?;
+        frames.writer().write_all(&intent)?;
+        frames.writer().sync_all()?;
         crate::fault::checkpoint("recovered_wal2_restart_intended_before_open");
-        let mut files=Vec::new();
-        for name in ["journal.sqlite","journal.sqlite-wal","journal.sqlite-journal","journal.sqlite-shm"] {
-            let index=read.read.files.iter().position(|f|f.path==data.join(name)).ok_or(ReconcileError::Invariant("WAL2 native file absent"))?;
-            let evidence=read.read.files.remove(index);
-            let RecoveredFileProtection::Sqlite(file)=evidence.file else {return Err(ReconcileError::Invariant("WAL2 exclusive native acquisition"));};
+        let mut files = Vec::new();
+        for name in [
+            "journal.sqlite",
+            "journal.sqlite-wal",
+            "journal.sqlite-journal",
+            "journal.sqlite-shm",
+        ] {
+            let index = read
+                .read
+                .files
+                .iter()
+                .position(|f| f.path == data.join(name))
+                .ok_or(ReconcileError::Invariant("WAL2 native file absent"))?;
+            let evidence = read.read.files.remove(index);
+            let RecoveredFileProtection::Sqlite(file) = evidence.file else {
+                return Err(ReconcileError::Invariant(
+                    "WAL2 exclusive native acquisition",
+                ));
+            };
             files.push(file);
         }
-        let native=sync_extend_platform_fs::FreshNativeWalConnection::open(&data.join("journal.sqlite"),
-            files.try_into().map_err(|_|ReconcileError::Invariant("WAL2 four files"))?,
-            [scope.max_main_bytes,scope.max_wal_bytes,scope.max_rollback_bytes,1024*1024])?;
-        let native_keys=native.all_native_keys()?.map(|key|key.to_string());let before_rows=read.read.rows.clone();
-        let mut result=FreshRecoveredNodeWalV2Session {
-            created_work_directories:std::collections::BTreeMap::new(),read,native,frames,owner,path:parent.join(name+".frames"),bounds,space:self.space().clone(),
-            previous:terminal.fresh,fresh,before_rows,archive:self.digest().clone(),original_frames:ContentId::hash(&bytes),
-            next:0,previous_record:ContentId::hash(&intent),attempted:false,committed:false,closed:false,poisoned:false,
-            predecessor:current_digest,native_keys,history_count:0,new_content_bytes:0,new_file_bytes:0,manifest_entry_limit:bounds.max_entries,retained_receipts:std::collections::BTreeMap::new(),retained_receipt_bytes:0,history_baseline:Vec::new(),history_chain_parent:None,history_chain_depth:0,history_retained_originals:Vec::new(),history_retained_directories:Vec::new(),retained_history_evidence:Vec::new(),retained_mutations:Vec::new(),mutation_requested:false,new_cas_bytes:0,new_cas_objects:0,new_cas_buckets:std::collections::BTreeMap::new(),
+        let native = sync_extend_platform_fs::FreshNativeWalConnection::open(
+            &data.join("journal.sqlite"),
+            files
+                .try_into()
+                .map_err(|_| ReconcileError::Invariant("WAL2 four files"))?,
+            [
+                scope.max_main_bytes,
+                scope.max_wal_bytes,
+                scope.max_rollback_bytes,
+                1024 * 1024,
+            ],
+        )?;
+        let native_keys = native.all_native_keys()?.map(|key| key.to_string());
+        let before_rows = read.read.rows.clone();
+        let mut result = FreshRecoveredNodeWalV2Session {
+            created_work_directories: std::collections::BTreeMap::new(),
+            read,
+            native,
+            frames,
+            owner,
+            path: parent.join(name + ".frames"),
+            bounds,
+            space: self.space().clone(),
+            previous: terminal.fresh,
+            fresh,
+            before_rows,
+            archive: self.digest().clone(),
+            original_frames: ContentId::hash(&bytes),
+            next: 0,
+            previous_record: ContentId::hash(&intent),
+            attempted: false,
+            committed: false,
+            closed: false,
+            poisoned: false,
+            predecessor: current_digest,
+            native_keys,
+            history_count: 0,
+            metadata_count: 0,
+            retained_metadata_receipts: Vec::new(),
+            new_content_bytes: 0,
+            new_file_bytes: 0,
+            manifest_entry_limit: bounds.max_entries,
+            retained_receipts: std::collections::BTreeMap::new(),
+            retained_receipt_bytes: 0,
+            history_baseline: Vec::new(),
+            history_chain_parent: None,
+            history_chain_depth: 0,
+            history_retained_originals: Vec::new(),
+            history_retained_directories: Vec::new(),
+            retained_history_evidence: Vec::new(),
+            retained_mutations: Vec::new(),
+            mutation_requested: false,
+            new_cas_bytes: 0,
+            new_cas_objects: 0,
+            new_cas_buckets: std::collections::BTreeMap::new(),
+            verified_main: std::cell::RefCell::new(None),
         };
-        result.record("intended",None)?;result.verify()?;Ok(result)
+        result.record("intended", None)?;
+        result.verify()?;
+        Ok(result)
     }
 }
 
 impl FreshRecoveredNodeWalV2Session {
-    fn retain_recovered_receipt(&mut self,receipt:OwnedFileCreation)->Result<()> {
-        let name=receipt.original_creation()?.created_component().to_owned();
-        let path=self.path.parent().ok_or(ReconcileError::Invariant("recovered receipt parent"))?.join(&name);
-        let file=RecoveredFileProtection::Created(receipt.seal_original()?);
-        let bytes=file.exact_bytes(256*1024)?;
-        let length=bytes.len() as u64;
-        let aggregate=self.retained_receipt_bytes.checked_add(length)
-            .filter(|n|*n<=4*1024*1024)
-            .ok_or(ReconcileError::ResourceLimit("recovered retained receipts aggregate"))?;
-        if self.retained_receipts.len()>=384 || self.retained_receipts.contains_key(&name)
-            || !file.matches_path(&path)? {
-            return Err(ReconcileError::Invariant("recovered exact receipt unique slot"));
+    fn retain_recovered_receipt(&mut self, receipt: OwnedFileCreation) -> Result<()> {
+        let name = receipt.original_creation()?.created_component().to_owned();
+        let path = self
+            .path
+            .parent()
+            .ok_or(ReconcileError::Invariant("recovered receipt parent"))?
+            .join(&name);
+        let file = RecoveredFileProtection::Created(receipt.seal_original()?);
+        let bytes = file.exact_bytes(256 * 1024)?;
+        let length = bytes.len() as u64;
+        let aggregate = self
+            .retained_receipt_bytes
+            .checked_add(length)
+            .filter(|n| *n <= 4 * 1024 * 1024)
+            .ok_or(ReconcileError::ResourceLimit(
+                "recovered retained receipts aggregate",
+            ))?;
+        if self.retained_receipts.len() >= 384
+            || self.retained_receipts.contains_key(&name)
+            || !file.matches_path(&path)?
+        {
+            return Err(ReconcileError::Invariant(
+                "recovered exact receipt unique slot",
+            ));
         }
-        self.retained_receipts.insert(name,ReacquiredFile {
-            path,file,bytes:length,digest:ContentId::hash(&bytes),
-        });
-        self.retained_receipt_bytes=aggregate;
+        self.retained_receipts.insert(
+            name,
+            ReacquiredFile {
+                path,
+                file,
+                bytes: length,
+                digest: ContentId::hash(&bytes),
+            },
+        );
+        self.retained_receipt_bytes = aggregate;
         Ok(())
     }
 }
 
-
 impl FreshRecoveredNodeWalV2Session {
     /// Ordinary same-content Put: metadata history changes, all native file
     /// content stays held and unchanged; arbitrary manifest or SQL is not exposed.
-    pub fn commit_same_content_history(&mut self,timestamp:u64)
-        ->Result<sync_extend_core_model::SnapshotId> {
+    pub fn commit_same_content_history(
+        &mut self,
+        timestamp: u64,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
         self.verify()?;
-        if !self.committed || self.closed || self.next!=2 {
-            return Err(ReconcileError::Invariant("recovered history requires committed live WAL2 session"));
+        if !self.committed || self.closed || self.next != 2 {
+            return Err(ReconcileError::Invariant(
+                "recovered history requires committed live WAL2 session",
+            ));
         }
-        let previous=self.read.read.manifest.clone();
-        let entry=previous.entries.values().find(|e|e.kind==sync_extend_core_model::EntryKind::File)
-            .ok_or(ReconcileError::Invariant("recovered history ordinary file absent"))?.clone();
-        let device=self.read.read.files.iter().find(|f|f.path==self.read.read.data.join("device.secret"))
-            .ok_or(ReconcileError::Invariant("recovered history protected device absent"))?;
-        let stored=device.file.exact_bytes(device.bytes)?;
-        let key=ed25519_dalek::SigningKey::from_bytes(&crate::identity::decode_stored_backup(&stored)?);
-        let origin=sync_extend_core_model::DeviceId::from_public_key(key.verifying_key().as_bytes());
-        let seq=previous.version_vector.get(&origin).checked_add(1)
-            .ok_or(ReconcileError::Invariant("recovered history sequence overflow"))?;
-        let operation=sync_extend_core_model::Operation::new(sync_extend_core_model::OperationPayload {
-            format_version:sync_extend_core_model::FORMAT_VERSION,space_id:self.space.clone(),
-            origin_device_id:origin.clone(),origin_seq:seq,causal:previous.version_vector.clone(),
-            change:sync_extend_core_model::Change::Put{entry},created_at_ms:timestamp,
-        })?;
-        let mut manifest=previous.clone();manifest.version_vector.observe(origin,seq);
-        self.commit_exact_recovered_history(manifest,vec![operation],timestamp)
+        let previous = self.read.read.manifest.clone();
+        let entry = previous
+            .entries
+            .values()
+            .find(|e| e.kind == sync_extend_core_model::EntryKind::File)
+            .ok_or(ReconcileError::Invariant(
+                "recovered history ordinary file absent",
+            ))?
+            .clone();
+        let device = self
+            .read
+            .read
+            .files
+            .iter()
+            .find(|f| f.path == self.read.read.data.join("device.secret"))
+            .ok_or(ReconcileError::Invariant(
+                "recovered history protected device absent",
+            ))?;
+        let stored = device.file.exact_bytes(device.bytes)?;
+        let key =
+            ed25519_dalek::SigningKey::from_bytes(&crate::identity::decode_stored_backup(&stored)?);
+        let origin =
+            sync_extend_core_model::DeviceId::from_public_key(key.verifying_key().as_bytes());
+        let seq = previous.version_vector.get(&origin).checked_add(1).ok_or(
+            ReconcileError::Invariant("recovered history sequence overflow"),
+        )?;
+        let operation =
+            sync_extend_core_model::Operation::new(sync_extend_core_model::OperationPayload {
+                format_version: sync_extend_core_model::FORMAT_VERSION,
+                space_id: self.space.clone(),
+                origin_device_id: origin.clone(),
+                origin_seq: seq,
+                causal: previous.version_vector.clone(),
+                change: sync_extend_core_model::Change::Put { entry },
+                created_at_ms: timestamp,
+            })?;
+        let mut manifest = previous.clone();
+        manifest.version_vector.observe(origin, seq);
+        self.commit_exact_recovered_history(manifest, vec![operation], timestamp)
     }
     fn commit_exact_recovered_history(
-        &mut self,manifest:sync_extend_core_model::Manifest,
-        operations:Vec<sync_extend_core_model::Operation>,timestamp:u64,
-    )->Result<sync_extend_core_model::SnapshotId> {
+        &mut self,
+        manifest: sync_extend_core_model::Manifest,
+        operations: Vec<sync_extend_core_model::Operation>,
+        timestamp: u64,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
         self.verify()?;
-        if self.history_count>=128
-            || self.retained_receipt_bytes.checked_add(256*1024).is_none_or(|n|n>4*1024*1024) {
-            return Err(ReconcileError::ResourceLimit("recovered history aggregate count or receipt bytes"));
+        if self.metadata_count != 0
+            || self.history_count >= 128
+            || self
+                .retained_receipt_bytes
+                .checked_add(256 * 1024)
+                .is_none_or(|n| n > 4 * 1024 * 1024)
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered history aggregate count or receipt bytes",
+            ));
         }
-        let expected=self.read.read.manifest.root()?;
-        let bytes=self.native.exact_main_bytes()?;
-        let image=sync_extend_journal::JournalBackupImage::from_current_node_image(
-            bytes.clone(),ContentId::hash(&bytes).as_str(),bytes.len(),&self.space,self.bounds)?;
-        let plan=image.plan_recovered_local_history(&self.space,&expected,&manifest,&operations,timestamp,self.bounds)?;
+        let expected = self.read.read.manifest.root()?;
+        let bytes = self.native.exact_main_bytes()?;
+        let image = sync_extend_journal::JournalBackupImage::from_current_node_image(
+            bytes.clone(),
+            ContentId::hash(&bytes).as_str(),
+            bytes.len(),
+            &self.space,
+            self.bounds,
+        )?;
+        let plan = image.plan_recovered_local_history(
+            &self.space,
+            &expected,
+            &manifest,
+            &operations,
+            timestamp,
+            self.bounds,
+        )?;
         // Durable independent intended evidence precedes the actual history commit.
-        let external=self.path.parent().ok_or(ReconcileError::Invariant("recovered history external"))?;
-        let held=self.read.read.directories.iter().find(|d|d.path==external)
+        let external = self
+            .path
+            .parent()
+            .ok_or(ReconcileError::Invariant("recovered history external"))?;
+        let held = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|d| d.path == external)
             .ok_or(ReconcileError::Invariant("recovered history held external"))?;
-        let intent=serde_json::to_vec(&(1u32,&self.archive,&self.fresh,&expected,manifest.root()?,timestamp))?;
-        if intent.len()>65536 {return Err(ReconcileError::ResourceLimit("recovered history intent preeffect bytes"));}
-        self.poisoned=true;
-        let mut receipt=held.file.create_new_file(&format!("node-recovered-history-{}-{}.frames",self.fresh,self.history_count))?;
-        receipt.writer().write_all(&intent)?;receipt.writer().sync_all()?;
+        let intent = serde_json::to_vec(&(
+            1u32,
+            &self.archive,
+            &self.fresh,
+            &expected,
+            manifest.root()?,
+            timestamp,
+        ))?;
+        if intent.len() > 65536 {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered history intent preeffect bytes",
+            ));
+        }
+        self.poisoned = true;
+        let mut receipt = held.file.create_new_file(&format!(
+            "node-recovered-history-{}-{}.frames",
+            self.fresh, self.history_count
+        ))?;
+        receipt.writer().write_all(&intent)?;
+        receipt.writer().sync_all()?;
         crate::fault::checkpoint("recovered_history_intended_before_sql");
-        let root=plan.execute(&mut self.native)?;
+        let root = plan.execute(&mut self.native)?;
         crate::fault::checkpoint("recovered_history_committed_before_receipt");
-        let bytes=self.native.exact_main_bytes()?;
-        let image=sync_extend_journal::JournalBackupImage::from_current_node_image(
-            bytes.clone(),ContentId::hash(&bytes).as_str(),bytes.len(),&self.space,self.bounds)?;
-        self.before_rows=image.recovered_session_preserved_rows_digest(&self.space,self.bounds,&self.previous,&self.fresh)?;
-        self.read.read.manifest=manifest;
-        receipt.writer().write_all(&serde_json::to_vec(&(1u32,"committed",&root,ContentId::hash(&bytes)))?)?;
+        let bytes = self.native.exact_main_bytes()?;
+        let image = sync_extend_journal::JournalBackupImage::from_current_node_image(
+            bytes.clone(),
+            ContentId::hash(&bytes).as_str(),
+            bytes.len(),
+            &self.space,
+            self.bounds,
+        )?;
+        self.before_rows = image.recovered_session_preserved_rows_digest(
+            &self.space,
+            self.bounds,
+            &self.previous,
+            &self.fresh,
+        )?;
+        self.read.read.manifest = manifest;
+        receipt.writer().write_all(&serde_json::to_vec(&(
+            1u32,
+            "committed",
+            &root,
+            ContentId::hash(&bytes),
+        ))?)?;
         receipt.writer().sync_all()?;
         self.retain_recovered_receipt(receipt)?;
-        self.history_count+=1;
-        self.poisoned=false;
-        if let Err(error)=self.verify() {self.poisoned=true;return Err(error);}
+        self.history_count += 1;
+        self.poisoned = false;
+        if let Err(error) = self.verify() {
+            self.poisoned = true;
+            return Err(error);
+        }
         Ok(root)
     }
 }
@@ -3954,183 +4760,429 @@ impl FreshRecoveredNodeWalV2Session {
 // Ordinary fresh CREATE through reacquired parents, retained through native scan.
 impl FreshRecoveredNodeWalV2Session {
     pub fn create_recovered_file_from_existing_content(
-        &mut self, path:&sync_extend_core_model::PortablePath,
-        source:&sync_extend_core_model::PortablePath,timestamp:u64,
-    )->Result<sync_extend_core_model::SnapshotId> {
+        &mut self,
+        path: &sync_extend_core_model::PortablePath,
+        source: &sync_extend_core_model::PortablePath,
+        timestamp: u64,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
         self.verify()?;
-        if !self.committed || self.closed || self.next!=2 || self.history_count>=128 {
-            return Err(ReconcileError::ResourceLimit("recovered file session attempt bound"));
+        if !self.committed
+            || self.closed
+            || self.next != 2
+            || self.metadata_count != 0
+            || self.history_count >= 128
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered file session attempt bound",
+            ));
         }
-        let previous=self.read.read.manifest.clone();
-        let original=previous.entries.values().find(|e|e.path==*source && e.kind==sync_extend_core_model::EntryKind::File)
-            .ok_or(ReconcileError::Invariant("recovered file existing manifest source absent"))?;
-        let content=original.content.clone().ok_or(ReconcileError::Invariant("recovered file source content"))?;
-        let source_file=self.read.read.files.iter().find(|f|f.path==self.read.read.worktree.join(source.as_str()))
+        let previous = self.read.read.manifest.clone();
+        let original = previous
+            .entries
+            .values()
+            .find(|e| e.path == *source && e.kind == sync_extend_core_model::EntryKind::File)
+            .ok_or(ReconcileError::Invariant(
+                "recovered file existing manifest source absent",
+            ))?;
+        let content = original
+            .content
+            .clone()
+            .ok_or(ReconcileError::Invariant("recovered file source content"))?;
+        let source_file = self
+            .read
+            .read
+            .files
+            .iter()
+            .find(|f| f.path == self.read.read.worktree.join(source.as_str()))
             .ok_or(ReconcileError::Invariant("recovered source file absent"))?;
-        let bytes=source_file.file.exact_bytes(8*1024*1024)?;
-        self.create_recovered_file_materialized(path,content,bytes,timestamp)
+        let bytes = source_file.file.exact_bytes(8 * 1024 * 1024)?;
+        self.create_recovered_file_materialized(path, content, bytes, timestamp)
     }
     fn create_recovered_file_materialized(
-        &mut self,path:&sync_extend_core_model::PortablePath,
-        content:sync_extend_core_model::FileManifest,bytes:Vec<u8>,timestamp:u64,
-    )->Result<sync_extend_core_model::SnapshotId> {
+        &mut self,
+        path: &sync_extend_core_model::PortablePath,
+        content: sync_extend_core_model::FileManifest,
+        bytes: Vec<u8>,
+        timestamp: u64,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
         self.verify()?;
-        self.preflight_recovered_file(path,&content)?;
-        let previous=self.read.read.manifest.clone();
-        let components:Vec<_>=path.as_str().split('/').collect();
-        if components.len()>256 || components.iter().any(|name|name.starts_with('.'))
-            || content.length>8*1024*1024 || content.chunks.len()>128
-            || previous.entries.len().checked_add(1).is_none_or(|n|n>self.manifest_entry_limit)
-            || previous.entries.values().any(|e|e.path.collision_key()==path.collision_key()) {
-            return Err(ReconcileError::ResourceLimit("recovered file preCREATE path content entry budget"));
+        self.preflight_recovered_file(path, &content)?;
+        let previous = self.read.read.manifest.clone();
+        let components: Vec<_> = path.as_str().split('/').collect();
+        if components.len() > 256
+            || components.iter().any(|name| name.starts_with('.'))
+            || content.length > 8 * 1024 * 1024
+            || content.chunks.len() > 128
+            || previous
+                .entries
+                .len()
+                .checked_add(1)
+                .is_none_or(|n| n > self.manifest_entry_limit)
+            || previous
+                .entries
+                .values()
+                .any(|e| e.path.collision_key() == path.collision_key())
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered file preCREATE path content entry budget",
+            ));
         }
-        let name=components.last().ok_or(ReconcileError::Invariant("recovered file component"))?;
-        let target=self.read.read.worktree.join(path.as_str());
-        let parent=target.parent().ok_or(ReconcileError::Invariant("recovered file parent"))?;
-        let held=self.read.read.directories.iter().find(|d|d.path==parent)
-            .ok_or(ReconcileError::Invariant("recovered file exact held parent absent"))?;
-        if self.read.read.expected_membership.get(parent).is_none_or(|names|names.contains(*name)) {
-            return Err(ReconcileError::Invariant("recovered file existing or unknown membership"));
+        let name = components
+            .last()
+            .ok_or(ReconcileError::Invariant("recovered file component"))?;
+        let target = self.read.read.worktree.join(path.as_str());
+        let parent = target
+            .parent()
+            .ok_or(ReconcileError::Invariant("recovered file parent"))?;
+        let held = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|d| d.path == parent)
+            .ok_or(ReconcileError::Invariant(
+                "recovered file exact held parent absent",
+            ))?;
+        if self
+            .read
+            .read
+            .expected_membership
+            .get(parent)
+            .is_none_or(|names| names.contains(*name))
+        {
+            return Err(ReconcileError::Invariant(
+                "recovered file existing or unknown membership",
+            ));
         }
-        if bytes.len() as u64!=content.length || ContentId::hash(&bytes)!=content.content_id
-            || sync_extend_cas::plan_bounded_content(&bytes,8*1024*1024,128)?.manifest!=content {
-            return Err(ReconcileError::Invariant("recovered file exact content plan differs"));
+        if bytes.len() as u64 != content.length
+            || ContentId::hash(&bytes) != content.content_id
+            || sync_extend_cas::plan_bounded_content(&bytes, 8 * 1024 * 1024, 128)?.manifest
+                != content
+        {
+            return Err(ReconcileError::Invariant(
+                "recovered file exact content plan differs",
+            ));
         }
         // Existing CAS chunks were acquired with the complete manifest and
         // remain read-held; no new CAS object or namespace is inferred here.
         for chunk in &content.chunks {
-            let id=chunk.content_id.as_str();
-            let file=self.read.read.files.iter().find(|f|f.path==self.read.read.data.join("cas/objects").join(&id[..2]).join(id))
-                .ok_or(ReconcileError::Invariant("recovered file original CAS object absent"))?;
-            if file.digest!=chunk.content_id || file.bytes!=u64::from(chunk.length) {
-                return Err(ReconcileError::Invariant("recovered file CAS chunk differs"));
+            let id = chunk.content_id.as_str();
+            let file = self
+                .read
+                .read
+                .files
+                .iter()
+                .find(|f| {
+                    f.path
+                        == self
+                            .read
+                            .read
+                            .data
+                            .join("cas/objects")
+                            .join(&id[..2])
+                            .join(id)
+                })
+                .ok_or(ReconcileError::Invariant(
+                    "recovered file original CAS object absent",
+                ))?;
+            if file.digest != chunk.content_id || file.bytes != u64::from(chunk.length) {
+                return Err(ReconcileError::Invariant(
+                    "recovered file CAS chunk differs",
+                ));
             }
         }
-        let external=self.path.parent().ok_or(ReconcileError::Invariant("recovered file external parent"))?;
-        let held_external=self.read.read.directories.iter().find(|d|d.path==external)
-            .ok_or(ReconcileError::Invariant("recovered file external held parent"))?;
-        let intended=serde_json::to_vec(&(1u32,&self.archive,&self.fresh,path,&content.content_id,held.key.to_string(),
-            previous.root()?,&content,timestamp))?;
-        if intended.len()>65536 {return Err(ReconcileError::ResourceLimit("recovered file intended evidence bytes"));}
+        let external = self
+            .path
+            .parent()
+            .ok_or(ReconcileError::Invariant("recovered file external parent"))?;
+        let held_external = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|d| d.path == external)
+            .ok_or(ReconcileError::Invariant(
+                "recovered file external held parent",
+            ))?;
+        let intended = serde_json::to_vec(&(
+            1u32,
+            &self.archive,
+            &self.fresh,
+            path,
+            &content.content_id,
+            held.key.to_string(),
+            previous.root()?,
+            &content,
+            timestamp,
+        ))?;
+        if intended.len() > 65536 {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered file intended evidence bytes",
+            ));
+        }
         // Once any independent intent CREATE is attempted, failures retain an
         // uncertain session. No same-session retry can infer a clean boundary.
-        self.poisoned=true;
-        let mut evidence=held_external.file.create_new_file(&format!("node-recovered-file-{}-{}.frames",self.fresh,self.history_count))?;
-        evidence.writer().write_all(&intended)?;evidence.writer().sync_all()?;
+        self.poisoned = true;
+        let mut evidence = held_external.file.create_new_file(&format!(
+            "node-recovered-file-{}-{}.frames",
+            self.fresh, self.history_count
+        ))?;
+        evidence.writer().write_all(&intended)?;
+        evidence.writer().sync_all()?;
         crate::fault::checkpoint("recovered_file_intended_before_create");
-        let mut creator=held.file.create_new_file(name)?;
-        creator.writer().write_all(&bytes)?;creator.writer().sync_all()?;
-        let file=creator.seal_original()?;
-        let created_key=file.key()?;
-        if file.parent_key()?!=held.key || !file.matches_path(&target)? {
-            return Err(ReconcileError::Invariant("recovered file CREATE exact parent slot"));
+        let mut creator = held.file.create_new_file(name)?;
+        creator.writer().write_all(&bytes)?;
+        creator.writer().sync_all()?;
+        let file = creator.seal_original()?;
+        let created_key = file.key()?;
+        if file.parent_key()? != held.key || !file.matches_path(&target)? {
+            return Err(ReconcileError::Invariant(
+                "recovered file CREATE exact parent slot",
+            ));
         }
-        self.read.read.files.push(ReacquiredFile {path:target.clone(),file:RecoveredFileProtection::Created(file),
-            digest:content.content_id.clone(),bytes:content.length});
-        self.new_file_bytes+=content.length;
-        self.read.read.expected_membership.get_mut(parent).ok_or(ReconcileError::Invariant("recovered file membership absent"))?
+        self.read.read.files.push(ReacquiredFile {
+            path: target.clone(),
+            file: RecoveredFileProtection::Created(file),
+            digest: content.content_id.clone(),
+            bytes: content.length,
+        });
+        self.new_file_bytes += content.length;
+        self.read
+            .read
+            .expected_membership
+            .get_mut(parent)
+            .ok_or(ReconcileError::Invariant(
+                "recovered file membership absent",
+            ))?
             .insert((*name).into());
-        evidence.writer().write_all(&serde_json::to_vec(&(1u32,"created",created_key.to_string(),&content.content_id))?)?;
+        evidence.writer().write_all(&serde_json::to_vec(&(
+            1u32,
+            "created",
+            created_key.to_string(),
+            &content.content_id,
+        ))?)?;
         evidence.writer().sync_all()?;
         crate::fault::checkpoint("recovered_file_created_before_history");
-        self.poisoned=false;
-        let result=(||->Result<sync_extend_core_model::SnapshotId> {
-        self.verify()?;
-        let limits=sync_extend_core_model::limits::LocalLimits::default();
-        let allowed:std::collections::BTreeSet<_>=previous.entries.values().filter_map(|e|e.content.as_ref())
-            .flat_map(|c|&c.chunks).chain(content.chunks.iter()).map(|c|c.content_id.clone()).collect();
-        let cas=sync_extend_cas::Cas::open_existing_session_coordinated(&self.read.read.data.join("cas"),
-            move |id|if allowed.contains(id) {Ok(Box::new(()))} else {Err("recovered scan CAS outside held current set".into())},
-            ||Ok(Box::new(())))?;
-        let view=RecoveredSessionScanView(self);
-        let first=crate::scan::scan_native(&self.read.read.worktree,&cas,&limits,&view)?;
-        let second=crate::scan::scan_native(&self.read.read.worktree,&cas,&limits,&view)?;
-        if first!=second {return Err(ReconcileError::Unstable);}
-        let mut manifest=crate::build_manifest(&previous,&second,&std::collections::BTreeMap::new())?;
-        let added:Vec<_>=manifest.entries.values().filter(|e|!previous.entries.contains_key(&e.entry_id)).cloned().collect();
-        if added.len()!=1 || added[0].path!=*path || added[0].content.as_ref()!=Some(&content)
-            || previous.entries.iter().any(|(id,e)|manifest.entries.get(id)!=Some(e)) {
-            return Err(ReconcileError::Invariant("recovered file original native scan delta"));
-        }
-        let origin=self.recovered_device_id()?;
-        let seq=manifest.version_vector.get(&origin).checked_add(1)
-            .ok_or(ReconcileError::Invariant("recovered file local sequence overflow"))?;
-        let operation=sync_extend_core_model::Operation::new(sync_extend_core_model::OperationPayload {
-            format_version:sync_extend_core_model::FORMAT_VERSION,space_id:self.space.clone(),
-            origin_device_id:origin.clone(),origin_seq:seq,causal:manifest.version_vector.clone(),
-            change:sync_extend_core_model::Change::Put {entry:added[0].clone()},created_at_ms:timestamp,
-        })?;
-        manifest.version_vector.observe(origin,seq);
-        let root=self.commit_exact_recovered_history(manifest,vec![operation],timestamp)?;
-        evidence.writer().write_all(&serde_json::to_vec(&(1u32,"committed",&root,created_key.to_string()))?)?;
-        evidence.writer().sync_all()?;
-        self.retain_recovered_receipt(evidence)?;
-        self.verify()?;
-        Ok(root)
+        self.poisoned = false;
+        let result = (|| -> Result<sync_extend_core_model::SnapshotId> {
+            self.verify()?;
+            let limits = sync_extend_core_model::limits::LocalLimits::default();
+            let allowed: std::collections::BTreeSet<_> = previous
+                .entries
+                .values()
+                .filter_map(|e| e.content.as_ref())
+                .flat_map(|c| &c.chunks)
+                .chain(content.chunks.iter())
+                .map(|c| c.content_id.clone())
+                .collect();
+            let cas = sync_extend_cas::Cas::open_existing_session_coordinated(
+                &self.read.read.data.join("cas"),
+                move |id| {
+                    if allowed.contains(id) {
+                        Ok(Box::new(()))
+                    } else {
+                        Err("recovered scan CAS outside held current set".into())
+                    }
+                },
+                || Ok(Box::new(())),
+            )?;
+            let view = RecoveredSessionScanView(self);
+            let first = crate::scan::scan_native(&self.read.read.worktree, &cas, &limits, &view)?;
+            let second = crate::scan::scan_native(&self.read.read.worktree, &cas, &limits, &view)?;
+            if first != second {
+                return Err(ReconcileError::Unstable);
+            }
+            let mut manifest =
+                crate::build_manifest(&previous, &second, &std::collections::BTreeMap::new())?;
+            let added: Vec<_> = manifest
+                .entries
+                .values()
+                .filter(|e| !previous.entries.contains_key(&e.entry_id))
+                .cloned()
+                .collect();
+            if added.len() != 1
+                || added[0].path != *path
+                || added[0].content.as_ref() != Some(&content)
+                || previous
+                    .entries
+                    .iter()
+                    .any(|(id, e)| manifest.entries.get(id) != Some(e))
+            {
+                return Err(ReconcileError::Invariant(
+                    "recovered file original native scan delta",
+                ));
+            }
+            let origin = self.recovered_device_id()?;
+            let seq = manifest.version_vector.get(&origin).checked_add(1).ok_or(
+                ReconcileError::Invariant("recovered file local sequence overflow"),
+            )?;
+            let operation =
+                sync_extend_core_model::Operation::new(sync_extend_core_model::OperationPayload {
+                    format_version: sync_extend_core_model::FORMAT_VERSION,
+                    space_id: self.space.clone(),
+                    origin_device_id: origin.clone(),
+                    origin_seq: seq,
+                    causal: manifest.version_vector.clone(),
+                    change: sync_extend_core_model::Change::Put {
+                        entry: added[0].clone(),
+                    },
+                    created_at_ms: timestamp,
+                })?;
+            manifest.version_vector.observe(origin, seq);
+            let root = self.commit_exact_recovered_history(manifest, vec![operation], timestamp)?;
+            evidence.writer().write_all(&serde_json::to_vec(&(
+                1u32,
+                "committed",
+                &root,
+                created_key.to_string(),
+            ))?)?;
+            evidence.writer().sync_all()?;
+            self.retain_recovered_receipt(evidence)?;
+            self.verify()?;
+            Ok(root)
         })();
-        if result.is_err() {self.poisoned=true;}
+        if result.is_err() {
+            self.poisoned = true;
+        }
         result
     }
-    fn recovered_device_id(&self)->Result<sync_extend_core_model::DeviceId> {
+    fn recovered_device_id(&self) -> Result<sync_extend_core_model::DeviceId> {
         self.verify()?;
-        let file=self.read.read.files.iter().find(|f|f.path==self.read.read.data.join("device.secret"))
-            .ok_or(ReconcileError::Invariant("recovered protected identity absent"))?;
-        let secret=crate::identity::decode_stored_backup(&file.file.exact_bytes(file.bytes)?)?;
-        let key=ed25519_dalek::SigningKey::from_bytes(&secret);
-        Ok(sync_extend_core_model::DeviceId::from_public_key(key.verifying_key().as_bytes()))
+        let file = self
+            .read
+            .read
+            .files
+            .iter()
+            .find(|f| f.path == self.read.read.data.join("device.secret"))
+            .ok_or(ReconcileError::Invariant(
+                "recovered protected identity absent",
+            ))?;
+        let secret = crate::identity::decode_stored_backup(&file.file.exact_bytes(file.bytes)?)?;
+        let key = ed25519_dalek::SigningKey::from_bytes(&secret);
+        Ok(sync_extend_core_model::DeviceId::from_public_key(
+            key.verifying_key().as_bytes(),
+        ))
     }
 }
 struct RecoveredSessionScanView<'a>(&'a FreshRecoveredNodeWalV2Session);
 impl crate::native_file_view::NativeFileView for RecoveredSessionScanView<'_> {
-    fn verify(&self)->sync_extend_journal::Result<()> {
-        self.0.verify().map_err(|_|sync_extend_journal::JournalError::Invariant("recovered scan scope"))
+    fn verify(&self) -> sync_extend_journal::Result<()> {
+        self.0
+            .verify()
+            .map_err(|_| sync_extend_journal::JournalError::Invariant("recovered scan scope"))
     }
-    fn observe_file(&self,path:&std::path::Path)
-        ->sync_extend_journal::Result<Option<sync_extend_journal::NativePublicationFileObservation>> {
+    fn observe_file(
+        &self,
+        path: &std::path::Path,
+    ) -> sync_extend_journal::Result<Option<sync_extend_journal::NativePublicationFileObservation>>
+    {
         self.verify()?;
-        let file=self.0.read.read.files.iter().find(|f|f.path==path)
-            .ok_or(sync_extend_journal::JournalError::Invariant("recovered scan unheld file"))?;
-        let bytes=file.file.exact_bytes(8*1024*1024)?;
-        let plan=sync_extend_cas::plan_bounded_content(&bytes,8*1024*1024,128)
-            .map_err(|_|sync_extend_journal::JournalError::Invariant("recovered scan content plan"))?;
-        if plan.manifest.content_id!=file.digest || plan.manifest.length!=file.bytes {
-            return Err(sync_extend_journal::JournalError::Invariant("recovered scan exact content"));
+        let file = self
+            .0
+            .read
+            .read
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .ok_or(sync_extend_journal::JournalError::Invariant(
+                "recovered scan unheld file",
+            ))?;
+        let bytes = file.file.exact_bytes(8 * 1024 * 1024)?;
+        let plan =
+            sync_extend_cas::plan_bounded_content(&bytes, 8 * 1024 * 1024, 128).map_err(|_| {
+                sync_extend_journal::JournalError::Invariant("recovered scan content plan")
+            })?;
+        if plan.manifest.content_id != file.digest || plan.manifest.length != file.bytes {
+            return Err(sync_extend_journal::JournalError::Invariant(
+                "recovered scan exact content",
+            ));
         }
-        let key=file.file.key()?;
-        Ok(Some(sync_extend_journal::NativePublicationFileObservation {
-            metadata:file.file.metadata()?,
-            physical_identity:ContentId::hash(format!("windows:{}:{}",key.volume,key.id).as_bytes()),
-            content:Some(plan.manifest),
-        }))
+        let key = file.file.key()?;
+        Ok(Some(
+            sync_extend_journal::NativePublicationFileObservation {
+                metadata: file.file.metadata()?,
+                physical_identity: ContentId::hash(
+                    format!("windows:{}:{}", key.volume, key.id).as_bytes(),
+                ),
+                content: Some(plan.manifest),
+            },
+        ))
     }
-    fn remaining_internal_bytes(&self)->sync_extend_journal::Result<u64> {self.verify()?;Ok(0)}
+    fn remaining_internal_bytes(&self) -> sync_extend_journal::Result<u64> {
+        self.verify()?;
+        Ok(0)
+    }
 }
 
 impl FreshRecoveredNodeWalV2Session {
     // This gate performs no CREATE and no SQLite effect. CAS publication calls
     // it before its own intent, so downstream ordinary-file limits apply first.
     fn preflight_recovered_file(
-        &self,path:&sync_extend_core_model::PortablePath,
-        content:&sync_extend_core_model::FileManifest,
-    )->Result<()> {
-        if !self.committed || self.closed || self.next!=2 || self.history_count>=128
-            || self.retained_receipt_bytes.checked_add(3*256*1024).is_none_or(|n|n>4*1024*1024)
-            || content.length>8*1024*1024 || content.chunks.len()>128
-            || self.new_file_bytes.checked_add(content.length).is_none_or(|n|n>64*1024*1024)
-            || self.read.read.manifest.entries.len().checked_add(1).is_none_or(|n|n>self.manifest_entry_limit) {
-            return Err(ReconcileError::ResourceLimit("recovered file aggregate preeffect bound"));
+        &self,
+        path: &sync_extend_core_model::PortablePath,
+        content: &sync_extend_core_model::FileManifest,
+    ) -> Result<()> {
+        if !self.committed
+            || self.closed
+            || self.next != 2
+            || self.metadata_count != 0
+            || self.history_count >= 128
+            || self
+                .retained_receipt_bytes
+                .checked_add(3 * 256 * 1024)
+                .is_none_or(|n| n > 4 * 1024 * 1024)
+            || content.length > 8 * 1024 * 1024
+            || content.chunks.len() > 128
+            || self
+                .new_file_bytes
+                .checked_add(content.length)
+                .is_none_or(|n| n > 64 * 1024 * 1024)
+            || self
+                .read
+                .read
+                .manifest
+                .entries
+                .len()
+                .checked_add(1)
+                .is_none_or(|n| n > self.manifest_entry_limit)
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered file aggregate preeffect bound",
+            ));
         }
-        let components:Vec<_>=path.as_str().split('/').collect();
-        if components.len()>256 || components.iter().any(|n|n.starts_with('.'))
-            || self.read.read.manifest.entries.values().any(|e|e.path.collision_key()==path.collision_key()) {
-            return Err(ReconcileError::Invariant("recovered file preeffect path scope"));
+        let components: Vec<_> = path.as_str().split('/').collect();
+        if components.len() > 256
+            || components.iter().any(|n| n.starts_with('.'))
+            || self
+                .read
+                .read
+                .manifest
+                .entries
+                .values()
+                .any(|e| e.path.collision_key() == path.collision_key())
+        {
+            return Err(ReconcileError::Invariant(
+                "recovered file preeffect path scope",
+            ));
         }
-        let target=self.read.read.worktree.join(path.as_str());
-        let parent=target.parent().ok_or(ReconcileError::Invariant("recovered file preeffect parent"))?;
-        let name=components.last().ok_or(ReconcileError::Invariant("recovered file preeffect component"))?;
-        if !self.read.read.directories.iter().any(|d|d.path==parent)
-            || self.read.read.expected_membership.get(parent).is_none_or(|names|names.contains(*name)) {
-            return Err(ReconcileError::Invariant("recovered file preeffect exact held parent membership"));
+        let target = self.read.read.worktree.join(path.as_str());
+        let parent = target
+            .parent()
+            .ok_or(ReconcileError::Invariant("recovered file preeffect parent"))?;
+        let name = components.last().ok_or(ReconcileError::Invariant(
+            "recovered file preeffect component",
+        ))?;
+        if !self.read.read.directories.iter().any(|d| d.path == parent)
+            || self
+                .read
+                .read
+                .expected_membership
+                .get(parent)
+                .is_none_or(|names| names.contains(*name))
+        {
+            return Err(ReconcileError::Invariant(
+                "recovered file preeffect exact held parent membership",
+            ));
         }
         Ok(())
     }
@@ -4139,20 +5191,23 @@ impl FreshRecoveredNodeWalV2Session {
 impl FreshRecoveredNodeWalV2Session {
     /// Explicit caller limit can only reduce this already acquired session's
     /// future manifest capacity. It grants no effect or cleanup permission.
-    pub fn constrain_recovered_entry_limit(&mut self,max_entries:usize)->Result<()> {
+    pub fn constrain_recovered_entry_limit(&mut self, max_entries: usize) -> Result<()> {
         self.verify()?;
-        if max_entries>self.manifest_entry_limit
-            || max_entries<self.read.read.manifest.entries.len() {
-            return Err(ReconcileError::ResourceLimit("recovered entry limit cannot expand or invalidate current manifest"));
+        if max_entries > self.manifest_entry_limit
+            || max_entries < self.read.read.manifest.entries.len()
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered entry limit cannot expand or invalidate current manifest",
+            ));
         }
-        self.manifest_entry_limit=max_entries;
+        self.manifest_entry_limit = max_entries;
         self.verify()
     }
 }
 
 impl FreshRecoveredNodeWalV2Session {
     /// Scalar current capacity observation; does not expose native or Journal references.
-    pub fn recovered_current_entry_count(&self)->Result<usize> {
+    pub fn recovered_current_entry_count(&self) -> Result<usize> {
         self.verify()?;
         Ok(self.read.read.manifest.entries.len())
     }
@@ -4160,7 +5215,7 @@ impl FreshRecoveredNodeWalV2Session {
 
 impl FreshRecoveredNodeWalV2Session {
     /// Complete main digest through the actual held connection, no path reopen.
-    pub fn recovered_current_main_digest(&self)->Result<ContentId> {
+    pub fn recovered_current_main_digest(&self) -> Result<ContentId> {
         self.verify()?;
         Ok(ContentId::hash(&self.native.exact_main_bytes()?))
     }
@@ -4169,149 +5224,299 @@ impl FreshRecoveredNodeWalV2Session {
 // Explicit new CAS buckets/chunks retain their actual creators until session close.
 impl FreshRecoveredNodeWalV2Session {
     pub fn create_recovered_file_from_bytes(
-        &mut self,path:&sync_extend_core_model::PortablePath,bytes:&[u8],timestamp:u64,
-    )->Result<sync_extend_core_model::SnapshotId> {
-        self.materialize_recovered_file_bytes(path,bytes,timestamp,false)
+        &mut self,
+        path: &sync_extend_core_model::PortablePath,
+        bytes: &[u8],
+        timestamp: u64,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
+        self.materialize_recovered_file_bytes(path, bytes, timestamp, false)
     }
     pub fn replace_recovered_file_from_bytes(
-        &mut self,path:&sync_extend_core_model::PortablePath,bytes:&[u8],timestamp:u64,
-    )->Result<sync_extend_core_model::SnapshotId> {
-        self.materialize_recovered_file_bytes(path,bytes,timestamp,true)
+        &mut self,
+        path: &sync_extend_core_model::PortablePath,
+        bytes: &[u8],
+        timestamp: u64,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
+        self.materialize_recovered_file_bytes(path, bytes, timestamp, true)
     }
     fn materialize_recovered_file_bytes(
-        &mut self,path:&sync_extend_core_model::PortablePath,bytes:&[u8],timestamp:u64,replacing:bool,
-    )->Result<sync_extend_core_model::SnapshotId> {
+        &mut self,
+        path: &sync_extend_core_model::PortablePath,
+        bytes: &[u8],
+        timestamp: u64,
+        replacing: bool,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
         self.verify()?;
-        if !self.committed || self.closed || self.next!=2 || self.history_count>=128
-            || bytes.len()>8*1024*1024 || self.new_content_bytes.checked_add(bytes.len() as u64)
-                .is_none_or(|n|n>64*1024*1024) {
-            return Err(ReconcileError::ResourceLimit("recovered new content aggregate preeffect bound"));
+        if !self.committed
+            || self.closed
+            || self.next != 2
+            || self.metadata_count != 0
+            || self.history_count >= 128
+            || bytes.len() > 8 * 1024 * 1024
+            || self
+                .new_content_bytes
+                .checked_add(bytes.len() as u64)
+                .is_none_or(|n| n > 64 * 1024 * 1024)
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered new content aggregate preeffect bound",
+            ));
         }
-        let plan=sync_extend_cas::plan_bounded_content(bytes,8*1024*1024,128)?;
-        if replacing {self.preflight_recovered_replacement_bytes(path,&plan.manifest)?;}
-        else {self.preflight_recovered_file(path,&plan.manifest)?;}
+        let plan = sync_extend_cas::plan_bounded_content(bytes, 8 * 1024 * 1024, 128)?;
+        if replacing {
+            self.preflight_recovered_replacement_bytes(path, &plan.manifest)?;
+        } else {
+            self.preflight_recovered_file(path, &plan.manifest)?;
+        }
         // A file manifest may repeat the same content chunk. The physical
         // publication and its budget count unique object identities once.
-        let mut unique=std::collections::BTreeMap::new();
-        for (chunk,chunk_bytes) in &plan.chunks {
-            if let Some((previous,bytes))=unique.insert(chunk.content_id.clone(),(chunk,chunk_bytes)) {
-                if previous!=chunk || bytes!=chunk_bytes {
-                    return Err(ReconcileError::Invariant("recovered CAS repeated identity differs"));
+        let mut unique = std::collections::BTreeMap::new();
+        for (chunk, chunk_bytes) in &plan.chunks {
+            if let Some((previous, bytes)) =
+                unique.insert(chunk.content_id.clone(), (chunk, chunk_bytes))
+            {
+                if previous != chunk || bytes != chunk_bytes {
+                    return Err(ReconcileError::Invariant(
+                        "recovered CAS repeated identity differs",
+                    ));
                 }
             }
         }
-        let mut new_chunk_bytes=0u64;
-        let mut missing_objects=0usize;
-        for (chunk,chunk_bytes) in unique.values().copied() {
-            let id=chunk.content_id.as_str();
-            let object=self.read.read.data.join("cas/objects").join(&id[..2]).join(id);
-            if let Some(actual)=self.read.read.files.iter().find(|f|f.path==object) {
-                if actual.digest!=chunk.content_id || actual.bytes!=u64::from(chunk.length)
-                    || actual.file.exact_bytes(actual.bytes)?!=*chunk_bytes {
-                    return Err(ReconcileError::Invariant("recovered preeffect existing CAS content"));
+        let mut new_chunk_bytes = 0u64;
+        let mut missing_objects = 0usize;
+        for (chunk, chunk_bytes) in unique.values().copied() {
+            let id = chunk.content_id.as_str();
+            let object = self
+                .read
+                .read
+                .data
+                .join("cas/objects")
+                .join(&id[..2])
+                .join(id);
+            if let Some(actual) = self.read.read.files.iter().find(|f| f.path == object) {
+                if actual.digest != chunk.content_id
+                    || actual.bytes != u64::from(chunk.length)
+                    || actual.file.exact_bytes(actual.bytes)? != *chunk_bytes
+                {
+                    return Err(ReconcileError::Invariant(
+                        "recovered preeffect existing CAS content",
+                    ));
                 }
             } else {
-                missing_objects=missing_objects.checked_add(1)
-                    .ok_or(ReconcileError::ResourceLimit("recovered CAS object counter overflow"))?;
-                new_chunk_bytes=new_chunk_bytes.checked_add(chunk_bytes.len() as u64)
-                    .ok_or(ReconcileError::ResourceLimit("recovered CAS physical bytes overflow"))?;
+                missing_objects =
+                    missing_objects
+                        .checked_add(1)
+                        .ok_or(ReconcileError::ResourceLimit(
+                            "recovered CAS object counter overflow",
+                        ))?;
+                new_chunk_bytes = new_chunk_bytes
+                    .checked_add(chunk_bytes.len() as u64)
+                    .ok_or(ReconcileError::ResourceLimit(
+                        "recovered CAS physical bytes overflow",
+                    ))?;
             }
         }
-        if self.new_cas_bytes.checked_add(new_chunk_bytes).is_none_or(|n|n>64*1024*1024)
-            || self.new_cas_objects.checked_add(missing_objects).is_none_or(|n|n>128*128) {
-            return Err(ReconcileError::ResourceLimit("recovered CAS aggregate physical preeffect budget"));
+        if self
+            .new_cas_bytes
+            .checked_add(new_chunk_bytes)
+            .is_none_or(|n| n > 64 * 1024 * 1024)
+            || self
+                .new_cas_objects
+                .checked_add(missing_objects)
+                .is_none_or(|n| n > 128 * 128)
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered CAS aggregate physical preeffect budget",
+            ));
         }
         // Reserve all three bounded intent streams and their terminal records,
         // including ordinary file/history streams, before any CAS-side CREATE.
-        let intended_bound=serde_json::to_vec(&(1u32,&self.archive,&self.fresh,path,&plan.manifest,timestamp))?;
-        if intended_bound.len()>65536 {
-            return Err(ReconcileError::ResourceLimit("recovered CAS intent preeffect bytes"));
+        let intended_bound = serde_json::to_vec(&(
+            1u32,
+            &self.archive,
+            &self.fresh,
+            path,
+            &plan.manifest,
+            timestamp,
+        ))?;
+        if intended_bound.len() > 65536 {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered CAS intent preeffect bytes",
+            ));
         }
-        let target=self.read.read.worktree.join(path.as_str());
-        let parent=target.parent().ok_or(ReconcileError::Invariant("recovered new content file parent"))?;
-        if path.as_str().split('/').any(|p|p.starts_with('.'))
+        let target = self.read.read.worktree.join(path.as_str());
+        let parent = target.parent().ok_or(ReconcileError::Invariant(
+            "recovered new content file parent",
+        ))?;
+        if path.as_str().split('/').any(|p| p.starts_with('.'))
             || !self.read.read.expected_membership.contains_key(parent)
-            || (!replacing && self.read.read.manifest.entries.values().any(|e|e.path.collision_key()==path.collision_key())) {
-            return Err(ReconcileError::Invariant("recovered new content destination scope"));
+            || (!replacing
+                && self
+                    .read
+                    .read
+                    .manifest
+                    .entries
+                    .values()
+                    .any(|e| e.path.collision_key() == path.collision_key()))
+        {
+            return Err(ReconcileError::Invariant(
+                "recovered new content destination scope",
+            ));
         }
-        let external=self.path.parent().ok_or(ReconcileError::Invariant("recovered CAS external"))?;
-        let held=self.read.read.directories.iter().find(|d|d.path==external)
+        let external = self
+            .path
+            .parent()
+            .ok_or(ReconcileError::Invariant("recovered CAS external"))?;
+        let held = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|d| d.path == external)
             .ok_or(ReconcileError::Invariant("recovered CAS held external"))?;
-        self.poisoned=true;
-        let mut evidence=held.file.create_new_file(&format!("node-recovered-cas-{}-{}.frames",self.fresh,self.history_count))?;
-        evidence.writer().write_all(&intended_bound)?;evidence.writer().sync_all()?;
+        self.poisoned = true;
+        let mut evidence = held.file.create_new_file(&format!(
+            "node-recovered-cas-{}-{}.frames",
+            self.fresh, self.history_count
+        ))?;
+        evidence.writer().write_all(&intended_bound)?;
+        evidence.writer().sync_all()?;
         crate::fault::checkpoint("recovered_cas_intended_before_create");
-        for (chunk,chunk_bytes) in unique.values().copied() {
-            let id=chunk.content_id.as_str();
-            let bucket=self.read.read.data.join("cas/objects").join(&id[..2]);
-            let object=bucket.join(id);
-            if let Some(actual)=self.read.read.files.iter().find(|f|f.path==object) {
-                if actual.digest!=chunk.content_id || actual.file.exact_bytes(actual.bytes)?!=*chunk_bytes {
-                    return Err(ReconcileError::Invariant("recovered existing CAS exact content"));
+        for (chunk, chunk_bytes) in unique.values().copied() {
+            let id = chunk.content_id.as_str();
+            let bucket = self.read.read.data.join("cas/objects").join(&id[..2]);
+            let object = bucket.join(id);
+            if let Some(actual) = self.read.read.files.iter().find(|f| f.path == object) {
+                if actual.digest != chunk.content_id
+                    || actual.file.exact_bytes(actual.bytes)? != *chunk_bytes
+                {
+                    return Err(ReconcileError::Invariant(
+                        "recovered existing CAS exact content",
+                    ));
                 }
                 continue;
             }
-            let directory=if let Some(existing)=self.new_cas_buckets.get(&bucket) {
+            let directory = if let Some(existing) = self.new_cas_buckets.get(&bucket) {
                 existing.verify_exact(&bucket)?;
                 None
-            } else if self.read.read.directories.iter().any(|d|d.path==bucket) {
+            } else if self.read.read.directories.iter().any(|d| d.path == bucket) {
                 None
             } else {
-                let root=self.read.read.data.join("cas/objects");
-                let parent=self.read.read.directories.iter().find(|d|d.path==root)
-                    .ok_or(ReconcileError::Invariant("recovered CAS objects root absent"))?;
-                let creator=parent.file.create_new_child(&id[..2])?;
-                let key=creator.key()?;
-                self.read.read.expected_membership.get_mut(&root)
-                    .ok_or(ReconcileError::Invariant("recovered CAS root membership"))?.insert(id[..2].into());
-                self.read.read.expected_membership.insert(bucket.clone(),std::collections::BTreeSet::new());
-                let guard=creator.duplicate_read_guard()?;
-                self.read.read.directories.push(ReacquiredDirectory{path:bucket.clone(),file:guard,key});
-                Some(RecoveredCasBucket {creator,key})
+                let root = self.read.read.data.join("cas/objects");
+                let parent = self
+                    .read
+                    .read
+                    .directories
+                    .iter()
+                    .find(|d| d.path == root)
+                    .ok_or(ReconcileError::Invariant(
+                        "recovered CAS objects root absent",
+                    ))?;
+                let creator = parent.file.create_new_child(&id[..2])?;
+                let key = creator.key()?;
+                self.read
+                    .read
+                    .expected_membership
+                    .get_mut(&root)
+                    .ok_or(ReconcileError::Invariant("recovered CAS root membership"))?
+                    .insert(id[..2].into());
+                self.read
+                    .read
+                    .expected_membership
+                    .insert(bucket.clone(), std::collections::BTreeSet::new());
+                let guard = creator.duplicate_read_guard()?;
+                self.read.read.directories.push(ReacquiredDirectory {
+                    path: bucket.clone(),
+                    file: guard,
+                    key,
+                });
+                Some(RecoveredCasBucket { creator, key })
             };
-            if let Some(directory)=directory {self.new_cas_buckets.insert(bucket.clone(),directory);}
-            let mut creator=if let Some(created)=self.new_cas_buckets.get(&bucket) {
-                created.verify_exact(&bucket)?;created.creator.create_new_file(id)?
+            if let Some(directory) = directory {
+                self.new_cas_buckets.insert(bucket.clone(), directory);
+            }
+            let mut creator = if let Some(created) = self.new_cas_buckets.get(&bucket) {
+                created.verify_exact(&bucket)?;
+                created.creator.create_new_file(id)?
             } else {
-                self.read.read.directories.iter().find(|d|d.path==bucket)
-                    .ok_or(ReconcileError::Invariant("recovered CAS bucket absent"))?.file.create_new_file(id)?
+                self.read
+                    .read
+                    .directories
+                    .iter()
+                    .find(|d| d.path == bucket)
+                    .ok_or(ReconcileError::Invariant("recovered CAS bucket absent"))?
+                    .file
+                    .create_new_file(id)?
             };
-            creator.writer().write_all(chunk_bytes)?;creator.writer().sync_all()?;
-            let sealed=creator.seal_original()?;
-            if !sealed.matches_path(&object)? {return Err(ReconcileError::Invariant("recovered CAS original CREATE slot"));}
-            self.read.read.files.push(ReacquiredFile {path:object,file:RecoveredFileProtection::Created(sealed),
-                digest:chunk.content_id.clone(),bytes:chunk_bytes.len() as u64});
-            self.read.read.expected_membership.get_mut(&bucket)
-                .ok_or(ReconcileError::Invariant("recovered CAS bucket membership"))?.insert(id.into());
-            evidence.writer().write_all(&serde_json::to_vec(&(1u32,"created",&chunk.content_id,chunk.length))?)?;
+            creator.writer().write_all(chunk_bytes)?;
+            creator.writer().sync_all()?;
+            let sealed = creator.seal_original()?;
+            if !sealed.matches_path(&object)? {
+                return Err(ReconcileError::Invariant(
+                    "recovered CAS original CREATE slot",
+                ));
+            }
+            self.read.read.files.push(ReacquiredFile {
+                path: object,
+                file: RecoveredFileProtection::Created(sealed),
+                digest: chunk.content_id.clone(),
+                bytes: chunk_bytes.len() as u64,
+            });
+            self.read
+                .read
+                .expected_membership
+                .get_mut(&bucket)
+                .ok_or(ReconcileError::Invariant("recovered CAS bucket membership"))?
+                .insert(id.into());
+            evidence.writer().write_all(&serde_json::to_vec(&(
+                1u32,
+                "created",
+                &chunk.content_id,
+                chunk.length,
+            ))?)?;
             evidence.writer().sync_all()?;
         }
-        self.new_content_bytes+=bytes.len() as u64;
-        self.new_cas_bytes+=new_chunk_bytes;
-        self.new_cas_objects+=missing_objects;
-        self.poisoned=false;
-        let result=(||->Result<sync_extend_core_model::SnapshotId> {
-        self.verify()?;
-        crate::fault::checkpoint("recovered_cas_created_before_file");
-        let root=if replacing {self.mutate_recovered_file(path,Some((plan.manifest,bytes.to_vec())),timestamp)?}
-            else {self.create_recovered_file_materialized(path,plan.manifest,bytes.to_vec(),timestamp)?};
-        evidence.writer().write_all(&serde_json::to_vec(&(1u32,"committed",root.clone()))?)?;
-        evidence.writer().sync_all()?;
-        self.retain_recovered_receipt(evidence)?;self.verify()?;
-        Ok(root)
+        self.new_content_bytes += bytes.len() as u64;
+        self.new_cas_bytes += new_chunk_bytes;
+        self.new_cas_objects += missing_objects;
+        self.poisoned = false;
+        let result = (|| -> Result<sync_extend_core_model::SnapshotId> {
+            self.verify()?;
+            crate::fault::checkpoint("recovered_cas_created_before_file");
+            let root = if replacing {
+                self.mutate_recovered_file(path, Some((plan.manifest, bytes.to_vec())), timestamp)?
+            } else {
+                self.create_recovered_file_materialized(
+                    path,
+                    plan.manifest,
+                    bytes.to_vec(),
+                    timestamp,
+                )?
+            };
+            evidence.writer().write_all(&serde_json::to_vec(&(
+                1u32,
+                "committed",
+                root.clone(),
+            ))?)?;
+            evidence.writer().sync_all()?;
+            self.retain_recovered_receipt(evidence)?;
+            self.verify()?;
+            Ok(root)
         })();
-        if result.is_err() {self.poisoned=true;}
+        if result.is_err() {
+            self.poisoned = true;
+        }
         result
     }
 }
 struct RecoveredCasBucket {
-    creator:sync_extend_platform_fs::LockedDirectoryMutation,
-    key:FileKey,
+    creator: sync_extend_platform_fs::LockedDirectoryMutation,
+    key: FileKey,
 }
 impl RecoveredCasBucket {
-    fn verify_exact(&self,path:&std::path::Path)->Result<()> {
+    fn verify_exact(&self, path: &std::path::Path) -> Result<()> {
         self.creator.original_creation()?.verify()?;
-        if self.creator.key()?!=self.key || !self.creator.matches_path(path)? {
+        if self.creator.key()? != self.key || !self.creator.matches_path(path)? {
             return Err(ReconcileError::Invariant("recovered new CAS held bucket"));
         }
         Ok(())
@@ -4320,35 +5525,90 @@ impl RecoveredCasBucket {
 
 impl FreshRecoveredNodeWalV2Session {
     fn preflight_recovered_replacement_bytes(
-        &self,path:&sync_extend_core_model::PortablePath,content:&sync_extend_core_model::FileManifest,
-    )->Result<()> {
+        &self,
+        path: &sync_extend_core_model::PortablePath,
+        content: &sync_extend_core_model::FileManifest,
+    ) -> Result<()> {
         self.verify()?;
-        if !self.mutation_requested || !self.committed || self.closed || self.next!=2
-            || self.history_count>=128 || self.retained_mutations.len()>=128
-            || content.length>8*1024*1024 || content.chunks.len()>128
-            || self.retained_receipt_bytes.checked_add(3*256*1024).is_none_or(|n|n>4*1024*1024)
-            || self.new_file_bytes.checked_add(content.length).is_none_or(|n|n>64*1024*1024) {
-            return Err(ReconcileError::ResourceLimit("replacement bytes aggregate preeffect bound"));
+        if !self.mutation_requested
+            || !self.committed
+            || self.closed
+            || self.next != 2
+            || self.metadata_count != 0
+            || self.history_count >= 128
+            || self.retained_mutations.len() >= 128
+            || content.length > 8 * 1024 * 1024
+            || content.chunks.len() > 128
+            || self
+                .retained_receipt_bytes
+                .checked_add(3 * 256 * 1024)
+                .is_none_or(|n| n > 4 * 1024 * 1024)
+            || self
+                .new_file_bytes
+                .checked_add(content.length)
+                .is_none_or(|n| n > 64 * 1024 * 1024)
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "replacement bytes aggregate preeffect bound",
+            ));
         }
-        let target=self.read.read.worktree.join(path.as_str());
-        let original=self.read.read.files.iter().find(|file|file.path==target)
-            .ok_or(ReconcileError::Invariant("replacement bytes held target absent"))?;
-        let parent=target.parent().ok_or(ReconcileError::Invariant("replacement bytes parent"))?;
-        let name=target.file_name().and_then(|name|name.to_str()).ok_or(ReconcileError::Invariant("replacement name"))?;
-        if path.as_str().split('/').any(|name|name.starts_with('.'))
-            || !self.read.read.manifest.entries.values().any(|entry|entry.path==*path
-                && entry.kind==sync_extend_core_model::EntryKind::File)
-            || !matches!(original.file,RecoveredFileProtection::Mutation(_) | RecoveredFileProtection::Created(_))
-            || content.content_id==original.digest
-            || self.read.read.expected_membership.get(parent).is_none_or(|names|!names.contains(name))
-            || self.read.read.directories.iter().find(|directory|directory.path==parent)
-                .is_none_or(|directory|original.file.parent_key().ok()!=Some(directory.key)) {
-            return Err(ReconcileError::Invariant("replacement bytes exact source rights and scope"));
+        let target = self.read.read.worktree.join(path.as_str());
+        let original = self
+            .read
+            .read
+            .files
+            .iter()
+            .find(|file| file.path == target)
+            .ok_or(ReconcileError::Invariant(
+                "replacement bytes held target absent",
+            ))?;
+        let parent = target
+            .parent()
+            .ok_or(ReconcileError::Invariant("replacement bytes parent"))?;
+        let name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(ReconcileError::Invariant("replacement name"))?;
+        if path.as_str().split('/').any(|name| name.starts_with('.'))
+            || !self.read.read.manifest.entries.values().any(|entry| {
+                entry.path == *path && entry.kind == sync_extend_core_model::EntryKind::File
+            })
+            || !matches!(
+                original.file,
+                RecoveredFileProtection::Mutation(_) | RecoveredFileProtection::Created(_)
+            )
+            || content.content_id == original.digest
+            || self
+                .read
+                .read
+                .expected_membership
+                .get(parent)
+                .is_none_or(|names| !names.contains(name))
+            || self
+                .read
+                .read
+                .directories
+                .iter()
+                .find(|directory| directory.path == parent)
+                .is_none_or(|directory| original.file.parent_key().ok() != Some(directory.key))
+        {
+            return Err(ReconcileError::Invariant(
+                "replacement bytes exact source rights and scope",
+            ));
         }
-        let retained=self.retained_mutations.iter().try_fold(0u64,|sum,item|sum.checked_add(item.original.bytes)
-            .ok_or(ReconcileError::ResourceLimit("replacement retained byte overflow")))?;
-        if retained.checked_add(original.bytes).is_none_or(|n|n>64*1024*1024) {
-            return Err(ReconcileError::ResourceLimit("replacement retained bytes preeffect"));
+        let retained = self.retained_mutations.iter().try_fold(0u64, |sum, item| {
+            sum.checked_add(item.original.bytes)
+                .ok_or(ReconcileError::ResourceLimit(
+                    "replacement retained byte overflow",
+                ))
+        })?;
+        if retained
+            .checked_add(original.bytes)
+            .is_none_or(|n| n > 64 * 1024 * 1024)
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "replacement retained bytes preeffect",
+            ));
         }
         Ok(())
     }
@@ -4374,6 +5634,8 @@ struct RecoveredHistoryCloseRecord {
     wal2_frames: Option<ContentId>,
     receipts: Vec<(String, ContentId, u64)>,
     history_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata: Option<live_retention::RecoveredMetadataCloseEvidence>,
 }
 #[derive(Serialize)]
 pub struct RecoveredHistoryCloseClassification {
@@ -4390,916 +5652,11 @@ impl FreshRecoveredNodeWalV2Session {
     /// This preserves the original WAL2 record/parser and grants no restart API.
     pub fn close_recovered_history_with_evidence(&mut self) -> Result<PathBuf> {
         self.verify()?;
-        if self.closed || self.history_count == 0 || self.history_count >= 128 {
-            return Err(ReconcileError::Invariant("explicit live recovered history required"));
-        }
-        let parent=self.path.parent().ok_or(ReconcileError::Invariant("history close external parent"))?;
-        let held=self.read.read.directories.iter().find(|d|d.path==parent)
-            .ok_or(ReconcileError::Invariant("history close held external"))?;
-        let mut receipts=Vec::new();
-        let mut aggregate=0u64;
-        for (count,item) in std::fs::read_dir(parent)?.enumerate() {
-            if count>=4096 {return Err(ReconcileError::ResourceLimit("history close external count"));}
-            let name=item?.file_name().into_string()
-                .map_err(|_|ReconcileError::Invariant("history close external encoding"))?;
-            if ["history","file","cas"].iter().any(|kind|
-                name.starts_with(&format!("node-recovered-{kind}-{}-",self.fresh))) {
-                let file=self.retained_receipts.get(&name)
-                    .ok_or(ReconcileError::Invariant("history close unheld or foreign receipt"))?;
-                file.file.verify()?;
-                let bytes=file.file.exact_bytes(file.bytes)?;
-                if ContentId::hash(&bytes)!=file.digest || !file.file.matches_path(&file.path)? {
-                    return Err(ReconcileError::Invariant("history close original held receipt differs"));
-                }
-                aggregate=aggregate.checked_add(bytes.len() as u64)
-                    .filter(|n|*n<=4*1024*1024)
-                    .ok_or(ReconcileError::ResourceLimit("history close receipts aggregate"))?;
-                // Each append-only local stream must end in its own synced
-                // committed record. Mere intent or materialization stays open.
-                let values=serde_json::Deserializer::from_slice(&bytes)
-                    .into_iter::<serde_json::Value>().collect::<std::result::Result<Vec<_>,_>>()?;
-                let last=values.last().and_then(|v|v.as_array())
-                    .ok_or(ReconcileError::Invariant("history close receipt terminal shape"))?;
-                if values.len()<2 || last.get(1).and_then(|v|v.as_str())!=Some("committed") {
-                    return Err(ReconcileError::Invariant("history close unresolved receipt"));
-                }
-                receipts.push((name,ContentId::hash(&bytes),bytes.len() as u64));
-            }
-        }
-        receipts.sort_by(|a,b|a.0.cmp(&b.0));
-        let history_receipts=receipts.iter().filter(|r|r.0.starts_with("node-recovered-history-")).count();
-        if history_receipts!=self.history_count as usize {
-            return Err(ReconcileError::Invariant("history close exact committed history count"));
-        }
-        let main=self.native.exact_main_bytes()?;
-        let image=sync_extend_journal::JournalBackupImage::from_current_node_image(
-            main.clone(),ContentId::hash(&main).as_str(),main.len(),&self.space,self.bounds)?;
-        let mut intended=RecoveredHistoryCloseRecord {
-            version:3,index:0,phase:"close_intended".into(),archive:self.archive.clone(),
-            original_frames:self.original_frames.clone(),session:self.fresh.clone(),
-            worktree:self.read.read.worktree.to_string_lossy().into(),
-            data:self.read.read.data.to_string_lossy().into(),keys:self.native_keys.clone(),
-            root:self.read.read.manifest.root()?,
-            rows:image.closed_node_complete_rows_digest(&self.space,self.bounds)?,
-            main:ContentId::hash(&main),shm:ContentId::hash(&self.native.held_shm_bytes()?),
-            wal2_frames:None,receipts,history_count:self.history_count,
-        };
-        let bytes=serde_json::to_vec(&intended)?;
-        if bytes.len()>256*1024 {
-            return Err(ReconcileError::ResourceLimit("history close envelope intended bound"));
-        }
-        let path=parent.join(format!("node-recovered-history-close-{}.frames",self.fresh));
-        self.poisoned=true;
-        let mut evidence=held.file.create_new_file(path.file_name().and_then(|n|n.to_str())
-            .ok_or(ReconcileError::Invariant("history close component"))?)?;
-        evidence.writer().write_all(b"SYNC-RECOVERED-HISTORY-CLOSE3\n")?;
-        evidence.writer().write_all(&(bytes.len() as u32).to_le_bytes())?;
-        evidence.writer().write_all(&bytes)?;evidence.writer().sync_all()?;
-        crate::fault::checkpoint("recovered_history_close_intended_before_native_close");
-        self.poisoned=false;
-        let result=(||->Result<PathBuf> {
-            self.close_completed()?;
-            intended.index=1;intended.phase="closed".into();
-            {
-                use std::os::windows::fs::FileExt;
-                self.frames.original_creation()?.verify()?;
-                let length=self.frames.reader().metadata()?.len();
-                if length>256*1024 {return Err(ReconcileError::ResourceLimit("history close WAL2 bytes"));}
-                let mut bytes=vec![0u8;length as usize];
-                let mut offset=0;
-                while offset<bytes.len() {
-                    let n=self.frames.reader().seek_read(&mut bytes[offset..],offset as u64)?;
-                    if n==0 {return Err(ReconcileError::Invariant("history close WAL2 short read"));}
-                    offset+=n;
-                }
-                intended.wal2_frames=Some(ContentId::hash(&bytes));
-            }
-            let after=self.native.exact_closed_main_bytes()?;
-            if ContentId::hash(&after)!=intended.main
-                || ContentId::hash(&self.native.held_shm_bytes()?)!=intended.shm {
-                return Err(ReconcileError::Invariant("history close native bytes changed"));
-            }
-            let terminal=serde_json::to_vec(&intended)?;
-            if terminal.len()>256*1024 {return Err(ReconcileError::ResourceLimit("history close terminal bound"));}
-            evidence.writer().write_all(&(terminal.len() as u32).to_le_bytes())?;
-            evidence.writer().write_all(ContentId::hash(&bytes).as_str().as_bytes())?;
-            evidence.writer().write_all(&terminal)?;evidence.writer().sync_all()?;
-            self.verify()?;
-            self.retain_history_creation(evidence,512*1024)?;
-            crate::fault::checkpoint("recovered_history_closed_after_terminal_sync");
-            Ok(path.clone())
-        })();
-        if result.is_err() {self.poisoned=true;}
-        result
-    }
-}
-impl super::VerifiedNodeStateArchive {
-    /// Classify bytes only. Neither historical native keys nor a digest become
-    /// living ownership, cleanup permission, or a recovery writer capability.
-    pub fn classify_recovered_history_close(
-        &self,bytes:&[u8],wal2_frames:&[u8],
-    )->RecoveredHistoryCloseClassification {
-        let parsed=(||->Result<RecoveredHistoryCloseRecord> {
-            const HEADER:&[u8]=b"SYNC-RECOVERED-HISTORY-CLOSE3\n";
-            if !bytes.starts_with(HEADER) || bytes.len()>512*1024 || wal2_frames.len()>256*1024 {
-                return Err(ReconcileError::Invariant("history close bounded header"));
-            }
-            let mut offset=HEADER.len();
-            let read_size=|offset:usize|->Result<usize> {
-                let prefix=bytes.get(offset..offset+4).ok_or(ReconcileError::Invariant("history close size"))?;
-                Ok(u32::from_le_bytes(prefix.try_into()
-                    .map_err(|_|ReconcileError::Invariant("history close size encoding"))?) as usize)
-            };
-            let size=read_size(offset)?;offset+=4;
-            if size>256*1024 {return Err(ReconcileError::ResourceLimit("history close intended size"));}
-            let payload=bytes.get(offset..offset+size).ok_or(ReconcileError::Invariant("history close intended truncated"))?;
-            let first:RecoveredHistoryCloseRecord=serde_json::from_slice(payload)?;offset+=size;
-            let size=read_size(offset)?;offset+=4;
-            if size>256*1024 {return Err(ReconcileError::ResourceLimit("history close terminal size"));}
-            let digest=bytes.get(offset..offset+64).ok_or(ReconcileError::Invariant("history close chain"))?;offset+=64;
-            if digest!=ContentId::hash(payload).as_str().as_bytes() {
-                return Err(ReconcileError::Invariant("history close exact intended chain"));
-            }
-            let final_bytes=bytes.get(offset..offset+size).ok_or(ReconcileError::Invariant("history close terminal truncated"))?;
-            let terminal:RecoveredHistoryCloseRecord=serde_json::from_slice(final_bytes)?;
-            if offset+size!=bytes.len() || serde_json::to_vec(&first)?!=payload
-                || serde_json::to_vec(&terminal)?!=final_bytes
-                || first.version!=3 || first.index!=0 || first.phase!="close_intended"
-                || first.archive!=*self.digest() || first.wal2_frames.is_some()
-                || first.history_count==0 || first.history_count>=128
-                || terminal.index!=1 || terminal.phase!="closed"
-                || terminal.wal2_frames.as_ref()!=Some(&ContentId::hash(wal2_frames)) {
-                return Err(ReconcileError::Invariant("history close canonical phase and scope"));
-            }
-            let mut normalized=terminal.clone();
-            normalized.index=0;normalized.phase="close_intended".into();normalized.wal2_frames=None;
-            if serde_json::to_vec(&normalized)?!=payload {
-                return Err(ReconcileError::Invariant("history close final bindings changed"));
-            }
-            let mut total=0u64;
-            let mut last:Option<&str>=None;
-            for (name,_,size) in &terminal.receipts {
-                if *size>256*1024 || last.is_some_and(|old|old>=name.as_str())
-                    || !["history","file","cas"].iter().any(|kind|
-                        name.starts_with(&format!("node-recovered-{kind}-{}-",terminal.session)))
-                    || !name.ends_with(".frames") || name.contains(['/', '\\']) {
-                    return Err(ReconcileError::Invariant("history close exact receipt slots"));
-                }
-                total=total.checked_add(*size).filter(|n|*n<=4*1024*1024)
-                    .ok_or(ReconcileError::ResourceLimit("history close exact aggregate"))?;
-                last=Some(name);
-            }
-            if terminal.receipts.iter().filter(|r|r.0.starts_with("node-recovered-history-")).count()
-                !=terminal.history_count as usize {
-                return Err(ReconcileError::Invariant("history close exact receipt count"));
-            }
-            Ok(terminal)
-        })();
-        match parsed {
-            Ok(record)=>RecoveredHistoryCloseClassification {state:"closed_descriptive_history_evidence",
-                actual_records:2,history_count:record.history_count,receipts:record.receipts.len(),
-                native_write_authority:false,cleanup_authority:false},
-            Err(_)=>RecoveredHistoryCloseClassification {state:"refused_evidence",actual_records:0,
-                history_count:0,receipts:0,native_write_authority:false,cleanup_authority:false},
-        }
-    }
-}
-
-// This new admission is never deserialized from caller input or a classification.
-struct RecoveredHistoryAdmission {
-    original_rows:ContentId,
-    final_rows:ContentId,
-    final_root:sync_extend_core_model::SnapshotId,
-    mutation_requested:bool,
-}
-fn manifest_root_from_recovered_image(
-    image:&sync_extend_journal::JournalBackupImage,space:&SpaceId,
-    bounds:sync_extend_journal::NodeInspectionBounds,
-)->Result<sync_extend_core_model::SnapshotId> {
-    image.with_audited_readonly(space,bounds,|connection| {
-        let json:String=connection.query_row(
-            "SELECT s.manifest FROM main.current_manifests c JOIN main.snapshots s ON c.snapshot_id=s.snapshot_id WHERE c.space_id=?1",
-            [space.as_str()],|row|row.get(0))?;
-        let manifest:sync_extend_core_model::Manifest=serde_json::from_str(&json)?;
-        manifest.root().map_err(Into::into)
-    }).map_err(Into::into)
-}
-#[derive(Clone,Serialize,Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HistoryRestartObject {
-    name:String,key:String,parent:String,digest:ContentId,bytes:u64,
-}
-#[derive(Clone,Serialize,Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HistoryRestartRecord {
-    version:u32,index:u32,phase:String,archive:ContentId,original_frames:ContentId,
-    session:SpaceId,worktree:String,data:String,
-    work_key:String,data_key:String,external_key:String,
-    native_keys:[String;4],root:sync_extend_core_model::SnapshotId,
-    rows:ContentId,main:ContentId,shm:ContentId,
-    baseline:HistoryRestartObject,receipts:Vec<HistoryRestartObject>,
-    history_close:Option<HistoryRestartObject>,wal2:Option<HistoryRestartObject>,
-}
-fn history_restart_records(bytes:&[u8])->Result<HistoryRestartRecord> {
-    const HEADER:&[u8]=b"SYNC-HISTORY-RESTART4\n";
-    if !bytes.starts_with(HEADER) || bytes.len()>1024*1024 {
-        return Err(ReconcileError::Invariant("history restart exact bounded header"));
-    }
-    let mut offset=HEADER.len();
-    let mut payloads:Vec<&[u8]>=Vec::new();
-    for _ in 0..2 {
-        let length=u32::from_le_bytes(bytes.get(offset..offset+4)
-            .ok_or(ReconcileError::Invariant("history restart size"))?.try_into()
-            .map_err(|_|ReconcileError::Invariant("history restart size encoding"))?) as usize;
-        offset+=4;
-        if length>384*1024 {return Err(ReconcileError::ResourceLimit("history restart record bytes"));}
-        if let Some(previous)=payloads.first() {
-            let digest=bytes.get(offset..offset+64).ok_or(ReconcileError::Invariant("history restart chain"))?;
-            if digest!=ContentId::hash(previous).as_str().as_bytes() {
-                return Err(ReconcileError::Invariant("history restart intended chain changed"));
-            }
-            offset+=64;
-        }
-        let payload=bytes.get(offset..offset+length).ok_or(ReconcileError::Invariant("history restart truncated"))?;
-        payloads.push(payload);offset+=length;
-    }
-    let first:HistoryRestartRecord=serde_json::from_slice(payloads[0])?;
-    let terminal:HistoryRestartRecord=serde_json::from_slice(payloads[1])?;
-    if offset!=bytes.len() || first.version!=4 || first.index!=0 || first.phase!="close_intended"
-        || first.wal2.is_some() || first.history_close.is_some()
-        || terminal.index!=1 || terminal.phase!="closed" || terminal.wal2.is_none() || terminal.history_close.is_none()
-        || serde_json::to_vec(&first)?!=payloads[0] || serde_json::to_vec(&terminal)?!=payloads[1] {
-        return Err(ReconcileError::Invariant("history restart canonical terminal"));
-    }
-    let mut normalized=terminal.clone();normalized.index=0;normalized.phase="close_intended".into();
-    normalized.wal2=None;normalized.history_close=None;
-    if serde_json::to_vec(&normalized)?!=payloads[0] {
-        return Err(ReconcileError::Invariant("history restart final bindings changed"));
-    }
-    Ok(terminal)
-}
-fn history_object(file:&ReacquiredFile)->Result<HistoryRestartObject> {
-    file.file.verify()?;
-    if !file.file.matches_path(&file.path)? || ContentId::hash(&file.file.exact_bytes(file.bytes)?)!=file.digest {
-        return Err(ReconcileError::Invariant("history object held identity and bytes"));
-    }
-    Ok(HistoryRestartObject {
-        name:file.path.file_name().and_then(|n|n.to_str())
-            .ok_or(ReconcileError::Invariant("history object exact name"))?.into(),
-        key:file.file.key()?.to_string(),parent:file.file.parent_key()?.to_string(),
-        digest:file.digest.clone(),bytes:file.bytes,
-    })
-}
-impl FreshRecoveredNodeWalV2Session {
-    fn retain_history_creation(&mut self,creator:OwnedFileCreation,maximum:u64)->Result<HistoryRestartObject> {
-        let name=creator.original_creation()?.created_component().to_owned();
-        let path=self.path.parent().ok_or(ReconcileError::Invariant("history creation parent"))?.join(&name);
-        let file=RecoveredFileProtection::Created(creator.seal_original()?);
-        let bytes=file.exact_bytes(maximum)?;
-        let held=ReacquiredFile{path,file,bytes:bytes.len() as u64,digest:ContentId::hash(&bytes)};
-        let result=history_object(&held)?;
-        self.retained_history_evidence.push(held);
-        Ok(result)
-    }
-    /// Publish a fresh protocol that binds actual creator keys, immutable baseline
-    /// and final complete history. The original descriptive close remains intact.
-    pub fn close_recovered_history_for_explicit_restart(&mut self)->Result<PathBuf> {
-        self.verify()?;
-        if self.history_count==0 || self.closed || self.history_baseline.is_empty()
-            || self.history_baseline.len()>64*1024*1024 {
-            return Err(ReconcileError::Invariant("history restart explicit live baseline"));
-        }
-        let main=self.native.exact_main_bytes()?;
-        let baseline=sync_extend_journal::JournalBackupImage::from_current_node_image(
-            self.history_baseline.clone(),ContentId::hash(&self.history_baseline).as_str(),
-            self.history_baseline.len(),&self.space,self.bounds)?;
-        let final_image=sync_extend_journal::JournalBackupImage::from_current_node_image(
-            main.clone(),ContentId::hash(&main).as_str(),main.len(),&self.space,self.bounds)?;
-        final_image.audit_recovered_history_extension(&baseline,&self.space,self.bounds)?;
-        let parent=self.path.parent().ok_or(ReconcileError::Invariant("history restart parent"))?.to_path_buf();
-        let external=self.read.read.directories.iter().find(|d|d.path==parent)
-            .ok_or(ReconcileError::Invariant("history restart held external"))?;
-        let external_key=external.key.to_string();
-        let mut receipts=self.retained_receipts.values().map(history_object).collect::<Result<Vec<_>>>()?;
-        receipts.sort_by(|a,b|a.name.cmp(&b.name));
-        if receipts.is_empty() || receipts.len()>384 || receipts.iter().try_fold(0u64,|sum,item|
-            sum.checked_add(item.bytes).filter(|n|*n<=4*1024*1024)
-                .ok_or(ReconcileError::ResourceLimit("history restart receipt aggregate"))).is_err() {
-            return Err(ReconcileError::ResourceLimit("history restart bounded receipts"));
-        }
-        self.poisoned=true;
-        let mut creator=external.file.create_new_file(&format!("node-history-baseline-{}.image",self.fresh))?;
-        creator.writer().write_all(&self.history_baseline)?;creator.writer().sync_all()?;
-        let baseline=self.retain_history_creation(creator,64*1024*1024)?;
-        let root=self.read.read.manifest.root()?;
-        let mut record=HistoryRestartRecord {
-            version:4,index:0,phase:"close_intended".into(),archive:self.archive.clone(),
-            original_frames:self.original_frames.clone(),session:self.fresh.clone(),
-            worktree:self.read.read.worktree.to_string_lossy().into(),data:self.read.read.data.to_string_lossy().into(),
-            work_key:self.read.read.directories.iter().find(|d|d.path==self.read.read.worktree)
-                .ok_or(ReconcileError::Invariant("history work root"))?.key.to_string(),
-            data_key:self.read.read.directories.iter().find(|d|d.path==self.read.read.data)
-                .ok_or(ReconcileError::Invariant("history data root"))?.key.to_string(),
-            external_key,native_keys:self.native_keys.clone(),root,
-            rows:final_image.closed_node_complete_rows_digest(&self.space,self.bounds)?,
-            main:ContentId::hash(&main),shm:ContentId::hash(&self.native.held_shm_bytes()?),
-            baseline,receipts,history_close:None,wal2:None,
-        };
-        let intended=serde_json::to_vec(&record)?;
-        if intended.len()>384*1024 {return Err(ReconcileError::ResourceLimit("history restart intended bound"));}
-        let held=self.read.read.directories.iter().find(|d|d.path==parent)
-            .ok_or(ReconcileError::Invariant("history restart external"))?;
-        let path=parent.join(format!("node-history-restart-{}.frames",self.fresh));
-        let mut evidence=held.file.create_new_file(path.file_name().and_then(|n|n.to_str())
-            .ok_or(ReconcileError::Invariant("history restart frame name"))?)?;
-        evidence.writer().write_all(b"SYNC-HISTORY-RESTART4\n")?;
-        evidence.writer().write_all(&(intended.len() as u32).to_le_bytes())?;
-        evidence.writer().write_all(&intended)?;evidence.writer().sync_all()?;
-        crate::fault::checkpoint("history_restart4_intended_before_native_close");
-        self.poisoned=false;
-        let result=(||->Result<PathBuf> {
-            let closed_path=self.close_recovered_history_with_evidence()?;
-            let close=self.retained_history_evidence.iter().find(|e|e.path==closed_path)
-                .ok_or(ReconcileError::Invariant("history restart close creator held"))?;
-            record.history_close=Some(history_object(close)?);
-            let frame_bytes=self.frames.reader().metadata()?.len();
-            if frame_bytes>256*1024 {return Err(ReconcileError::ResourceLimit("history restart WAL2 size"));}
-            let wal_key=self.frames.original_creation()?.key()?.to_string();
-            let wal_parent=self.frames.original_creation()?.parent_key()?.to_string();
-            let held=self.read.read.directories.iter().find(|d|d.path==parent)
-                .ok_or(ReconcileError::Invariant("history restart frame external"))?;
-            // The original creator is still held; reopen is unnecessary.
-            let bytes=read_history_owned_bytes(&self.frames,256*1024)?;
-            let _=held;
-            record.wal2=Some(HistoryRestartObject {
-                name:self.path.file_name().and_then(|n|n.to_str()).ok_or(ReconcileError::Invariant("history WAL name"))?.into(),
-                key:wal_key,parent:wal_parent,digest:ContentId::hash(&bytes),bytes:frame_bytes,
-            });
-            record.index=1;record.phase="closed".into();
-            let terminal=serde_json::to_vec(&record)?;
-            if terminal.len()>384*1024 {return Err(ReconcileError::ResourceLimit("history restart terminal bound"));}
-            evidence.writer().write_all(&(terminal.len() as u32).to_le_bytes())?;
-            evidence.writer().write_all(ContentId::hash(&intended).as_str().as_bytes())?;
-            evidence.writer().write_all(&terminal)?;evidence.writer().sync_all()?;
-            self.retain_history_creation(evidence,1024*1024)?;
-            self.verify()?;
-            crate::fault::checkpoint("history_restart4_closed_after_terminal_sync");
-            Ok(path)
-        })();
-        if result.is_err() {self.poisoned=true;}
-        result
-    }
-}
-fn read_history_owned_bytes(file:&OwnedFileCreation,maximum:u64)->Result<Vec<u8>> {
-    use std::os::windows::fs::FileExt;
-    file.original_creation()?.verify()?;
-    let size=file.reader().metadata()?.len();
-    if size>maximum {return Err(ReconcileError::ResourceLimit("history owned bytes"));}
-    let mut bytes=vec![0u8;size as usize];let mut offset=0;
-    while offset<bytes.len() {
-        let count=file.reader().seek_read(&mut bytes[offset..],offset as u64)?;
-        if count==0 {return Err(ReconcileError::Invariant("history owned short read"));}
-        offset+=count;
-    }
-    Ok(bytes)
-}
-impl super::VerifiedNodeStateArchive {
-    /// Admit one explicitly closed history session by freshly held native roots,
-    /// full current content, original completion and every exact receipt key.
-    /// Classification bytes alone never construct this session.
-    #[allow(clippy::too_many_arguments)]
-    pub fn reacquire_closed_history_restart4(
-        &self,worktree:&std::path::Path,data:&std::path::Path,original_frames:&std::path::Path,
-        restore_ledger:&std::path::Path,restart_frames:&std::path::Path,
-        bounds:sync_extend_journal::NodeInspectionBounds,ledger_bounds:super::LedgerBounds,
-    )->Result<FreshRecoveredNodeWalV2Session> {
-        self.reacquire_history_restart4_internal(worktree,data,original_frames,restore_ledger,restart_frames,bounds,ledger_bounds,false)
-    }
-    #[allow(clippy::too_many_arguments)]
-    pub fn reacquire_closed_history_restart4_with_mutation(
-        &self,worktree:&std::path::Path,data:&std::path::Path,original_frames:&std::path::Path,
-        restore_ledger:&std::path::Path,restart_frames:&std::path::Path,
-        bounds:sync_extend_journal::NodeInspectionBounds,ledger_bounds:super::LedgerBounds,
-    )->Result<FreshRecoveredNodeWalV2Session> {
-        self.reacquire_history_restart4_internal(worktree,data,original_frames,restore_ledger,restart_frames,bounds,ledger_bounds,true)
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn reacquire_history_restart4_internal(
-        &self,worktree:&std::path::Path,data:&std::path::Path,
-        original_frames:&std::path::Path,restore_ledger:&std::path::Path,
-        restart_frames:&std::path::Path,bounds:sync_extend_journal::NodeInspectionBounds,
-        ledger_bounds:super::LedgerBounds,mutation_requested:bool,
-    )->Result<FreshRecoveredNodeWalV2Session> {
-        let parent=original_frames.parent().ok_or(ReconcileError::Invariant("history recovery parent"))?;
-        if restart_frames.parent()!=Some(parent) || restore_ledger.parent()!=Some(parent) {
-            return Err(ReconcileError::Invariant("history recovery explicit external slots"));
-        }
-        let ancestors=super::external::hold_ancestors(parent)?;
-        let held=&ancestors.last().ok_or(ReconcileError::Invariant("history held parent"))?.1;
-        let restart_name=restart_frames.file_name().and_then(|n|n.to_str())
-            .ok_or(ReconcileError::Invariant("history recovery name"))?;
-        let restart=held.reacquire_existing_node_read_file(restart_name)?;
-        let restart_bytes=restart.exact_bytes(1024*1024)?;
-        let record=history_restart_records(&restart_bytes)?;
-        if record.archive!=*self.digest() || record.worktree!=worktree.to_string_lossy()
-            || record.data!=data.to_string_lossy() || held.key()?.to_string()!=record.external_key
-            || restart_name!=format!("node-history-restart-{}.frames",record.session) {
-            return Err(ReconcileError::Invariant("history exact protocol and root binding"));
-        }
-        let mut names=std::collections::BTreeSet::new();
-        names.insert(restart_name.to_owned());
-        let mut retained=Vec::new();let mut aggregate=restart_bytes.len() as u64;
-        let mut objects=record.receipts.clone();
-        let close=record.history_close.as_ref().ok_or(ReconcileError::Invariant("history close object"))?;
-        let wal=record.wal2.as_ref().ok_or(ReconcileError::Invariant("history WAL object"))?;
-        if record.baseline.name!=format!("node-history-baseline-{}.image",record.session)
-            || close.name!=format!("node-recovered-history-close-{}.frames",record.session)
-            || wal.name!=format!("node-recovered-wal-{}.frames",record.session)
-            || record.receipts.len()>384 {
-            return Err(ReconcileError::Invariant("history exact object slots"));
-        }
-        let mut receipt_bytes=0u64;
-        for item in &record.receipts {
-            if item.bytes>256*1024 || !["history","file","cas"].iter().any(|kind|
-                item.name.starts_with(&format!("node-recovered-{kind}-{}-",record.session))) {
-                return Err(ReconcileError::Invariant("history exact receipt namespace"));
-            }
-            receipt_bytes=receipt_bytes.checked_add(item.bytes).filter(|n|*n<=4*1024*1024)
-                .ok_or(ReconcileError::ResourceLimit("history receipt recovery aggregate"))?;
-        }
-        objects.extend([record.baseline.clone(),close.clone(),wal.clone()]);
-        for object in &objects {
-            let maximum=if object.name==record.baseline.name {64*1024*1024}
-                else if object.name==close.name {512*1024} else {256*1024};
-            if object.name.contains(['/', '\\']) || !names.insert(object.name.clone())
-                || object.bytes>maximum || object.parent!=record.external_key {
-                return Err(ReconcileError::Invariant("history exact unique bounded object"));
-            }
-            aggregate=aggregate.checked_add(object.bytes).filter(|n|*n<=72*1024*1024)
-                .ok_or(ReconcileError::ResourceLimit("history restart aggregate before acquisition"))?;
-            let file=held.reacquire_existing_node_read_file(&object.name)?;
-            let bytes=file.exact_bytes(maximum)?;
-            if file.key()?.to_string()!=object.key || file.parent_key()?.to_string()!=object.parent
-                || !file.matches_path(&parent.join(&object.name))?
-                || bytes.len() as u64!=object.bytes || ContentId::hash(&bytes)!=object.digest {
-                return Err(ReconcileError::Invariant("history recovery actual key parent bytes"));
-            }
-            retained.push(ReacquiredFile {
-                path:parent.join(&object.name),file:RecoveredFileProtection::Read(file),
-                bytes:object.bytes,digest:object.digest.clone(),
-            });
-        }
-        retained.push(ReacquiredFile {
-            path:restart_frames.to_owned(),file:RecoveredFileProtection::Read(restart),
-            bytes:restart_bytes.len() as u64,digest:ContentId::hash(&restart_bytes),
-        });
-        let original_name=original_frames.file_name().and_then(|n|n.to_str())
-            .ok_or(ReconcileError::Invariant("history original name"))?;
-        let original=held.reacquire_existing_node_read_file(original_name)?;
-        let original_bytes=original.exact_bytes(1024*1024)?;
-        if ContentId::hash(&original_bytes)!=record.original_frames
-            || self.classify_original_node_write_frames(&original_bytes).state!="closed_evidence" {
-            return Err(ReconcileError::Invariant("history original completed scope"));
-        }
-        let size=u32::from_le_bytes(original_bytes[16..20].try_into()
-            .map_err(|_|ReconcileError::Invariant("history original scope size"))?) as usize;
-        let scope:OriginalWriteScope=serde_json::from_slice(&original_bytes[84..84+size])?;
-        scope.validate()?;
-        let owner_name=format!("node-recovered-wal-{}.owner",record.session);
-        names.insert(owner_name.clone());
-        let owner=held.reacquire_existing_node_read_file(&owner_name)?;
-        let owner_bytes=owner.exact_bytes(65536)?;
-        if owner_bytes!=serde_json::to_vec(&(2u32,self.digest(),&record.session))? {
-            return Err(ReconcileError::Invariant("history exact recovered owner"));
-        }
-        let owner_lock=owner.acquire_fresh_coordination_lock(false)?;
-        let wal_bytes=retained.iter().find(|e|e.path==parent.join(&wal.name))
-            .ok_or(ReconcileError::Invariant("history held WAL bytes"))?.file.exact_bytes(wal.bytes)?;
-        let wal_records=history_restart_wal_records(&wal_bytes)?;
-        let first=&wal_records[1];let terminal=&wal_records[3];
-        if terminal.archive!=record.archive || terminal.original_frames!=record.original_frames
-            || terminal.fresh!=record.session || terminal.previous!=scope.session
-            || terminal.predecessor.is_some() || terminal.keys!=record.native_keys
-            || terminal.rows!=record.rows || terminal.main!=record.main || terminal.shm!=record.shm
-            || terminal.worktree!=record.worktree || terminal.data!=record.data {
-            return Err(ReconcileError::Invariant("history exact terminal WAL binding"));
-        }
-        let close_bytes=retained.iter().find(|e|e.path==parent.join(&close.name))
-            .ok_or(ReconcileError::Invariant("history held close bytes"))?.file.exact_bytes(close.bytes)?;
-        let classification=self.classify_recovered_history_close(&close_bytes,&wal_bytes);
-        if classification.state!="closed_descriptive_history_evidence"
-            || classification.receipts!=record.receipts.len() {
-            return Err(ReconcileError::Invariant("history exact descriptive close"));
-        }
-        for (count,item) in std::fs::read_dir(parent)?.enumerate() {
-            if count as u64>=ledger_bounds.max_records {
-                return Err(ReconcileError::ResourceLimit("history exact external membership bound"));
-            }
-            let name=item?.file_name().into_string()
-                .map_err(|_|ReconcileError::Invariant("history external name encoding"))?;
-            if (name.starts_with("node-recovered-") || name.starts_with("node-history-"))
-                && !names.contains(&name) {
-                return Err(ReconcileError::Invariant("history unresolved or foreign prior attempt"));
-            }
-        }
-        let baseline_bytes=retained.iter().find(|e|e.path==parent.join(&record.baseline.name))
-            .ok_or(ReconcileError::Invariant("history held baseline"))?.file.exact_bytes(record.baseline.bytes)?;
-        let baseline=sync_extend_journal::JournalBackupImage::from_current_node_image(
-            baseline_bytes.clone(),record.baseline.digest.as_str(),baseline_bytes.len(),self.space(),bounds)?;
-        if record.baseline.digest!=first.main
-            || baseline.closed_node_complete_rows_digest(self.space(),bounds)?!=first.rows {
-            return Err(ReconcileError::Invariant("history baseline exact first checkpoint"));
-        }
-        let original_rows=baseline.recovered_session_preserved_rows_digest(
-            self.space(),bounds,&scope.session,&record.session)?;
-        let admission=FreshSessionRecord {
-            version:2,phase:"closed".into(),archive:self.digest().clone(),original_frames:record.original_frames.clone(),
-            original_completion:scope.completion.clone(),predecessor_frames:None,
-            previous:scope.session.clone(),fresh:record.session.clone(),
-            worktree:record.worktree.clone(),data:record.data.clone(),
-            keys:record.native_keys[..3].to_vec().try_into()
-                .map_err(|_|ReconcileError::Invariant("history three native keys"))?,
-            rows:record.rows.clone(),main:record.main.clone(),
-            wal_shm:Some((record.native_keys[3].clone(),record.shm.clone())),
-            history_admission:Some(RecoveredHistoryAdmission {
-                original_rows,final_rows:record.rows.clone(),final_root:record.root.clone(),mutation_requested,
-            }),
-        };
-        drop(original);
-        let mut read=self.reacquire_closed_node_locked_scope_internal(
-            worktree,data,original_frames,restore_ledger,bounds,ledger_bounds,true,Some(&admission))?;
-        if read.read.directories.iter().find(|d|d.path==worktree).is_none_or(|d|d.key.to_string()!=record.work_key)
-            || read.read.directories.iter().find(|d|d.path==data).is_none_or(|d|d.key.to_string()!=record.data_key) {
-            return Err(ReconcileError::Invariant("history actual retained roots changed"));
-        }
-        let main=read.read.files.iter().find(|f|f.path==data.join("journal.sqlite"))
-            .ok_or(ReconcileError::Invariant("history held current main"))?.file.exact_bytes(scope.max_main_bytes)?;
-        let image=sync_extend_journal::JournalBackupImage::from_current_node_image(
-            main.clone(),record.main.as_str(),main.len(),self.space(),bounds)?;
-        image.audit_recovered_history_extension(&baseline,self.space(),bounds)?;
-        read.external.push(ReacquiredExternalEvidence {
-            path:parent.join(owner_name),file:owner,digest:ContentId::hash(&owner_bytes),bytes:owner_bytes.len() as u64,
-        });
-        read.locks.push(owner_lock);
-        read.verify()?;
-        let total=scope.max_main_bytes.checked_add(scope.max_wal_bytes)
-            .and_then(|n|n.checked_add(scope.max_rollback_bytes)).and_then(|n|n.checked_add(1024*1024))
-            .ok_or(ReconcileError::ResourceLimit("history native aggregate overflow"))?;
-        if total>512*1024*1024 {
-            return Err(ReconcileError::ResourceLimit("history native aggregate before effects"));
-        }
-        let fresh=SpaceId::random()?;let name=format!("node-recovered-wal-{fresh}");
-        let mut owner=held.create_new_file(&(name.clone()+".owner"))?;
-        owner.writer().write_all(&serde_json::to_vec(&(2u32,self.digest(),&fresh))?)?;owner.writer().sync_all()?;
-        let mut frames=held.create_new_file(&(name.clone()+".frames"))?;
-        let intent=serde_json::to_vec(&(2u32,self.digest(),&record.original_frames,&record.session,&fresh))?;
-        frames.writer().write_all(b"SYNC-RECOVERED-WAL2\n")?;
-        frames.writer().write_all(&(intent.len() as u32).to_le_bytes())?;
-        frames.writer().write_all(&intent)?;frames.writer().sync_all()?;
-        crate::fault::checkpoint("history_restart4_reacquired_intended_before_open");
-        let mut files=Vec::new();
-        for name in ["journal.sqlite","journal.sqlite-wal","journal.sqlite-journal","journal.sqlite-shm"] {
-            let index=read.read.files.iter().position(|f|f.path==data.join(name))
-                .ok_or(ReconcileError::Invariant("history next native file absent"))?;
-            let evidence=read.read.files.remove(index);
-            let RecoveredFileProtection::Sqlite(file)=evidence.file else {
-                return Err(ReconcileError::Invariant("history fresh exclusive native handoff"));
-            };
-            files.push(file);
-        }
-        // The fresh WAL2 intent is already durable. Resetting the retained SHM
-        // index starts a new native epoch, never modifies prior admission bytes.
-        let epoch_name=format!("node-recovered-shm-epoch-{fresh}.frames");
-        let mut epoch=held.create_new_file(&epoch_name)?;
-        let epoch_intent=serde_json::to_vec(&(1u32,"shm_epoch_intended",self.digest(),&record.original_frames,
-            &record.session,&fresh,&record.native_keys,&record.main,&record.shm,&record.rows))?;
-        if epoch_intent.len()>65536 {return Err(ReconcileError::ResourceLimit("new SHM epoch intended bound"));}
-        epoch.writer().write_all(&epoch_intent)?;epoch.writer().sync_all()?;
-        crate::fault::checkpoint("history_restart4_intended_before_new_shm_epoch");
-        let prior_shm=files[3].exact_bytes(1024*1024)?;
-        if ContentId::hash(&prior_shm)!=record.shm {return Err(ReconcileError::Invariant("exact prior held SHM bytes"));}
-        let native=sync_extend_platform_fs::FreshNativeWalConnection::open_after_explicit_shm_epoch(
-            &data.join("journal.sqlite"),files.try_into()
-                .map_err(|_|ReconcileError::Invariant("history native four files"))?,
-            [scope.max_main_bytes,scope.max_wal_bytes,scope.max_rollback_bytes,1024*1024],
-            (record.native_keys[3].as_str(),&prior_shm))?;
-        epoch.writer().write_all(&serde_json::to_vec(&(1u32,"shm_epoch_initialized",&fresh,
-            ContentId::hash(&native.held_shm_bytes()?),native.all_native_keys()?.map(|key|key.to_string())))?)?;
-        epoch.writer().sync_all()?;
-        crate::fault::checkpoint("history_restart4_new_shm_epoch_before_session_commit");
-        let epoch_file=RecoveredFileProtection::Created(epoch.seal_original()?);
-        let epoch_bytes=epoch_file.exact_bytes(256*1024)?;
-        retained.push(ReacquiredFile {path:parent.join(epoch_name),file:epoch_file,
-            bytes:epoch_bytes.len() as u64,digest:ContentId::hash(&epoch_bytes)});
-        let native_keys=native.all_native_keys()?.map(|key|key.to_string());
-        let before_rows=read.read.rows.clone();
-        let mut result=FreshRecoveredNodeWalV2Session {
-            created_work_directories:std::collections::BTreeMap::new(),read,native,frames,owner,path:parent.join(name+".frames"),bounds,space:self.space().clone(),
-            previous:record.session,fresh,before_rows,archive:self.digest().clone(),original_frames:record.original_frames,
-            next:0,previous_record:ContentId::hash(&intent),attempted:false,committed:false,closed:false,poisoned:false,
-            predecessor:Some(wal.digest.clone()),native_keys,history_count:0,
-            new_content_bytes:0,new_cas_buckets:std::collections::BTreeMap::new(),
-            new_file_bytes:0,new_cas_bytes:0,new_cas_objects:0,manifest_entry_limit:bounds.max_entries,
-            retained_receipts:std::collections::BTreeMap::new(),retained_receipt_bytes:0,
-            history_baseline:Vec::new(),history_chain_parent:None,history_chain_depth:0,history_retained_originals:Vec::new(),history_retained_directories:Vec::new(),retained_history_evidence:retained,retained_mutations:Vec::new(),mutation_requested,
-        };
-        result.record("intended",None)?;result.verify()?;Ok(result)
-    }
-}
-
-fn history_restart_wal_records(bytes:&[u8])->Result<Vec<RecoveredWalV2Record>> {
-    const HEADER:&[u8]=b"SYNC-RECOVERED-WAL2\n";
-    if !bytes.starts_with(HEADER) || bytes.len()>256*1024 {
-        return Err(ReconcileError::Invariant("WAL2 exact bounded header"));
-    }
-    let prefix=bytes.get(HEADER.len()..HEADER.len()+4).ok_or(ReconcileError::Invariant("WAL2 intent prefix"))?;
-    let length=u32::from_le_bytes(prefix.try_into().map_err(|_|ReconcileError::Invariant("WAL2 intent length"))?) as usize;
-    if length>65536 {return Err(ReconcileError::ResourceLimit("WAL2 intent bound"));}
-    let start=HEADER.len()+4;
-    let intent=bytes.get(start..start+length).ok_or(ReconcileError::Invariant("WAL2 incomplete intent"))?;
-    let admitted:(u32,ContentId,ContentId,SpaceId,SpaceId)=serde_json::from_slice(intent)?;
-    if admitted.0!=2 || admitted.3==admitted.4 || serde_json::to_vec(&admitted)?!=intent {
-        return Err(ReconcileError::Invariant("WAL2 canonical intent"));
-    }
-    let mut offset=start+length;let mut previous=ContentId::hash(intent);let mut result=Vec::new();
-    while offset<bytes.len() {
-        let prefix=bytes.get(offset..offset+136).ok_or(ReconcileError::Invariant("WAL2 truncated envelope"))?;
-        let index=u32::from_le_bytes(prefix[..4].try_into().map_err(|_|ReconcileError::Invariant("WAL2 index"))?);
-        let size=u32::from_le_bytes(prefix[4..8].try_into().map_err(|_|ReconcileError::Invariant("WAL2 size"))?) as usize;
-        if index as usize!=result.len() || index>=4 || size>65536 || prefix[8..72]!=*previous.as_str().as_bytes() {
-            return Err(ReconcileError::Invariant("WAL2 order bounds chain"));
-        }
-        let payload=bytes.get(offset+136..offset+136+size).ok_or(ReconcileError::Invariant("WAL2 payload truncated"))?;
-        let record:RecoveredWalV2Record=serde_json::from_slice(payload)?;
-        if record.version!=2 || record.index!=index || record.archive!=admitted.1
-            || record.original_frames!=admitted.2 || record.previous!=admitted.3 || record.fresh!=admitted.4
-            || record.phase!=["intended","committed_checkpointed","close_intended","closed"][index as usize]
-            || serde_json::to_vec(&record)?!=payload || ContentId::hash(payload).as_str().as_bytes()!=&prefix[72..136] {
-            return Err(ReconcileError::Invariant("WAL2 exact canonical record"));
-        }
-        if let Some(first)=result.first() {
-            let first:&RecoveredWalV2Record=first;
-            if record.keys!=first.keys || record.worktree!=first.worktree || record.data!=first.data
-                || record.predecessor!=first.predecessor {
-                return Err(ReconcileError::Invariant("WAL2 native binding changed across records"));
-            }
-        }
-        if index==3 {
-            let checkpoint:&RecoveredWalV2Record=&result[2];
-            if record.rows!=checkpoint.rows || record.main!=checkpoint.main || record.shm!=checkpoint.shm {
-                return Err(ReconcileError::Invariant("history WAL close bytes changed after checkpoint"));
-            }
-        }
-        offset+=136+size;previous=ContentId::hash(&bytes[offset-136-size..offset]);result.push(record);
-    }
-    if result.len()!=4 {return Err(ReconcileError::Invariant("WAL2 actual closed terminal required"));}
-    Ok(result)
-}
-
-// Newly acquired READ|DELETE authority retains the original in a fresh external
-// directory. Old CREATE provenance and cleanup permission are never reconstructed.
-struct RecoveredRetainedMutation {
-    directory:sync_extend_platform_fs::LockedDirectoryMutation,
-    path:PathBuf,
-    original:ReacquiredFile,
-}
-impl RecoveredRetainedMutation {
-    fn verify(&self)->Result<()> {
-        self.directory.original_creation()?.verify()?;
-        self.original.file.verify()?;
-        if !self.directory.matches_path(&self.path)?
-            || !self.original.file.matches_path(&self.path.join("original"))?
-            || ContentId::hash(&self.original.file.exact_bytes(self.original.bytes)?)!=self.original.digest {
-            return Err(ReconcileError::Invariant("recovered retained original mutation bytes or key"));
-        }
-        Ok(())
-    }
-}
-impl FreshRecoveredNodeWalV2Session {
-    pub fn replace_recovered_file_from_existing_content(
-        &mut self,path:&sync_extend_core_model::PortablePath,
-        source:&sync_extend_core_model::PortablePath,timestamp:u64,
-    )->Result<sync_extend_core_model::SnapshotId> {
-        self.verify()?;
-        let entry=self.read.read.manifest.entries.values()
-            .find(|e|e.path==*source && e.kind==sync_extend_core_model::EntryKind::File)
-            .ok_or(ReconcileError::Invariant("recovered replacement source"))?;
-        let content=entry.content.clone().ok_or(ReconcileError::Invariant("replacement source content"))?;
-        let source=self.read.read.files.iter().find(|f|f.path==self.read.read.worktree.join(source.as_str()))
-            .ok_or(ReconcileError::Invariant("replacement held source"))?;
-        let bytes=source.file.exact_bytes(8*1024*1024)?;
-        self.mutate_recovered_file(path,Some((content,bytes)),timestamp)
-    }
-    pub fn delete_recovered_file(
-        &mut self,path:&sync_extend_core_model::PortablePath,timestamp:u64,
-    )->Result<sync_extend_core_model::SnapshotId> {
-        self.mutate_recovered_file(path,None,timestamp)
-    }
-    fn mutate_recovered_file(
-        &mut self,path:&sync_extend_core_model::PortablePath,
-        replacement:Option<(sync_extend_core_model::FileManifest,Vec<u8>)>,timestamp:u64,
-    )->Result<sync_extend_core_model::SnapshotId> {
-        use sync_extend_core_model::{Change,EntryKind,Operation,OperationPayload,FORMAT_VERSION};
-        self.verify()?;
-        if !self.mutation_requested || !self.committed || self.closed || self.next!=2
-            || self.history_count>=128 || self.retained_mutations.len()>=128
-            || self.retained_receipt_bytes.checked_add(2*256*1024).is_none_or(|n|n>4*1024*1024) {
-            return Err(ReconcileError::ResourceLimit("recovered mutation preeffect session receipts"));
-        }
-        let previous=self.read.read.manifest.clone();
-        let entry=previous.entries.values().find(|e|e.path==*path && e.kind==EntryKind::File)
-            .ok_or(ReconcileError::Invariant("recovered mutation exact file"))?.clone();
-        let target=self.read.read.worktree.join(path.as_str());
-        let parent=target.parent().ok_or(ReconcileError::Invariant("recovered mutation parent"))?.to_path_buf();
-        let name=target.file_name().and_then(|n|n.to_str())
-            .ok_or(ReconcileError::Invariant("recovered mutation name"))?.to_owned();
-        if path.as_str().split('/').any(|n|n.starts_with('.')) {
-            return Err(ReconcileError::Invariant("recovered mutation reserved path"));
-        }
-        let index=self.read.read.files.iter().position(|f|f.path==target)
-            .ok_or(ReconcileError::Invariant("recovered mutation held file absent"))?;
-        let original=&self.read.read.files[index];
-        if !matches!(original.file,RecoveredFileProtection::Mutation(_) | RecoveredFileProtection::Created(_)) {
-            return Err(ReconcileError::Invariant("recovered mutation explicit native rights required"));
-        }
-        let original_key=original.file.key()?;
-        let original_parent=original.file.parent_key()?;
-        let external=self.path.parent().ok_or(ReconcileError::Invariant("recovered mutation external"))?.to_path_buf();
-        let held_external=self.read.read.directories.iter().find(|d|d.path==external)
-            .ok_or(ReconcileError::Invariant("recovered mutation held external"))?;
-        let held_parent=self.read.read.directories.iter().find(|d|d.path==parent)
-            .ok_or(ReconcileError::Invariant("recovered mutation held parent"))?;
-        if held_parent.key!=original_parent || held_external.key.volume!=original_key.volume {
-            return Err(ReconcileError::Invariant("recovered mutation original parent same external volume"));
-        }
-        let retained_bytes=self.retained_mutations.iter().try_fold(0u64,|sum,item|
-            sum.checked_add(item.original.bytes).filter(|n|*n<=64*1024*1024)
-                .ok_or(ReconcileError::ResourceLimit("recovered mutation retained byte aggregate")))?;
-        if retained_bytes.checked_add(original.bytes).is_none_or(|n|n>64*1024*1024) {
-            return Err(ReconcileError::ResourceLimit("recovered mutation preeffect retained bytes"));
-        }
-        if let Some((content,bytes))=&replacement {
-            if bytes.len()>8*1024*1024 || content.content_id==original.digest
-                || self.new_file_bytes.checked_add(content.length).is_none_or(|n|n>64*1024*1024)
-                || sync_extend_cas::plan_bounded_content(bytes,8*1024*1024,128)?.manifest!=*content {
-                return Err(ReconcileError::Invariant("recovered replacement exact bounded different content"));
-            }
-            for chunk in &content.chunks {
-                let id=chunk.content_id.as_str();
-                let file=self.read.read.files.iter().find(|f|f.path==self.read.read.data.join("cas/objects").join(&id[..2]).join(id))
-                    .ok_or(ReconcileError::Invariant("recovered replacement held CAS"))?;
-                if file.digest!=chunk.content_id || file.bytes!=u64::from(chunk.length) {
-                    return Err(ReconcileError::Invariant("recovered replacement CAS identity bytes"));
-                }
-            }
-        }
-        let intended=serde_json::to_vec(&(1u32,&self.archive,&self.fresh,path,previous.root()?,
-            original_key.to_string(),original_parent.to_string(),&original.digest,original.bytes,
-            replacement.as_ref().map(|r|&r.0),timestamp))?;
-        if intended.len()>65536 {return Err(ReconcileError::ResourceLimit("recovered mutation intended bytes"));}
-        self.poisoned=true;
-        let mut receipt=held_external.file.create_new_file(
-            &format!("node-recovered-mutation-{}-{}.frames",self.fresh,self.history_count))?;
-        receipt.writer().write_all(&intended)?;receipt.writer().sync_all()?;
-        crate::fault::checkpoint("recovered_mutation_intended_before_directory");
-        let result=(||->Result<sync_extend_core_model::SnapshotId> {
-            let held=self.read.read.directories.iter().find(|d|d.path==external)
-                .ok_or(ReconcileError::Invariant("mutation held directory creator"))?;
-            let directory_name=format!("node-recovered-retained-{}-{}",self.fresh,self.history_count);
-            let directory=held.file.create_new_rename_destination(&directory_name)?;
-            let retained_path=external.join(directory_name);
-            receipt.writer().write_all(&serde_json::to_vec(&(1u32,"directory_created",directory.key()?.to_string()))?)?;
-            receipt.writer().sync_all()?;
-            crate::fault::checkpoint("recovered_mutation_directory_before_move");
-            match &self.read.read.files[index].file {
-                RecoveredFileProtection::Mutation(file)=>file.rename_no_replace_in(&directory,"original")?,
-                RecoveredFileProtection::Created(file)=>file.rename_no_replace_in(&directory,"original")?,
-                _=>return Err(ReconcileError::Invariant("recovered original mutation capability")),
-            }
-            let mut original=self.read.read.files.remove(index);
-            original.path=retained_path.join("original");
-            self.retained_mutations.push(RecoveredRetainedMutation {
-                directory,path:retained_path,original,
-            });
-            self.read.read.expected_membership.get_mut(&parent)
-                .ok_or(ReconcileError::Invariant("mutation parent membership"))?.remove(&name);
-            receipt.writer().write_all(&serde_json::to_vec(&(1u32,"original_moved",original_key.to_string()))?)?;
-            receipt.writer().sync_all()?;
-            crate::fault::checkpoint("recovered_mutation_moved_before_replacement");
-            if let Some((content,bytes))=&replacement {
-                let held=self.read.read.directories.iter().find(|d|d.path==parent)
-                    .ok_or(ReconcileError::Invariant("mutation replacement held parent"))?;
-                let mut creator=held.file.create_new_file(&name)?;
-                creator.writer().write_all(bytes)?;creator.writer().sync_all()?;
-                let file=creator.seal_original()?;
-                if !file.matches_path(&target)? || file.parent_key()?!=original_parent {
-                    return Err(ReconcileError::Invariant("mutation replacement exact new CREATE"));
-                }
-                self.read.read.files.push(ReacquiredFile {
-                    path:target.clone(),file:RecoveredFileProtection::Created(file),
-                    digest:content.content_id.clone(),bytes:content.length,
-                });
-                self.read.read.expected_membership.get_mut(&parent)
-                    .ok_or(ReconcileError::Invariant("mutation replacement membership"))?.insert(name.clone());
-                self.new_file_bytes+=content.length;
-            }
-            receipt.writer().write_all(&serde_json::to_vec(&(1u32,"native_completed",replacement.is_some()))?)?;
-            receipt.writer().sync_all()?;
-            crate::fault::checkpoint("recovered_mutation_native_before_history");
-            self.poisoned=false;
-            self.verify()?;
-            let limits=sync_extend_core_model::limits::LocalLimits::default();
-            let allowed:std::collections::BTreeSet<_>=previous.entries.values().filter_map(|e|e.content.as_ref())
-                .flat_map(|c|&c.chunks).chain(replacement.iter().flat_map(|(content,_)|&content.chunks)).map(|c|c.content_id.clone()).collect();
-            let cas=sync_extend_cas::Cas::open_existing_session_coordinated(&self.read.read.data.join("cas"),
-                move |id|if allowed.contains(id){Ok(Box::new(()))}else{Err("mutation CAS outside held set".into())},
-                ||Ok(Box::new(())))?;
-            let view=RecoveredSessionScanView(self);
-            let first=crate::scan::scan_native(&self.read.read.worktree,&cas,&limits,&view)?;
-            let second=crate::scan::scan_native(&self.read.read.worktree,&cas,&limits,&view)?;
-            if first!=second {return Err(ReconcileError::Unstable);}
-            let mut manifest=crate::build_manifest(&previous,&second,&std::collections::BTreeMap::new())?;
-            let change=if let Some((content,_))=&replacement {
-                let actual=manifest.entries.get(&entry.entry_id).ok_or(ReconcileError::Invariant("mutation replacement entry id"))?;
-                if actual.path!=*path || actual.content.as_ref()!=Some(content)
-                    || manifest.entries.len()!=previous.entries.len() {
-                    return Err(ReconcileError::Invariant("mutation replacement exact manifest delta"));
-                }
-                Change::Put{entry:actual.clone()}
-            } else {
-                if manifest.entries.contains_key(&entry.entry_id) || manifest.entries.len()+1!=previous.entries.len() {
-                    return Err(ReconcileError::Invariant("mutation deletion exact manifest delta"));
-                }
-                Change::Delete{entry_id:entry.entry_id.clone()}
-            };
-            for (id,old) in &previous.entries {
-                if id!=&entry.entry_id && manifest.entries.get(id)!=Some(old) {
-                    return Err(ReconcileError::Invariant("mutation unchanged entry differs"));
-                }
-            }
-            let device=self.recovered_device_id()?;
-            let seq=manifest.version_vector.get(&device).checked_add(1)
-                .ok_or(ReconcileError::Invariant("mutation local sequence exhausted"))?;
-            let operation=Operation::new(OperationPayload {
-                format_version:FORMAT_VERSION,space_id:self.space.clone(),origin_device_id:device.clone(),
-                origin_seq:seq,causal:manifest.version_vector.clone(),created_at_ms:timestamp,change,
-            })?;
-            if let Change::Delete{entry_id}=&operation.payload.change {
-                manifest.tombstones.insert(entry_id.clone(),operation.op_id.clone());
-            }
-            manifest.version_vector.observe(device,seq);
-            let root=self.commit_exact_recovered_history(manifest,vec![operation],timestamp)?;
-            crate::fault::checkpoint("recovered_mutation_history_before_receipt");
-            self.poisoned=true;
-            receipt.writer().write_all(&serde_json::to_vec(&(1u32,"committed",&root))?)?;
-            receipt.writer().sync_all()?;
-            self.retain_recovered_receipt(receipt)?;
-            self.poisoned=false;self.verify()?;
-            crate::fault::checkpoint("recovered_mutation_committed_after_sync");
-            Ok(root)
-        })();
-        if result.is_err() {self.poisoned=true;}
-        result
-    }
-}
-
-// Separate descriptive closed-history envelope. It never issues restart authority.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RecoveredMutationHistoryCloseRecord {
-    version: u32,
-    index: u32,
-    phase: String,
-    archive: ContentId,
-    original_frames: ContentId,
-    session: SpaceId,
-    worktree: String,
-    data: String,
-    keys: [String; 4],
-    root: sync_extend_core_model::SnapshotId,
-    rows: ContentId,
-    main: ContentId,
-    shm: ContentId,
-    wal2_frames: Option<ContentId>,
-    receipts: Vec<(String, ContentId, u64)>,
-    history_count: u32,
-}
-#[derive(Serialize)]
-pub struct RecoveredMutationHistoryCloseClassification {
-    pub state: &'static str,
-    pub actual_records: usize,
-    pub history_count: u32,
-    pub receipts: usize,
-    pub native_write_authority: bool,
-    pub cleanup_authority: bool,
-}
-impl FreshRecoveredNodeWalV2Session {
-    /// Close the actual native session, then bind complete final rows and all
-    /// independently intended history/file/CAS receipts in a separate envelope.
-    /// This preserves the original WAL2 record/parser and grants no restart API.
-    pub fn close_recovered_mutation_history_with_evidence(&mut self) -> Result<PathBuf> {
-        self.verify()?;
-        if self.closed || self.history_count == 0 || self.history_count >= 128 {
+        let metadata = self.verified_metadata_close_evidence()?;
+        if self.closed
+            || (self.history_count == 0 && metadata.is_none())
+            || self.history_count >= 128
+        {
             return Err(ReconcileError::Invariant(
                 "explicit live recovered history required",
             ));
@@ -5327,7 +5684,7 @@ impl FreshRecoveredNodeWalV2Session {
                 .file_name()
                 .into_string()
                 .map_err(|_| ReconcileError::Invariant("history close external encoding"))?;
-            if ["history", "file", "cas", "mutation", "namespace"]
+            if ["history", "file", "cas", "retention"]
                 .iter()
                 .any(|kind| name.starts_with(&format!("node-recovered-{kind}-{}-", self.fresh)))
             {
@@ -5352,21 +5709,1848 @@ impl FreshRecoveredNodeWalV2Session {
                     ))?;
                 // Each append-only local stream must end in its own synced
                 // committed record. Mere intent or materialization stays open.
-                let values = serde_json::Deserializer::from_slice(&bytes)
-                    .into_iter::<serde_json::Value>()
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                let last =
-                    values
-                        .last()
-                        .and_then(|v| v.as_array())
-                        .ok_or(ReconcileError::Invariant(
-                            "history close receipt terminal shape",
-                        ))?;
-                if values.len() < 2 || last.get(1).and_then(|v| v.as_str()) != Some("committed") {
+                live_retention::require_committed_receipt(&name, &bytes)?;
+                receipts.push((name, ContentId::hash(&bytes), bytes.len() as u64));
+            }
+        }
+        receipts.sort_by(|a, b| a.0.cmp(&b.0));
+        let history_receipts = receipts
+            .iter()
+            .filter(|r| r.0.starts_with("node-recovered-history-"))
+            .count();
+        if history_receipts != self.history_count as usize {
+            return Err(ReconcileError::Invariant(
+                "history close exact committed history count",
+            ));
+        }
+        let main = self.native.exact_main_bytes()?;
+        let image = sync_extend_journal::JournalBackupImage::from_current_node_image(
+            main.clone(),
+            ContentId::hash(&main).as_str(),
+            main.len(),
+            &self.space,
+            self.bounds,
+        )?;
+        let mut intended = RecoveredHistoryCloseRecord {
+            version: 3,
+            index: 0,
+            phase: "close_intended".into(),
+            archive: self.archive.clone(),
+            original_frames: self.original_frames.clone(),
+            session: self.fresh.clone(),
+            worktree: self.read.read.worktree.to_string_lossy().into(),
+            data: self.read.read.data.to_string_lossy().into(),
+            keys: self.native_keys.clone(),
+            root: self.read.read.manifest.root()?,
+            rows: image.closed_node_complete_rows_digest(&self.space, self.bounds)?,
+            main: ContentId::hash(&main),
+            shm: ContentId::hash(&self.native.held_shm_bytes()?),
+            wal2_frames: None,
+            receipts,
+            history_count: self.history_count,
+            metadata,
+        };
+        let bytes = serde_json::to_vec(&intended)?;
+        if bytes.len() > 256 * 1024 {
+            return Err(ReconcileError::ResourceLimit(
+                "history close envelope intended bound",
+            ));
+        }
+        let path = parent.join(format!(
+            "node-recovered-history-close-{}.frames",
+            self.fresh
+        ));
+        self.poisoned = true;
+        let mut evidence = held.file.create_new_file(
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .ok_or(ReconcileError::Invariant("history close component"))?,
+        )?;
+        evidence
+            .writer()
+            .write_all(b"SYNC-RECOVERED-HISTORY-CLOSE3\n")?;
+        evidence
+            .writer()
+            .write_all(&(bytes.len() as u32).to_le_bytes())?;
+        evidence.writer().write_all(&bytes)?;
+        evidence.writer().sync_all()?;
+        crate::fault::checkpoint("recovered_history_close_intended_before_native_close");
+        self.poisoned = false;
+        let result = (|| -> Result<PathBuf> {
+            self.close_completed()?;
+            intended.index = 1;
+            intended.phase = "closed".into();
+            {
+                use std::os::windows::fs::FileExt;
+                self.frames.original_creation()?.verify()?;
+                let length = self.frames.reader().metadata()?.len();
+                if length > 256 * 1024 {
+                    return Err(ReconcileError::ResourceLimit("history close WAL2 bytes"));
+                }
+                let mut bytes = vec![0u8; length as usize];
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    let n = self
+                        .frames
+                        .reader()
+                        .seek_read(&mut bytes[offset..], offset as u64)?;
+                    if n == 0 {
+                        return Err(ReconcileError::Invariant("history close WAL2 short read"));
+                    }
+                    offset += n;
+                }
+                intended.wal2_frames = Some(ContentId::hash(&bytes));
+            }
+            let after = self.native.exact_closed_main_bytes()?;
+            if ContentId::hash(&after) != intended.main
+                || ContentId::hash(&self.native.held_shm_bytes()?) != intended.shm
+            {
+                return Err(ReconcileError::Invariant(
+                    "history close native bytes changed",
+                ));
+            }
+            let terminal = serde_json::to_vec(&intended)?;
+            if terminal.len() > 256 * 1024 {
+                return Err(ReconcileError::ResourceLimit(
+                    "history close terminal bound",
+                ));
+            }
+            evidence
+                .writer()
+                .write_all(&(terminal.len() as u32).to_le_bytes())?;
+            evidence
+                .writer()
+                .write_all(ContentId::hash(&bytes).as_str().as_bytes())?;
+            evidence.writer().write_all(&terminal)?;
+            evidence.writer().sync_all()?;
+            self.verify()?;
+            self.retain_history_creation(evidence, 512 * 1024)?;
+            crate::fault::checkpoint("recovered_history_closed_after_terminal_sync");
+            Ok(path.clone())
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+}
+impl super::VerifiedNodeStateArchive {
+    /// Classify bytes only. Neither historical native keys nor a digest become
+    /// living ownership, cleanup permission, or a recovery writer capability.
+    pub fn classify_recovered_history_close(
+        &self,
+        bytes: &[u8],
+        wal2_frames: &[u8],
+    ) -> RecoveredHistoryCloseClassification {
+        let parsed = (|| -> Result<RecoveredHistoryCloseRecord> {
+            const HEADER: &[u8] = b"SYNC-RECOVERED-HISTORY-CLOSE3\n";
+            if !bytes.starts_with(HEADER)
+                || bytes.len() > 512 * 1024
+                || wal2_frames.len() > 256 * 1024
+            {
+                return Err(ReconcileError::Invariant("history close bounded header"));
+            }
+            let mut offset = HEADER.len();
+            let read_size = |offset: usize| -> Result<usize> {
+                let prefix = bytes
+                    .get(offset..offset + 4)
+                    .ok_or(ReconcileError::Invariant("history close size"))?;
+                Ok(u32::from_le_bytes(
+                    prefix
+                        .try_into()
+                        .map_err(|_| ReconcileError::Invariant("history close size encoding"))?,
+                ) as usize)
+            };
+            let size = read_size(offset)?;
+            offset += 4;
+            if size > 256 * 1024 {
+                return Err(ReconcileError::ResourceLimit("history close intended size"));
+            }
+            let payload = bytes
+                .get(offset..offset + size)
+                .ok_or(ReconcileError::Invariant(
+                    "history close intended truncated",
+                ))?;
+            let first: RecoveredHistoryCloseRecord = serde_json::from_slice(payload)?;
+            offset += size;
+            let size = read_size(offset)?;
+            offset += 4;
+            if size > 256 * 1024 {
+                return Err(ReconcileError::ResourceLimit("history close terminal size"));
+            }
+            let digest = bytes
+                .get(offset..offset + 64)
+                .ok_or(ReconcileError::Invariant("history close chain"))?;
+            offset += 64;
+            if digest != ContentId::hash(payload).as_str().as_bytes() {
+                return Err(ReconcileError::Invariant(
+                    "history close exact intended chain",
+                ));
+            }
+            let final_bytes = bytes
+                .get(offset..offset + size)
+                .ok_or(ReconcileError::Invariant(
+                    "history close terminal truncated",
+                ))?;
+            let terminal: RecoveredHistoryCloseRecord = serde_json::from_slice(final_bytes)?;
+            if offset + size != bytes.len()
+                || serde_json::to_vec(&first)? != payload
+                || serde_json::to_vec(&terminal)? != final_bytes
+                || first.version != 3
+                || first.index != 0
+                || first.phase != "close_intended"
+                || first.archive != *self.digest()
+                || first.wal2_frames.is_some()
+                || (first.history_count == 0 && first.metadata.is_none())
+                || first.history_count >= 128
+                || terminal.index != 1
+                || terminal.phase != "closed"
+                || terminal.wal2_frames.as_ref() != Some(&ContentId::hash(wal2_frames))
+            {
+                return Err(ReconcileError::Invariant(
+                    "history close canonical phase and scope",
+                ));
+            }
+            let mut normalized = terminal.clone();
+            normalized.index = 0;
+            normalized.phase = "close_intended".into();
+            normalized.wal2_frames = None;
+            if serde_json::to_vec(&normalized)? != payload {
+                return Err(ReconcileError::Invariant(
+                    "history close final bindings changed",
+                ));
+            }
+            let mut total = 0u64;
+            let mut last: Option<&str> = None;
+            for (name, _, size) in &terminal.receipts {
+                if *size > 256 * 1024
+                    || last.is_some_and(|old| old >= name.as_str())
+                    || !["history", "file", "cas", "retention"].iter().any(|kind| {
+                        name.starts_with(&format!("node-recovered-{kind}-{}-", terminal.session))
+                    })
+                    || !name.ends_with(".frames")
+                    || name.contains(['/', '\\'])
+                {
                     return Err(ReconcileError::Invariant(
-                        "history close unresolved receipt",
+                        "history close exact receipt slots",
                     ));
                 }
+                total = total
+                    .checked_add(*size)
+                    .filter(|n| *n <= 4 * 1024 * 1024)
+                    .ok_or(ReconcileError::ResourceLimit(
+                        "history close exact aggregate",
+                    ))?;
+                last = Some(name);
+            }
+            if terminal
+                .receipts
+                .iter()
+                .filter(|r| r.0.starts_with("node-recovered-history-"))
+                .count()
+                != terminal.history_count as usize
+            {
+                return Err(ReconcileError::Invariant(
+                    "history close exact receipt count",
+                ));
+            }
+            live_retention::validate_close_metadata(
+                terminal.metadata.as_ref(),
+                terminal.history_count,
+                &terminal.receipts,
+                &terminal.session,
+                &terminal.main,
+            )?;
+            Ok(terminal)
+        })();
+        match parsed {
+            Ok(record) => RecoveredHistoryCloseClassification {
+                state: "closed_descriptive_history_evidence",
+                actual_records: 2,
+                history_count: record.history_count,
+                receipts: record.receipts.len(),
+                native_write_authority: false,
+                cleanup_authority: false,
+            },
+            Err(_) => RecoveredHistoryCloseClassification {
+                state: "refused_evidence",
+                actual_records: 0,
+                history_count: 0,
+                receipts: 0,
+                native_write_authority: false,
+                cleanup_authority: false,
+            },
+        }
+    }
+}
+
+// This new admission is never deserialized from caller input or a classification.
+struct RecoveredHistoryAdmission {
+    original_rows: ContentId,
+    final_rows: ContentId,
+    final_root: sync_extend_core_model::SnapshotId,
+    mutation_requested: bool,
+}
+fn manifest_root_from_recovered_image(
+    image: &sync_extend_journal::JournalBackupImage,
+    space: &SpaceId,
+    bounds: sync_extend_journal::NodeInspectionBounds,
+) -> Result<sync_extend_core_model::SnapshotId> {
+    image.with_audited_readonly(space,bounds,|connection| {
+        let json:String=connection.query_row(
+            "SELECT s.manifest FROM main.current_manifests c JOIN main.snapshots s ON c.snapshot_id=s.snapshot_id WHERE c.space_id=?1",
+            [space.as_str()],|row|row.get(0))?;
+        let manifest:sync_extend_core_model::Manifest=serde_json::from_str(&json)?;
+        manifest.root().map_err(Into::into)
+    }).map_err(Into::into)
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryRestartObject {
+    name: String,
+    key: String,
+    parent: String,
+    digest: ContentId,
+    bytes: u64,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryRestartRecord {
+    version: u32,
+    index: u32,
+    phase: String,
+    archive: ContentId,
+    original_frames: ContentId,
+    session: SpaceId,
+    worktree: String,
+    data: String,
+    work_key: String,
+    data_key: String,
+    external_key: String,
+    native_keys: [String; 4],
+    root: sync_extend_core_model::SnapshotId,
+    rows: ContentId,
+    main: ContentId,
+    shm: ContentId,
+    baseline: HistoryRestartObject,
+    receipts: Vec<HistoryRestartObject>,
+    history_close: Option<HistoryRestartObject>,
+    wal2: Option<HistoryRestartObject>,
+}
+fn history_restart_records(bytes: &[u8]) -> Result<HistoryRestartRecord> {
+    const HEADER: &[u8] = b"SYNC-HISTORY-RESTART4\n";
+    if !bytes.starts_with(HEADER) || bytes.len() > 1024 * 1024 {
+        return Err(ReconcileError::Invariant(
+            "history restart exact bounded header",
+        ));
+    }
+    let mut offset = HEADER.len();
+    let mut payloads: Vec<&[u8]> = Vec::new();
+    for _ in 0..2 {
+        let length = u32::from_le_bytes(
+            bytes
+                .get(offset..offset + 4)
+                .ok_or(ReconcileError::Invariant("history restart size"))?
+                .try_into()
+                .map_err(|_| ReconcileError::Invariant("history restart size encoding"))?,
+        ) as usize;
+        offset += 4;
+        if length > 384 * 1024 {
+            return Err(ReconcileError::ResourceLimit(
+                "history restart record bytes",
+            ));
+        }
+        if let Some(previous) = payloads.first() {
+            let digest = bytes
+                .get(offset..offset + 64)
+                .ok_or(ReconcileError::Invariant("history restart chain"))?;
+            if digest != ContentId::hash(previous).as_str().as_bytes() {
+                return Err(ReconcileError::Invariant(
+                    "history restart intended chain changed",
+                ));
+            }
+            offset += 64;
+        }
+        let payload = bytes
+            .get(offset..offset + length)
+            .ok_or(ReconcileError::Invariant("history restart truncated"))?;
+        payloads.push(payload);
+        offset += length;
+    }
+    let first: HistoryRestartRecord = serde_json::from_slice(payloads[0])?;
+    let terminal: HistoryRestartRecord = serde_json::from_slice(payloads[1])?;
+    if offset != bytes.len()
+        || first.version != 4
+        || first.index != 0
+        || first.phase != "close_intended"
+        || first.wal2.is_some()
+        || first.history_close.is_some()
+        || terminal.index != 1
+        || terminal.phase != "closed"
+        || terminal.wal2.is_none()
+        || terminal.history_close.is_none()
+        || serde_json::to_vec(&first)? != payloads[0]
+        || serde_json::to_vec(&terminal)? != payloads[1]
+    {
+        return Err(ReconcileError::Invariant(
+            "history restart canonical terminal",
+        ));
+    }
+    let mut normalized = terminal.clone();
+    normalized.index = 0;
+    normalized.phase = "close_intended".into();
+    normalized.wal2 = None;
+    normalized.history_close = None;
+    if serde_json::to_vec(&normalized)? != payloads[0] {
+        return Err(ReconcileError::Invariant(
+            "history restart final bindings changed",
+        ));
+    }
+    Ok(terminal)
+}
+fn history_object(file: &ReacquiredFile) -> Result<HistoryRestartObject> {
+    file.file.verify()?;
+    if !file.file.matches_path(&file.path)?
+        || ContentId::hash(&file.file.exact_bytes(file.bytes)?) != file.digest
+    {
+        return Err(ReconcileError::Invariant(
+            "history object held identity and bytes",
+        ));
+    }
+    Ok(HistoryRestartObject {
+        name: file
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(ReconcileError::Invariant("history object exact name"))?
+            .into(),
+        key: file.file.key()?.to_string(),
+        parent: file.file.parent_key()?.to_string(),
+        digest: file.digest.clone(),
+        bytes: file.bytes,
+    })
+}
+impl FreshRecoveredNodeWalV2Session {
+    fn retain_history_creation(
+        &mut self,
+        creator: OwnedFileCreation,
+        maximum: u64,
+    ) -> Result<HistoryRestartObject> {
+        let name = creator.original_creation()?.created_component().to_owned();
+        let path = self
+            .path
+            .parent()
+            .ok_or(ReconcileError::Invariant("history creation parent"))?
+            .join(&name);
+        let file = RecoveredFileProtection::Created(creator.seal_original()?);
+        let bytes = file.exact_bytes(maximum)?;
+        let held = ReacquiredFile {
+            path,
+            file,
+            bytes: bytes.len() as u64,
+            digest: ContentId::hash(&bytes),
+        };
+        let result = history_object(&held)?;
+        self.retained_history_evidence.push(held);
+        Ok(result)
+    }
+    /// Publish a fresh protocol that binds actual creator keys, immutable baseline
+    /// and final complete history. The original descriptive close remains intact.
+    pub fn close_recovered_history_for_explicit_restart(&mut self) -> Result<PathBuf> {
+        self.verify()?;
+        if self.history_count == 0
+            || self.closed
+            || self.history_baseline.is_empty()
+            || self.history_baseline.len() > 64 * 1024 * 1024
+        {
+            return Err(ReconcileError::Invariant(
+                "history restart explicit live baseline",
+            ));
+        }
+        let main = self.native.exact_main_bytes()?;
+        let baseline = sync_extend_journal::JournalBackupImage::from_current_node_image(
+            self.history_baseline.clone(),
+            ContentId::hash(&self.history_baseline).as_str(),
+            self.history_baseline.len(),
+            &self.space,
+            self.bounds,
+        )?;
+        let final_image = sync_extend_journal::JournalBackupImage::from_current_node_image(
+            main.clone(),
+            ContentId::hash(&main).as_str(),
+            main.len(),
+            &self.space,
+            self.bounds,
+        )?;
+        final_image.audit_recovered_history_extension(&baseline, &self.space, self.bounds)?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or(ReconcileError::Invariant("history restart parent"))?
+            .to_path_buf();
+        let external = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|d| d.path == parent)
+            .ok_or(ReconcileError::Invariant("history restart held external"))?;
+        let external_key = external.key.to_string();
+        let mut receipts = self
+            .retained_receipts
+            .values()
+            .map(history_object)
+            .collect::<Result<Vec<_>>>()?;
+        receipts.sort_by(|a, b| a.name.cmp(&b.name));
+        if receipts.is_empty()
+            || receipts.len() > 384
+            || receipts
+                .iter()
+                .try_fold(0u64, |sum, item| {
+                    sum.checked_add(item.bytes)
+                        .filter(|n| *n <= 4 * 1024 * 1024)
+                        .ok_or(ReconcileError::ResourceLimit(
+                            "history restart receipt aggregate",
+                        ))
+                })
+                .is_err()
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "history restart bounded receipts",
+            ));
+        }
+        self.poisoned = true;
+        let mut creator = external
+            .file
+            .create_new_file(&format!("node-history-baseline-{}.image", self.fresh))?;
+        creator.writer().write_all(&self.history_baseline)?;
+        creator.writer().sync_all()?;
+        let baseline = self.retain_history_creation(creator, 64 * 1024 * 1024)?;
+        let root = self.read.read.manifest.root()?;
+        let mut record = HistoryRestartRecord {
+            version: 4,
+            index: 0,
+            phase: "close_intended".into(),
+            archive: self.archive.clone(),
+            original_frames: self.original_frames.clone(),
+            session: self.fresh.clone(),
+            worktree: self.read.read.worktree.to_string_lossy().into(),
+            data: self.read.read.data.to_string_lossy().into(),
+            work_key: self
+                .read
+                .read
+                .directories
+                .iter()
+                .find(|d| d.path == self.read.read.worktree)
+                .ok_or(ReconcileError::Invariant("history work root"))?
+                .key
+                .to_string(),
+            data_key: self
+                .read
+                .read
+                .directories
+                .iter()
+                .find(|d| d.path == self.read.read.data)
+                .ok_or(ReconcileError::Invariant("history data root"))?
+                .key
+                .to_string(),
+            external_key,
+            native_keys: self.native_keys.clone(),
+            root,
+            rows: final_image.closed_node_complete_rows_digest(&self.space, self.bounds)?,
+            main: ContentId::hash(&main),
+            shm: ContentId::hash(&self.native.held_shm_bytes()?),
+            baseline,
+            receipts,
+            history_close: None,
+            wal2: None,
+        };
+        let intended = serde_json::to_vec(&record)?;
+        if intended.len() > 384 * 1024 {
+            return Err(ReconcileError::ResourceLimit(
+                "history restart intended bound",
+            ));
+        }
+        let held = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|d| d.path == parent)
+            .ok_or(ReconcileError::Invariant("history restart external"))?;
+        let path = parent.join(format!("node-history-restart-{}.frames", self.fresh));
+        let mut evidence = held.file.create_new_file(
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .ok_or(ReconcileError::Invariant("history restart frame name"))?,
+        )?;
+        evidence.writer().write_all(b"SYNC-HISTORY-RESTART4\n")?;
+        evidence
+            .writer()
+            .write_all(&(intended.len() as u32).to_le_bytes())?;
+        evidence.writer().write_all(&intended)?;
+        evidence.writer().sync_all()?;
+        crate::fault::checkpoint("history_restart4_intended_before_native_close");
+        self.poisoned = false;
+        let result = (|| -> Result<PathBuf> {
+            let closed_path = self.close_recovered_history_with_evidence()?;
+            let close = self
+                .retained_history_evidence
+                .iter()
+                .find(|e| e.path == closed_path)
+                .ok_or(ReconcileError::Invariant(
+                    "history restart close creator held",
+                ))?;
+            record.history_close = Some(history_object(close)?);
+            let frame_bytes = self.frames.reader().metadata()?.len();
+            if frame_bytes > 256 * 1024 {
+                return Err(ReconcileError::ResourceLimit("history restart WAL2 size"));
+            }
+            let wal_key = self.frames.original_creation()?.key()?.to_string();
+            let wal_parent = self.frames.original_creation()?.parent_key()?.to_string();
+            let held = self
+                .read
+                .read
+                .directories
+                .iter()
+                .find(|d| d.path == parent)
+                .ok_or(ReconcileError::Invariant("history restart frame external"))?;
+            // The original creator is still held; reopen is unnecessary.
+            let bytes = read_history_owned_bytes(&self.frames, 256 * 1024)?;
+            let _ = held;
+            record.wal2 = Some(HistoryRestartObject {
+                name: self
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or(ReconcileError::Invariant("history WAL name"))?
+                    .into(),
+                key: wal_key,
+                parent: wal_parent,
+                digest: ContentId::hash(&bytes),
+                bytes: frame_bytes,
+            });
+            record.index = 1;
+            record.phase = "closed".into();
+            let terminal = serde_json::to_vec(&record)?;
+            if terminal.len() > 384 * 1024 {
+                return Err(ReconcileError::ResourceLimit(
+                    "history restart terminal bound",
+                ));
+            }
+            evidence
+                .writer()
+                .write_all(&(terminal.len() as u32).to_le_bytes())?;
+            evidence
+                .writer()
+                .write_all(ContentId::hash(&intended).as_str().as_bytes())?;
+            evidence.writer().write_all(&terminal)?;
+            evidence.writer().sync_all()?;
+            self.retain_history_creation(evidence, 1024 * 1024)?;
+            self.verify()?;
+            crate::fault::checkpoint("history_restart4_closed_after_terminal_sync");
+            Ok(path)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+}
+fn read_history_owned_bytes(file: &OwnedFileCreation, maximum: u64) -> Result<Vec<u8>> {
+    use std::os::windows::fs::FileExt;
+    file.original_creation()?.verify()?;
+    let size = file.reader().metadata()?.len();
+    if size > maximum {
+        return Err(ReconcileError::ResourceLimit("history owned bytes"));
+    }
+    let mut bytes = vec![0u8; size as usize];
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let count = file
+            .reader()
+            .seek_read(&mut bytes[offset..], offset as u64)?;
+        if count == 0 {
+            return Err(ReconcileError::Invariant("history owned short read"));
+        }
+        offset += count;
+    }
+    Ok(bytes)
+}
+impl super::VerifiedNodeStateArchive {
+    /// Admit one explicitly closed history session by freshly held native roots,
+    /// full current content, original completion and every exact receipt key.
+    /// Classification bytes alone never construct this session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reacquire_closed_history_restart4(
+        &self,
+        worktree: &std::path::Path,
+        data: &std::path::Path,
+        original_frames: &std::path::Path,
+        restore_ledger: &std::path::Path,
+        restart_frames: &std::path::Path,
+        bounds: sync_extend_journal::NodeInspectionBounds,
+        ledger_bounds: super::LedgerBounds,
+    ) -> Result<FreshRecoveredNodeWalV2Session> {
+        self.reacquire_history_restart4_internal(
+            worktree,
+            data,
+            original_frames,
+            restore_ledger,
+            restart_frames,
+            bounds,
+            ledger_bounds,
+            false,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn reacquire_closed_history_restart4_with_mutation(
+        &self,
+        worktree: &std::path::Path,
+        data: &std::path::Path,
+        original_frames: &std::path::Path,
+        restore_ledger: &std::path::Path,
+        restart_frames: &std::path::Path,
+        bounds: sync_extend_journal::NodeInspectionBounds,
+        ledger_bounds: super::LedgerBounds,
+    ) -> Result<FreshRecoveredNodeWalV2Session> {
+        self.reacquire_history_restart4_internal(
+            worktree,
+            data,
+            original_frames,
+            restore_ledger,
+            restart_frames,
+            bounds,
+            ledger_bounds,
+            true,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn reacquire_history_restart4_internal(
+        &self,
+        worktree: &std::path::Path,
+        data: &std::path::Path,
+        original_frames: &std::path::Path,
+        restore_ledger: &std::path::Path,
+        restart_frames: &std::path::Path,
+        bounds: sync_extend_journal::NodeInspectionBounds,
+        ledger_bounds: super::LedgerBounds,
+        mutation_requested: bool,
+    ) -> Result<FreshRecoveredNodeWalV2Session> {
+        let parent = original_frames
+            .parent()
+            .ok_or(ReconcileError::Invariant("history recovery parent"))?;
+        if restart_frames.parent() != Some(parent) || restore_ledger.parent() != Some(parent) {
+            return Err(ReconcileError::Invariant(
+                "history recovery explicit external slots",
+            ));
+        }
+        let ancestors = super::external::hold_ancestors(parent)?;
+        let held = &ancestors
+            .last()
+            .ok_or(ReconcileError::Invariant("history held parent"))?
+            .1;
+        let restart_name = restart_frames
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(ReconcileError::Invariant("history recovery name"))?;
+        let restart = held.reacquire_existing_node_read_file(restart_name)?;
+        let restart_bytes = restart.exact_bytes(1024 * 1024)?;
+        let record = history_restart_records(&restart_bytes)?;
+        if record.archive != *self.digest()
+            || record.worktree != worktree.to_string_lossy()
+            || record.data != data.to_string_lossy()
+            || held.key()?.to_string() != record.external_key
+            || restart_name != format!("node-history-restart-{}.frames", record.session)
+        {
+            return Err(ReconcileError::Invariant(
+                "history exact protocol and root binding",
+            ));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        names.insert(restart_name.to_owned());
+        let mut retained = Vec::new();
+        let mut aggregate = restart_bytes.len() as u64;
+        let mut objects = record.receipts.clone();
+        let close = record
+            .history_close
+            .as_ref()
+            .ok_or(ReconcileError::Invariant("history close object"))?;
+        let wal = record
+            .wal2
+            .as_ref()
+            .ok_or(ReconcileError::Invariant("history WAL object"))?;
+        if record.baseline.name != format!("node-history-baseline-{}.image", record.session)
+            || close.name != format!("node-recovered-history-close-{}.frames", record.session)
+            || wal.name != format!("node-recovered-wal-{}.frames", record.session)
+            || record.receipts.len() > 384
+        {
+            return Err(ReconcileError::Invariant("history exact object slots"));
+        }
+        let mut receipt_bytes = 0u64;
+        for item in &record.receipts {
+            if item.bytes > 256 * 1024
+                || !["history", "file", "cas"].iter().any(|kind| {
+                    item.name
+                        .starts_with(&format!("node-recovered-{kind}-{}-", record.session))
+                })
+            {
+                return Err(ReconcileError::Invariant("history exact receipt namespace"));
+            }
+            receipt_bytes = receipt_bytes
+                .checked_add(item.bytes)
+                .filter(|n| *n <= 4 * 1024 * 1024)
+                .ok_or(ReconcileError::ResourceLimit(
+                    "history receipt recovery aggregate",
+                ))?;
+        }
+        objects.extend([record.baseline.clone(), close.clone(), wal.clone()]);
+        for object in &objects {
+            let maximum = if object.name == record.baseline.name {
+                64 * 1024 * 1024
+            } else if object.name == close.name {
+                512 * 1024
+            } else {
+                256 * 1024
+            };
+            if object.name.contains(['/', '\\'])
+                || !names.insert(object.name.clone())
+                || object.bytes > maximum
+                || object.parent != record.external_key
+            {
+                return Err(ReconcileError::Invariant(
+                    "history exact unique bounded object",
+                ));
+            }
+            aggregate = aggregate
+                .checked_add(object.bytes)
+                .filter(|n| *n <= 72 * 1024 * 1024)
+                .ok_or(ReconcileError::ResourceLimit(
+                    "history restart aggregate before acquisition",
+                ))?;
+            let file = held.reacquire_existing_node_read_file(&object.name)?;
+            let bytes = file.exact_bytes(maximum)?;
+            if file.key()?.to_string() != object.key
+                || file.parent_key()?.to_string() != object.parent
+                || !file.matches_path(&parent.join(&object.name))?
+                || bytes.len() as u64 != object.bytes
+                || ContentId::hash(&bytes) != object.digest
+            {
+                return Err(ReconcileError::Invariant(
+                    "history recovery actual key parent bytes",
+                ));
+            }
+            retained.push(ReacquiredFile {
+                path: parent.join(&object.name),
+                file: RecoveredFileProtection::Read(file),
+                bytes: object.bytes,
+                digest: object.digest.clone(),
+            });
+        }
+        retained.push(ReacquiredFile {
+            path: restart_frames.to_owned(),
+            file: RecoveredFileProtection::Read(restart),
+            bytes: restart_bytes.len() as u64,
+            digest: ContentId::hash(&restart_bytes),
+        });
+        let original_name = original_frames
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(ReconcileError::Invariant("history original name"))?;
+        let original = held.reacquire_existing_node_read_file(original_name)?;
+        let original_bytes = original.exact_bytes(1024 * 1024)?;
+        if ContentId::hash(&original_bytes) != record.original_frames
+            || self
+                .classify_original_node_write_frames(&original_bytes)
+                .state
+                != "closed_evidence"
+        {
+            return Err(ReconcileError::Invariant(
+                "history original completed scope",
+            ));
+        }
+        let size = u32::from_le_bytes(
+            original_bytes[16..20]
+                .try_into()
+                .map_err(|_| ReconcileError::Invariant("history original scope size"))?,
+        ) as usize;
+        let scope: OriginalWriteScope = serde_json::from_slice(&original_bytes[84..84 + size])?;
+        scope.validate()?;
+        let owner_name = format!("node-recovered-wal-{}.owner", record.session);
+        names.insert(owner_name.clone());
+        let owner = held.reacquire_existing_node_read_file(&owner_name)?;
+        let owner_bytes = owner.exact_bytes(65536)?;
+        if owner_bytes != serde_json::to_vec(&(2u32, self.digest(), &record.session))? {
+            return Err(ReconcileError::Invariant("history exact recovered owner"));
+        }
+        let owner_lock = owner.acquire_fresh_coordination_lock(false)?;
+        let wal_bytes = retained
+            .iter()
+            .find(|e| e.path == parent.join(&wal.name))
+            .ok_or(ReconcileError::Invariant("history held WAL bytes"))?
+            .file
+            .exact_bytes(wal.bytes)?;
+        let wal_records = history_restart_wal_records(&wal_bytes)?;
+        let first = &wal_records[1];
+        let terminal = &wal_records[3];
+        if terminal.archive != record.archive
+            || terminal.original_frames != record.original_frames
+            || terminal.fresh != record.session
+            || terminal.previous != scope.session
+            || terminal.predecessor.is_some()
+            || terminal.keys != record.native_keys
+            || terminal.rows != record.rows
+            || terminal.main != record.main
+            || terminal.shm != record.shm
+            || terminal.worktree != record.worktree
+            || terminal.data != record.data
+        {
+            return Err(ReconcileError::Invariant(
+                "history exact terminal WAL binding",
+            ));
+        }
+        let close_bytes = retained
+            .iter()
+            .find(|e| e.path == parent.join(&close.name))
+            .ok_or(ReconcileError::Invariant("history held close bytes"))?
+            .file
+            .exact_bytes(close.bytes)?;
+        let classification = self.classify_recovered_history_close(&close_bytes, &wal_bytes);
+        if classification.state != "closed_descriptive_history_evidence"
+            || classification.receipts != record.receipts.len()
+        {
+            return Err(ReconcileError::Invariant("history exact descriptive close"));
+        }
+        for (count, item) in std::fs::read_dir(parent)?.enumerate() {
+            if count as u64 >= ledger_bounds.max_records {
+                return Err(ReconcileError::ResourceLimit(
+                    "history exact external membership bound",
+                ));
+            }
+            let name = item?
+                .file_name()
+                .into_string()
+                .map_err(|_| ReconcileError::Invariant("history external name encoding"))?;
+            if (name.starts_with("node-recovered-") || name.starts_with("node-history-"))
+                && !names.contains(&name)
+            {
+                return Err(ReconcileError::Invariant(
+                    "history unresolved or foreign prior attempt",
+                ));
+            }
+        }
+        let baseline_bytes = retained
+            .iter()
+            .find(|e| e.path == parent.join(&record.baseline.name))
+            .ok_or(ReconcileError::Invariant("history held baseline"))?
+            .file
+            .exact_bytes(record.baseline.bytes)?;
+        let baseline = sync_extend_journal::JournalBackupImage::from_current_node_image(
+            baseline_bytes.clone(),
+            record.baseline.digest.as_str(),
+            baseline_bytes.len(),
+            self.space(),
+            bounds,
+        )?;
+        if record.baseline.digest != first.main
+            || baseline.closed_node_complete_rows_digest(self.space(), bounds)? != first.rows
+        {
+            return Err(ReconcileError::Invariant(
+                "history baseline exact first checkpoint",
+            ));
+        }
+        let original_rows = baseline.recovered_session_preserved_rows_digest(
+            self.space(),
+            bounds,
+            &scope.session,
+            &record.session,
+        )?;
+        let admission = FreshSessionRecord {
+            version: 2,
+            phase: "closed".into(),
+            archive: self.digest().clone(),
+            original_frames: record.original_frames.clone(),
+            original_completion: scope.completion.clone(),
+            predecessor_frames: None,
+            previous: scope.session.clone(),
+            fresh: record.session.clone(),
+            worktree: record.worktree.clone(),
+            data: record.data.clone(),
+            keys: record.native_keys[..3]
+                .to_vec()
+                .try_into()
+                .map_err(|_| ReconcileError::Invariant("history three native keys"))?,
+            rows: record.rows.clone(),
+            main: record.main.clone(),
+            wal_shm: Some((record.native_keys[3].clone(), record.shm.clone())),
+            history_admission: Some(RecoveredHistoryAdmission {
+                original_rows,
+                final_rows: record.rows.clone(),
+                final_root: record.root.clone(),
+                mutation_requested,
+            }),
+        };
+        drop(original);
+        let mut read = self.reacquire_closed_node_locked_scope_internal(
+            worktree,
+            data,
+            original_frames,
+            restore_ledger,
+            bounds,
+            ledger_bounds,
+            true,
+            Some(&admission),
+        )?;
+        if read
+            .read
+            .directories
+            .iter()
+            .find(|d| d.path == worktree)
+            .is_none_or(|d| d.key.to_string() != record.work_key)
+            || read
+                .read
+                .directories
+                .iter()
+                .find(|d| d.path == data)
+                .is_none_or(|d| d.key.to_string() != record.data_key)
+        {
+            return Err(ReconcileError::Invariant(
+                "history actual retained roots changed",
+            ));
+        }
+        let main = read
+            .read
+            .files
+            .iter()
+            .find(|f| f.path == data.join("journal.sqlite"))
+            .ok_or(ReconcileError::Invariant("history held current main"))?
+            .file
+            .exact_bytes(scope.max_main_bytes)?;
+        let image = sync_extend_journal::JournalBackupImage::from_current_node_image(
+            main.clone(),
+            record.main.as_str(),
+            main.len(),
+            self.space(),
+            bounds,
+        )?;
+        image.audit_recovered_history_extension(&baseline, self.space(), bounds)?;
+        read.external.push(ReacquiredExternalEvidence {
+            path: parent.join(owner_name),
+            file: owner,
+            digest: ContentId::hash(&owner_bytes),
+            bytes: owner_bytes.len() as u64,
+        });
+        read.locks.push(owner_lock);
+        read.verify()?;
+        let total = scope
+            .max_main_bytes
+            .checked_add(scope.max_wal_bytes)
+            .and_then(|n| n.checked_add(scope.max_rollback_bytes))
+            .and_then(|n| n.checked_add(1024 * 1024))
+            .ok_or(ReconcileError::ResourceLimit(
+                "history native aggregate overflow",
+            ))?;
+        if total > 512 * 1024 * 1024 {
+            return Err(ReconcileError::ResourceLimit(
+                "history native aggregate before effects",
+            ));
+        }
+        let fresh = SpaceId::random()?;
+        let name = format!("node-recovered-wal-{fresh}");
+        let mut owner = held.create_new_file(&(name.clone() + ".owner"))?;
+        owner
+            .writer()
+            .write_all(&serde_json::to_vec(&(2u32, self.digest(), &fresh))?)?;
+        owner.writer().sync_all()?;
+        let mut frames = held.create_new_file(&(name.clone() + ".frames"))?;
+        let intent = serde_json::to_vec(&(
+            2u32,
+            self.digest(),
+            &record.original_frames,
+            &record.session,
+            &fresh,
+        ))?;
+        frames.writer().write_all(b"SYNC-RECOVERED-WAL2\n")?;
+        frames
+            .writer()
+            .write_all(&(intent.len() as u32).to_le_bytes())?;
+        frames.writer().write_all(&intent)?;
+        frames.writer().sync_all()?;
+        crate::fault::checkpoint("history_restart4_reacquired_intended_before_open");
+        let mut files = Vec::new();
+        for name in [
+            "journal.sqlite",
+            "journal.sqlite-wal",
+            "journal.sqlite-journal",
+            "journal.sqlite-shm",
+        ] {
+            let index = read
+                .read
+                .files
+                .iter()
+                .position(|f| f.path == data.join(name))
+                .ok_or(ReconcileError::Invariant("history next native file absent"))?;
+            let evidence = read.read.files.remove(index);
+            let RecoveredFileProtection::Sqlite(file) = evidence.file else {
+                return Err(ReconcileError::Invariant(
+                    "history fresh exclusive native handoff",
+                ));
+            };
+            files.push(file);
+        }
+        // The fresh WAL2 intent is already durable. Resetting the retained SHM
+        // index starts a new native epoch, never modifies prior admission bytes.
+        let epoch_name = format!("node-recovered-shm-epoch-{fresh}.frames");
+        let mut epoch = held.create_new_file(&epoch_name)?;
+        let epoch_intent = serde_json::to_vec(&(
+            1u32,
+            "shm_epoch_intended",
+            self.digest(),
+            &record.original_frames,
+            &record.session,
+            &fresh,
+            &record.native_keys,
+            &record.main,
+            &record.shm,
+            &record.rows,
+        ))?;
+        if epoch_intent.len() > 65536 {
+            return Err(ReconcileError::ResourceLimit(
+                "new SHM epoch intended bound",
+            ));
+        }
+        epoch.writer().write_all(&epoch_intent)?;
+        epoch.writer().sync_all()?;
+        crate::fault::checkpoint("history_restart4_intended_before_new_shm_epoch");
+        let prior_shm = files[3].exact_bytes(1024 * 1024)?;
+        if ContentId::hash(&prior_shm) != record.shm {
+            return Err(ReconcileError::Invariant("exact prior held SHM bytes"));
+        }
+        let native =
+            sync_extend_platform_fs::FreshNativeWalConnection::open_after_explicit_shm_epoch(
+                &data.join("journal.sqlite"),
+                files
+                    .try_into()
+                    .map_err(|_| ReconcileError::Invariant("history native four files"))?,
+                [
+                    scope.max_main_bytes,
+                    scope.max_wal_bytes,
+                    scope.max_rollback_bytes,
+                    1024 * 1024,
+                ],
+                (record.native_keys[3].as_str(), &prior_shm),
+            )?;
+        epoch.writer().write_all(&serde_json::to_vec(&(
+            1u32,
+            "shm_epoch_initialized",
+            &fresh,
+            ContentId::hash(&native.held_shm_bytes()?),
+            native.all_native_keys()?.map(|key| key.to_string()),
+        ))?)?;
+        epoch.writer().sync_all()?;
+        crate::fault::checkpoint("history_restart4_new_shm_epoch_before_session_commit");
+        let epoch_file = RecoveredFileProtection::Created(epoch.seal_original()?);
+        let epoch_bytes = epoch_file.exact_bytes(256 * 1024)?;
+        retained.push(ReacquiredFile {
+            path: parent.join(epoch_name),
+            file: epoch_file,
+            bytes: epoch_bytes.len() as u64,
+            digest: ContentId::hash(&epoch_bytes),
+        });
+        let native_keys = native.all_native_keys()?.map(|key| key.to_string());
+        let before_rows = read.read.rows.clone();
+        let mut result = FreshRecoveredNodeWalV2Session {
+            created_work_directories: std::collections::BTreeMap::new(),
+            read,
+            native,
+            frames,
+            owner,
+            path: parent.join(name + ".frames"),
+            bounds,
+            space: self.space().clone(),
+            previous: record.session,
+            fresh,
+            before_rows,
+            archive: self.digest().clone(),
+            original_frames: record.original_frames,
+            next: 0,
+            previous_record: ContentId::hash(&intent),
+            attempted: false,
+            committed: false,
+            closed: false,
+            poisoned: false,
+            predecessor: Some(wal.digest.clone()),
+            native_keys,
+            history_count: 0,
+            metadata_count: 0,
+            retained_metadata_receipts: Vec::new(),
+            new_content_bytes: 0,
+            new_cas_buckets: std::collections::BTreeMap::new(),
+            verified_main: std::cell::RefCell::new(None),
+            new_file_bytes: 0,
+            new_cas_bytes: 0,
+            new_cas_objects: 0,
+            manifest_entry_limit: bounds.max_entries,
+            retained_receipts: std::collections::BTreeMap::new(),
+            retained_receipt_bytes: 0,
+            history_baseline: Vec::new(),
+            history_chain_parent: None,
+            history_chain_depth: 0,
+            history_retained_originals: Vec::new(),
+            history_retained_directories: Vec::new(),
+            retained_history_evidence: retained,
+            retained_mutations: Vec::new(),
+            mutation_requested,
+        };
+        result.record("intended", None)?;
+        result.verify()?;
+        Ok(result)
+    }
+}
+
+fn history_restart_wal_records(bytes: &[u8]) -> Result<Vec<RecoveredWalV2Record>> {
+    const HEADER: &[u8] = b"SYNC-RECOVERED-WAL2\n";
+    if !bytes.starts_with(HEADER) || bytes.len() > 256 * 1024 {
+        return Err(ReconcileError::Invariant("WAL2 exact bounded header"));
+    }
+    let prefix = bytes
+        .get(HEADER.len()..HEADER.len() + 4)
+        .ok_or(ReconcileError::Invariant("WAL2 intent prefix"))?;
+    let length = u32::from_le_bytes(
+        prefix
+            .try_into()
+            .map_err(|_| ReconcileError::Invariant("WAL2 intent length"))?,
+    ) as usize;
+    if length > 65536 {
+        return Err(ReconcileError::ResourceLimit("WAL2 intent bound"));
+    }
+    let start = HEADER.len() + 4;
+    let intent = bytes
+        .get(start..start + length)
+        .ok_or(ReconcileError::Invariant("WAL2 incomplete intent"))?;
+    let admitted: (u32, ContentId, ContentId, SpaceId, SpaceId) = serde_json::from_slice(intent)?;
+    if admitted.0 != 2 || admitted.3 == admitted.4 || serde_json::to_vec(&admitted)? != intent {
+        return Err(ReconcileError::Invariant("WAL2 canonical intent"));
+    }
+    let mut offset = start + length;
+    let mut previous = ContentId::hash(intent);
+    let mut result = Vec::new();
+    while offset < bytes.len() {
+        let prefix = bytes
+            .get(offset..offset + 136)
+            .ok_or(ReconcileError::Invariant("WAL2 truncated envelope"))?;
+        let index = u32::from_le_bytes(
+            prefix[..4]
+                .try_into()
+                .map_err(|_| ReconcileError::Invariant("WAL2 index"))?,
+        );
+        let size = u32::from_le_bytes(
+            prefix[4..8]
+                .try_into()
+                .map_err(|_| ReconcileError::Invariant("WAL2 size"))?,
+        ) as usize;
+        if index as usize != result.len()
+            || index >= 4
+            || size > 65536
+            || prefix[8..72] != *previous.as_str().as_bytes()
+        {
+            return Err(ReconcileError::Invariant("WAL2 order bounds chain"));
+        }
+        let payload = bytes
+            .get(offset + 136..offset + 136 + size)
+            .ok_or(ReconcileError::Invariant("WAL2 payload truncated"))?;
+        let record: RecoveredWalV2Record = serde_json::from_slice(payload)?;
+        if record.version != 2
+            || record.index != index
+            || record.archive != admitted.1
+            || record.original_frames != admitted.2
+            || record.previous != admitted.3
+            || record.fresh != admitted.4
+            || record.phase
+                != [
+                    "intended",
+                    "committed_checkpointed",
+                    "close_intended",
+                    "closed",
+                ][index as usize]
+            || serde_json::to_vec(&record)? != payload
+            || ContentId::hash(payload).as_str().as_bytes() != &prefix[72..136]
+        {
+            return Err(ReconcileError::Invariant("WAL2 exact canonical record"));
+        }
+        if let Some(first) = result.first() {
+            let first: &RecoveredWalV2Record = first;
+            if record.keys != first.keys
+                || record.worktree != first.worktree
+                || record.data != first.data
+                || record.predecessor != first.predecessor
+            {
+                return Err(ReconcileError::Invariant(
+                    "WAL2 native binding changed across records",
+                ));
+            }
+        }
+        if index == 3 {
+            let checkpoint: &RecoveredWalV2Record = &result[2];
+            if record.rows != checkpoint.rows
+                || record.main != checkpoint.main
+                || record.shm != checkpoint.shm
+            {
+                return Err(ReconcileError::Invariant(
+                    "history WAL close bytes changed after checkpoint",
+                ));
+            }
+        }
+        offset += 136 + size;
+        previous = ContentId::hash(&bytes[offset - 136 - size..offset]);
+        result.push(record);
+    }
+    if result.len() != 4 {
+        return Err(ReconcileError::Invariant(
+            "WAL2 actual closed terminal required",
+        ));
+    }
+    Ok(result)
+}
+
+// Newly acquired READ|DELETE authority retains the original in a fresh external
+// directory. Old CREATE provenance and cleanup permission are never reconstructed.
+struct RecoveredRetainedMutation {
+    directory: sync_extend_platform_fs::LockedDirectoryMutation,
+    path: PathBuf,
+    original: ReacquiredFile,
+}
+impl RecoveredRetainedMutation {
+    fn verify(&self) -> Result<()> {
+        self.directory.original_creation()?.verify()?;
+        self.original.file.verify()?;
+        if !self.directory.matches_path(&self.path)?
+            || !self
+                .original
+                .file
+                .matches_path(&self.path.join("original"))?
+            || ContentId::hash(&self.original.file.exact_bytes(self.original.bytes)?)
+                != self.original.digest
+        {
+            return Err(ReconcileError::Invariant(
+                "recovered retained original mutation bytes or key",
+            ));
+        }
+        Ok(())
+    }
+}
+impl FreshRecoveredNodeWalV2Session {
+    pub fn replace_recovered_file_from_existing_content(
+        &mut self,
+        path: &sync_extend_core_model::PortablePath,
+        source: &sync_extend_core_model::PortablePath,
+        timestamp: u64,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
+        self.verify()?;
+        let entry = self
+            .read
+            .read
+            .manifest
+            .entries
+            .values()
+            .find(|e| e.path == *source && e.kind == sync_extend_core_model::EntryKind::File)
+            .ok_or(ReconcileError::Invariant("recovered replacement source"))?;
+        let content = entry
+            .content
+            .clone()
+            .ok_or(ReconcileError::Invariant("replacement source content"))?;
+        let source = self
+            .read
+            .read
+            .files
+            .iter()
+            .find(|f| f.path == self.read.read.worktree.join(source.as_str()))
+            .ok_or(ReconcileError::Invariant("replacement held source"))?;
+        let bytes = source.file.exact_bytes(8 * 1024 * 1024)?;
+        self.mutate_recovered_file(path, Some((content, bytes)), timestamp)
+    }
+    pub fn delete_recovered_file(
+        &mut self,
+        path: &sync_extend_core_model::PortablePath,
+        timestamp: u64,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
+        self.mutate_recovered_file(path, None, timestamp)
+    }
+    fn mutate_recovered_file(
+        &mut self,
+        path: &sync_extend_core_model::PortablePath,
+        replacement: Option<(sync_extend_core_model::FileManifest, Vec<u8>)>,
+        timestamp: u64,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
+        use sync_extend_core_model::{
+            Change, EntryKind, Operation, OperationPayload, FORMAT_VERSION,
+        };
+        self.verify()?;
+        if !self.mutation_requested
+            || !self.committed
+            || self.closed
+            || self.next != 2
+            || self.metadata_count != 0
+            || self.history_count >= 128
+            || self.retained_mutations.len() >= 128
+            || self
+                .retained_receipt_bytes
+                .checked_add(2 * 256 * 1024)
+                .is_none_or(|n| n > 4 * 1024 * 1024)
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered mutation preeffect session receipts",
+            ));
+        }
+        let previous = self.read.read.manifest.clone();
+        let entry = previous
+            .entries
+            .values()
+            .find(|e| e.path == *path && e.kind == EntryKind::File)
+            .ok_or(ReconcileError::Invariant("recovered mutation exact file"))?
+            .clone();
+        let target = self.read.read.worktree.join(path.as_str());
+        let parent = target
+            .parent()
+            .ok_or(ReconcileError::Invariant("recovered mutation parent"))?
+            .to_path_buf();
+        let name = target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(ReconcileError::Invariant("recovered mutation name"))?
+            .to_owned();
+        if path.as_str().split('/').any(|n| n.starts_with('.')) {
+            return Err(ReconcileError::Invariant(
+                "recovered mutation reserved path",
+            ));
+        }
+        let index = self
+            .read
+            .read
+            .files
+            .iter()
+            .position(|f| f.path == target)
+            .ok_or(ReconcileError::Invariant(
+                "recovered mutation held file absent",
+            ))?;
+        let original = &self.read.read.files[index];
+        if !matches!(
+            original.file,
+            RecoveredFileProtection::Mutation(_) | RecoveredFileProtection::Created(_)
+        ) {
+            return Err(ReconcileError::Invariant(
+                "recovered mutation explicit native rights required",
+            ));
+        }
+        let original_key = original.file.key()?;
+        let original_parent = original.file.parent_key()?;
+        let external = self
+            .path
+            .parent()
+            .ok_or(ReconcileError::Invariant("recovered mutation external"))?
+            .to_path_buf();
+        let held_external = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|d| d.path == external)
+            .ok_or(ReconcileError::Invariant(
+                "recovered mutation held external",
+            ))?;
+        let held_parent = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|d| d.path == parent)
+            .ok_or(ReconcileError::Invariant("recovered mutation held parent"))?;
+        if held_parent.key != original_parent || held_external.key.volume != original_key.volume {
+            return Err(ReconcileError::Invariant(
+                "recovered mutation original parent same external volume",
+            ));
+        }
+        let retained_bytes = self.retained_mutations.iter().try_fold(0u64, |sum, item| {
+            sum.checked_add(item.original.bytes)
+                .filter(|n| *n <= 64 * 1024 * 1024)
+                .ok_or(ReconcileError::ResourceLimit(
+                    "recovered mutation retained byte aggregate",
+                ))
+        })?;
+        if retained_bytes
+            .checked_add(original.bytes)
+            .is_none_or(|n| n > 64 * 1024 * 1024)
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered mutation preeffect retained bytes",
+            ));
+        }
+        if let Some((content, bytes)) = &replacement {
+            if bytes.len() > 8 * 1024 * 1024
+                || content.content_id == original.digest
+                || self
+                    .new_file_bytes
+                    .checked_add(content.length)
+                    .is_none_or(|n| n > 64 * 1024 * 1024)
+                || sync_extend_cas::plan_bounded_content(bytes, 8 * 1024 * 1024, 128)?.manifest
+                    != *content
+            {
+                return Err(ReconcileError::Invariant(
+                    "recovered replacement exact bounded different content",
+                ));
+            }
+            for chunk in &content.chunks {
+                let id = chunk.content_id.as_str();
+                let file = self
+                    .read
+                    .read
+                    .files
+                    .iter()
+                    .find(|f| {
+                        f.path
+                            == self
+                                .read
+                                .read
+                                .data
+                                .join("cas/objects")
+                                .join(&id[..2])
+                                .join(id)
+                    })
+                    .ok_or(ReconcileError::Invariant("recovered replacement held CAS"))?;
+                if file.digest != chunk.content_id || file.bytes != u64::from(chunk.length) {
+                    return Err(ReconcileError::Invariant(
+                        "recovered replacement CAS identity bytes",
+                    ));
+                }
+            }
+        }
+        let intended = serde_json::to_vec(&(
+            1u32,
+            &self.archive,
+            &self.fresh,
+            path,
+            previous.root()?,
+            original_key.to_string(),
+            original_parent.to_string(),
+            &original.digest,
+            original.bytes,
+            replacement.as_ref().map(|r| &r.0),
+            timestamp,
+        ))?;
+        if intended.len() > 65536 {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered mutation intended bytes",
+            ));
+        }
+        self.poisoned = true;
+        let mut receipt = held_external.file.create_new_file(&format!(
+            "node-recovered-mutation-{}-{}.frames",
+            self.fresh, self.history_count
+        ))?;
+        receipt.writer().write_all(&intended)?;
+        receipt.writer().sync_all()?;
+        crate::fault::checkpoint("recovered_mutation_intended_before_directory");
+        let result = (|| -> Result<sync_extend_core_model::SnapshotId> {
+            let held = self
+                .read
+                .read
+                .directories
+                .iter()
+                .find(|d| d.path == external)
+                .ok_or(ReconcileError::Invariant("mutation held directory creator"))?;
+            let directory_name = format!(
+                "node-recovered-retained-{}-{}",
+                self.fresh, self.history_count
+            );
+            let directory = held.file.create_new_rename_destination(&directory_name)?;
+            let retained_path = external.join(directory_name);
+            receipt.writer().write_all(&serde_json::to_vec(&(
+                1u32,
+                "directory_created",
+                directory.key()?.to_string(),
+            ))?)?;
+            receipt.writer().sync_all()?;
+            crate::fault::checkpoint("recovered_mutation_directory_before_move");
+            match &self.read.read.files[index].file {
+                RecoveredFileProtection::Mutation(file) => {
+                    file.rename_no_replace_in(&directory, "original")?
+                }
+                RecoveredFileProtection::Created(file) => {
+                    file.rename_no_replace_in(&directory, "original")?
+                }
+                _ => {
+                    return Err(ReconcileError::Invariant(
+                        "recovered original mutation capability",
+                    ))
+                }
+            }
+            let mut original = self.read.read.files.remove(index);
+            original.path = retained_path.join("original");
+            self.retained_mutations.push(RecoveredRetainedMutation {
+                directory,
+                path: retained_path,
+                original,
+            });
+            self.read
+                .read
+                .expected_membership
+                .get_mut(&parent)
+                .ok_or(ReconcileError::Invariant("mutation parent membership"))?
+                .remove(&name);
+            receipt.writer().write_all(&serde_json::to_vec(&(
+                1u32,
+                "original_moved",
+                original_key.to_string(),
+            ))?)?;
+            receipt.writer().sync_all()?;
+            crate::fault::checkpoint("recovered_mutation_moved_before_replacement");
+            if let Some((content, bytes)) = &replacement {
+                let held = self
+                    .read
+                    .read
+                    .directories
+                    .iter()
+                    .find(|d| d.path == parent)
+                    .ok_or(ReconcileError::Invariant(
+                        "mutation replacement held parent",
+                    ))?;
+                let mut creator = held.file.create_new_file(&name)?;
+                creator.writer().write_all(bytes)?;
+                creator.writer().sync_all()?;
+                let file = creator.seal_original()?;
+                if !file.matches_path(&target)? || file.parent_key()? != original_parent {
+                    return Err(ReconcileError::Invariant(
+                        "mutation replacement exact new CREATE",
+                    ));
+                }
+                self.read.read.files.push(ReacquiredFile {
+                    path: target.clone(),
+                    file: RecoveredFileProtection::Created(file),
+                    digest: content.content_id.clone(),
+                    bytes: content.length,
+                });
+                self.read
+                    .read
+                    .expected_membership
+                    .get_mut(&parent)
+                    .ok_or(ReconcileError::Invariant("mutation replacement membership"))?
+                    .insert(name.clone());
+                self.new_file_bytes += content.length;
+            }
+            receipt.writer().write_all(&serde_json::to_vec(&(
+                1u32,
+                "native_completed",
+                replacement.is_some(),
+            ))?)?;
+            receipt.writer().sync_all()?;
+            crate::fault::checkpoint("recovered_mutation_native_before_history");
+            self.poisoned = false;
+            self.verify()?;
+            let limits = sync_extend_core_model::limits::LocalLimits::default();
+            let allowed: std::collections::BTreeSet<_> = previous
+                .entries
+                .values()
+                .filter_map(|e| e.content.as_ref())
+                .flat_map(|c| &c.chunks)
+                .chain(replacement.iter().flat_map(|(content, _)| &content.chunks))
+                .map(|c| c.content_id.clone())
+                .collect();
+            let cas = sync_extend_cas::Cas::open_existing_session_coordinated(
+                &self.read.read.data.join("cas"),
+                move |id| {
+                    if allowed.contains(id) {
+                        Ok(Box::new(()))
+                    } else {
+                        Err("mutation CAS outside held set".into())
+                    }
+                },
+                || Ok(Box::new(())),
+            )?;
+            let view = RecoveredSessionScanView(self);
+            let first = crate::scan::scan_native(&self.read.read.worktree, &cas, &limits, &view)?;
+            let second = crate::scan::scan_native(&self.read.read.worktree, &cas, &limits, &view)?;
+            if first != second {
+                return Err(ReconcileError::Unstable);
+            }
+            let mut manifest =
+                crate::build_manifest(&previous, &second, &std::collections::BTreeMap::new())?;
+            let change = if let Some((content, _)) = &replacement {
+                let actual = manifest
+                    .entries
+                    .get(&entry.entry_id)
+                    .ok_or(ReconcileError::Invariant("mutation replacement entry id"))?;
+                if actual.path != *path
+                    || actual.content.as_ref() != Some(content)
+                    || manifest.entries.len() != previous.entries.len()
+                {
+                    return Err(ReconcileError::Invariant(
+                        "mutation replacement exact manifest delta",
+                    ));
+                }
+                Change::Put {
+                    entry: actual.clone(),
+                }
+            } else {
+                if manifest.entries.contains_key(&entry.entry_id)
+                    || manifest.entries.len() + 1 != previous.entries.len()
+                {
+                    return Err(ReconcileError::Invariant(
+                        "mutation deletion exact manifest delta",
+                    ));
+                }
+                Change::Delete {
+                    entry_id: entry.entry_id.clone(),
+                }
+            };
+            for (id, old) in &previous.entries {
+                if id != &entry.entry_id && manifest.entries.get(id) != Some(old) {
+                    return Err(ReconcileError::Invariant(
+                        "mutation unchanged entry differs",
+                    ));
+                }
+            }
+            let device = self.recovered_device_id()?;
+            let seq = manifest.version_vector.get(&device).checked_add(1).ok_or(
+                ReconcileError::Invariant("mutation local sequence exhausted"),
+            )?;
+            let operation = Operation::new(OperationPayload {
+                format_version: FORMAT_VERSION,
+                space_id: self.space.clone(),
+                origin_device_id: device.clone(),
+                origin_seq: seq,
+                causal: manifest.version_vector.clone(),
+                created_at_ms: timestamp,
+                change,
+            })?;
+            if let Change::Delete { entry_id } = &operation.payload.change {
+                manifest
+                    .tombstones
+                    .insert(entry_id.clone(), operation.op_id.clone());
+            }
+            manifest.version_vector.observe(device, seq);
+            let root = self.commit_exact_recovered_history(manifest, vec![operation], timestamp)?;
+            crate::fault::checkpoint("recovered_mutation_history_before_receipt");
+            self.poisoned = true;
+            receipt
+                .writer()
+                .write_all(&serde_json::to_vec(&(1u32, "committed", &root))?)?;
+            receipt.writer().sync_all()?;
+            self.retain_recovered_receipt(receipt)?;
+            self.poisoned = false;
+            self.verify()?;
+            crate::fault::checkpoint("recovered_mutation_committed_after_sync");
+            Ok(root)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+}
+
+// Separate descriptive closed-history envelope. It never issues restart authority.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveredMutationHistoryCloseRecord {
+    version: u32,
+    index: u32,
+    phase: String,
+    archive: ContentId,
+    original_frames: ContentId,
+    session: SpaceId,
+    worktree: String,
+    data: String,
+    keys: [String; 4],
+    root: sync_extend_core_model::SnapshotId,
+    rows: ContentId,
+    main: ContentId,
+    shm: ContentId,
+    wal2_frames: Option<ContentId>,
+    receipts: Vec<(String, ContentId, u64)>,
+    history_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata: Option<live_retention::RecoveredMetadataCloseEvidence>,
+}
+#[derive(Serialize)]
+pub struct RecoveredMutationHistoryCloseClassification {
+    pub state: &'static str,
+    pub actual_records: usize,
+    pub history_count: u32,
+    pub receipts: usize,
+    pub native_write_authority: bool,
+    pub cleanup_authority: bool,
+}
+impl FreshRecoveredNodeWalV2Session {
+    /// Close the actual native session, then bind complete final rows and all
+    /// independently intended history/file/CAS receipts in a separate envelope.
+    /// This preserves the original WAL2 record/parser and grants no restart API.
+    pub fn close_recovered_mutation_history_with_evidence(&mut self) -> Result<PathBuf> {
+        self.verify()?;
+        let metadata = self.verified_metadata_close_evidence()?;
+        if self.closed
+            || (self.history_count == 0 && metadata.is_none())
+            || self.history_count >= 128
+        {
+            return Err(ReconcileError::Invariant(
+                "explicit live recovered history required",
+            ));
+        }
+        let parent = self
+            .path
+            .parent()
+            .ok_or(ReconcileError::Invariant("history close external parent"))?;
+        let held = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|d| d.path == parent)
+            .ok_or(ReconcileError::Invariant("history close held external"))?;
+        let mut receipts = Vec::new();
+        let mut aggregate = 0u64;
+        for (count, item) in std::fs::read_dir(parent)?.enumerate() {
+            if count >= 4096 {
+                return Err(ReconcileError::ResourceLimit(
+                    "history close external count",
+                ));
+            }
+            let name = item?
+                .file_name()
+                .into_string()
+                .map_err(|_| ReconcileError::Invariant("history close external encoding"))?;
+            if [
+                "history",
+                "file",
+                "cas",
+                "mutation",
+                "namespace",
+                "retention",
+            ]
+            .iter()
+            .any(|kind| name.starts_with(&format!("node-recovered-{kind}-{}-", self.fresh)))
+            {
+                let file = self
+                    .retained_receipts
+                    .get(&name)
+                    .ok_or(ReconcileError::Invariant(
+                        "history close unheld or foreign receipt",
+                    ))?;
+                file.file.verify()?;
+                let bytes = file.file.exact_bytes(file.bytes)?;
+                if ContentId::hash(&bytes) != file.digest || !file.file.matches_path(&file.path)? {
+                    return Err(ReconcileError::Invariant(
+                        "history close original held receipt differs",
+                    ));
+                }
+                aggregate = aggregate
+                    .checked_add(bytes.len() as u64)
+                    .filter(|n| *n <= 4 * 1024 * 1024)
+                    .ok_or(ReconcileError::ResourceLimit(
+                        "history close receipts aggregate",
+                    ))?;
+                // Each append-only local stream must end in its own synced
+                // committed record. Mere intent or materialization stays open.
+                live_retention::require_committed_receipt(&name, &bytes)?;
                 receipts.push((name, ContentId::hash(&bytes), bytes.len() as u64));
             }
         }
@@ -5405,6 +7589,7 @@ impl FreshRecoveredNodeWalV2Session {
             wal2_frames: None,
             receipts,
             history_count: self.history_count,
+            metadata,
         };
         let bytes = serde_json::to_vec(&intended)?;
         if bytes.len() > 256 * 1024 {
@@ -5480,7 +7665,7 @@ impl FreshRecoveredNodeWalV2Session {
             evidence.writer().write_all(&terminal)?;
             evidence.writer().sync_all()?;
             self.verify()?;
-            self.retain_history_creation(evidence,512*1024)?;
+            self.retain_history_creation(evidence, 512 * 1024)?;
             crate::fault::checkpoint("recovered_mutation_history_closed_after_terminal_sync");
             Ok(path.clone())
         })();
@@ -5558,7 +7743,7 @@ impl super::VerifiedNodeStateArchive {
                 || first.phase != "close_intended"
                 || first.archive != *self.digest()
                 || first.wal2_frames.is_some()
-                || first.history_count == 0
+                || (first.history_count == 0 && first.metadata.is_none())
                 || first.history_count >= 128
                 || terminal.index != 1
                 || terminal.phase != "closed"
@@ -5582,7 +7767,16 @@ impl super::VerifiedNodeStateArchive {
             for (name, _, size) in &terminal.receipts {
                 if *size > 256 * 1024
                     || last.is_some_and(|old| old >= name.as_str())
-                    || !["history", "file", "cas", "mutation", "namespace"].iter().any(|kind| {
+                    || ![
+                        "history",
+                        "file",
+                        "cas",
+                        "mutation",
+                        "namespace",
+                        "retention",
+                    ]
+                    .iter()
+                    .any(|kind| {
                         name.starts_with(&format!("node-recovered-{kind}-{}-", terminal.session))
                     })
                     || !name.ends_with(".frames")
@@ -5611,6 +7805,13 @@ impl super::VerifiedNodeStateArchive {
                     "history close exact receipt count",
                 ));
             }
+            live_retention::validate_close_metadata(
+                terminal.metadata.as_ref(),
+                terminal.history_count,
+                &terminal.receipts,
+                &terminal.session,
+                &terminal.main,
+            )?;
             Ok(terminal)
         })();
         match parsed {
@@ -5634,58 +7835,101 @@ impl super::VerifiedNodeStateArchive {
     }
 }
 
-
-#[derive(Clone,Serialize,Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HistoryCurrentObject {
-    root:String,
-    path:String,
-    directory:bool,
-    key:String,
-    parent:String,
-    digest:Option<ContentId>,
-    bytes:u64,
+    root: String,
+    path: String,
+    directory: bool,
+    key: String,
+    parent: String,
+    digest: Option<ContentId>,
+    bytes: u64,
 }
-fn history_current_objects(read:&ReacquiredClosedNodeReadScope)->Result<Vec<HistoryCurrentObject>> {
-    let mut objects=Vec::new();
-    let mut aggregate=0u64;
-    for (label,root) in [("work",&read.worktree),("data",&read.data)] {
+fn history_current_objects(
+    read: &ReacquiredClosedNodeReadScope,
+) -> Result<Vec<HistoryCurrentObject>> {
+    let mut objects = Vec::new();
+    let mut aggregate = 0u64;
+    for (label, root) in [("work", &read.worktree), ("data", &read.data)] {
         for directory in &read.directories {
-            if directory.path==*root || !directory.path.starts_with(root){continue;}
-            let parent=directory.path.parent().ok_or(ReconcileError::Invariant("current directory parent"))?;
-            let held=read.directories.iter().find(|item|item.path==parent)
+            if directory.path == *root || !directory.path.starts_with(root) {
+                continue;
+            }
+            let parent = directory
+                .path
+                .parent()
+                .ok_or(ReconcileError::Invariant("current directory parent"))?;
+            let held = read
+                .directories
+                .iter()
+                .find(|item| item.path == parent)
                 .ok_or(ReconcileError::Invariant("current directory parent unheld"))?;
-            objects.push(HistoryCurrentObject{
-                root:label.into(),path:directory.path.strip_prefix(root)
-                    .map_err(|_|ReconcileError::Invariant("current directory root"))?
-                    .to_string_lossy().replace('\\',"/"),directory:true,
-                key:directory.key.to_string(),parent:held.key.to_string(),digest:None,bytes:0,
+            objects.push(HistoryCurrentObject {
+                root: label.into(),
+                path: directory
+                    .path
+                    .strip_prefix(root)
+                    .map_err(|_| ReconcileError::Invariant("current directory root"))?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                directory: true,
+                key: directory.key.to_string(),
+                parent: held.key.to_string(),
+                digest: None,
+                bytes: 0,
             });
         }
         for file in &read.files {
             if !file.path.starts_with(root)
-                || (label=="data" && matches!(file.path.file_name().and_then(|name|name.to_str()),
-                    Some("journal.sqlite"|"journal.sqlite-wal"|"journal.sqlite-journal"|"journal.sqlite-shm"))) {
+                || (label == "data"
+                    && matches!(
+                        file.path.file_name().and_then(|name| name.to_str()),
+                        Some(
+                            "journal.sqlite"
+                                | "journal.sqlite-wal"
+                                | "journal.sqlite-journal"
+                                | "journal.sqlite-shm"
+                        )
+                    ))
+            {
                 continue;
             }
-            aggregate=aggregate.checked_add(file.bytes).filter(|bytes|*bytes<=256*1024*1024)
-                .ok_or(ReconcileError::ResourceLimit("current objects byte aggregate"))?;
-            objects.push(HistoryCurrentObject{
-                root:label.into(),path:file.path.strip_prefix(root)
-                    .map_err(|_|ReconcileError::Invariant("current file root"))?
-                    .to_string_lossy().replace('\\',"/"),directory:false,
-                key:file.file.key()?.to_string(),parent:file.file.parent_key()?.to_string(),
-                digest:Some(file.digest.clone()),bytes:file.bytes,
+            aggregate = aggregate
+                .checked_add(file.bytes)
+                .filter(|bytes| *bytes <= 256 * 1024 * 1024)
+                .ok_or(ReconcileError::ResourceLimit(
+                    "current objects byte aggregate",
+                ))?;
+            objects.push(HistoryCurrentObject {
+                root: label.into(),
+                path: file
+                    .path
+                    .strip_prefix(root)
+                    .map_err(|_| ReconcileError::Invariant("current file root"))?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                directory: false,
+                key: file.file.key()?.to_string(),
+                parent: file.file.parent_key()?.to_string(),
+                digest: Some(file.digest.clone()),
+                bytes: file.bytes,
             });
         }
     }
-    objects.sort_by(|a,b|(&a.root,&a.path).cmp(&(&b.root,&b.path)));
-    if objects.len()>4096 || objects.windows(2).any(|pair|pair[0].root==pair[1].root && pair[0].path==pair[1].path) {
-        return Err(ReconcileError::ResourceLimit("current objects bounded unique slots"));
+    objects.sort_by(|a, b| (&a.root, &a.path).cmp(&(&b.root, &b.path)));
+    if objects.len() > 4096
+        || objects
+            .windows(2)
+            .any(|pair| pair[0].root == pair[1].root && pair[0].path == pair[1].path)
+    {
+        return Err(ReconcileError::ResourceLimit(
+            "current objects bounded unique slots",
+        ));
     }
-    let mut keys=std::collections::BTreeSet::new();
+    let mut keys = std::collections::BTreeSet::new();
     for object in &objects {
-        if !keys.insert(object.key.clone()){
+        if !keys.insert(object.key.clone()) {
             return Err(ReconcileError::Invariant("current objects native alias"));
         }
     }
@@ -5727,7 +7971,7 @@ struct HistoryChain8Record {
     baseline: HistoryRestartObject,
     receipts: Vec<HistoryRestartObject>,
     retained_originals: Vec<HistoryRetainedOriginal>,
-    current_objects:Vec<HistoryCurrentObject>,
+    current_objects: Vec<HistoryCurrentObject>,
     history_close: Option<HistoryRestartObject>,
     wal2: Option<HistoryRestartObject>,
 }
@@ -5807,7 +8051,8 @@ impl FreshRecoveredNodeWalV2Session {
     /// and final complete history. The original descriptive close remains intact.
     pub fn close_recovered_history_for_chain8(&mut self) -> Result<PathBuf> {
         self.verify()?;
-        if self.history_count == 0
+        self.verified_metadata_close_evidence()?;
+        if (self.history_count == 0 && self.metadata_count == 0)
             || self.closed
             || self.history_baseline.is_empty()
             || self.history_baseline.len() > 64 * 1024 * 1024
@@ -6007,7 +8252,7 @@ impl FreshRecoveredNodeWalV2Session {
             baseline,
             receipts,
             retained_originals,
-            current_objects:history_current_objects(&self.read.read)?,
+            current_objects: history_current_objects(&self.read.read)?,
             history_close: None,
             wal2: None,
         };
@@ -6109,6 +8354,7 @@ struct LoadedHistoryGeneration {
     baseline: sync_extend_journal::JournalBackupImage,
     frame_object: HistoryRestartObject,
     retained_directories: Vec<(PathBuf, sync_extend_platform_fs::LockedDirectory)>,
+    metadata: Option<live_retention::RecoveredMetadataCloseEvidence>,
 }
 fn hold_history_chain_object(
     held: &sync_extend_platform_fs::LockedDirectory,
@@ -6315,7 +8561,16 @@ impl super::VerifiedNodeStateArchive {
         let mut receipt_bytes = 0u64;
         for receipt in &record.receipts {
             if previous.is_some_and(|old| old >= receipt.name.as_str())
-                || !["history", "file", "cas", "mutation", "namespace"].iter().any(|kind| {
+                || ![
+                    "history",
+                    "file",
+                    "cas",
+                    "mutation",
+                    "namespace",
+                    "retention",
+                ]
+                .iter()
+                .any(|kind| {
                     receipt
                         .name
                         .starts_with(&format!("node-recovered-{kind}-{}-", record.session))
@@ -6333,23 +8588,17 @@ impl super::VerifiedNodeStateArchive {
                 ))?;
             let bytes =
                 hold_history_chain_object(held, parent, receipt, 256 * 1024, retained, aggregate)?;
-            let values = serde_json::Deserializer::from_slice(&bytes)
-                .into_iter::<serde_json::Value>()
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            if values.len() < 2
-                || values
-                    .last()
-                    .and_then(|v| v.as_array())
-                    .and_then(|a| a.get(1))
-                    .and_then(|v| v.as_str())
-                    != Some("committed")
-            {
-                return Err(ReconcileError::Invariant(
-                    "history chain unresolved receipt",
-                ));
-            }
+            live_retention::require_committed_receipt(&receipt.name, &bytes)?;
             previous = Some(&receipt.name);
         }
+        live_retention::verify_generation_metadata(
+            self,
+            &record,
+            terminal_close.metadata.as_ref(),
+            &baseline,
+            retained,
+            bounds,
+        )?;
         if let Some(epoch) = &record.epoch {
             if epoch.name != format!("node-recovered-shm-epoch-{}.frames", record.session) {
                 return Err(ReconcileError::Invariant("history chain epoch exact slot"));
@@ -6530,6 +8779,7 @@ impl super::VerifiedNodeStateArchive {
             baseline,
             frame_object: object,
             retained_directories,
+            metadata: terminal_close.metadata,
         })
     }
 }
@@ -6557,6 +8807,7 @@ impl super::VerifiedNodeStateArchive {
             bounds,
             ledger_bounds,
             false,
+            None,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -6579,6 +8830,7 @@ impl super::VerifiedNodeStateArchive {
             bounds,
             ledger_bounds,
             true,
+            None,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -6592,6 +8844,7 @@ impl super::VerifiedNodeStateArchive {
         bounds: sync_extend_journal::NodeInspectionBounds,
         ledger_bounds: super::LedgerBounds,
         mutation_requested: bool,
+        operation_preflight: Option<RecoveredHistoryOperation<'_>>,
     ) -> Result<FreshRecoveredNodeWalV2Session> {
         let parent = original_frames
             .parent()
@@ -6931,8 +9184,11 @@ impl super::VerifiedNodeStateArchive {
             ));
         }
         if serde_json::to_vec(&history_current_objects(&read.read)?)?
-            !=serde_json::to_vec(&record.current_objects)? {
-            return Err(ReconcileError::Invariant("history8 complete current native objects key parent bytes changed"));
+            != serde_json::to_vec(&record.current_objects)?
+        {
+            return Err(ReconcileError::Invariant(
+                "history8 complete current native objects key parent bytes changed",
+            ));
         }
         let main = read
             .read
@@ -6950,9 +9206,22 @@ impl super::VerifiedNodeStateArchive {
             bounds,
         )?;
         image.audit_recovered_history_extension(baseline, self.space(), bounds)?;
+        live_retention::verify_chain_metadata_sql(self, &generations, &image, &retained, bounds)?;
         read.external.extend(owner_evidence);
         read.locks.extend(owner_locks);
         read.verify()?;
+        if let Some(operation) = operation_preflight {
+            live_retention::preflight_operation(
+                self,
+                &read,
+                &image,
+                &retained,
+                &record.native_keys,
+                &record.original_frames,
+                operation,
+                bounds,
+            )?;
+        }
         let total = scope
             .max_main_bytes
             .checked_add(scope.max_wal_bytes)
@@ -7086,7 +9355,8 @@ impl super::VerifiedNodeStateArchive {
         let native_keys = native.all_native_keys()?.map(|key| key.to_string());
         let before_rows = read.read.rows.clone();
         let mut result = FreshRecoveredNodeWalV2Session {
-            created_work_directories:std::collections::BTreeMap::new(),read,
+            created_work_directories: std::collections::BTreeMap::new(),
+            read,
             native,
             frames,
             owner,
@@ -7107,8 +9377,11 @@ impl super::VerifiedNodeStateArchive {
             predecessor: Some(wal.digest.clone()),
             native_keys,
             history_count: 0,
+            metadata_count: 0,
+            retained_metadata_receipts: Vec::new(),
             new_content_bytes: 0,
             new_cas_buckets: std::collections::BTreeMap::new(),
+            verified_main: std::cell::RefCell::new(None),
             new_file_bytes: 0,
             new_cas_bytes: 0,
             new_cas_objects: 0,
@@ -7129,6 +9402,12 @@ impl super::VerifiedNodeStateArchive {
         Ok(result)
     }
 }
+
+#[cfg(windows)]
+#[path = "live_retention.rs"]
+mod live_retention;
+#[cfg(windows)]
+pub use live_retention::RecoveredHistoryOperation;
 
 impl FreshRecoveredNodeWalV2Session {
     fn recovered_local_query_image(&self) -> Result<sync_extend_journal::JournalBackupImage> {
@@ -7236,367 +9515,825 @@ impl super::VerifiedNodeStateArchive {
 // Exact held native namespace changes, with independent append-only intent.
 impl FreshRecoveredNodeWalV2Session {
     fn preflight_recovered_namespace_path(
-        &self, path:&sync_extend_core_model::PortablePath, adding:bool,
-    )->Result<(PathBuf,PathBuf,String)> {
+        &self,
+        path: &sync_extend_core_model::PortablePath,
+        adding: bool,
+    ) -> Result<(PathBuf, PathBuf, String)> {
         self.verify()?;
-        if !self.mutation_requested || !self.committed || self.closed || self.next!=2
-            || self.history_count>=128
-            || self.retained_receipt_bytes.checked_add(3*256*1024).is_none_or(|n|n>4*1024*1024)
-            || (adding && self.read.read.manifest.entries.len().checked_add(1)
-                .is_none_or(|n|n>self.manifest_entry_limit)) {
-            return Err(ReconcileError::ResourceLimit("recovered namespace preeffect capacity"));
+        if !self.mutation_requested
+            || !self.committed
+            || self.closed
+            || self.next != 2
+            || self.metadata_count != 0
+            || self.history_count >= 128
+            || self
+                .retained_receipt_bytes
+                .checked_add(3 * 256 * 1024)
+                .is_none_or(|n| n > 4 * 1024 * 1024)
+            || (adding
+                && self
+                    .read
+                    .read
+                    .manifest
+                    .entries
+                    .len()
+                    .checked_add(1)
+                    .is_none_or(|n| n > self.manifest_entry_limit))
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered namespace preeffect capacity",
+            ));
         }
-        let parts:Vec<_>=path.as_str().split('/').collect();
-        if parts.len()>256 || parts.iter().any(|part|part.starts_with('.'))
-            || self.read.read.manifest.entries.values().any(|entry|entry.path.collision_key()==path.collision_key()) {
-            return Err(ReconcileError::Invariant("recovered namespace exact absent destination"));
+        let parts: Vec<_> = path.as_str().split('/').collect();
+        if parts.len() > 256
+            || parts.iter().any(|part| part.starts_with('.'))
+            || self
+                .read
+                .read
+                .manifest
+                .entries
+                .values()
+                .any(|entry| entry.path.collision_key() == path.collision_key())
+        {
+            return Err(ReconcileError::Invariant(
+                "recovered namespace exact absent destination",
+            ));
         }
-        let target=self.read.read.worktree.join(path.as_str());
-        let parent=target.parent().ok_or(ReconcileError::Invariant("namespace parent"))?.to_owned();
-        let name=parts.last().ok_or(ReconcileError::Invariant("namespace component"))?.to_string();
-        if !self.read.read.directories.iter().any(|directory|directory.path==parent)
-            || self.read.read.expected_membership.get(&parent).is_none_or(|names|names.contains(&name)) {
-            return Err(ReconcileError::Invariant("namespace held parent and exact absence"));
+        let target = self.read.read.worktree.join(path.as_str());
+        let parent = target
+            .parent()
+            .ok_or(ReconcileError::Invariant("namespace parent"))?
+            .to_owned();
+        let name = parts
+            .last()
+            .ok_or(ReconcileError::Invariant("namespace component"))?
+            .to_string();
+        if !self
+            .read
+            .read
+            .directories
+            .iter()
+            .any(|directory| directory.path == parent)
+            || self
+                .read
+                .read
+                .expected_membership
+                .get(&parent)
+                .is_none_or(|names| names.contains(&name))
+        {
+            return Err(ReconcileError::Invariant(
+                "namespace held parent and exact absence",
+            ));
         }
-        Ok((target,parent,name))
+        Ok((target, parent, name))
     }
     fn commit_recovered_namespace_scan(
-        &mut self, previous:&sync_extend_core_model::Manifest,
-        expected:&sync_extend_core_model::Manifest, timestamp:u64,
-    )->Result<sync_extend_core_model::SnapshotId> {
-        use sync_extend_core_model::{Change,Operation,OperationPayload,FORMAT_VERSION};
+        &mut self,
+        previous: &sync_extend_core_model::Manifest,
+        expected: &sync_extend_core_model::Manifest,
+        timestamp: u64,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
+        use sync_extend_core_model::{Change, Operation, OperationPayload, FORMAT_VERSION};
         self.verify()?;
-        let allowed:std::collections::BTreeSet<_>=expected.entries.values()
-            .filter_map(|entry|entry.content.as_ref()).flat_map(|content|&content.chunks)
-            .map(|chunk|chunk.content_id.clone()).collect();
-        let cas=sync_extend_cas::Cas::open_existing_session_coordinated(&self.read.read.data.join("cas"),
-            move|id|if allowed.contains(id){Ok(Box::new(()))}else{Err("namespace scan unheld CAS".into())},
-            ||Ok(Box::new(())))?;
-        let limits=sync_extend_core_model::limits::LocalLimits::default();
-        let view=RecoveredSessionScanView(self);
-        let first=crate::scan::scan_native(&self.read.read.worktree,&cas,&limits,&view)?;
-        let second=crate::scan::scan_native(&self.read.read.worktree,&cas,&limits,&view)?;
-        if first!=second || first.len()!=expected.entries.len()
-            || expected.entries.values().any(|entry|first.get(&entry.path)
-                .is_none_or(|actual|actual.kind!=entry.kind || actual.content!=entry.content)) {
+        let allowed: std::collections::BTreeSet<_> = expected
+            .entries
+            .values()
+            .filter_map(|entry| entry.content.as_ref())
+            .flat_map(|content| &content.chunks)
+            .map(|chunk| chunk.content_id.clone())
+            .collect();
+        let cas = sync_extend_cas::Cas::open_existing_session_coordinated(
+            &self.read.read.data.join("cas"),
+            move |id| {
+                if allowed.contains(id) {
+                    Ok(Box::new(()))
+                } else {
+                    Err("namespace scan unheld CAS".into())
+                }
+            },
+            || Ok(Box::new(())),
+        )?;
+        let limits = sync_extend_core_model::limits::LocalLimits::default();
+        let view = RecoveredSessionScanView(self);
+        let first = crate::scan::scan_native(&self.read.read.worktree, &cas, &limits, &view)?;
+        let second = crate::scan::scan_native(&self.read.read.worktree, &cas, &limits, &view)?;
+        if first != second
+            || first.len() != expected.entries.len()
+            || expected.entries.values().any(|entry| {
+                first.get(&entry.path).is_none_or(|actual| {
+                    actual.kind != entry.kind || actual.content != entry.content
+                })
+            })
+        {
             return Err(ReconcileError::Unstable);
         }
         // Keep the original manifest builder and validate the explicit native
         // identity mapping independently of content-based rename inference.
-        let scanned=crate::build_manifest(previous,&second,&std::collections::BTreeMap::new())?;
-        if scanned.entries.len()!=expected.entries.len()
-            || scanned.entries.values().any(|entry|!expected.entries.values()
-                .any(|wanted|wanted.path==entry.path && wanted.kind==entry.kind && wanted.content==entry.content)) {
-            return Err(ReconcileError::Invariant("namespace original builder differs"));
+        let scanned = crate::build_manifest(previous, &second, &std::collections::BTreeMap::new())?;
+        if scanned.entries.len() != expected.entries.len()
+            || scanned.entries.values().any(|entry| {
+                !expected.entries.values().any(|wanted| {
+                    wanted.path == entry.path
+                        && wanted.kind == entry.kind
+                        && wanted.content == entry.content
+                })
+            })
+        {
+            return Err(ReconcileError::Invariant(
+                "namespace original builder differs",
+            ));
         }
-        let mut manifest=expected.clone();
-        let origin=self.recovered_device_id()?;
-        let mut operations=Vec::new();
+        let mut manifest = expected.clone();
+        let origin = self.recovered_device_id()?;
+        let mut operations = Vec::new();
         for old in previous.entries.values() {
-            if manifest.entries.contains_key(&old.entry_id){continue;}
-            let seq=manifest.version_vector.get(&origin).checked_add(1)
-                .ok_or(ReconcileError::Invariant("namespace delete sequence exhausted"))?;
+            if manifest.entries.contains_key(&old.entry_id) {
+                continue;
+            }
+            let seq = manifest.version_vector.get(&origin).checked_add(1).ok_or(
+                ReconcileError::Invariant("namespace delete sequence exhausted"),
+            )?;
             operations.push(Operation::new(OperationPayload {
-                format_version:FORMAT_VERSION,space_id:self.space.clone(),origin_device_id:origin.clone(),
-                origin_seq:seq,causal:manifest.version_vector.clone(),created_at_ms:timestamp,
-                change:Change::Delete{entry_id:old.entry_id.clone()},
+                format_version: FORMAT_VERSION,
+                space_id: self.space.clone(),
+                origin_device_id: origin.clone(),
+                origin_seq: seq,
+                causal: manifest.version_vector.clone(),
+                created_at_ms: timestamp,
+                change: Change::Delete {
+                    entry_id: old.entry_id.clone(),
+                },
             })?);
-            manifest.version_vector.observe(origin.clone(),seq);
+            manifest.version_vector.observe(origin.clone(), seq);
         }
         for entry in manifest.entries.values() {
-            if previous.entries.get(&entry.entry_id)==Some(entry) {continue;}
-            let seq=manifest.version_vector.get(&origin).checked_add(1)
+            if previous.entries.get(&entry.entry_id) == Some(entry) {
+                continue;
+            }
+            let seq = manifest
+                .version_vector
+                .get(&origin)
+                .checked_add(1)
                 .ok_or(ReconcileError::Invariant("namespace sequence exhausted"))?;
             operations.push(Operation::new(OperationPayload {
-                format_version:FORMAT_VERSION,space_id:self.space.clone(),origin_device_id:origin.clone(),
-                origin_seq:seq,causal:manifest.version_vector.clone(),created_at_ms:timestamp,
-                change:Change::Put{entry:entry.clone()},
+                format_version: FORMAT_VERSION,
+                space_id: self.space.clone(),
+                origin_device_id: origin.clone(),
+                origin_seq: seq,
+                causal: manifest.version_vector.clone(),
+                created_at_ms: timestamp,
+                change: Change::Put {
+                    entry: entry.clone(),
+                },
             })?);
-            manifest.version_vector.observe(origin.clone(),seq);
+            manifest.version_vector.observe(origin.clone(), seq);
         }
         manifest.validate()?;
-        self.commit_exact_recovered_history(manifest,operations,timestamp)
+        self.commit_exact_recovered_history(manifest, operations, timestamp)
     }
     pub fn create_recovered_directory(
-        &mut self,path:&sync_extend_core_model::PortablePath,timestamp:u64,
-    )->Result<sync_extend_core_model::SnapshotId> {
-        let (target,parent,name)=self.preflight_recovered_namespace_path(path,true)?;
-        if self.created_work_directories.len()>=128 {
-            return Err(ReconcileError::ResourceLimit("recovered created directory capacity"));
+        &mut self,
+        path: &sync_extend_core_model::PortablePath,
+        timestamp: u64,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
+        let (target, parent, name) = self.preflight_recovered_namespace_path(path, true)?;
+        if self.created_work_directories.len() >= 128 {
+            return Err(ReconcileError::ResourceLimit(
+                "recovered created directory capacity",
+            ));
         }
-        let previous=self.read.read.manifest.clone();
-        let held=self.read.read.directories.iter().find(|directory|directory.path==parent)
+        let previous = self.read.read.manifest.clone();
+        let held = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|directory| directory.path == parent)
             .ok_or(ReconcileError::Invariant("namespace retained parent"))?;
-        let parent_key=held.key;
-        let held=held.file.duplicate_read_guard()?;
-        let external=self.path.parent().ok_or(ReconcileError::Invariant("namespace external"))?;
-        let owner=self.read.read.directories.iter().find(|directory|directory.path==external)
+        let parent_key = held.key;
+        let held = held.file.duplicate_read_guard()?;
+        let external = self
+            .path
+            .parent()
+            .ok_or(ReconcileError::Invariant("namespace external"))?;
+        let owner = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|directory| directory.path == external)
             .ok_or(ReconcileError::Invariant("namespace retained external"))?;
-        let intended=serde_json::to_vec(&(1u32,&self.archive,&self.fresh,"directory",path,
-            previous.root()?,parent_key.to_string(),timestamp))?;
-        if intended.len()>65536 {return Err(ReconcileError::ResourceLimit("namespace intended bytes"));}
-        let owner=owner.file.duplicate_read_guard()?;
-        self.poisoned=true;
-        let result=(||->Result<sync_extend_core_model::SnapshotId>{
-            let mut receipt=owner.create_new_file(&format!("node-recovered-namespace-{}-{}.frames",self.fresh,self.history_count))?;
-            receipt.writer().write_all(&intended)?;receipt.writer().sync_all()?;
+        let intended = serde_json::to_vec(&(
+            1u32,
+            &self.archive,
+            &self.fresh,
+            "directory",
+            path,
+            previous.root()?,
+            parent_key.to_string(),
+            timestamp,
+        ))?;
+        if intended.len() > 65536 {
+            return Err(ReconcileError::ResourceLimit("namespace intended bytes"));
+        }
+        let owner = owner.file.duplicate_read_guard()?;
+        self.poisoned = true;
+        let result = (|| -> Result<sync_extend_core_model::SnapshotId> {
+            let mut receipt = owner.create_new_file(&format!(
+                "node-recovered-namespace-{}-{}.frames",
+                self.fresh, self.history_count
+            ))?;
+            receipt.writer().write_all(&intended)?;
+            receipt.writer().sync_all()?;
             crate::fault::checkpoint("recovered_namespace_intended_before_create");
-            let creator=held.create_new_rename_destination(&name)?;
-            let key=creator.key()?;
-            if creator.original_creation()?.parent_key()?!=parent_key || !creator.matches_path(&target)? {
-                return Err(ReconcileError::Invariant("namespace exact new directory lineage"));
+            let creator = held.create_new_rename_destination(&name)?;
+            let key = creator.key()?;
+            if creator.original_creation()?.parent_key()? != parent_key
+                || !creator.matches_path(&target)?
+            {
+                return Err(ReconcileError::Invariant(
+                    "namespace exact new directory lineage",
+                ));
             }
-            let read=creator.duplicate_read_guard()?;
-            self.read.read.directories.push(ReacquiredDirectory{path:target.clone(),file:read,key});
-            self.created_work_directories.insert(target.clone(),creator);
-            self.read.read.expected_membership.get_mut(&parent)
-                .ok_or(ReconcileError::Invariant("namespace parent membership"))?.insert(name);
-            self.read.read.expected_membership.insert(target.clone(),std::collections::BTreeSet::new());
-            receipt.writer().write_all(&serde_json::to_vec(&(1u32,"directory_created",key.to_string(),parent_key.to_string()))?)?;
+            let read = creator.duplicate_read_guard()?;
+            self.read.read.directories.push(ReacquiredDirectory {
+                path: target.clone(),
+                file: read,
+                key,
+            });
+            self.created_work_directories
+                .insert(target.clone(), creator);
+            self.read
+                .read
+                .expected_membership
+                .get_mut(&parent)
+                .ok_or(ReconcileError::Invariant("namespace parent membership"))?
+                .insert(name);
+            self.read
+                .read
+                .expected_membership
+                .insert(target.clone(), std::collections::BTreeSet::new());
+            receipt.writer().write_all(&serde_json::to_vec(&(
+                1u32,
+                "directory_created",
+                key.to_string(),
+                parent_key.to_string(),
+            ))?)?;
             receipt.writer().sync_all()?;
             crate::fault::checkpoint("recovered_namespace_created_before_history");
-            self.poisoned=false;
-            let mut expected=previous.clone();
-            let id=sync_extend_core_model::EntryId::random()?;
-            expected.entries.insert(id.clone(),sync_extend_core_model::Entry{
-                entry_id:id,path:path.clone(),kind:sync_extend_core_model::EntryKind::Directory,content:None,
-            });
-            let root=self.commit_recovered_namespace_scan(&previous,&expected,timestamp)?;
-            self.poisoned=true;
-            receipt.writer().write_all(&serde_json::to_vec(&(1u32,"committed",&root))?)?;
-            receipt.writer().sync_all()?;self.retain_recovered_receipt(receipt)?;
-            self.poisoned=false;self.verify()?;
+            self.poisoned = false;
+            let mut expected = previous.clone();
+            let id = sync_extend_core_model::EntryId::random()?;
+            expected.entries.insert(
+                id.clone(),
+                sync_extend_core_model::Entry {
+                    entry_id: id,
+                    path: path.clone(),
+                    kind: sync_extend_core_model::EntryKind::Directory,
+                    content: None,
+                },
+            );
+            let root = self.commit_recovered_namespace_scan(&previous, &expected, timestamp)?;
+            self.poisoned = true;
+            receipt
+                .writer()
+                .write_all(&serde_json::to_vec(&(1u32, "committed", &root))?)?;
+            receipt.writer().sync_all()?;
+            self.retain_recovered_receipt(receipt)?;
+            self.poisoned = false;
+            self.verify()?;
             Ok(root)
         })();
-        if result.is_err(){self.poisoned=true;}
+        if result.is_err() {
+            self.poisoned = true;
+        }
         result
     }
     pub fn move_recovered_file(
-        &mut self,source:&sync_extend_core_model::PortablePath,
-        destination:&sync_extend_core_model::PortablePath,timestamp:u64,
-    )->Result<sync_extend_core_model::SnapshotId>{
-        let (target,parent,name)=self.preflight_recovered_namespace_path(destination,false)?;
-        let previous=self.read.read.manifest.clone();
-        let entry=previous.entries.values().find(|entry|entry.path==*source
-            && entry.kind==sync_extend_core_model::EntryKind::File)
-            .ok_or(ReconcileError::Invariant("namespace exact file source"))?.clone();
-        let original=self.read.read.worktree.join(source.as_str());
-        let old_parent=original.parent().ok_or(ReconcileError::Invariant("namespace source parent"))?.to_owned();
-        let old_name=original.file_name().and_then(|name|name.to_str())
-            .ok_or(ReconcileError::Invariant("namespace source component"))?.to_string();
-        if source.as_str().split('/').any(|part|part.starts_with('.')){
+        &mut self,
+        source: &sync_extend_core_model::PortablePath,
+        destination: &sync_extend_core_model::PortablePath,
+        timestamp: u64,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
+        let (target, parent, name) = self.preflight_recovered_namespace_path(destination, false)?;
+        let previous = self.read.read.manifest.clone();
+        let entry = previous
+            .entries
+            .values()
+            .find(|entry| {
+                entry.path == *source && entry.kind == sync_extend_core_model::EntryKind::File
+            })
+            .ok_or(ReconcileError::Invariant("namespace exact file source"))?
+            .clone();
+        let original = self.read.read.worktree.join(source.as_str());
+        let old_parent = original
+            .parent()
+            .ok_or(ReconcileError::Invariant("namespace source parent"))?
+            .to_owned();
+        let old_name = original
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(ReconcileError::Invariant("namespace source component"))?
+            .to_string();
+        if source.as_str().split('/').any(|part| part.starts_with('.')) {
             return Err(ReconcileError::Invariant("namespace reserved source"));
         }
-        let index=self.read.read.files.iter().position(|file|file.path==original)
+        let index = self
+            .read
+            .read
+            .files
+            .iter()
+            .position(|file| file.path == original)
             .ok_or(ReconcileError::Invariant("namespace original file unheld"))?;
-        let file=&self.read.read.files[index];
-        if !matches!(file.file,RecoveredFileProtection::Mutation(_) | RecoveredFileProtection::Created(_)){
-            return Err(ReconcileError::Invariant("namespace explicit fresh DELETE authority"));
+        let file = &self.read.read.files[index];
+        if !matches!(
+            file.file,
+            RecoveredFileProtection::Mutation(_) | RecoveredFileProtection::Created(_)
+        ) {
+            return Err(ReconcileError::Invariant(
+                "namespace explicit fresh DELETE authority",
+            ));
         }
-        let key=file.file.key()?;
-        let from=file.file.parent_key()?;
-        let held=self.read.read.directories.iter().find(|directory|directory.path==parent)
+        let key = file.file.key()?;
+        let from = file.file.parent_key()?;
+        let held = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|directory| directory.path == parent)
             .ok_or(ReconcileError::Invariant("namespace retained destination"))?;
-        if held.key.volume!=key.volume || self.read.read.directories.iter()
-            .find(|directory|directory.path==old_parent).is_none_or(|directory|directory.key!=from){
-            return Err(ReconcileError::Invariant("namespace exact native source parent and volume"));
+        if held.key.volume != key.volume
+            || self
+                .read
+                .read
+                .directories
+                .iter()
+                .find(|directory| directory.path == old_parent)
+                .is_none_or(|directory| directory.key != from)
+        {
+            return Err(ReconcileError::Invariant(
+                "namespace exact native source parent and volume",
+            ));
         }
-        let to=held.key;
-        let held=held.file.duplicate_read_guard()?;
-        let owner=self.read.read.directories.iter().find(|directory|
-            Some(directory.path.as_path())==self.path.parent())
+        let to = held.key;
+        let held = held.file.duplicate_read_guard()?;
+        let owner = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|directory| Some(directory.path.as_path()) == self.path.parent())
             .ok_or(ReconcileError::Invariant("namespace retained external"))?;
-        let intended=serde_json::to_vec(&(1u32,&self.archive,&self.fresh,"move_file",source,destination,
-            previous.root()?,key.to_string(),from.to_string(),to.to_string(),&file.digest,file.bytes,timestamp))?;
-        if intended.len()>65536{return Err(ReconcileError::ResourceLimit("namespace move intended bytes"));}
-        let owner=owner.file.duplicate_read_guard()?;
-        self.poisoned=true;
-        let result=(||->Result<sync_extend_core_model::SnapshotId>{
-            let mut receipt=owner.create_new_file(&format!("node-recovered-namespace-{}-{}.frames",self.fresh,self.history_count))?;
-            receipt.writer().write_all(&intended)?;receipt.writer().sync_all()?;
+        let intended = serde_json::to_vec(&(
+            1u32,
+            &self.archive,
+            &self.fresh,
+            "move_file",
+            source,
+            destination,
+            previous.root()?,
+            key.to_string(),
+            from.to_string(),
+            to.to_string(),
+            &file.digest,
+            file.bytes,
+            timestamp,
+        ))?;
+        if intended.len() > 65536 {
+            return Err(ReconcileError::ResourceLimit(
+                "namespace move intended bytes",
+            ));
+        }
+        let owner = owner.file.duplicate_read_guard()?;
+        self.poisoned = true;
+        let result = (|| -> Result<sync_extend_core_model::SnapshotId> {
+            let mut receipt = owner.create_new_file(&format!(
+                "node-recovered-namespace-{}-{}.frames",
+                self.fresh, self.history_count
+            ))?;
+            receipt.writer().write_all(&intended)?;
+            receipt.writer().sync_all()?;
             crate::fault::checkpoint("recovered_namespace_intended_before_move");
             match &mut self.read.read.files[index].file {
-                RecoveredFileProtection::Mutation(file)=>file.rename_no_replace_to_parent(&held,&name)?,
-                RecoveredFileProtection::Created(file)=>file.rename_no_replace_to_parent(&held,&name)?,
-                _=>return Err(ReconcileError::Invariant("namespace original native authority")),
+                RecoveredFileProtection::Mutation(file) => {
+                    file.rename_no_replace_to_parent(&held, &name)?
+                }
+                RecoveredFileProtection::Created(file) => {
+                    file.rename_no_replace_to_parent(&held, &name)?
+                }
+                _ => {
+                    return Err(ReconcileError::Invariant(
+                        "namespace original native authority",
+                    ))
+                }
             }
-            self.read.read.files[index].path=target;
-            self.read.read.expected_membership.get_mut(&old_parent)
-                .ok_or(ReconcileError::Invariant("namespace source membership"))?.remove(&old_name);
-            self.read.read.expected_membership.get_mut(&parent)
-                .ok_or(ReconcileError::Invariant("namespace destination membership"))?.insert(name);
-            receipt.writer().write_all(&serde_json::to_vec(&(1u32,"file_moved",key.to_string(),from.to_string(),to.to_string()))?)?;
+            self.read.read.files[index].path = target;
+            self.read
+                .read
+                .expected_membership
+                .get_mut(&old_parent)
+                .ok_or(ReconcileError::Invariant("namespace source membership"))?
+                .remove(&old_name);
+            self.read
+                .read
+                .expected_membership
+                .get_mut(&parent)
+                .ok_or(ReconcileError::Invariant(
+                    "namespace destination membership",
+                ))?
+                .insert(name);
+            receipt.writer().write_all(&serde_json::to_vec(&(
+                1u32,
+                "file_moved",
+                key.to_string(),
+                from.to_string(),
+                to.to_string(),
+            ))?)?;
             receipt.writer().sync_all()?;
             crate::fault::checkpoint("recovered_namespace_moved_before_history");
-            self.poisoned=false;
-            let mut expected=previous.clone();
-            expected.entries.get_mut(&entry.entry_id).ok_or(ReconcileError::Invariant("namespace original entry"))?.path=destination.clone();
-            let root=self.commit_recovered_namespace_scan(&previous,&expected,timestamp)?;
-            self.poisoned=true;
-            receipt.writer().write_all(&serde_json::to_vec(&(1u32,"committed",&root))?)?;
-            receipt.writer().sync_all()?;self.retain_recovered_receipt(receipt)?;
-            self.poisoned=false;self.verify()?;Ok(root)
+            self.poisoned = false;
+            let mut expected = previous.clone();
+            expected
+                .entries
+                .get_mut(&entry.entry_id)
+                .ok_or(ReconcileError::Invariant("namespace original entry"))?
+                .path = destination.clone();
+            let root = self.commit_recovered_namespace_scan(&previous, &expected, timestamp)?;
+            self.poisoned = true;
+            receipt
+                .writer()
+                .write_all(&serde_json::to_vec(&(1u32, "committed", &root))?)?;
+            receipt.writer().sync_all()?;
+            self.retain_recovered_receipt(receipt)?;
+            self.poisoned = false;
+            self.verify()?;
+            Ok(root)
         })();
-        if result.is_err(){self.poisoned=true;}
+        if result.is_err() {
+            self.poisoned = true;
+        }
         result
     }
 }
 
 impl FreshRecoveredNodeWalV2Session {
     fn preflight_created_empty_recovered_directory(
-        &self,path:&sync_extend_core_model::PortablePath,
-    )->Result<(sync_extend_core_model::Entry,PathBuf,PathBuf,String,usize)>{
+        &self,
+        path: &sync_extend_core_model::PortablePath,
+    ) -> Result<(
+        sync_extend_core_model::Entry,
+        PathBuf,
+        PathBuf,
+        String,
+        usize,
+    )> {
         self.verify()?;
-        if !self.mutation_requested || !self.committed || self.closed || self.next!=2
-            || self.history_count>=128
-            || self.retained_receipt_bytes.checked_add(3*256*1024).is_none_or(|n|n>4*1024*1024){
-            return Err(ReconcileError::ResourceLimit("empty directory preeffect capacity"));
+        if !self.mutation_requested
+            || !self.committed
+            || self.closed
+            || self.next != 2
+            || self.metadata_count != 0
+            || self.history_count >= 128
+            || self
+                .retained_receipt_bytes
+                .checked_add(3 * 256 * 1024)
+                .is_none_or(|n| n > 4 * 1024 * 1024)
+        {
+            return Err(ReconcileError::ResourceLimit(
+                "empty directory preeffect capacity",
+            ));
         }
-        if path.as_str().split('/').any(|part|part.starts_with('.')){
+        if path.as_str().split('/').any(|part| part.starts_with('.')) {
             return Err(ReconcileError::Invariant("empty directory reserved source"));
         }
-        let target=self.read.read.worktree.join(path.as_str());
-        let parent=target.parent().ok_or(ReconcileError::Invariant("empty directory parent"))?.to_owned();
-        let name=target.file_name().and_then(|v|v.to_str())
-            .ok_or(ReconcileError::Invariant("empty directory component"))?.to_string();
-        let entry=self.read.read.manifest.entries.values().find(|entry|
-            entry.path==*path && entry.kind==sync_extend_core_model::EntryKind::Directory)
-            .ok_or(ReconcileError::Invariant("empty directory exact manifest entry"))?.clone();
-        let creator=self.created_work_directories.get(&target)
-            .ok_or(ReconcileError::Invariant("empty directory requires actual live CREATE"))?;
+        let target = self.read.read.worktree.join(path.as_str());
+        let parent = target
+            .parent()
+            .ok_or(ReconcileError::Invariant("empty directory parent"))?
+            .to_owned();
+        let name = target
+            .file_name()
+            .and_then(|v| v.to_str())
+            .ok_or(ReconcileError::Invariant("empty directory component"))?
+            .to_string();
+        let entry = self
+            .read
+            .read
+            .manifest
+            .entries
+            .values()
+            .find(|entry| {
+                entry.path == *path && entry.kind == sync_extend_core_model::EntryKind::Directory
+            })
+            .ok_or(ReconcileError::Invariant(
+                "empty directory exact manifest entry",
+            ))?
+            .clone();
+        let creator =
+            self.created_work_directories
+                .get(&target)
+                .ok_or(ReconcileError::Invariant(
+                    "empty directory requires actual live CREATE",
+                ))?;
         creator.original_creation()?.verify()?;
-        let index=self.read.read.directories.iter().position(|directory|directory.path==target)
+        let index = self
+            .read
+            .read
+            .directories
+            .iter()
+            .position(|directory| directory.path == target)
             .ok_or(ReconcileError::Invariant("empty directory retained read"))?;
-        if self.read.read.directories[index].key!=creator.key()?
+        if self.read.read.directories[index].key != creator.key()?
             || !creator.matches_path(&target)?
-            || self.read.read.expected_membership.get(&target).is_none_or(|names|!names.is_empty())
-            || self.read.read.manifest.entries.values().any(|other|
-                other.path.as_str().starts_with(&(path.as_str().to_owned()+"/")))
-            || self.read.read.files.iter().any(|file|file.path.starts_with(&target))
-            || self.read.read.directories.iter().any(|directory|
-                directory.path!=target && directory.path.starts_with(&target)){
-            return Err(ReconcileError::Invariant("empty directory exact no descendants"));
+            || self
+                .read
+                .read
+                .expected_membership
+                .get(&target)
+                .is_none_or(|names| !names.is_empty())
+            || self.read.read.manifest.entries.values().any(|other| {
+                other
+                    .path
+                    .as_str()
+                    .starts_with(&(path.as_str().to_owned() + "/"))
+            })
+            || self
+                .read
+                .read
+                .files
+                .iter()
+                .any(|file| file.path.starts_with(&target))
+            || self
+                .read
+                .read
+                .directories
+                .iter()
+                .any(|directory| directory.path != target && directory.path.starts_with(&target))
+        {
+            return Err(ReconcileError::Invariant(
+                "empty directory exact no descendants",
+            ));
         }
         // Directory read sharing does not freeze child membership. Observe
         // absence again before intent; the kernel rejects nonempty disposition.
-        if std::fs::read_dir(&target)?.next().is_some(){
-            return Err(ReconcileError::Invariant("empty directory native membership differs"));
+        if std::fs::read_dir(&target)?.next().is_some() {
+            return Err(ReconcileError::Invariant(
+                "empty directory native membership differs",
+            ));
         }
-        Ok((entry,target,parent,name,index))
+        Ok((entry, target, parent, name, index))
     }
 
     pub fn move_created_empty_recovered_directory(
-        &mut self,source:&sync_extend_core_model::PortablePath,
-        destination:&sync_extend_core_model::PortablePath,timestamp:u64,
-    )->Result<sync_extend_core_model::SnapshotId>{
-        let (target,parent,name)=self.preflight_recovered_namespace_path(destination,false)?;
-        let (entry,original,old_parent,old_name,index)=self.preflight_created_empty_recovered_directory(source)?;
-        let previous=self.read.read.manifest.clone();
-        let key=self.read.read.directories[index].key;
-        let from=self.read.read.directories.iter().find(|directory|directory.path==old_parent)
-            .ok_or(ReconcileError::Invariant("empty move source parent unheld"))?.key;
-        let destination_parent=self.read.read.directories.iter().find(|directory|directory.path==parent)
-            .ok_or(ReconcileError::Invariant("empty move destination parent unheld"))?;
-        let to=destination_parent.key;
-        if key.volume!=to.volume || parent.starts_with(&original){
+        &mut self,
+        source: &sync_extend_core_model::PortablePath,
+        destination: &sync_extend_core_model::PortablePath,
+        timestamp: u64,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
+        let (target, parent, name) = self.preflight_recovered_namespace_path(destination, false)?;
+        let (entry, original, old_parent, old_name, index) =
+            self.preflight_created_empty_recovered_directory(source)?;
+        let previous = self.read.read.manifest.clone();
+        let key = self.read.read.directories[index].key;
+        let from = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|directory| directory.path == old_parent)
+            .ok_or(ReconcileError::Invariant("empty move source parent unheld"))?
+            .key;
+        let destination_parent = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|directory| directory.path == parent)
+            .ok_or(ReconcileError::Invariant(
+                "empty move destination parent unheld",
+            ))?;
+        let to = destination_parent.key;
+        if key.volume != to.volume || parent.starts_with(&original) {
             return Err(ReconcileError::Invariant("empty move same volume no cycle"));
         }
-        let destination_parent=destination_parent.file.duplicate_read_guard()?;
-        let owner=self.read.read.directories.iter().find(|directory|
-            Some(directory.path.as_path())==self.path.parent())
+        let destination_parent = destination_parent.file.duplicate_read_guard()?;
+        let owner = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|directory| Some(directory.path.as_path()) == self.path.parent())
             .ok_or(ReconcileError::Invariant("empty move external unheld"))?
-            .file.duplicate_read_guard()?;
-        let intended=serde_json::to_vec(&(1u32,&self.archive,&self.fresh,"move_created_empty_directory",
-            source,destination,previous.root()?,key.to_string(),from.to_string(),to.to_string(),timestamp))?;
-        if intended.len()>65536{return Err(ReconcileError::ResourceLimit("empty move intent bytes"));}
-        self.poisoned=true;
-        let result=(||->Result<sync_extend_core_model::SnapshotId>{
-            let mut receipt=owner.create_new_file(&format!("node-recovered-namespace-{}-{}.frames",self.fresh,self.history_count))?;
-            receipt.writer().write_all(&intended)?;receipt.writer().sync_all()?;
+            .file
+            .duplicate_read_guard()?;
+        let intended = serde_json::to_vec(&(
+            1u32,
+            &self.archive,
+            &self.fresh,
+            "move_created_empty_directory",
+            source,
+            destination,
+            previous.root()?,
+            key.to_string(),
+            from.to_string(),
+            to.to_string(),
+            timestamp,
+        ))?;
+        if intended.len() > 65536 {
+            return Err(ReconcileError::ResourceLimit("empty move intent bytes"));
+        }
+        self.poisoned = true;
+        let result = (|| -> Result<sync_extend_core_model::SnapshotId> {
+            let mut receipt = owner.create_new_file(&format!(
+                "node-recovered-namespace-{}-{}.frames",
+                self.fresh, self.history_count
+            ))?;
+            receipt.writer().write_all(&intended)?;
+            receipt.writer().sync_all()?;
             crate::fault::checkpoint("recovered_empty_directory_intended_before_move");
-            self.created_work_directories.get(&original)
+            self.created_work_directories
+                .get(&original)
                 .ok_or(ReconcileError::Invariant("empty move creator missing"))?
-                .rename_created_directory_to_parent(&destination_parent,&name)?;
-            let creator=self.created_work_directories.remove(&original)
+                .rename_created_directory_to_parent(&destination_parent, &name)?;
+            let creator = self
+                .created_work_directories
+                .remove(&original)
                 .ok_or(ReconcileError::Invariant("empty move creator lost"))?;
-            self.created_work_directories.insert(target.clone(),creator);
-            self.read.read.directories[index].path=target.clone();
-            let members=self.read.read.expected_membership.remove(&original)
-                .ok_or(ReconcileError::Invariant("empty move source membership lost"))?;
-            self.read.read.expected_membership.insert(target.clone(),members);
-            self.read.read.expected_membership.get_mut(&old_parent)
-                .ok_or(ReconcileError::Invariant("empty move source parent membership"))?.remove(&old_name);
-            self.read.read.expected_membership.get_mut(&parent)
-                .ok_or(ReconcileError::Invariant("empty move destination membership"))?.insert(name);
-            if !self.read.read.directories[index].file.matches_path(&target)?{
-                return Err(ReconcileError::Invariant("empty move exact destination key"));
+            self.created_work_directories
+                .insert(target.clone(), creator);
+            self.read.read.directories[index].path = target.clone();
+            let members = self.read.read.expected_membership.remove(&original).ok_or(
+                ReconcileError::Invariant("empty move source membership lost"),
+            )?;
+            self.read
+                .read
+                .expected_membership
+                .insert(target.clone(), members);
+            self.read
+                .read
+                .expected_membership
+                .get_mut(&old_parent)
+                .ok_or(ReconcileError::Invariant(
+                    "empty move source parent membership",
+                ))?
+                .remove(&old_name);
+            self.read
+                .read
+                .expected_membership
+                .get_mut(&parent)
+                .ok_or(ReconcileError::Invariant(
+                    "empty move destination membership",
+                ))?
+                .insert(name);
+            if !self.read.read.directories[index]
+                .file
+                .matches_path(&target)?
+            {
+                return Err(ReconcileError::Invariant(
+                    "empty move exact destination key",
+                ));
             }
-            receipt.writer().write_all(&serde_json::to_vec(&(1u32,"empty_directory_moved",
-                key.to_string(),from.to_string(),to.to_string()))?)?;
+            receipt.writer().write_all(&serde_json::to_vec(&(
+                1u32,
+                "empty_directory_moved",
+                key.to_string(),
+                from.to_string(),
+                to.to_string(),
+            ))?)?;
             receipt.writer().sync_all()?;
             crate::fault::checkpoint("recovered_empty_directory_moved_before_history");
-            self.poisoned=false;
-            let mut expected=previous.clone();
-            expected.entries.get_mut(&entry.entry_id)
-                .ok_or(ReconcileError::Invariant("empty move original entry identity"))?.path=destination.clone();
-            let root=self.commit_recovered_namespace_scan(&previous,&expected,timestamp)?;
-            self.poisoned=true;
-            receipt.writer().write_all(&serde_json::to_vec(&(1u32,"committed",&root))?)?;
-            receipt.writer().sync_all()?;self.retain_recovered_receipt(receipt)?;
-            self.poisoned=false;self.verify()?;Ok(root)
+            self.poisoned = false;
+            let mut expected = previous.clone();
+            expected
+                .entries
+                .get_mut(&entry.entry_id)
+                .ok_or(ReconcileError::Invariant(
+                    "empty move original entry identity",
+                ))?
+                .path = destination.clone();
+            let root = self.commit_recovered_namespace_scan(&previous, &expected, timestamp)?;
+            self.poisoned = true;
+            receipt
+                .writer()
+                .write_all(&serde_json::to_vec(&(1u32, "committed", &root))?)?;
+            receipt.writer().sync_all()?;
+            self.retain_recovered_receipt(receipt)?;
+            self.poisoned = false;
+            self.verify()?;
+            Ok(root)
         })();
-        if result.is_err(){self.poisoned=true;}
+        if result.is_err() {
+            self.poisoned = true;
+        }
         result
     }
 
     pub fn delete_created_empty_recovered_directory(
-        &mut self,path:&sync_extend_core_model::PortablePath,timestamp:u64,
-    )->Result<sync_extend_core_model::SnapshotId>{
-        let (entry,target,parent,name,index)=self.preflight_created_empty_recovered_directory(path)?;
-        let previous=self.read.read.manifest.clone();
-        let key=self.read.read.directories[index].key;
-        let parent_key=self.read.read.directories.iter().find(|directory|directory.path==parent)
-            .ok_or(ReconcileError::Invariant("empty delete parent unheld"))?.key;
-        let owner=self.read.read.directories.iter().find(|directory|
-            Some(directory.path.as_path())==self.path.parent())
+        &mut self,
+        path: &sync_extend_core_model::PortablePath,
+        timestamp: u64,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
+        let (entry, target, parent, name, index) =
+            self.preflight_created_empty_recovered_directory(path)?;
+        let previous = self.read.read.manifest.clone();
+        let key = self.read.read.directories[index].key;
+        let parent_key = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|directory| directory.path == parent)
+            .ok_or(ReconcileError::Invariant("empty delete parent unheld"))?
+            .key;
+        let owner = self
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|directory| Some(directory.path.as_path()) == self.path.parent())
             .ok_or(ReconcileError::Invariant("empty delete external unheld"))?
-            .file.duplicate_read_guard()?;
-        let intended=serde_json::to_vec(&(1u32,&self.archive,&self.fresh,"delete_created_empty_directory",
-            path,previous.root()?,key.to_string(),parent_key.to_string(),timestamp))?;
-        if intended.len()>65536{return Err(ReconcileError::ResourceLimit("empty delete intent bytes"));}
-        self.poisoned=true;
-        let result=(||->Result<sync_extend_core_model::SnapshotId>{
-            let mut receipt=owner.create_new_file(&format!("node-recovered-namespace-{}-{}.frames",self.fresh,self.history_count))?;
-            receipt.writer().write_all(&intended)?;receipt.writer().sync_all()?;
-            crate::fault::checkpoint("recovered_empty_directory_intended_before_disposition");
-            self.created_work_directories.get(&target)
-                .ok_or(ReconcileError::Invariant("empty delete creator missing"))?
-                .delete_empty_on_close()?;
-            receipt.writer().write_all(&serde_json::to_vec(&(1u32,"empty_directory_disposition_requested",key.to_string()))?)?;
-            receipt.writer().sync_all()?;
-            crate::fault::checkpoint("recovered_empty_directory_disposition_before_close");
-            drop(self.read.read.directories.remove(index));
-            drop(self.created_work_directories.remove(&target));
-            match std::fs::symlink_metadata(&target){
-                Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},
-                _=>return Err(ReconcileError::Invariant("empty delete exact native absence uncertain")),
-            }
-            self.read.read.expected_membership.remove(&target)
-                .ok_or(ReconcileError::Invariant("empty delete old membership lost"))?;
-            self.read.read.expected_membership.get_mut(&parent)
-                .ok_or(ReconcileError::Invariant("empty delete parent membership"))?.remove(&name);
-            receipt.writer().write_all(&serde_json::to_vec(&(1u32,"empty_directory_absent",key.to_string(),parent_key.to_string()))?)?;
-            receipt.writer().sync_all()?;
-            crate::fault::checkpoint("recovered_empty_directory_absent_before_history");
-            self.poisoned=false;
-            let mut expected=previous.clone();expected.entries.remove(&entry.entry_id);
-            let root=self.commit_recovered_namespace_scan(&previous,&expected,timestamp)?;
-            self.poisoned=true;
-            receipt.writer().write_all(&serde_json::to_vec(&(1u32,"committed",&root))?)?;
-            receipt.writer().sync_all()?;self.retain_recovered_receipt(receipt)?;
-            self.poisoned=false;self.verify()?;Ok(root)
-        })();
-        if result.is_err(){self.poisoned=true;}
+            .file
+            .duplicate_read_guard()?;
+        let intended = serde_json::to_vec(&(
+            1u32,
+            &self.archive,
+            &self.fresh,
+            "delete_created_empty_directory",
+            path,
+            previous.root()?,
+            key.to_string(),
+            parent_key.to_string(),
+            timestamp,
+        ))?;
+        if intended.len() > 65536 {
+            return Err(ReconcileError::ResourceLimit("empty delete intent bytes"));
+        }
+        self.poisoned = true;
+        let result =
+            (|| -> Result<sync_extend_core_model::SnapshotId> {
+                let mut receipt = owner.create_new_file(&format!(
+                    "node-recovered-namespace-{}-{}.frames",
+                    self.fresh, self.history_count
+                ))?;
+                receipt.writer().write_all(&intended)?;
+                receipt.writer().sync_all()?;
+                crate::fault::checkpoint("recovered_empty_directory_intended_before_disposition");
+                self.created_work_directories
+                    .get(&target)
+                    .ok_or(ReconcileError::Invariant("empty delete creator missing"))?
+                    .delete_empty_on_close()?;
+                receipt.writer().write_all(&serde_json::to_vec(&(
+                    1u32,
+                    "empty_directory_disposition_requested",
+                    key.to_string(),
+                ))?)?;
+                receipt.writer().sync_all()?;
+                crate::fault::checkpoint("recovered_empty_directory_disposition_before_close");
+                drop(self.read.read.directories.remove(index));
+                drop(self.created_work_directories.remove(&target));
+                match std::fs::symlink_metadata(&target) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => {
+                        return Err(ReconcileError::Invariant(
+                            "empty delete exact native absence uncertain",
+                        ))
+                    }
+                }
+                self.read.read.expected_membership.remove(&target).ok_or(
+                    ReconcileError::Invariant("empty delete old membership lost"),
+                )?;
+                self.read
+                    .read
+                    .expected_membership
+                    .get_mut(&parent)
+                    .ok_or(ReconcileError::Invariant("empty delete parent membership"))?
+                    .remove(&name);
+                receipt.writer().write_all(&serde_json::to_vec(&(
+                    1u32,
+                    "empty_directory_absent",
+                    key.to_string(),
+                    parent_key.to_string(),
+                ))?)?;
+                receipt.writer().sync_all()?;
+                crate::fault::checkpoint("recovered_empty_directory_absent_before_history");
+                self.poisoned = false;
+                let mut expected = previous.clone();
+                expected.entries.remove(&entry.entry_id);
+                let root = self.commit_recovered_namespace_scan(&previous, &expected, timestamp)?;
+                self.poisoned = true;
+                receipt
+                    .writer()
+                    .write_all(&serde_json::to_vec(&(1u32, "committed", &root))?)?;
+                receipt.writer().sync_all()?;
+                self.retain_recovered_receipt(receipt)?;
+                self.poisoned = false;
+                self.verify()?;
+                Ok(root)
+            })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
         result
     }
 }
@@ -7620,21 +10357,29 @@ impl FreshRecoveredNodeWalV2Session {
     pub fn recovered_live_history_binding(&self) -> Result<RecoveredLiveHistoryBinding> {
         self.verify()?;
         if !self.committed || self.closed || self.history_baseline.is_empty() {
-            return Err(ReconcileError::Invariant("live history committed native session required"));
+            return Err(ReconcileError::Invariant(
+                "live history committed native session required",
+            ));
         }
         let image = self.recovered_local_query_image()?;
         let baseline = sync_extend_journal::JournalBackupImage::from_current_node_image(
             self.history_baseline.clone(),
             ContentId::hash(&self.history_baseline).as_str(),
-            self.history_baseline.len(), &self.space, self.bounds,
+            self.history_baseline.len(),
+            &self.space,
+            self.bounds,
         )?;
         let original_history = image.audit_recovered_immutable_history_inventory(
-            &baseline, &self.space, self.bounds,
+            &baseline,
+            &self.space,
+            self.bounds,
         )?;
         let objects = history_current_objects(&self.read.read)?;
         let encoded = serde_json::to_vec(&objects)?;
         if encoded.len() > 4 * 1024 * 1024 {
-            return Err(ReconcileError::ResourceLimit("live native history encoded inventory"));
+            return Err(ReconcileError::ResourceLimit(
+                "live native history encoded inventory",
+            ));
         }
         let binding = RecoveredLiveHistoryBinding {
             archive: self.archive.clone(),
@@ -7654,13 +10399,10 @@ impl FreshRecoveredNodeWalV2Session {
     }
 }
 
-
 #[cfg(windows)]
 impl FreshRecoveredNodeWalV2Session {
     /// Read the immutable image's retained catalogue under the same verified session.
-    pub fn recovered_history_tables(
-        &self,
-    ) -> Result<sync_extend_journal::RecoveredHistoryTables> {
+    pub fn recovered_history_tables(&self) -> Result<sync_extend_journal::RecoveredHistoryTables> {
         self.verify()?;
         let result = self
             .recovered_local_query_image()?
@@ -7670,13 +10412,25 @@ impl FreshRecoveredNodeWalV2Session {
     }
 
     /// Read the complete immutable image catalogue without granting any writer authority.
-    pub fn recovered_main_tables(
-        &self,
-    ) -> Result<sync_extend_journal::RecoveredMainTables> {
+    pub fn recovered_main_tables(&self) -> Result<sync_extend_journal::RecoveredMainTables> {
         self.verify()?;
         let result = self
             .recovered_local_query_image()?
             .recovered_main_tables(&self.space, self.bounds)?;
+        self.verify()?;
+        Ok(result)
+    }
+
+    /// Return bounded descriptive original pending-attempt diagnostics. The
+    /// immutable image parser is shared with the live Journal and grants no
+    /// restart, native or cleanup authority.
+    pub fn recovered_attempt_diagnostics(
+        &self,
+    ) -> Result<Vec<sync_extend_journal::OriginalLocalHistoryAttemptDiagnostic>> {
+        self.verify()?;
+        let result = self
+            .recovered_local_query_image()?
+            .recovered_original_attempt_diagnostics(&self.space, self.bounds)?;
         self.verify()?;
         Ok(result)
     }

@@ -122,6 +122,11 @@ impl Journal {
         intent.validate()?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         self.audit_gc_owners(&intent.space_id, max_entries)?;
+        if self.gc_protected(&intent.content_id)? {
+            return Err(JournalError::Invariant(
+                "GC mark admission content is referenced",
+            ));
+        }
         let marks = self.gc_marks(&intent.space_id, max_entries)?;
         self.gc_observe_clock(intent.marked_at_ms, max_entries)?;
         if let Some(old) = marks
@@ -422,6 +427,12 @@ impl crate::JournalReadView<'_> {
     }
 
     pub(crate) fn gc_protected(&self, id: &ContentId) -> Result<bool> {
+        // Immutable image preflight and the live writer share every pin family.
+        if crate::recovered_retention::active_pins(self.connection)?.contains(id)
+            || crate::history_reservation::original_reserved_content(self.connection)?.contains(id)
+        {
+            return Ok(true);
+        }
         Ok(self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM main.webdav_native_objects o
                 LEFT JOIN main.webdav_native_cancellations c USING(transaction_id)

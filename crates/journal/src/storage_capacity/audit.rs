@@ -303,6 +303,7 @@ fn identityless_snapshots(
 }
 
 fn ordinary_scope(view: &JournalReadView<'_>, space: &SpaceId) -> Result<()> {
+    crate::recovered_retention::audit(view.connection)?;
     let foreign = [
         "operations",
         "receive_cursors",

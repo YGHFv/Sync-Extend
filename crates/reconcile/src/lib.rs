@@ -282,6 +282,13 @@ pub struct Status {
 }
 
 impl LocalSpace {
+    /// Return the canonical worktree root bound to this local space.  Capture
+    /// callers use this only to compare the stopped source with an archived
+    /// original identity before any archive bytes are written.
+    pub fn worktree_path(&self) -> &Path {
+        &self.worktree
+    }
+
     pub fn initialize(data_dir: &Path, worktree: &Path) -> Result<Self> {
         Self::initialize_with_limits(data_dir, worktree, LocalLimits::default())
     }
@@ -1409,29 +1416,52 @@ impl RecoveredLocalSpace {
         self.verify()?;
         self.session.delete_recovered_file(path, timestamp)
     }
-    pub fn create_directory(&mut self,path:&PortablePath,timestamp:u64)->Result<SnapshotId> {
-        self.verify()?;self.session.create_recovered_directory(path,timestamp)
+    pub fn create_directory(&mut self, path: &PortablePath, timestamp: u64) -> Result<SnapshotId> {
+        self.verify()?;
+        self.session.create_recovered_directory(path, timestamp)
     }
-    pub fn move_file(&mut self,source:&PortablePath,destination:&PortablePath,timestamp:u64)->Result<SnapshotId> {
-        self.verify()?;self.session.move_recovered_file(source,destination,timestamp)
+    pub fn move_file(
+        &mut self,
+        source: &PortablePath,
+        destination: &PortablePath,
+        timestamp: u64,
+    ) -> Result<SnapshotId> {
+        self.verify()?;
+        self.session
+            .move_recovered_file(source, destination, timestamp)
     }
-    pub fn replace_file_bytes(&mut self,path:&PortablePath,bytes:&[u8],timestamp:u64)->Result<SnapshotId> {
-        self.verify()?;self.session.replace_recovered_file_from_bytes(path,bytes,timestamp)
+    pub fn replace_file_bytes(
+        &mut self,
+        path: &PortablePath,
+        bytes: &[u8],
+        timestamp: u64,
+    ) -> Result<SnapshotId> {
+        self.verify()?;
+        self.session
+            .replace_recovered_file_from_bytes(path, bytes, timestamp)
     }
     pub fn move_created_empty_directory(
-        &mut self,source:&PortablePath,destination:&PortablePath,timestamp:u64,
-    )->Result<SnapshotId>{
+        &mut self,
+        source: &PortablePath,
+        destination: &PortablePath,
+        timestamp: u64,
+    ) -> Result<SnapshotId> {
         self.verify()?;
-        self.session.move_created_empty_recovered_directory(source,destination,timestamp)
+        self.session
+            .move_created_empty_recovered_directory(source, destination, timestamp)
     }
     pub fn delete_created_empty_directory(
-        &mut self,path:&PortablePath,timestamp:u64,
-    )->Result<SnapshotId>{
+        &mut self,
+        path: &PortablePath,
+        timestamp: u64,
+    ) -> Result<SnapshotId> {
         self.verify()?;
-        self.session.delete_created_empty_recovered_directory(path,timestamp)
+        self.session
+            .delete_created_empty_recovered_directory(path, timestamp)
     }
-    pub fn history_binding(&self)->Result<node_archive::RecoveredLiveHistoryBinding>{
-        self.verify()?;self.session.recovered_live_history_binding()
+    pub fn history_binding(&self) -> Result<node_archive::RecoveredLiveHistoryBinding> {
+        self.verify()?;
+        self.session.recovered_live_history_binding()
     }
     /// A canonical explicit chain closes the exact current native session.
     /// A failed close remains uncertain and cannot be retried as clean.
@@ -1443,24 +1473,149 @@ impl RecoveredLocalSpace {
 }
 
 #[cfg(windows)]
+pub use node_archive::RecoveredHistoryOperation;
+#[cfg(windows)]
 pub use node_archive::RecoveredLiveHistoryBinding;
+#[cfg(windows)]
+pub use node_archive::{ExplicitAclMappingEvidence, ExplicitOriginalAclMapping};
 
+#[cfg(windows)]
+#[derive(Serialize)]
+pub struct RecoveredArchiveInspection {
+    pub archive_digest: ContentId,
+    pub space_id: SpaceId,
+    pub device_id: DeviceId,
+    pub original_worktree: PathBuf,
+    pub original_config_data: Option<PathBuf>,
+    pub history_tables: sync_extend_journal::RecoveredHistoryTables,
+    pub main_tables: sync_extend_journal::RecoveredMainTables,
+    pub attempt_diagnostics: Vec<sync_extend_journal::OriginalLocalHistoryAttemptDiagnostic>,
+}
+
+#[cfg(windows)]
+#[derive(Serialize)]
+pub struct RecoveredOriginalPinObservation {
+    pub source_image: ContentId,
+    pub content_id: ContentId,
+    pub protected: bool,
+    pub native_retain_authority: bool,
+    pub release_authority: bool,
+}
+
+#[cfg(windows)]
+impl VerifiedNodeStateArchive {
+    /// Inspect only the immutable Journal section. No target roots, native
+    /// handles, writer locks, or restart issuers are acquired by this method.
+    pub fn inspect_recovered_archive(
+        &self,
+        bounds: sync_extend_journal::NodeInspectionBounds,
+    ) -> Result<RecoveredArchiveInspection> {
+        let bytes = self.journal_bytes()?;
+        let image = sync_extend_journal::JournalBackupImage::from_current_node_image(
+            bytes.to_vec(),
+            ContentId::hash(bytes).as_str(),
+            bytes.len(),
+            self.space(),
+            bounds,
+        )?;
+        Ok(RecoveredArchiveInspection {
+            archive_digest: self.digest().clone(),
+            space_id: self.space().clone(),
+            device_id: self.device().clone(),
+            original_worktree: self.original_worktree().to_owned(),
+            original_config_data: self.original_config_data().map(Path::to_owned),
+            history_tables: image.recovered_history_tables(self.space(), bounds)?,
+            main_tables: image.recovered_main_tables(self.space(), bounds)?,
+            attempt_diagnostics: image
+                .recovered_original_attempt_diagnostics(self.space(), bounds)?,
+        })
+    }
+
+    /// Observe original GC protection predicates through an immutable retained
+    /// history mapping. This creates no live owner, CAS guard, release issuer,
+    /// or cleanup authority.
+    pub fn observe_original_pin_references(
+        &self,
+        desired_worktree: &Path,
+        content: &[ContentId],
+        bounds: sync_extend_journal::NodeInspectionBounds,
+    ) -> Result<Vec<RecoveredOriginalPinObservation>> {
+        let bytes = self.journal_bytes()?;
+        let image = sync_extend_journal::JournalBackupImage::from_current_node_image(
+            bytes.to_vec(),
+            ContentId::hash(bytes).as_str(),
+            bytes.len(),
+            self.space(),
+            bounds,
+        )?;
+        let retained = image.bind_retained_original_history(
+            self.space(),
+            self.original_worktree(),
+            desired_worktree,
+            bounds,
+        )?;
+        Ok(retained
+            .observe_original_content_references(content, bounds)?
+            .into_iter()
+            .map(|reference| RecoveredOriginalPinObservation {
+                source_image: reference.source_image().clone(),
+                content_id: reference.content_id().clone(),
+                protected: reference.protected(),
+                native_retain_authority: false,
+                release_authority: false,
+            })
+            .collect())
+    }
+}
 
 #[cfg(windows)]
 impl RecoveredLocalSpace {
     /// Return bounded retained-row summaries from the immutable recovered image.
-    pub fn history_tables(
-        &self,
-    ) -> Result<sync_extend_journal::RecoveredHistoryTables> {
+    pub fn history_tables(&self) -> Result<sync_extend_journal::RecoveredHistoryTables> {
         self.verify()?;
         self.session.recovered_history_tables()
     }
+    pub fn retain_history(
+        &mut self,
+        archive: &VerifiedNodeStateArchive,
+        extra: &[ContentId],
+    ) -> Result<sync_extend_journal::RecoveredRetentionAudit> {
+        self.verify()?;
+        self.session.retain_recovered_history(archive, extra)
+    }
+    pub fn release_history(
+        &mut self,
+        mapping: &sync_extend_journal::RecoveredRetentionMapping,
+        timestamp: u64,
+    ) -> Result<sync_extend_journal::RecoveredRetentionAudit> {
+        self.verify()?;
+        self.session.release_recovered_history(mapping, timestamp)
+    }
+    pub fn admit_history_gc(
+        &mut self,
+        content: &ContentId,
+        grace_secs: u64,
+    ) -> Result<sync_extend_journal::GcMarkAudit> {
+        self.verify()?;
+        self.session.admit_recovered_gc_mark(content, grace_secs)
+    }
 
     /// Return bounded summaries for every named original main table.
-    pub fn main_tables(
-        &self,
-    ) -> Result<sync_extend_journal::RecoveredMainTables> {
+    pub fn main_tables(&self) -> Result<sync_extend_journal::RecoveredMainTables> {
         self.verify()?;
         self.session.recovered_main_tables()
+    }
+
+    /// Return descriptive original pending-attempt rows from the immutable
+    /// recovered image. These rows intentionally carry no restart, native or
+    /// cleanup issuer; callers must treat every non-empty pending family as a
+    /// refusal until a separately implemented protocol exists.
+    pub fn attempt_diagnostics(
+        &self,
+    ) -> Result<Vec<sync_extend_journal::OriginalLocalHistoryAttemptDiagnostic>> {
+        self.verify()?;
+        let result = self.session.recovered_attempt_diagnostics()?;
+        self.verify()?;
+        Ok(result)
     }
 }

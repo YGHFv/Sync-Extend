@@ -2167,83 +2167,191 @@ unsafe fn open_held_rollback(
 }
 
 pub(in super::super) fn execute_fresh_planned_history(
-    connection:&rusqlite::Connection,statements:&[OriginalSqliteStatement],
-    queries:&[OriginalSqliteQuery],before:&[OriginalSqliteRows],after:&[OriginalSqliteRows],
-    budget:OriginalSqliteReadBudget,
-)->io::Result<()> {
-    if statements.is_empty() || statements.len()>1024 || queries.len()!=before.len() || queries.len()!=after.len() {
-        return Err(io::Error::other("fresh history exact complete transition bounds"));
-    }
-        for &name in original_ordinary_rejecting_callbacks() {
-            if !name.starts_with("sync_")
-                || name.len() > 128
-                || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-            {
-                return Err(io::Error::other("original rejecting function exact name"));
-            }
-            connection
-                .create_scalar_function(
-                    name,
-                    -1,
-                    rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-                    |_| Ok(false),
-                )
-                .map_err(io::Error::other)?;
-        }
-        validate_ordinary_whole_catalog(connection, queries)?;
-        connection
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(io::Error::other)?;
-        let result = (|| -> io::Result<()> {
-            admitted_query_rows(connection, queries, before, budget).map_err(|error|io::Error::other(format!("fresh history before whole rows: {error}")))?;
-            {
-                let _progress = OriginalVmBudget::install(
-                    connection,
-                    budget.max_vm_instructions,
-                    budget.max_seconds,
-                )?;
-                let _authorizer = AdmittedDmlAuthorization::install(connection)?;
-                for item in statements {
-                    let mut statement = connection.prepare(&item.sql).map_err(io::Error::other)?;
-                    if statement.readonly()
-                        || statement.column_count() != 0
-                        || statement.parameter_count() != item.parameters.len()
-                    {
-                        return Err(io::Error::other("admitted original bounded DML required"));
-                    }
-                    let values: Vec<_> = item
-                        .parameters
-                        .iter()
-                        .map(OriginalSqliteValue::owned)
-                        .collect();
-                    let changed = statement
-                        .execute(rusqlite::params_from_iter(values))
-                        .map_err(io::Error::other)?;
-                    if changed as u64 != item.expected_changed_rows {
-                        return Err(io::Error::other("admitted original exact changed rows"));
-                    }
-                }
-            }
-            admitted_query_rows(connection, queries, after, budget).map_err(|error|io::Error::other(format!("fresh history after whole rows: {error}")))?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                if let Err(error) = connection.execute_batch("COMMIT") {
-                    
-                    return Err(io::Error::other(error));
-                }
-                Ok(())
-            }
-            Err(error) => {
-                if connection.execute_batch("ROLLBACK").is_err() {
-                    
-                    return Err(io::Error::other("admitted original rollback uncertain"));
-                }
-                // A failed actual native attempt closes further issuance.
-                
-                Err(error)
-            }
-        }
+    connection: &rusqlite::Connection,
+    statements: &[OriginalSqliteStatement],
+    queries: &[OriginalSqliteQuery],
+    before: &[OriginalSqliteRows],
+    after: &[OriginalSqliteRows],
+    budget: OriginalSqliteReadBudget,
+) -> io::Result<()> {
+    execute_fresh_metadata(connection, statements, queries, before, after, budget, None)
 }
 
+pub(in super::super) fn execute_fresh_retention_metadata(
+    connection: &rusqlite::Connection,
+    statements: &[OriginalSqliteStatement],
+    queries: &[OriginalSqliteQuery],
+    before: &[OriginalSqliteRows],
+    after: &[OriginalSqliteRows],
+    budget: OriginalSqliteReadBudget,
+    gc_mark: bool,
+) -> io::Result<()> {
+    execute_fresh_metadata(
+        connection,
+        statements,
+        queries,
+        before,
+        after,
+        budget,
+        Some(gc_mark),
+    )
+}
+
+struct RetentionDmlAuthorization<'a>(&'a rusqlite::Connection);
+unsafe extern "C" fn retention_dml(
+    data: *mut std::ffi::c_void,
+    action: i32,
+    first: *const std::ffi::c_char,
+    second: *const std::ffi::c_char,
+    database: *const std::ffi::c_char,
+    origin: *const std::ffi::c_char,
+) -> i32 {
+    if matches!(
+        action,
+        ffi::SQLITE_INSERT | ffi::SQLITE_UPDATE | ffi::SQLITE_DELETE
+    ) {
+        if first.is_null() || !origin.is_null() {
+            return ffi::SQLITE_DENY;
+        }
+        // SAFETY: SQLite owns this terminated table identifier during authorization.
+        let table = unsafe { CStr::from_ptr(first) }.to_bytes();
+        let gc_mark = !data.is_null();
+        let allowed = if gc_mark {
+            (action == ffi::SQLITE_INSERT && matches!(table, b"gc_marks" | b"gc_clock"))
+                || (action == ffi::SQLITE_UPDATE && table == b"gc_clock")
+        } else {
+            action == ffi::SQLITE_INSERT && table == b"local_state"
+        };
+        if !allowed {
+            return ffi::SQLITE_DENY;
+        }
+    }
+    // SAFETY: unchanged SQLite identifiers are passed to the original deny-first callback.
+    unsafe { authorize_dml(ptr::null_mut(), action, first, second, database, origin) }
+}
+impl<'a> RetentionDmlAuthorization<'a> {
+    fn install(connection: &'a rusqlite::Connection, gc_mark: bool) -> io::Result<Self> {
+        let mode = if gc_mark {
+            std::ptr::dangling_mut::<std::ffi::c_void>()
+        } else {
+            ptr::null_mut()
+        };
+        // SAFETY: callback uses data only as a mode bit and never dereferences it.
+        let result =
+            unsafe { ffi::sqlite3_set_authorizer(connection.handle(), Some(retention_dml), mode) };
+        if result != ffi::SQLITE_OK {
+            return Err(io::Error::other("retention metadata authorizer"));
+        }
+        Ok(Self(connection))
+    }
+}
+impl Drop for RetentionDmlAuthorization<'_> {
+    fn drop(&mut self) {
+        // SAFETY: guard retains this connection for the full synchronous transition.
+        unsafe {
+            ffi::sqlite3_set_authorizer(self.0.handle(), None, ptr::null_mut());
+        }
+    }
+}
+
+fn execute_fresh_metadata(
+    connection: &rusqlite::Connection,
+    statements: &[OriginalSqliteStatement],
+    queries: &[OriginalSqliteQuery],
+    before: &[OriginalSqliteRows],
+    after: &[OriginalSqliteRows],
+    budget: OriginalSqliteReadBudget,
+    metadata_mode: Option<bool>,
+) -> io::Result<()> {
+    if statements.is_empty()
+        || statements.len() > 1024
+        || queries.len() != before.len()
+        || queries.len() != after.len()
+    {
+        return Err(io::Error::other(
+            "fresh history exact complete transition bounds",
+        ));
+    }
+    for &name in original_ordinary_rejecting_callbacks() {
+        if !name.starts_with("sync_")
+            || name.len() > 128
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(io::Error::other("original rejecting function exact name"));
+        }
+        connection
+            .create_scalar_function(
+                name,
+                -1,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                |_| Ok(false),
+            )
+            .map_err(io::Error::other)?;
+    }
+    validate_ordinary_whole_catalog(connection, queries)?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE")
+        .map_err(io::Error::other)?;
+    let result = (|| -> io::Result<()> {
+        admitted_query_rows(connection, queries, before, budget).map_err(|error| {
+            io::Error::other(format!("fresh history before whole rows: {error}"))
+        })?;
+        {
+            let _progress = OriginalVmBudget::install(
+                connection,
+                budget.max_vm_instructions,
+                budget.max_seconds,
+            )?;
+            let _history_authorizer;
+            let _metadata_authorizer;
+            if let Some(gc_mark) = metadata_mode {
+                _history_authorizer = None;
+                _metadata_authorizer =
+                    Some(RetentionDmlAuthorization::install(connection, gc_mark)?);
+            } else {
+                _history_authorizer = Some(AdmittedDmlAuthorization::install(connection)?);
+                _metadata_authorizer = None;
+            }
+            for item in statements {
+                let mut statement = connection.prepare(&item.sql).map_err(io::Error::other)?;
+                if statement.readonly()
+                    || statement.column_count() != 0
+                    || statement.parameter_count() != item.parameters.len()
+                {
+                    return Err(io::Error::other("admitted original bounded DML required"));
+                }
+                let values: Vec<_> = item
+                    .parameters
+                    .iter()
+                    .map(OriginalSqliteValue::owned)
+                    .collect();
+                let changed = statement
+                    .execute(rusqlite::params_from_iter(values))
+                    .map_err(io::Error::other)?;
+                if changed as u64 != item.expected_changed_rows {
+                    return Err(io::Error::other("admitted original exact changed rows"));
+                }
+            }
+        }
+        admitted_query_rows(connection, queries, after, budget).map_err(|error| {
+            io::Error::other(format!("fresh history after whole rows: {error}"))
+        })?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            if let Err(error) = connection.execute_batch("COMMIT") {
+                return Err(io::Error::other(error));
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if connection.execute_batch("ROLLBACK").is_err() {
+                return Err(io::Error::other("admitted original rollback uncertain"));
+            }
+            // A failed actual native attempt closes further issuance.
+
+            Err(error)
+        }
+    }
+}

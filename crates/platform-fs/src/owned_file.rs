@@ -152,7 +152,7 @@ pub struct SealedOriginalFile {
     original_key: FileKey,
     original_parent_key: FileKey,
     created_component: String,
-    current_parent:Option<File>,
+    current_parent: Option<File>,
 }
 
 impl OwnedFileCreation {
@@ -203,7 +203,7 @@ impl OwnedFileCreation {
             original_key,
             original_parent_key,
             created_component,
-            current_parent:None,
+            current_parent: None,
         };
         sealed.verify_original()?;
         drop(writable);
@@ -222,7 +222,12 @@ impl SealedOriginalFile {
     }
     pub fn parent_key(&self) -> io::Result<FileKey> {
         self.verify_original()?;
-        if let Some(parent)=&self.current_parent {regular(parent,true)?;key(parent)} else {Ok(self.original_parent_key)}
+        if let Some(parent) = &self.current_parent {
+            regular(parent, true)?;
+            key(parent)
+        } else {
+            Ok(self.original_parent_key)
+        }
     }
     pub fn created_component(&self) -> &str {
         &self.created_component
@@ -267,7 +272,11 @@ impl SealedOriginalFile {
             created_component,
             current_parent,
         } = self;
-        if current_parent.is_some() {return Err(super::invalid("moved namespace file cannot release original creation lineage"));}
+        if current_parent.is_some() {
+            return Err(super::invalid(
+                "moved namespace file cannot release original creation lineage",
+            ));
+        }
         let result = PublishedOriginalFile {
             file,
             original_key,
@@ -720,7 +729,10 @@ impl LockedDirectory {
         };
         if !matches!(
             name,
-            "journal.sqlite" | "journal.sqlite-wal" | "journal.sqlite-journal" | "journal.sqlite-shm"
+            "journal.sqlite"
+                | "journal.sqlite-wal"
+                | "journal.sqlite-journal"
+                | "journal.sqlite-shm"
         ) {
             return Err(super::invalid(
                 "fresh SQLite acquisition exact component required",
@@ -792,22 +804,35 @@ impl LockedDirectory {
 
 impl OwnedFileCreation {
     /// Transfer the actual new exclusive SHM CREATE; retain its parent and key.
-    pub fn into_fresh_sqlite_shm(self)->io::Result<FreshExclusiveSqliteFile> {
+    pub fn into_fresh_sqlite_shm(self) -> io::Result<FreshExclusiveSqliteFile> {
         self.original_creation()?.verify()?;
-        if self.created_component!="journal.sqlite-shm" || self.file.metadata()?.len()!=0 {
-            return Err(super::invalid("fresh SHM exact empty actual CREATE required"));
+        if self.created_component != "journal.sqlite-shm" || self.file.metadata()?.len() != 0 {
+            return Err(super::invalid(
+                "fresh SHM exact empty actual CREATE required",
+            ));
         }
-        let result=FreshExclusiveSqliteFile {acquired:ReacquiredNodeFile {
-            file:self.file,parent:self.parent,key:self.original_key,parent_key:self.original_parent_key,
-        }};
-        result.verify()?;Ok(result)
+        let result = FreshExclusiveSqliteFile {
+            acquired: ReacquiredNodeFile {
+                file: self.file,
+                parent: self.parent,
+                key: self.original_key,
+                parent_key: self.original_parent_key,
+            },
+        };
+        result.verify()?;
+        Ok(result)
     }
 }
 
 /// Fresh explicit READ|DELETE native acquisition. No historical CREATE rights.
-pub struct FreshRecoveredMutationFile { acquired:ReacquiredNodeFile }
+pub struct FreshRecoveredMutationFile {
+    acquired: ReacquiredNodeFile,
+}
 impl LockedDirectory {
-    pub fn reacquire_existing_node_mutation_file(&self, name: &str) -> io::Result<FreshRecoveredMutationFile> {
+    pub fn reacquire_existing_node_mutation_file(
+        &self,
+        name: &str,
+    ) -> io::Result<FreshRecoveredMutationFile> {
         use std::os::windows::io::{AsRawHandle, FromRawHandle};
         use windows_sys::{
             Wdk::{
@@ -902,17 +927,30 @@ impl LockedDirectory {
             parent_key,
         };
         value.verify()?;
-        Ok(FreshRecoveredMutationFile {acquired:value})
+        Ok(FreshRecoveredMutationFile { acquired: value })
     }
 }
 
 impl FreshRecoveredMutationFile {
-    pub fn verify(&self)->io::Result<()> {self.acquired.verify()}
-    pub fn key(&self)->io::Result<FileKey> {self.acquired.key()}
-    pub fn parent_key(&self)->io::Result<FileKey> {self.acquired.parent_key()}
-    pub fn matches_path(&self,path:&Path)->io::Result<bool> {self.acquired.matches_path(path)}
-    pub fn exact_bytes(&self,bound:u64)->io::Result<Vec<u8>> {self.acquired.exact_bytes(bound)}
-    pub fn metadata(&self)->io::Result<std::fs::Metadata> {self.verify()?;self.acquired.file.metadata()}
+    pub fn verify(&self) -> io::Result<()> {
+        self.acquired.verify()
+    }
+    pub fn key(&self) -> io::Result<FileKey> {
+        self.acquired.key()
+    }
+    pub fn parent_key(&self) -> io::Result<FileKey> {
+        self.acquired.parent_key()
+    }
+    pub fn matches_path(&self, path: &Path) -> io::Result<bool> {
+        self.acquired.matches_path(path)
+    }
+    pub fn exact_bytes(&self, bound: u64) -> io::Result<Vec<u8>> {
+        self.acquired.exact_bytes(bound)
+    }
+    pub fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.verify()?;
+        self.acquired.file.metadata()
+    }
 }
 
 impl FreshRecoveredMutationFile {
@@ -1001,96 +1039,162 @@ impl FreshRecoveredMutationFile {
     }
 }
 
-impl ReacquiredNodeFile { pub fn metadata(&self)->io::Result<std::fs::Metadata> {self.verify()?;self.file.metadata()} }
+impl ReacquiredNodeFile {
+    pub fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.verify()?;
+        self.file.metadata()
+    }
+}
 
 impl LockedDirectoryMutation {
     /// Reduce the same continuously retained CREATE handle to a directory read
     /// guard. No pathname is reopened and the creator remains held by the caller.
-    pub fn duplicate_read_guard(&self)->io::Result<LockedDirectory> {
-        use std::os::windows::io::{AsRawHandle,FromRawHandle};
-        use windows_sys::Win32::{Foundation::{DuplicateHandle,GENERIC_READ,HANDLE},
-            System::Threading::GetCurrentProcess};
+    pub fn duplicate_read_guard(&self) -> io::Result<LockedDirectory> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows_sys::Win32::{
+            Foundation::{DuplicateHandle, GENERIC_READ, HANDLE},
+            System::Threading::GetCurrentProcess,
+        };
         self.original_creation()?.verify()?;
-        let mut output:HANDLE=std::ptr::null_mut();
+        let mut output: HANDLE = std::ptr::null_mut();
         // SAFETY: both process handles and retained source are live; output is
         // sized, non-inherited, and READ access cannot expand mutation authority.
-        let success=unsafe{
-            let process=GetCurrentProcess();
-            DuplicateHandle(process,self.file.as_raw_handle() as HANDLE,process,&mut output,
-                GENERIC_READ,0,0)
+        let success = unsafe {
+            let process = GetCurrentProcess();
+            DuplicateHandle(
+                process,
+                self.file.as_raw_handle() as HANDLE,
+                process,
+                &mut output,
+                GENERIC_READ,
+                0,
+                0,
+            )
         };
-        if success==0{return Err(io::Error::last_os_error());}
-        if output.is_null(){return Err(super::invalid("directory read duplicate absent"));}
+        if success == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if output.is_null() {
+            return Err(super::invalid("directory read duplicate absent"));
+        }
         // SAFETY: successful duplication transfers one new owned handle.
-        let file=unsafe{File::from_raw_handle(output)};
-        regular(&file,true)?;
-        if key(&file)?!=self.key()?{return Err(super::invalid("directory duplicate key differs"));}
-        Ok(LockedDirectory{file})
+        let file = unsafe { File::from_raw_handle(output) };
+        regular(&file, true)?;
+        if key(&file)? != self.key()? {
+            return Err(super::invalid("directory duplicate key differs"));
+        }
+        Ok(LockedDirectory { file })
     }
 }
-fn rename_held_object_to_parent(file:&File,parent:&LockedDirectory,name:&str,directory:bool)->io::Result<File> {
+fn rename_held_object_to_parent(
+    file: &File,
+    parent: &LockedDirectory,
+    name: &str,
+    directory: bool,
+) -> io::Result<File> {
+    use std::mem::{offset_of, size_of};
     use std::os::windows::io::AsRawHandle;
-    use std::mem::{offset_of,size_of};
-    use windows_sys::Win32::{Foundation::{HANDLE,STATUS_SUCCESS,RtlNtStatusToDosError},
-        Storage::FileSystem::FILE_RENAME_INFO,System::IO::IO_STATUS_BLOCK};
-    #[link(name="ntdll")]
-    unsafe extern "system"{
-        fn NtSetInformationFile(handle:HANDLE,status:*mut IO_STATUS_BLOCK,
-            information:*const std::ffi::c_void,length:u32,class:u32)->i32;
+    use windows_sys::Win32::{
+        Foundation::{RtlNtStatusToDosError, HANDLE, STATUS_SUCCESS},
+        Storage::FileSystem::FILE_RENAME_INFO,
+        System::IO::IO_STATUS_BLOCK,
+    };
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtSetInformationFile(
+            handle: HANDLE,
+            status: *mut IO_STATUS_BLOCK,
+            information: *const std::ffi::c_void,
+            length: u32,
+            class: u32,
+        ) -> i32;
     }
-    if name.is_empty() || name.len()>255 || name=="." || name==".." || name.starts_with('.')
-        || name.ends_with(['.',' '])
-        || name.chars().any(|c|c.is_control() || "<>:\"/\\|?*".contains(c)){
+    if name.is_empty()
+        || name.len() > 255
+        || name == "."
+        || name == ".."
+        || name.starts_with('.')
+        || name.ends_with(['.', ' '])
+        || name
+            .chars()
+            .any(|c| c.is_control() || "<>:\"/\\|?*".contains(c))
+    {
         return Err(super::invalid("namespace relative rename safe component"));
     }
-    regular(file,directory)?;regular(&parent.file,true)?;
+    regular(file, directory)?;
+    regular(&parent.file, true)?;
     parent.require_case_insensitive()?;
-    if key(file)?.volume!=parent.key()?.volume{
+    if key(file)?.volume != parent.key()?.volume {
         return Err(super::invalid("namespace relative rename same held volume"));
     }
     // Retain the new parent before the effect. A later error never drops the
     // old file guard or turns a pathname into recovered cleanup authority.
-    let retained_parent=parent.file.try_clone()?;
-    let encoded:Vec<u16>=name.encode_utf16().collect();
-    let bytes=encoded.len().checked_mul(2).ok_or_else(||super::invalid("namespace name size"))?;
-    let length=offset_of!(FILE_RENAME_INFO,FileName).checked_add(bytes)
-        .ok_or_else(||super::invalid("namespace rename structure size"))?
+    let retained_parent = parent.file.try_clone()?;
+    let encoded: Vec<u16> = name.encode_utf16().collect();
+    let bytes = encoded
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| super::invalid("namespace name size"))?;
+    let length = offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(bytes)
+        .ok_or_else(|| super::invalid("namespace rename structure size"))?
         .max(size_of::<FILE_RENAME_INFO>());
-    let size=u32::try_from(length).map_err(|_|super::invalid("namespace rename size conversion"))?;
-    let mut storage=vec![0usize;length.div_ceil(size_of::<usize>())];
-    let header=storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    let mut status=IO_STATUS_BLOCK::default();
+    let size =
+        u32::try_from(length).map_err(|_| super::invalid("namespace rename size conversion"))?;
+    let mut storage = vec![0usize; length.div_ceil(size_of::<usize>())];
+    let header = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let mut status = IO_STATUS_BLOCK::default();
     // SAFETY: aligned zeroed header and counted UTF16 tail remain live; both
     // native handles are retained, exact RootDirectory and replace=false.
-    let result=unsafe{
-        std::ptr::write(header,FILE_RENAME_INFO::default());
-        (*header).RootDirectory=parent.file.as_raw_handle() as HANDLE;
-        (*header).FileNameLength=bytes as u32;
-        std::ptr::copy_nonoverlapping(encoded.as_ptr(),
-            std::ptr::addr_of_mut!((*header).FileName).cast(),encoded.len());
-        NtSetInformationFile(file.as_raw_handle() as HANDLE,&mut status,header.cast(),size,10)
+    let result = unsafe {
+        std::ptr::write(header, FILE_RENAME_INFO::default());
+        (*header).RootDirectory = parent.file.as_raw_handle() as HANDLE;
+        (*header).FileNameLength = bytes as u32;
+        std::ptr::copy_nonoverlapping(
+            encoded.as_ptr(),
+            std::ptr::addr_of_mut!((*header).FileName).cast(),
+            encoded.len(),
+        );
+        NtSetInformationFile(
+            file.as_raw_handle() as HANDLE,
+            &mut status,
+            header.cast(),
+            size,
+            10,
+        )
     };
-    if result!=STATUS_SUCCESS{
+    if result != STATUS_SUCCESS {
         // SAFETY: pointer-free conversion of the returned NTSTATUS.
-        return Err(io::Error::from_raw_os_error(unsafe{RtlNtStatusToDosError(result)} as i32));
+        return Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(result) } as i32,
+        ));
     }
-    regular(file,directory)?;regular(&retained_parent,true)?;
+    regular(file, directory)?;
+    regular(&retained_parent, true)?;
     Ok(retained_parent)
 }
 impl FreshRecoveredMutationFile {
-    pub fn rename_no_replace_to_parent(&mut self,parent:&LockedDirectory,name:&str)->io::Result<()>{
+    pub fn rename_no_replace_to_parent(
+        &mut self,
+        parent: &LockedDirectory,
+        name: &str,
+    ) -> io::Result<()> {
         self.verify()?;
-        let held=rename_held_object_to_parent(&self.acquired.file,parent,name,false)?;
-        self.acquired.parent_key=key(&held)?;
-        self.acquired.parent=held;
+        let held = rename_held_object_to_parent(&self.acquired.file, parent, name, false)?;
+        self.acquired.parent_key = key(&held)?;
+        self.acquired.parent = held;
         self.verify()
     }
 }
 impl SealedOriginalFile {
-    pub fn rename_no_replace_to_parent(&mut self,parent:&LockedDirectory,name:&str)->io::Result<()>{
+    pub fn rename_no_replace_to_parent(
+        &mut self,
+        parent: &LockedDirectory,
+        name: &str,
+    ) -> io::Result<()> {
         self.verify_original()?;
-        let held=rename_held_object_to_parent(&self.file,parent,name,false)?;
-        self.current_parent=Some(held);
+        let held = rename_held_object_to_parent(&self.file, parent, name, false)?;
+        self.current_parent = Some(held);
         self.verify_original()
     }
 }
@@ -1099,10 +1203,12 @@ impl LockedDirectoryMutation {
     /// Only an actual retained CREATE is eligible. Original CREATE lineage
     /// remains historical; the caller independently binds the new parent slot.
     pub fn rename_created_directory_to_parent(
-        &self,parent:&LockedDirectory,name:&str,
-    )->io::Result<()>{
+        &self,
+        parent: &LockedDirectory,
+        name: &str,
+    ) -> io::Result<()> {
         self.original_creation()?.verify()?;
-        rename_held_object_to_parent(&self.file,parent,name,true)?;
+        rename_held_object_to_parent(&self.file, parent, name, true)?;
         self.original_creation()?.verify()
     }
 }
@@ -1110,10 +1216,13 @@ impl LockedDirectoryMutation {
 impl LockedDirectory {
     /// Another read guard for the same continuously retained native directory.
     /// The source and duplicate share the kernel exclusion and cannot mint CREATE provenance.
-    pub fn duplicate_read_guard(&self)->io::Result<Self>{
-        regular(&self.file,true)?;self.require_case_insensitive()?;
-        let file=self.file.try_clone()?;
-        if key(&file)?!=self.key()?{return Err(super::invalid("held directory duplicate identity"));}
-        Ok(Self{file})
+    pub fn duplicate_read_guard(&self) -> io::Result<Self> {
+        regular(&self.file, true)?;
+        self.require_case_insensitive()?;
+        let file = self.file.try_clone()?;
+        if key(&file)? != self.key()? {
+            return Err(super::invalid("held directory duplicate identity"));
+        }
+        Ok(Self { file })
     }
 }

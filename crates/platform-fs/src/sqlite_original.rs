@@ -11,3 +11,4 @@ pub use scoped_vfs::{
 };
 
 pub(super) use scoped_vfs::execute_fresh_planned_history;
+pub(super) use scoped_vfs::execute_fresh_retention_metadata;

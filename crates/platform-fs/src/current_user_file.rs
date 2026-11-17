@@ -248,3 +248,54 @@ pub fn verify_current_user_private_file(file: &File) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// Original handle-backed owner and DACL bytes, bounded and audited to the
+/// nonimpersonated current process user. Application code exposes only digests.
+pub fn capture_current_user_private_acl(file: &File) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    verify_current_user_private_file(file)?;
+    let mut owner = ptr::null_mut();
+    let mut acl = ptr::null_mut();
+    let mut descriptor = ptr::null_mut();
+    // SAFETY: the retained file handle is valid; native outputs are writable.
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle() as HANDLE,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            &mut acl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let _allocation = LocalAllocation(descriptor);
+    let user = ProcessUser::new()?;
+    // SAFETY: successful descriptor outputs stay alive until the owned allocation drops.
+    if owner.is_null()
+        || acl.is_null()
+        || unsafe { IsValidSid(owner) } == 0
+        || unsafe { IsValidAcl(acl) } == 0
+        || unsafe { EqualSid(owner, user.sid()) } == 0
+    {
+        return Err(invalid(
+            "original ACL owner must be the current process user",
+        ));
+    }
+    // SAFETY: valid SID and ACL have their documented length fields.
+    let owner_length = unsafe { GetLengthSid(owner) } as usize;
+    let acl_length = unsafe { (*acl).AclSize } as usize;
+    if !(8..=65536).contains(&owner_length) || !(8..=65536).contains(&acl_length) {
+        return Err(invalid("original ACL snapshot bounds"));
+    }
+    // SAFETY: lengths were validated in the successful, live native allocation.
+    let owner_bytes =
+        unsafe { std::slice::from_raw_parts(owner.cast::<u8>(), owner_length) }.to_vec();
+    // SAFETY: validated ACL length stays within the native descriptor allocation.
+    let acl_bytes = unsafe { std::slice::from_raw_parts(acl.cast::<u8>(), acl_length) }.to_vec();
+    verify_current_user_private_file(file)?;
+    Ok((owner_bytes, acl_bytes))
+}

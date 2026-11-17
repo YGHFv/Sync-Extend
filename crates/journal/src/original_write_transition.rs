@@ -1,6 +1,6 @@
 //! Private original Journal transition with complete row equality before handoff.
 use crate::{Journal, JournalBackupImage, JournalError, NodeInspectionBounds, Result};
-use sync_extend_core_model::SpaceId;
+use sync_extend_core_model::{ContentId, SpaceId};
 use sync_extend_platform_fs::{
     OriginalSqliteConnection, OriginalSqliteMainHandoff, OriginalSqliteOpenFailure,
     OriginalSqliteQuery, OriginalSqliteReadBudget, OriginalSqliteRows,
@@ -821,6 +821,9 @@ fn original_history_diff(
                 | "snapshots"
                 | "snapshot_objects"
                 | "current_manifests"
+                | "local_state"
+                | "gc_clock"
+                | "gc_marks"
         )
     }
     let old: BTreeMap<_, _> = before.iter().map(|r| (key(r), r)).collect();
@@ -838,6 +841,9 @@ fn original_history_diff(
         "snapshots",
         "snapshot_objects",
         "current_manifests",
+        "local_state",
+        "gc_clock",
+        "gc_marks",
     ] {
         for (key, row) in new.iter().filter(|(k, _)| k.0 == table) {
             if old.get(key).is_some_and(|old| *old == *row) {
@@ -845,10 +851,33 @@ fn original_history_diff(
             }
             let mut parameters = Vec::new();
             let sql = if let Some(previous) = old.get(key) {
-                if !matches!(table, "receive_cursors" | "current_manifests") {
+                if !matches!(table, "receive_cursors" | "current_manifests" | "gc_clock") {
                     return Err(JournalError::Invariant(
                         "original immutable history update refused",
                     ));
+                }
+                if table == "gc_clock" {
+                    let integer = |row: &crate::JournalStoredRow, name: &str| -> Result<u64> {
+                        match row.columns().iter().find(|column| column.name == name) {
+                            Some(crate::JournalStorageColumn {
+                                value: Value::Integer(n),
+                                ..
+                            }) => Ok(*n),
+                            _ => Err(JournalError::Invariant(
+                                "recovered history exact GC clock integer",
+                            )),
+                        }
+                    };
+                    if row.columns().len() != 2
+                        || previous.columns().len() != 2
+                        || integer(row, "singleton")? != 1
+                        || integer(previous, "singleton")? != 1
+                        || integer(row, "observed_at_ms")? < integer(previous, "observed_at_ms")?
+                    {
+                        return Err(JournalError::Invariant(
+                            "recovered history GC clock moved backward",
+                        ));
+                    }
                 }
                 let sets = row
                     .columns()
@@ -869,6 +898,16 @@ fn original_history_diff(
                     predicates.join(" AND ")
                 )
             } else {
+                if table == "local_state"
+                    && !row.primary_key().first().is_some_and(|key| {
+                        key.starts_with(crate::recovered_retention::RETAIN)
+                            || key.starts_with(crate::recovered_retention::RELEASE)
+                    })
+                {
+                    return Err(JournalError::Invariant(
+                        "recovered history unknown appended state family",
+                    ));
+                }
                 for c in row.columns() {
                     parameters.push(value(&c.value));
                 }
@@ -1091,24 +1130,34 @@ impl JournalBackupImage {
     }
 }
 
-
 /// Opaque planner-issued ordinary history transition. Caller SQL cannot supply it.
 pub struct RecoveredLocalHistoryPlan {
-    statements:Vec<sync_extend_platform_fs::OriginalSqliteStatement>,
-    queries:Vec<sync_extend_platform_fs::OriginalSqliteQuery>,
-    before:Vec<sync_extend_platform_fs::OriginalSqliteRows>,
-    after:Vec<sync_extend_platform_fs::OriginalSqliteRows>,
-    budget:sync_extend_platform_fs::OriginalSqliteReadBudget,
-    before_image:sync_extend_core_model::ContentId,
-    root:sync_extend_core_model::SnapshotId,
+    statements: Vec<sync_extend_platform_fs::OriginalSqliteStatement>,
+    queries: Vec<sync_extend_platform_fs::OriginalSqliteQuery>,
+    before: Vec<sync_extend_platform_fs::OriginalSqliteRows>,
+    after: Vec<sync_extend_platform_fs::OriginalSqliteRows>,
+    budget: sync_extend_platform_fs::OriginalSqliteReadBudget,
+    before_image: sync_extend_core_model::ContentId,
+    root: sync_extend_core_model::SnapshotId,
 }
 impl RecoveredLocalHistoryPlan {
-    pub fn execute(self,native:&mut sync_extend_platform_fs::FreshNativeWalConnection)
-        ->Result<sync_extend_core_model::SnapshotId> {
-        if sync_extend_core_model::ContentId::hash(&native.exact_main_bytes()?)!=self.before_image {
-            return Err(JournalError::Invariant("recovered history exact before main changed"));
+    pub fn execute(
+        self,
+        native: &mut sync_extend_platform_fs::FreshNativeWalConnection,
+    ) -> Result<sync_extend_core_model::SnapshotId> {
+        if sync_extend_core_model::ContentId::hash(&native.exact_main_bytes()?) != self.before_image
+        {
+            return Err(JournalError::Invariant(
+                "recovered history exact before main changed",
+            ));
         }
-        native.execute_planned_history(&self.statements,&self.queries,&self.before,&self.after,self.budget)?;
+        native.execute_planned_history(
+            &self.statements,
+            &self.queries,
+            &self.before,
+            &self.after,
+            self.budget,
+        )?;
         Ok(self.root)
     }
 }
@@ -1116,58 +1165,468 @@ impl JournalBackupImage {
     /// Same existing Journal planner, immutable old owner rows and original
     /// complete typed row diff; this object grants no ordinary native file rights.
     pub fn plan_recovered_local_history(
-        &self,space:&SpaceId,expected_root:&sync_extend_core_model::SnapshotId,
-        manifest:&sync_extend_core_model::Manifest,operations:&[sync_extend_core_model::Operation],
-        timestamp:u64,bounds:NodeInspectionBounds,
-    )->Result<RecoveredLocalHistoryPlan> {
-        if manifest.space_id!=*space || operations.is_empty() || operations.len()>512 {
-            return Err(JournalError::Invariant("recovered history exact scope bounds"));
+        &self,
+        space: &SpaceId,
+        expected_root: &sync_extend_core_model::SnapshotId,
+        manifest: &sync_extend_core_model::Manifest,
+        operations: &[sync_extend_core_model::Operation],
+        timestamp: u64,
+        bounds: NodeInspectionBounds,
+    ) -> Result<RecoveredLocalHistoryPlan> {
+        if manifest.space_id != *space || operations.is_empty() || operations.len() > 512 {
+            return Err(JournalError::Invariant(
+                "recovered history exact scope bounds",
+            ));
         }
-        let (queries,before)=self.with_audited_readonly(space,bounds,|connection| {
-            let mut aggregate=ExpectedAggregate{rows:0,bytes:0};
-            let mut sqls=vec!["SELECT type,name,tbl_name,sql FROM main.sqlite_schema ORDER BY type,name".to_owned()];
-            let mut names=connection.prepare("SELECT name FROM main.sqlite_schema WHERE type='table' ORDER BY name")?;
-            let names=names.query_map([],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            if names.len()>1023 {return Err(JournalError::Invariant("recovered history table count"));}
-            for name in names {
-                if name.len()>255 || name.starts_with("sqlite_") {return Err(JournalError::Invariant("recovered history table name"));}
-                let quoted=format!("\"{}\"",name.replace('"',"\"\""));
-                let count=connection.prepare(&format!("SELECT * FROM main.{quoted} LIMIT 0"))?.column_count();
-                if count==0 || count>1024 {return Err(JournalError::Invariant("recovered history column count"));}
-                let order=(1..=count).map(|n|n.to_string()).collect::<Vec<_>>().join(",");
-                sqls.push(format!("SELECT * FROM main.{quoted} ORDER BY {order}"));
+        let (queries, before) = recovered_complete_image_rows(self, space, bounds)?;
+        let memory = original_planning_memory(&before, bounds)?;
+        let mut planner = Journal::from_original_planning_memory(
+            memory,
+            std::path::Path::new("explicit-held-recovered-history"),
+            bounds.max_entries,
+        )?;
+        let before_audit = {
+            let snapshot = planner.connection.unchecked_transaction()?;
+            let audit = planner.read_view().audit_original_provenance_capacity(
+                space,
+                bounds.max_entries,
+                bounds.capacity,
+            )?;
+            snapshot.rollback()?;
+            audit
+        };
+        let root = planner.commit_local(Some(expected_root), manifest, operations, timestamp)?;
+        let after_audit = {
+            let snapshot = planner.connection.unchecked_transaction()?;
+            let audit = planner.read_view().audit_original_provenance_capacity(
+                space,
+                bounds.max_entries,
+                bounds.capacity,
+            )?;
+            snapshot.rollback()?;
+            audit
+        };
+        let statements = original_history_diff(&before_audit.rows, &after_audit.rows)?;
+        let mut aggregate = ExpectedAggregate { rows: 0, bytes: 0 };
+        let mut after = Vec::new();
+        for query in &queries {
+            after.push(expected_rows(
+                &mut planner.connection.prepare(&query.sql)?,
+                bounds,
+                &mut aggregate,
+            )?);
+        }
+        let budget = sync_extend_platform_fs::OriginalSqliteReadBudget {
+            max_queries: queries.len(),
+            max_rows: bounds
+                .capacity
+                .max_rows
+                .try_into()
+                .map_err(|_| JournalError::Invariant("recovered history row bound"))?,
+            max_columns: 1024,
+            max_owned_bytes: bounds.capacity.max_logical_bytes.min(256 * 1024 * 1024),
+            max_vm_instructions: bounds.max_vm_instructions,
+            max_seconds: bounds.max_query_time.as_secs(),
+        };
+        Ok(RecoveredLocalHistoryPlan {
+            statements,
+            queries,
+            before,
+            after,
+            budget,
+            before_image: sync_extend_core_model::ContentId::hash(self.bytes()),
+            root,
+        })
+    }
+}
+
+fn recovered_complete_image_rows(
+    image: &JournalBackupImage,
+    space: &SpaceId,
+    bounds: NodeInspectionBounds,
+) -> Result<(Vec<OriginalSqliteQuery>, Vec<OriginalSqliteRows>)> {
+    image.with_audited_readonly(space, bounds, |connection| {
+        let mut aggregate = ExpectedAggregate { rows: 0, bytes: 0 };
+        let mut sqls = vec![
+            "SELECT type,name,tbl_name,sql FROM main.sqlite_schema ORDER BY type,name".to_owned(),
+        ];
+        let names = connection
+            .prepare("SELECT name FROM main.sqlite_schema WHERE type='table' ORDER BY name")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if names.len() > 1023 {
+            return Err(JournalError::Invariant("recovered history table count"));
+        }
+        for name in names {
+            if name.len() > 255 || name.starts_with("sqlite_") {
+                return Err(JournalError::Invariant("recovered history table name"));
             }
-            let mut queries=Vec::new();let mut before=Vec::new();
-            for sql in sqls {
-                before.push(expected_rows(&mut connection.prepare(&sql)?,bounds,&mut aggregate)?);
-                queries.push(sync_extend_platform_fs::OriginalSqliteQuery{sql,parameters:Vec::new()});
+            let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+            let count = connection
+                .prepare(&format!("SELECT * FROM main.{quoted} LIMIT 0"))?
+                .column_count();
+            if count == 0 || count > 1024 {
+                return Err(JournalError::Invariant("recovered history column count"));
             }
-            Ok((queries,before))
-        })?;
-        let memory=original_planning_memory(&before,bounds)?;
-        let mut planner=Journal::from_original_planning_memory(memory,std::path::Path::new("explicit-held-recovered-history"),bounds.max_entries)?;
-        let before_audit={
-            let snapshot=planner.connection.unchecked_transaction()?;
-            let audit=planner.read_view().audit_original_provenance_capacity(space,bounds.max_entries,bounds.capacity)?;
-            snapshot.rollback()?;audit
+            let order = (1..=count)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            sqls.push(format!("SELECT * FROM main.{quoted} ORDER BY {order}"));
+        }
+        let mut queries = Vec::new();
+        let mut before = Vec::new();
+        for sql in sqls {
+            before.push(expected_rows(
+                &mut connection.prepare(&sql)?,
+                bounds,
+                &mut aggregate,
+            )?);
+            queries.push(OriginalSqliteQuery {
+                sql,
+                parameters: Vec::new(),
+            });
+        }
+        Ok((queries, before))
+    })
+}
+
+fn recovered_gc_rows(
+    image: &JournalBackupImage,
+    space: &SpaceId,
+    bounds: NodeInspectionBounds,
+) -> Result<(OriginalSqliteRows, Vec<OriginalSqliteRows>)> {
+    const TABLES: [&str; 4] = [
+        "gc_clock",
+        "gc_marks",
+        "gc_cancellations",
+        "gc_invalidations",
+    ];
+    image.with_audited_readonly(space, bounds, |connection| {
+        let mut aggregate = ExpectedAggregate { rows: 0, bytes: 0 };
+        let schema = expected_rows(
+            &mut connection.prepare(
+                "SELECT type,name,tbl_name,sql FROM main.sqlite_schema
+                 WHERE type='table' AND name IN
+                 ('gc_clock','gc_marks','gc_cancellations','gc_invalidations')
+                 ORDER BY type,name",
+            )?,
+            bounds,
+            &mut aggregate,
+        )?;
+        if schema.rows.len() != TABLES.len() {
+            return Err(JournalError::Invariant(
+                "recovered GC table schema incomplete",
+            ));
+        }
+        let mut rows = Vec::with_capacity(TABLES.len());
+        for table in TABLES {
+            let quoted = format!("\"{}\"", table.replace('"', "\"\""));
+            let count = connection
+                .prepare(&format!("SELECT * FROM main.{quoted} LIMIT 0"))?
+                .column_count();
+            if count == 0 || count > 1024 {
+                return Err(JournalError::Invariant("recovered GC table columns"));
+            }
+            let order = (1..=count)
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            rows.push(expected_rows(
+                &mut connection
+                    .prepare(&format!("SELECT * FROM main.{quoted} ORDER BY {order}"))?,
+                bounds,
+                &mut aggregate,
+            )?);
+        }
+        Ok((schema, rows))
+    })
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", content = "audit", rename_all = "snake_case")]
+pub enum RecoveredMetadataOutcome {
+    Retention(crate::RecoveredRetentionAudit),
+    GcMark(crate::GcMarkAudit),
+}
+
+/// An actual held WAL owner is mandatory. An immutable image, row, digest or
+/// mapping alone cannot construct an executable recovered-retention capability.
+pub struct RecoveredRetentionPlan {
+    lease: sync_extend_platform_fs::FreshNativeRetentionLease,
+    statements: Vec<sync_extend_platform_fs::OriginalSqliteStatement>,
+    queries: Vec<OriginalSqliteQuery>,
+    before: Vec<OriginalSqliteRows>,
+    after: Vec<OriginalSqliteRows>,
+    budget: OriginalSqliteReadBudget,
+    before_image: ContentId,
+    gc_mark: bool,
+    outcome: RecoveredMetadataOutcome,
+}
+impl RecoveredRetentionPlan {
+    pub fn execute(
+        self,
+        native: &mut sync_extend_platform_fs::FreshNativeWalConnection,
+    ) -> Result<RecoveredMetadataOutcome> {
+        native.verify_retention_lease(&self.lease)?;
+        if ContentId::hash(&native.exact_main_bytes()?) != self.before_image {
+            return Err(JournalError::Invariant(
+                "retention capability exact current image changed",
+            ));
+        }
+        native.execute_retention_metadata(
+            &self.lease,
+            &self.statements,
+            &self.queries,
+            &self.before,
+            &self.after,
+            self.budget,
+            self.gc_mark,
+        )?;
+        Ok(self.outcome)
+    }
+}
+
+impl JournalBackupImage {
+    /// Compare the GC metadata family exactly when a recovered generation has
+    /// no metadata receipt. The ordinary native history planner deliberately
+    /// permits monotonic `gc_clock` and new `gc_marks`; R04 close verification
+    /// must reject either change unless the private metadata proof covers it.
+    pub fn audit_recovered_gc_transition(
+        &self,
+        baseline: &JournalBackupImage,
+        space: &SpaceId,
+        bounds: NodeInspectionBounds,
+    ) -> Result<()> {
+        let (old_schema, old_rows) = recovered_gc_rows(baseline, space, bounds)?;
+        let (new_schema, new_rows) = recovered_gc_rows(self, space, bounds)?;
+        compare_rows(&old_schema, &new_schema)?;
+        if old_rows.len() != new_rows.len() {
+            return Err(JournalError::Invariant("recovered GC table count differs"));
+        }
+        for (old, new) in old_rows.iter().zip(&new_rows) {
+            compare_rows(old, new)?;
+        }
+        Ok(())
+    }
+
+    /// A read-only whole-catalog comparison against the same private production
+    /// metadata planner. Caller receipts are data; this returns no native lease.
+    pub fn audit_recovered_metadata_transition(
+        &self,
+        baseline: &JournalBackupImage,
+        space: &SpaceId,
+        outcome: &RecoveredMetadataOutcome,
+        bounds: NodeInspectionBounds,
+    ) -> Result<()> {
+        let (queries, before) = recovered_complete_image_rows(baseline, space, bounds)?;
+        let (actual_queries, actual) = recovered_complete_image_rows(self, space, bounds)?;
+        if queries.len() != actual_queries.len()
+            || queries.iter().zip(&actual_queries).any(|(left, right)| {
+                left.sql != right.sql || !left.parameters.is_empty() || !right.parameters.is_empty()
+            })
+        {
+            return Err(JournalError::Invariant(
+                "metadata close complete exact SQL catalogue differs",
+            ));
+        }
+        let memory = original_planning_memory(&before, bounds)?;
+        let mut planner = Journal::from_original_planning_memory(
+            memory,
+            std::path::Path::new("readonly-recovered-metadata-comparison"),
+            bounds.max_entries,
+        )?;
+        let planned = match outcome {
+            RecoveredMetadataOutcome::Retention(audit) => {
+                let tx = planner.connection.unchecked_transaction()?;
+                if let Some(release) = &audit.release {
+                    crate::recovered_retention::insert_release(
+                        &tx,
+                        &audit.mapping,
+                        release,
+                        bounds,
+                    )?;
+                } else {
+                    crate::recovered_retention::insert_mapping(&tx, &audit.mapping, bounds)?;
+                }
+                tx.commit()?;
+                RecoveredMetadataOutcome::Retention(
+                    crate::recovered_retention::audit(&planner.connection)?
+                        .into_iter()
+                        .find(|record| record.mapping.retention_id == audit.mapping.retention_id)
+                        .ok_or(JournalError::Invariant(
+                            "metadata exact planned SQL owner absent",
+                        ))?,
+                )
+            }
+            RecoveredMetadataOutcome::GcMark(audit) => RecoveredMetadataOutcome::GcMark(
+                planner.mark_gc_object(&audit.intent, bounds.max_entries)?,
+            ),
         };
-        let root=planner.commit_local(Some(expected_root),manifest,operations,timestamp)?;
-        let after_audit={
-            let snapshot=planner.connection.unchecked_transaction()?;
-            let audit=planner.read_view().audit_original_provenance_capacity(space,bounds.max_entries,bounds.capacity)?;
-            snapshot.rollback()?;audit
+        if serde_json::to_vec(&planned)? != serde_json::to_vec(outcome)? {
+            return Err(JournalError::Invariant(
+                "metadata terminal differs from exact production planned outcome",
+            ));
+        }
+        let mut aggregate = ExpectedAggregate { rows: 0, bytes: 0 };
+        for (query, rows) in queries.iter().zip(&actual) {
+            let expected = expected_rows(
+                &mut planner.connection.prepare(&query.sql)?,
+                bounds,
+                &mut aggregate,
+            )?;
+            compare_rows(&expected, rows)?;
+        }
+        Ok(())
+    }
+
+    fn plan_recovered_metadata(
+        &self,
+        space: &SpaceId,
+        bounds: NodeInspectionBounds,
+        lease: sync_extend_platform_fs::FreshNativeRetentionLease,
+        gc_mark: bool,
+        change: impl FnOnce(&mut Journal) -> Result<RecoveredMetadataOutcome>,
+    ) -> Result<RecoveredRetentionPlan> {
+        let (queries, before) = recovered_complete_image_rows(self, space, bounds)?;
+        let memory = original_planning_memory(&before, bounds)?;
+        let mut planner = Journal::from_original_planning_memory(
+            memory,
+            std::path::Path::new("held-recovered-retention-owner"),
+            bounds.max_entries,
+        )?;
+        let audit = |planner: &Journal| -> Result<_> {
+            let snapshot = planner.connection.unchecked_transaction()?;
+            let result = planner.read_view().audit_original_provenance_capacity(
+                space,
+                bounds.max_entries,
+                bounds.capacity,
+            )?;
+            snapshot.rollback()?;
+            Ok(result)
         };
-        let statements=original_history_diff(&before_audit.rows,&after_audit.rows)?;
-        let mut aggregate=ExpectedAggregate{rows:0,bytes:0};let mut after=Vec::new();
-        for query in &queries {after.push(expected_rows(&mut planner.connection.prepare(&query.sql)?,bounds,&mut aggregate)?);}
-        let budget=sync_extend_platform_fs::OriginalSqliteReadBudget {
-            max_queries:queries.len(),max_rows:bounds.capacity.max_rows.try_into()
-                .map_err(|_|JournalError::Invariant("recovered history row bound"))?,
-            max_columns:1024,max_owned_bytes:bounds.capacity.max_logical_bytes.min(256*1024*1024),
-            max_vm_instructions:bounds.max_vm_instructions,max_seconds:bounds.max_query_time.as_secs(),
-        };
-        Ok(RecoveredLocalHistoryPlan {statements,queries,before,after,budget,
-            before_image:sync_extend_core_model::ContentId::hash(self.bytes()),root})
+        let before_audit = audit(&planner)?;
+        let outcome = change(&mut planner)?;
+        let after_audit = audit(&planner)?;
+        let statements = original_history_diff(&before_audit.rows, &after_audit.rows)?;
+        let mut aggregate = ExpectedAggregate { rows: 0, bytes: 0 };
+        let after = queries
+            .iter()
+            .map(|query| {
+                expected_rows(
+                    &mut planner.connection.prepare(&query.sql)?,
+                    bounds,
+                    &mut aggregate,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(RecoveredRetentionPlan {
+            lease,
+            statements,
+            queries,
+            before,
+            after,
+            budget: OriginalSqliteReadBudget {
+                max_queries: 1024,
+                max_rows: bounds
+                    .capacity
+                    .max_rows
+                    .try_into()
+                    .map_err(|_| JournalError::Invariant("retention complete row budget"))?,
+                max_columns: 1024,
+                max_owned_bytes: bounds.capacity.max_logical_bytes.min(256 * 1024 * 1024),
+                max_vm_instructions: bounds.max_vm_instructions,
+                max_seconds: bounds.max_query_time.as_secs(),
+            },
+            before_image: ContentId::hash(self.bytes()),
+            gc_mark,
+            outcome,
+        })
+    }
+
+    pub fn plan_recovered_retain(
+        &self,
+        lease: sync_extend_platform_fs::FreshNativeRetentionLease,
+        mapping: &crate::RecoveredRetentionMapping,
+        bounds: NodeInspectionBounds,
+    ) -> Result<RecoveredRetentionPlan> {
+        if mapping.native_keys != lease.native_keys().map(|key| key.to_string())
+            || mapping.generation != lease.generation()
+            || mapping.source_image != ContentId::hash(self.bytes())
+            || mapping.source_inventory
+                != self
+                    .recovered_history_tables(&mapping.space_id, bounds)?
+                    .catalog_digest
+        {
+            return Err(JournalError::Invariant(
+                "retention live native source inventory binding",
+            ));
+        }
+        self.plan_recovered_metadata(&mapping.space_id, bounds, lease, false, |planner| {
+            let tx = planner.connection.unchecked_transaction()?;
+            crate::recovered_retention::insert_mapping(&tx, mapping, bounds)?;
+            tx.commit()?;
+            let audit = crate::recovered_retention::audit(&planner.connection)?
+                .into_iter()
+                .find(|r| r.mapping.retention_id == mapping.retention_id)
+                .ok_or(JournalError::Invariant("retained live owner absent"))?;
+            Ok(RecoveredMetadataOutcome::Retention(audit))
+        })
+    }
+
+    pub fn plan_recovered_release(
+        &self,
+        lease: sync_extend_platform_fs::FreshNativeRetentionLease,
+        mapping: &crate::RecoveredRetentionMapping,
+        release: &crate::RecoveredRetentionRelease,
+        bounds: NodeInspectionBounds,
+    ) -> Result<RecoveredRetentionPlan> {
+        if release.native_keys != lease.native_keys().map(|key| key.to_string())
+            || release.generation != lease.generation()
+            || release.native_keys[..3] != mapping.native_keys[..3]
+        {
+            return Err(JournalError::Invariant(
+                "retention release live native identity lineage",
+            ));
+        }
+        self.plan_recovered_metadata(&mapping.space_id, bounds, lease, false, |planner| {
+            let tx = planner.connection.unchecked_transaction()?;
+            crate::recovered_retention::insert_release(&tx, mapping, release, bounds)?;
+            tx.commit()?;
+            let audit = crate::recovered_retention::audit(&planner.connection)?
+                .into_iter()
+                .find(|r| r.mapping.retention_id == mapping.retention_id)
+                .ok_or(JournalError::Invariant("released live owner absent"))?;
+            Ok(RecoveredMetadataOutcome::Retention(audit))
+        })
+    }
+
+    /// Admission uses the original Journal GC planner. Its actual CAS observation
+    /// must already be held by the recovered session while this lease executes.
+    pub fn plan_recovered_gc_mark(
+        &self,
+        lease: sync_extend_platform_fs::FreshNativeRetentionLease,
+        mark: &crate::GcMark,
+        bounds: NodeInspectionBounds,
+    ) -> Result<RecoveredRetentionPlan> {
+        self.plan_recovered_metadata(&mark.space_id, bounds, lease, true, |planner| {
+            // The capacity audit requires a real owned snapshot. This private
+            // planning connection has no outside writer; finish the readonly
+            // preflight before the production GC planner opens its own write tx.
+            {
+                let snapshot = planner.connection.unchecked_transaction()?;
+                crate::recovered_retention::no_pending(&snapshot, &mark.space_id, bounds)?;
+                if planner.protected_objects()?.contains(&mark.content_id) {
+                    return Err(JournalError::Invariant(
+                        "recovered GC admission content is pinned",
+                    ));
+                }
+                snapshot.rollback()?;
+            }
+            Ok(RecoveredMetadataOutcome::GcMark(
+                planner.mark_gc_object(mark, bounds.max_entries)?,
+            ))
+        })
     }
 }
 
@@ -1349,7 +1808,9 @@ impl JournalBackupImage {
         for row in &current {
             let key = (row.table().to_owned(), row.primary_key().to_vec());
             if indexed.insert(key, row).is_some() {
-                return Err(JournalError::Invariant("live immutable history current duplicate key"));
+                return Err(JournalError::Invariant(
+                    "live immutable history current duplicate key",
+                ));
             }
         }
         let mut retained = 0usize;
@@ -1366,14 +1827,20 @@ impl JournalBackupImage {
             }
             let key = (row.table().to_owned(), row.primary_key().to_vec());
             if indexed.get(&key).is_none_or(|current| *current != row) {
-                return Err(JournalError::Invariant("live immutable original history row changed"));
+                return Err(JournalError::Invariant(
+                    "live immutable original history row changed",
+                ));
             }
-            retained = retained.checked_add(1)
+            retained = retained
+                .checked_add(1)
                 .filter(|count| *count <= bounds.max_entries)
                 .ok_or(JournalError::Invariant("live immutable history row budget"))?;
-            bytes = bytes.checked_add(row.logical_bytes())
+            bytes = bytes
+                .checked_add(row.logical_bytes())
                 .filter(|bytes| *bytes <= bounds.capacity.max_logical_bytes.min(256 * 1024 * 1024))
-                .ok_or(JournalError::Invariant("live immutable history byte budget"))?;
+                .ok_or(JournalError::Invariant(
+                    "live immutable history byte budget",
+                ))?;
             let encoded = serde_json::to_vec(row)?;
             fingerprint.update(&(encoded.len() as u64).to_le_bytes());
             fingerprint.update(&encoded);
@@ -1382,9 +1849,14 @@ impl JournalBackupImage {
                 "snapshots" => count[1] += 1,
                 "snapshot_objects" => count[2] += 1,
                 "original_operation_provenance" => count[3] += 1,
-                _ if row.table().contains("native") || row.table().contains("attempt")
-                    || row.table().contains("publication") || row.table().contains("restore")
-                    || row.table().contains("pin") => count[4] += 1,
+                _ if row.table().contains("native")
+                    || row.table().contains("attempt")
+                    || row.table().contains("publication")
+                    || row.table().contains("restore")
+                    || row.table().contains("pin") =>
+                {
+                    count[4] += 1
+                }
                 _ => {}
             }
         }

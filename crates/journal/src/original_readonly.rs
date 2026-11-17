@@ -170,6 +170,7 @@ impl Journal {
             let native_issuance = native_publication::issuance::register(&connection)?;
             Ok(Self {
                 connection,
+                original_local_history_issuer: std::sync::Arc::new(()),
                 #[cfg(windows)]
                 original_restored_image: None,
                 original_cas_coordination: None,
