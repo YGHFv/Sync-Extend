@@ -146,7 +146,7 @@ use std::{
 use sync_extend_cas::{is_reparse, sync_directory, Cas};
 use sync_extend_core_model::limits::LocalLimits;
 use sync_extend_core_model::*;
-use sync_extend_journal::Journal;
+use sync_extend_journal::{Journal, ReadOnlyJournal};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReconcileError {
@@ -254,6 +254,42 @@ pub struct LocalSpace {
     _worktree_lock: sync_extend_platform_fs::WriterOwner,
     #[cfg(not(windows))]
     _worktree_lock: File,
+}
+
+/// Existing local database reader. It holds the data writer lock so a live
+/// writer cannot race inspection, but opens SQLite with read-only flags.
+pub struct ReadOnlyLocalSpace {
+    pub space_id: SpaceId,
+    journal: ReadOnlyJournal,
+    #[cfg(windows)]
+    _lock: sync_extend_platform_fs::WriterOwner,
+    #[cfg(not(windows))]
+    _lock: File,
+}
+
+impl ReadOnlyLocalSpace {
+    pub fn open(data_dir: &Path) -> Result<Self> {
+        let data_dir = fs::canonicalize(data_dir)?;
+        let lock = acquire_lock(&data_dir)?;
+        let journal = ReadOnlyJournal::open(&data_dir.join("journal.sqlite"))?;
+        let space_id = journal
+            .state("space_id")?
+            .ok_or(ReconcileError::Invariant("incomplete initialization"))?
+            .parse()?;
+        Ok(Self {
+            space_id,
+            journal,
+            _lock: lock,
+        })
+    }
+
+    pub fn manifest(&self) -> Result<Option<Manifest>> {
+        Ok(self.journal.current(&self.space_id)?)
+    }
+
+    pub fn operations(&self) -> Result<Vec<Operation>> {
+        Ok(self.journal.operations(&self.space_id)?)
+    }
 }
 
 #[derive(Serialize)]
@@ -1751,6 +1787,26 @@ impl VerifiedNodeStateArchive {
         &self,
         bounds: sync_extend_journal::NodeInspectionBounds,
     ) -> Result<RecoveredArchiveInspection> {
+        if self.inspected_bounds == bounds {
+            let recovered =
+                sync_extend_journal::JournalBackupImage::
+                    recovered_archive_table_summaries_from_audited_rows(
+                        &self.journal_digest,
+                        &self.audited_rows,
+                        self.space(),
+                        bounds,
+                    )?;
+            return Ok(RecoveredArchiveInspection {
+                archive_digest: self.digest().clone(),
+                space_id: self.space().clone(),
+                device_id: self.device().clone(),
+                original_worktree: self.original_worktree().to_owned(),
+                original_config_data: self.original_config_data().map(Path::to_owned),
+                history_tables: recovered.history_tables,
+                main_tables: recovered.main_tables,
+                attempt_diagnostics: recovered.attempt_diagnostics,
+            });
+        }
         let bytes = self.journal_bytes()?;
         let image = sync_extend_journal::JournalBackupImage::from_current_node_image(
             bytes.to_vec(),

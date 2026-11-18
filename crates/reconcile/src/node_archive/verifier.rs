@@ -15,6 +15,9 @@ pub struct VerifiedNodeStateArchive {
     schema: u32,
     original_worktree: std::path::PathBuf,
     original_config_data: Option<std::path::PathBuf>,
+    pub(crate) inspected_bounds: NodeInspectionBounds,
+    pub(crate) journal_digest: ContentId,
+    pub(crate) audited_rows: Vec<sync_extend_journal::JournalStoredRow>,
 }
 
 impl VerifiedNodeStateArchive {
@@ -81,25 +84,19 @@ impl FramedNodeArchive {
         }
         let mut original_worktree = None;
         let mut original_config_data = None;
+        let mut audited_image_rows = None;
         let mut protected = std::collections::BTreeSet::new();
         let mut files = FileClosure::new(
             inspection.capacity.inventory.max_rows,
             max_content_hash_bytes,
         )?;
-        let references = JournalBackupImage::inspect_current_node_reference_reservations(
+        let (actual_schema, ()) = JournalBackupImage::inspect_current_node_image_with_audit_rows(
             bytes,
             digest.as_str(),
             journal_limit,
             self.space_id(),
             inspection,
-        )?;
-        let (actual_schema, ()) = JournalBackupImage::inspect_current_node_image(
-            bytes,
-            digest.as_str(),
-            journal_limit,
-            self.space_id(),
-            inspection,
-            |database| -> sync_extend_journal::Result<()> {
+            |database, audited_rows, references| -> sync_extend_journal::Result<()> {
                 let state = database
                     .prepare("SELECT key,value FROM local_state ORDER BY key")?
                     .query_map([], |row| {
@@ -300,7 +297,7 @@ impl FramedNodeArchive {
                 }
                 // Reference state is derived by the original Journal from
                 // exact intent/hash/pins and audited terminal adapters.
-                for owner in &references {
+                for owner in references {
                     if owner.state == "reserved" {
                         for file in &owner.intent.scope.files {
                             files.add(file)?;
@@ -321,6 +318,7 @@ impl FramedNodeArchive {
                     protected.insert(id);
                 }
                 files.verify(&self, &protected)?;
+                audited_image_rows = Some(audited_rows.to_vec());
                 Ok(())
             },
         )?;
@@ -404,6 +402,11 @@ impl FramedNodeArchive {
                 "node verified original worktree absent",
             ))?,
             original_config_data,
+            inspected_bounds: inspection,
+            journal_digest: digest,
+            audited_rows: audited_image_rows.ok_or(ReconcileError::Invariant(
+                "node recovered archive summary absent",
+            ))?,
             archive: self,
         })
     }

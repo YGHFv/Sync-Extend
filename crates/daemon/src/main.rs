@@ -4,7 +4,7 @@ use sync_extend_core_model::{
     config::{Config, HistoryPolicy},
     PortablePath,
 };
-use sync_extend_reconcile::LocalSpace;
+use sync_extend_reconcile::{LocalSpace, ReadOnlyLocalSpace};
 mod config_file;
 mod deployment;
 mod easytier;
@@ -2864,10 +2864,10 @@ async fn execute(
         }
         Command::RecoverCleanups { data_dir } => print(&open(&data_dir)?.recover_cleanups()?)?,
         Command::Manifest { data_dir } => {
-            print(&open(&data_dir)?.manifest()?)?;
+            print(&ReadOnlyLocalSpace::open(&data_dir)?.manifest()?)?;
         }
         Command::Ops { data_dir } => {
-            print(&open(&data_dir)?.operations()?)?;
+            print(&ReadOnlyLocalSpace::open(&data_dir)?.operations()?)?;
         }
         Command::Verify { data_dir } => {
             let files = open(&data_dir)?.verify()?;

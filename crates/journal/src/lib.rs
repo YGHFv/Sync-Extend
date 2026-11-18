@@ -22,6 +22,96 @@ pub enum JournalError {
 
 pub type Result<T> = std::result::Result<T, JournalError>;
 
+/// Refuse every path that would make an ordinary SQLite open cross a filesystem
+/// alias. Linux metadata-owned databases additionally require their held-VFS
+/// opener so SQLite cannot create unleased sidecars.
+fn guard_journal_open_path(path: &Path) -> Result<()> {
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                #[cfg(windows)]
+                let reparse = {
+                    use std::os::windows::fs::MetadataExt;
+                    metadata.file_attributes() & 0x400 != 0
+                };
+                #[cfg(not(windows))]
+                let reparse = false;
+                if metadata.file_type().is_symlink() || reparse {
+                    return Err(JournalError::Invariant("unsafe database path"));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // A persistent metadata-owner sidecar means this database belongs to
+        // the physically reserved Linux metadata set. Opening it through
+        // ordinary SQLite would bypass the held-descriptor VFS (and could
+        // create WAL/SHM files outside the five leased originals), so the
+        // caller must use `open_with_linux_metadata_budget` instead.
+        let component = path
+            .file_name()
+            .ok_or(JournalError::Invariant("database component required"))?;
+        let mut owner_component = component.to_os_string();
+        owner_component.push(".metadata-owner");
+        let owner_path = path.with_file_name(owner_component);
+        match std::fs::symlink_metadata(&owner_path) {
+            Ok(_) => {
+                return Err(JournalError::Invariant(
+                    "Linux metadata-owned database requires held VFS",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn immutable_readonly_uri(path: &Path) -> Result<String> {
+    use std::fmt::Write as _;
+
+    let raw = path
+        .to_str()
+        .ok_or(JournalError::Invariant("SQLite readonly path encoding"))?;
+    let value = raw.strip_prefix("\\\\?\\").unwrap_or(raw);
+    let bytes = value.as_bytes();
+    if !path.is_absolute()
+        || !(3..=4096).contains(&bytes.len())
+        || value.starts_with("\\\\")
+        || value.starts_with("//")
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+        || path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(JournalError::Invariant(
+            "normalized local drive SQLite readonly path required",
+        ));
+    }
+    let mut output = String::from("file:/");
+    for byte in value.replace('\\', "/").bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~')
+        {
+            output.push(byte as char);
+        } else {
+            write!(output, "%{byte:02X}")
+                .map_err(|_| JournalError::Invariant("SQLite readonly URI encoding"))?;
+        }
+    }
+    output.push_str("?mode=ro&immutable=1");
+    Ok(output)
+}
+
 mod causal_log;
 mod conflict_resolution;
 #[cfg(windows)]
@@ -167,6 +257,206 @@ pub struct Journal {
     remote_replace_issuance: remote_replace::issuance::Gate,
 }
 
+/// Existing database reader with no CREATE, migration, WAL-mode change or
+/// writer SQL. The connection is opened by SQLite with read-only flags.
+/// Windows supports closed main databases and empty WALs only. Its no-lock
+/// VFS is protected by retained Win32 handles that deny write/delete opens;
+/// ReadOnlyLocalSpace also retains the original data WriterOwner.
+pub struct ReadOnlyJournal {
+    connection: Connection,
+    #[cfg(windows)]
+    readonly_files: Vec<(std::path::PathBuf, sync_extend_platform_fs::GuardedReadFile)>,
+    #[cfg(windows)]
+    absent_sidecars: Vec<std::path::PathBuf>,
+}
+
+impl ReadOnlyJournal {
+    pub fn open(path: &Path) -> Result<Self> {
+        guard_journal_open_path(path)?;
+        if !path.is_file() {
+            return Err(JournalError::Invariant("space is not initialized"));
+        }
+        #[cfg(windows)]
+        let (readonly_files, absent_sidecars, wal_present) =
+            Self::hold_closed_readonly_files(path)?;
+        #[cfg(windows)]
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        #[cfg(not(windows))]
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        #[cfg(windows)]
+        let connection = if wal_present {
+            Connection::open_with_flags_and_vfs(path, flags, "win32-none")?
+        } else {
+            let uri = immutable_readonly_uri(path)?;
+            Connection::open_with_flags_and_vfs(&uri, flags, "win32-none")?
+        };
+        #[cfg(not(windows))]
+        let connection = Connection::open_with_flags(
+            path,
+            flags,
+        )?;
+        #[cfg(windows)]
+        if wal_present {
+            // EXCLUSIVE plus win32-none uses an in-memory WAL index. Actual
+            // sharing exclusion comes from the retained native read handles,
+            // so SQLite never creates/maps/writes a named SHM sidecar.
+            connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+        }
+        connection.set_prepared_statement_cache_capacity(256);
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.pragma_update(None, "query_only", true)?;
+        connection.pragma_update(None, "temp_store", "MEMORY")?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Err(JournalError::Invariant(
+                "readonly Journal current schema required",
+            ));
+        }
+        let journal = Self {
+            connection,
+            #[cfg(windows)]
+            readonly_files,
+            #[cfg(windows)]
+            absent_sidecars,
+        };
+        journal.verify_readonly_files()?;
+        Ok(journal)
+    }
+
+    pub fn state(&self, key: &str) -> Result<Option<String>> {
+        self.verify_readonly_files()?;
+        let result = self.read_view().state(key)?;
+        self.verify_readonly_files()?;
+        Ok(result)
+    }
+
+    pub fn current(&self, space: &SpaceId) -> Result<Option<Manifest>> {
+        self.verify_readonly_files()?;
+        let result = self.read_view().current(space)?;
+        self.verify_readonly_files()?;
+        Ok(result)
+    }
+
+    pub fn operations(&self, space: &SpaceId) -> Result<Vec<Operation>> {
+        self.verify_readonly_files()?;
+        let result = self.read_view().operations(space)?;
+        self.verify_readonly_files()?;
+        Ok(result)
+    }
+
+    pub fn integrity_check(&self) -> Result<()> {
+        self.verify_readonly_files()?;
+        let result: String =
+            self.connection
+                .pragma_query_value(None, "integrity_check", |row| row.get(0))?;
+        if result != "ok" {
+            return Err(JournalError::Invariant("SQLite integrity check failed"));
+        }
+        let mut foreign_keys = self.connection.prepare("PRAGMA foreign_key_check")?;
+        if foreign_keys.query([])?.next()?.is_some() {
+            return Err(JournalError::Invariant("SQLite foreign key check failed"));
+        }
+        self.verify_readonly_files()
+    }
+
+    fn read_view(&self) -> JournalReadView<'_> {
+        JournalReadView {
+            connection: &self.connection,
+        }
+    }
+
+    #[cfg(windows)]
+    fn hold_closed_readonly_files(
+        path: &Path,
+    ) -> Result<(
+        Vec<(std::path::PathBuf, sync_extend_platform_fs::GuardedReadFile)>,
+        Vec<std::path::PathBuf>,
+        bool,
+    )> {
+        use std::io::Read;
+        use std::os::windows::fs::MetadataExt;
+        let main = sync_extend_platform_fs::GuardedReadFile::open(path)?;
+        let mut files = vec![(path.to_owned(), main)];
+        let mut absent = Vec::new();
+        let mut wal_present = false;
+        for suffix in ["-wal", "-journal", "-shm"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            let sidecar = std::path::PathBuf::from(name);
+            match std::fs::symlink_metadata(&sidecar) {
+                Ok(metadata) => {
+                    if !metadata.is_file()
+                        || metadata.file_type().is_symlink()
+                        || metadata.file_attributes() & 0x400 != 0
+                    {
+                        return Err(JournalError::Invariant(
+                            "readonly Journal sidecar must be original regular file",
+                        ));
+                    }
+                    let held = sync_extend_platform_fs::GuardedReadFile::open(&sidecar)?;
+                    let length = held.reader().metadata()?.len();
+                    if suffix == "-wal" {
+                        wal_present = true;
+                        if length != 0 {
+                            return Err(JournalError::Invariant(
+                                "readonly Journal nonempty WAL requires recovery",
+                            ));
+                        }
+                    }
+                    if suffix == "-journal" && length != 0 {
+                        let mut header = [0u8; 8];
+                        let mut reader = held.reader();
+                        if length < header.len() as u64
+                            || reader.read_exact(&mut header).is_err()
+                            || header != [0; 8]
+                        {
+                            return Err(JournalError::Invariant(
+                                "readonly Journal hot rollback requires recovery",
+                            ));
+                        }
+                    }
+                    files.push((sidecar, held));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    absent.push(sidecar);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok((files, absent, wal_present))
+    }
+
+    fn verify_readonly_files(&self) -> Result<()> {
+        #[cfg(windows)]
+        {
+            for (path, held) in &self.readonly_files {
+                held.verify_single_link()?;
+                if !sync_extend_platform_fs::regular_file_matches_path(held.reader(), path)? {
+                    return Err(JournalError::Invariant(
+                        "readonly Journal held file slot differs",
+                    ));
+                }
+            }
+            for path in &self.absent_sidecars {
+                match std::fs::symlink_metadata(path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                    Ok(_) => {
+                        return Err(JournalError::Invariant(
+                            "readonly Journal absent sidecar appeared during read",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Journal {
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_storage_limit(path, limits::MAX_ENTRIES)
@@ -255,47 +545,7 @@ impl Journal {
         inspect: impl FnOnce(&Connection) -> Result<()>,
     ) -> Result<Self> {
         storage_policy::validate(max_storage_entries)?;
-        for ancestor in path.ancestors() {
-            match std::fs::symlink_metadata(ancestor) {
-                Ok(metadata) => {
-                    #[cfg(windows)]
-                    let reparse = {
-                        use std::os::windows::fs::MetadataExt;
-                        metadata.file_attributes() & 0x400 != 0
-                    };
-                    #[cfg(not(windows))]
-                    let reparse = false;
-                    if metadata.file_type().is_symlink() || reparse {
-                        return Err(JournalError::Invariant("unsafe database path"));
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        #[cfg(target_os = "linux")]
-        {
-            // A persistent metadata-owner sidecar means this database belongs to
-            // the physically reserved Linux metadata set.  Opening it through
-            // ordinary SQLite would bypass the held-descriptor VFS (and could
-            // create WAL/SHM files outside the five leased originals), so the
-            // caller must use `open_with_linux_metadata_budget` instead.
-            let component = path
-                .file_name()
-                .ok_or(JournalError::Invariant("database component required"))?;
-            let mut owner_component = component.to_os_string();
-            owner_component.push(".metadata-owner");
-            let owner_path = path.with_file_name(owner_component);
-            match std::fs::symlink_metadata(&owner_path) {
-                Ok(_) => {
-                    return Err(JournalError::Invariant(
-                        "Linux metadata-owned database requires held VFS",
-                    ));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
+        guard_journal_open_path(path)?;
         let mut flags =
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
         if allow_create {
@@ -980,17 +1230,7 @@ impl Journal {
     }
 
     pub fn operations(&self, space: &SpaceId) -> Result<Vec<Operation>> {
-        let mut statement = self.connection.prepare(
-            "SELECT payload FROM operations WHERE space_id=?1 ORDER BY origin_device_id, origin_seq",
-        )?;
-        let rows = statement.query_map([space.as_str()], |row| row.get::<_, String>(0))?;
-        let mut operations = Vec::new();
-        for row in rows {
-            let op: Operation = serde_json::from_str(&row?)?;
-            op.validate()?;
-            operations.push(op);
-        }
-        Ok(operations)
+        self.read_view().operations(space)
     }
 
     pub fn snapshots(&self, space: &SpaceId) -> Result<Vec<(SnapshotId, String)>> {
@@ -2594,6 +2834,20 @@ impl crate::JournalReadView<'_> {
         .transpose()
     }
 
+    pub(crate) fn operations(&self, space: &SpaceId) -> Result<Vec<Operation>> {
+        let mut statement = self.connection.prepare(
+            "SELECT payload FROM operations WHERE space_id=?1 ORDER BY origin_device_id, origin_seq",
+        )?;
+        let rows = statement.query_map([space.as_str()], |row| row.get::<_, String>(0))?;
+        let mut operations = Vec::new();
+        for row in rows {
+            let op: Operation = serde_json::from_str(&row?)?;
+            op.validate()?;
+            operations.push(op);
+        }
+        Ok(operations)
+    }
+
     pub(crate) fn snapshot(&self, space: &SpaceId, root: &SnapshotId) -> Result<Manifest> {
         self.require_snapshot_retained(space, root)?;
         let json: String = self.connection.query_row(
@@ -2822,7 +3076,8 @@ mod recovered_history_tables;
 pub use backup_image::CreatedJournalRestore;
 pub use backup_image::{JournalBackupImage, NodeInspectionBounds, PortableNodeImageScope};
 pub use recovered_history_tables::{
-    RecoveredHistoryTable, RecoveredHistoryTables, RecoveredMainTable, RecoveredMainTables,
+    RecoveredArchiveTableSummaries, RecoveredHistoryTable, RecoveredHistoryTables,
+    RecoveredMainTable, RecoveredMainTables,
 };
 
 #[cfg(windows)]

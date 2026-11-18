@@ -1,12 +1,12 @@
 //! Read-only image audits borrow the original Journal view, never writer gates.
-use crate::{JournalCapacityLimits, JournalError, JournalReadView, Result};
+use crate::{JournalCapacityLimits, JournalError, JournalReadView, JournalStoredRow, Result};
 use rusqlite::{limits::Limit, Connection, Transaction, TransactionBehavior, MAIN_DB};
 use std::time::{Duration, Instant};
 use sync_extend_core_model::SpaceId;
 
 /// SQL work limits complement the existing bounded physical row/byte preflight.
 /// They do not certify peak process memory or native recovery.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NodeInspectionBounds {
     pub max_entries: usize,
     pub capacity: JournalCapacityLimits,
@@ -74,6 +74,30 @@ impl super::JournalBackupImage {
         bounds: NodeInspectionBounds,
         inspect: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<(u32, T)> {
+        Self::inspect_current_node_image_with_audit_rows(
+            bytes,
+            expected_digest,
+            max_image_bytes,
+            space,
+            bounds,
+            |connection, _, _| inspect(connection),
+        )
+    }
+
+    /// One complete audit supplies both the bounded stored rows and the
+    /// original reference states to the caller. No second audit is implied.
+    pub fn inspect_current_node_image_with_audit_rows<T>(
+        bytes: &[u8],
+        expected_digest: &str,
+        max_image_bytes: usize,
+        space: &SpaceId,
+        bounds: NodeInspectionBounds,
+        inspect: impl FnOnce(
+            &Connection,
+            &[JournalStoredRow],
+            &[crate::ReferenceReservation],
+        ) -> Result<T>,
+    ) -> Result<(u32, T)> {
         bounds.validate()?;
         super::limit(max_image_bytes)?;
         if bytes.len() < super::MIN_IMAGE_BYTES || bytes.len() > max_image_bytes {
@@ -107,8 +131,10 @@ impl super::JournalBackupImage {
             connection: &database,
         };
         // Original audits remain mandatory even if an archive-specific callback is empty.
-        let _report = view.audit_storage_capacity(space, bounds.max_entries, bounds.capacity)?;
-        let result = inspect(&database)?;
+        let snapshot =
+            view.audit_original_provenance_capacity(space, bounds.max_entries, bounds.capacity)?;
+        let references = view.reference_reservations(space, bounds.max_entries)?;
+        let result = inspect(&database, &snapshot.rows, &references)?;
         transaction.rollback()?;
         Ok((version, result))
     }

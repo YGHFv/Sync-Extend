@@ -1,5 +1,5 @@
 //! Bounded original main-table descriptions; no persisted row becomes an issuer.
-use crate::{JournalBackupImage, JournalError, NodeInspectionBounds, Result};
+use crate::{JournalBackupImage, JournalError, JournalStoredRow, NodeInspectionBounds, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use sync_extend_core_model::{ContentId, SpaceId};
@@ -26,6 +26,34 @@ pub struct RecoveredHistoryTables {
 }
 
 impl JournalBackupImage {
+    /// Summarize rows returned by the complete audit of this exact image.
+    /// This performs no additional SQLite deserialization or original audit.
+    pub fn recovered_history_tables_from_audited_rows(
+        image_digest: &ContentId,
+        rows: &[JournalStoredRow],
+        bounds: NodeInspectionBounds,
+    ) -> Result<RecoveredHistoryTables> {
+        let (tables, retained_rows, retained_logical_bytes) =
+            summarize_original_tables(rows, bounds, true)?;
+        let encoded = serde_json::to_vec(&tables)?;
+        if encoded.len() as u64 > bounds.capacity.max_logical_bytes {
+            return Err(JournalError::Invariant(
+                "recovered history original summary byte bound",
+            ));
+        }
+        Ok(RecoveredHistoryTables {
+            image_digest: image_digest.clone(),
+            tables,
+            retained_rows,
+            retained_logical_bytes,
+            catalog_digest: ContentId::hash(&encoded),
+            native_authority: false,
+            cleanup_authority: false,
+            gc_release_authority: false,
+            pending_resume_authority: false,
+        })
+    }
+
     /// Uses every named table in the original audited catalog. Current/cursor
     /// cells and local_state are kept in the whole-image audit but excluded
     /// from retained history summaries because explicit new sessions evolve them.
@@ -42,25 +70,11 @@ impl JournalBackupImage {
                 bounds.max_entries,
                 bounds.capacity,
             )?;
-            let (tables, retained_rows, retained_logical_bytes) =
-                summarize_original_tables(&audit.rows, bounds, true)?;
-            let encoded = serde_json::to_vec(&tables)?;
-            if encoded.len() as u64 > bounds.capacity.max_logical_bytes {
-                return Err(JournalError::Invariant(
-                    "recovered history original summary byte bound",
-                ));
-            }
-            Ok(RecoveredHistoryTables {
-                image_digest: ContentId::hash(self.bytes()),
-                tables,
-                retained_rows,
-                retained_logical_bytes,
-                catalog_digest: ContentId::hash(&encoded),
-                native_authority: false,
-                cleanup_authority: false,
-                gc_release_authority: false,
-                pending_resume_authority: false,
-            })
+            Self::recovered_history_tables_from_audited_rows(
+                &ContentId::hash(self.bytes()),
+                &audit.rows,
+                bounds,
+            )
         })
     }
 }
@@ -89,6 +103,43 @@ pub struct RecoveredMainTables {
 }
 
 impl JournalBackupImage {
+    /// Summarize rows returned by the complete audit of this exact image.
+    /// This performs no additional SQLite deserialization or original audit.
+    pub fn recovered_main_tables_from_audited_rows(
+        image_digest: &ContentId,
+        rows: &[JournalStoredRow],
+        bounds: NodeInspectionBounds,
+    ) -> Result<RecoveredMainTables> {
+        let (history_tables, stored_rows, stored_logical_bytes) =
+            summarize_original_tables(rows, bounds, false)?;
+        let tables: Vec<_> = history_tables
+            .into_iter()
+            .map(|table| RecoveredMainTable {
+                table: table.table,
+                stored_rows: table.retained_rows,
+                stored_logical_bytes: table.retained_logical_bytes,
+                original_rows_digest: table.original_rows_digest,
+            })
+            .collect();
+        let encoded = serde_json::to_vec(&tables)?;
+        if encoded.len() as u64 > bounds.capacity.max_logical_bytes {
+            return Err(JournalError::Invariant(
+                "recovered main original summary byte bound",
+            ));
+        }
+        Ok(RecoveredMainTables {
+            image_digest: image_digest.clone(),
+            tables,
+            stored_rows,
+            stored_logical_bytes,
+            catalog_digest: ContentId::hash(&encoded),
+            native_authority: false,
+            cleanup_authority: false,
+            gc_release_authority: false,
+            pending_resume_authority: false,
+        })
+    }
+
     /// The complete original catalog shares the retained query's exact row
     /// summarizer. Whole-image provenance and capacity checks run first.
     /// No column values or secrets are returned, and rows confer no issuer.
@@ -103,34 +154,40 @@ impl JournalBackupImage {
                 bounds.max_entries,
                 bounds.capacity,
             )?;
-            let (history_tables, stored_rows, stored_logical_bytes) =
-                summarize_original_tables(&audit.rows, bounds, false)?;
-            let tables: Vec<_> = history_tables
-                .into_iter()
-                .map(|table| RecoveredMainTable {
-                    table: table.table,
-                    stored_rows: table.retained_rows,
-                    stored_logical_bytes: table.retained_logical_bytes,
-                    original_rows_digest: table.original_rows_digest,
-                })
-                .collect();
-            let encoded = serde_json::to_vec(&tables)?;
-            if encoded.len() as u64 > bounds.capacity.max_logical_bytes {
-                return Err(JournalError::Invariant(
-                    "recovered main original summary byte bound",
-                ));
-            }
-            Ok(RecoveredMainTables {
-                image_digest: ContentId::hash(self.bytes()),
-                tables,
-                stored_rows,
-                stored_logical_bytes,
-                catalog_digest: ContentId::hash(&encoded),
-                native_authority: false,
-                cleanup_authority: false,
-                gc_release_authority: false,
-                pending_resume_authority: false,
-            })
+            Self::recovered_main_tables_from_audited_rows(
+                &ContentId::hash(self.bytes()),
+                &audit.rows,
+                bounds,
+            )
+        })
+    }
+}
+
+pub struct RecoveredArchiveTableSummaries {
+    pub history_tables: RecoveredHistoryTables,
+    pub main_tables: RecoveredMainTables,
+    pub attempt_diagnostics: Vec<crate::OriginalLocalHistoryAttemptDiagnostic>,
+}
+
+impl JournalBackupImage {
+    /// Derive every inspect-only recovered table summary from one complete
+    /// audit's rows. No persisted row or returned value confers authority.
+    pub fn recovered_archive_table_summaries_from_audited_rows(
+        image_digest: &ContentId,
+        rows: &[JournalStoredRow],
+        space: &SpaceId,
+        bounds: NodeInspectionBounds,
+    ) -> Result<RecoveredArchiveTableSummaries> {
+        Ok(RecoveredArchiveTableSummaries {
+            history_tables: Self::recovered_history_tables_from_audited_rows(
+                image_digest,
+                rows,
+                bounds,
+            )?,
+            main_tables: Self::recovered_main_tables_from_audited_rows(image_digest, rows, bounds)?,
+            attempt_diagnostics: Self::recovered_original_attempt_diagnostics_from_audited_rows(
+                rows, space, bounds,
+            )?,
         })
     }
 }
