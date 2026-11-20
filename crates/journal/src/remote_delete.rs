@@ -288,6 +288,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
             ))?;
         }
         expected.execute_batch(include_str!("migration-040.sql"))?;
+        expected.execute_batch(include_str!("migration-067.sql"))?;
         let definitions = objects(&expected)?;
         let _ = EXPECTED.set(definitions);
     }
@@ -559,11 +560,12 @@ pub(crate) fn obligations(
             })
             .ok_or(invalid("remote Delete retained baseline missing"))?;
         if field(baseline, "manifest")? != serde_json::to_string(&header.baseline)?
-            || rows.iter().any(|r| {
-                r.table() == "snapshot_prunings"
-                    && (r.primary_key() == [header.baseline.root().unwrap().as_str()]
-                        || r.primary_key() == [header.target_root.as_str()])
-            })
+            || (!cleaned
+                && rows.iter().any(|r| {
+                    r.table() == "snapshot_prunings"
+                        && (r.primary_key() == [header.baseline.root().unwrap().as_str()]
+                            || r.primary_key() == [header.target_root.as_str()])
+                }))
         {
             return Err(invalid(
                 "remote Delete historical snapshot changed or pruned",

@@ -811,6 +811,10 @@ impl Journal {
         receipt(&expected, &after)?;
         observation.verify_content()?;
         tx.commit()?;
+        // Start the local deletion-retention window at the effective Final.
+        // Cleanup may be delayed by native filesystem state and is not the
+        // point at which the signed Delete first became current.
+        self.observe_after_current(&header.target.space_id, &header.target_root)?;
         Ok(header.target_root.clone())
     }
 }
