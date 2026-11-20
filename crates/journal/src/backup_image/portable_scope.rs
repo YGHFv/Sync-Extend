@@ -52,6 +52,23 @@ fn other_owner_tables(
     // In particular, restoration never observes a new deletion time or resets
     // the clock watermark, and this exemption grants no native/GC authority.
     crate::deletion_retention::audit(database, space, max_entries)?;
+    // A mark's original physical observation is inert only after its immutable
+    // cancellation or invalidation. Reuse the complete typed mark/clock audit;
+    // never infer a terminal state from a table name or a descriptive phase.
+    // Every authorization, execution and native disposition family remains
+    // unsupported even when its parent mark is terminal.
+    let terminal_gc_history = crate::JournalReadView {
+        connection: database,
+        dav_read_charge_cache: None,
+    }
+    .gc_marks(space)?
+    .iter()
+    .all(|mark| {
+        matches!(
+            mark.state,
+            crate::GcState::Cancelled | crate::GcState::Invalidated
+        )
+    });
     let mut tables = database.prepare(
         "SELECT name FROM main.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     )?;
@@ -82,6 +99,11 @@ fn other_owner_tables(
             || crate::deletion_retention::schema::TABLES
                 .iter()
                 .any(|table| table.name == name)
+            || (terminal_gc_history
+                && matches!(
+                    name.as_str(),
+                    "gc_marks" | "gc_cancellations" | "gc_invalidations"
+                ))
         {
             continue;
         }
