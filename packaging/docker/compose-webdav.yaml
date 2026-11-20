@@ -1,0 +1,7 @@
+# Overlay on compose.yaml for container-local DAV access via docker compose exec.
+services:
+  sync:
+    profiles: [webdav]
+    network_mode: none
+    environment:
+      SYNCEXTEND_DEPLOYMENT_PROFILE: webdav

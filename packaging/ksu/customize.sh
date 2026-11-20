@@ -19,5 +19,6 @@ set_perm "$MODPATH/service.sh" 0 0 0755
 set_perm "$MODPATH/action.sh" 0 0 0755
 ui_print 'Installed disabled. Edit /data/adb/sync-extend/config before reboot.'
 ui_print 'Local mode is default. File-server mode requires prior explicit pairing.'
+ui_print 'Use action.sh status, stop or wait-stopped to control the running daemon.'
 ui_print 'This alpha does not provide automatic multiway synchronization.'
 ui_print 'Uninstall preserves the worktree, history, config and device identity.'

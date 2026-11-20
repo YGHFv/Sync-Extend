@@ -1,0 +1,7 @@
+{
+  "format_version": 1,
+  "address": "127.0.0.1:17843",
+  "token_file": "/state/management.token",
+  "request_timeout_secs": 2,
+  "max_connections": 1000000
+}

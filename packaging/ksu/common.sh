@@ -3,6 +3,7 @@
 STATE=/data/adb/sync-extend
 DATA=$STATE/data
 CONFIG=$STATE/config
+CONTROL=$STATE/control
 
 fail() {
     printf 'SyncExtend: %s\n' "$*" >&2
@@ -15,6 +16,22 @@ private_state() {
     umask 077
     mkdir -p "$DATA" || return 1
     chmod 700 "$STATE" "$DATA" || return 1
+}
+
+private_control() {
+    [ ! -L "$CONTROL" ] || { fail 'symlink in private control directory'; return 1; }
+    mkdir -p "$CONTROL" && chmod 700 "$CONTROL"
+}
+
+module_enabled() {
+    [ ! -e "$MODDIR/disable" ] && [ ! -L "$MODDIR/disable" ] &&
+        [ ! -e "$MODDIR/remove" ] && [ ! -L "$MODDIR/remove" ]
+}
+
+control() {
+    [ -x "$MODDIR/bin/syncd" ] && [ ! -L "$MODDIR/bin/syncd" ] ||
+        { fail 'module daemon is unavailable'; return 1; }
+    "$MODDIR/bin/syncd" local-control --directory "$CONTROL" "$1"
 }
 
 load_config() {
