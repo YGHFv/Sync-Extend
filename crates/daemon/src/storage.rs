@@ -444,6 +444,7 @@ pub async fn pull(
         if transferred > config.max_request_bytes {
             return Err("storage pull request quota".into());
         }
+        node.admit_forwarded_chunk(&received, chunk)?;
         connection
             .send_json(&Request::Chunk {
                 storage_id: id.clone(),
@@ -460,7 +461,6 @@ pub async fn pull(
         if storage_id != id || actual != *chunk {
             return Err("storage response chunk identity".into());
         }
-        node.admit_forwarded_chunk(&received, chunk)?;
         let bytes = connection
             .receive_block(&chunk.content_id, chunk.length)
             .await?;
