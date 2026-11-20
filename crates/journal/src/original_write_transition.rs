@@ -107,12 +107,15 @@ impl Journal {
                 bounds.capacity,
             )?;
             image.with_audited_readonly(space, bounds, |connection| {
-                let expected = crate::JournalReadView { connection }
-                    .audit_original_provenance_capacity(
-                        space,
-                        bounds.max_entries,
-                        bounds.capacity,
-                    )?;
+                let expected = crate::JournalReadView {
+                    connection,
+                    dav_read_charge_cache: None,
+                }
+                .audit_original_provenance_capacity(
+                    space,
+                    bounds.max_entries,
+                    bounds.capacity,
+                )?;
                 if actual.rows != expected.rows {
                     return Err(JournalError::Invariant(
                         "original writable handoff full typed Journal rows differ",
@@ -1797,9 +1800,12 @@ impl JournalBackupImage {
                 // owned by with_audited_readonly. Its limits cover the complete
                 // provenance audit; opening another transaction here would
                 // issue a second BEGIN on the same connection.
-                crate::JournalReadView { connection }
-                    .audit_original_provenance_capacity(space, bounds.max_entries, bounds.capacity)
-                    .map(|audit| audit.rows)
+                crate::JournalReadView {
+                    connection,
+                    dav_read_charge_cache: None,
+                }
+                .audit_original_provenance_capacity(space, bounds.max_entries, bounds.capacity)
+                .map(|audit| audit.rows)
             })
         }
         let old = audited_image_rows(baseline, space, bounds)?;

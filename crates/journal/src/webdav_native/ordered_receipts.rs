@@ -1,5 +1,5 @@
 //! Original-plan D03 lineage audit. Descriptions cannot issue native effects.
-use super::receipt_protocol::{ReceiptDescription, ReceiptEvidence, ReceiptStage};
+use super::receipt_protocol::{ReceiptDescription, ReceiptEvidence, ReceiptStage, VerifiedPrefix};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::{
     tree_restore_identity::TreeNativeIdentity,
@@ -32,15 +32,12 @@ fn object(record: &ReceiptDescription) -> Result<&ActionObject> {
     }
 }
 
-fn completed(
-    prior: &[ReceiptDescription],
+fn completed<'a>(
+    prior: &VerifiedPrefix<'a>,
     action: usize,
     stage: ReceiptStage,
-) -> Result<&ActionObject> {
-    let record = prior
-        .iter()
-        .find(|record| record.stage == stage)
-        .ok_or_else(invalid)?;
+) -> Result<&'a ActionObject> {
+    let record = prior.first(stage).ok_or_else(invalid)?;
     let value = object(record)?;
     if value.action != action || value.original.is_none() {
         return Err(invalid());
@@ -77,11 +74,8 @@ fn complete_stage(plan: &WebDavNativePlan, action: usize) -> Result<ReceiptStage
     }
 }
 
-fn destination_parent(
-    plan: &WebDavNativePlan,
-    action: usize,
-    prior: &[ReceiptDescription],
-) -> Result<TreeNativeIdentity> {
+fn destination_parent(action: usize, prior: &VerifiedPrefix<'_>) -> Result<TreeNativeIdentity> {
+    let plan = prior.plan();
     match plan
         .steps()
         .get(action)
@@ -111,20 +105,18 @@ fn destination_parent(
 
 /// Validate bytes and causal lineage against the first immutable original plan.
 /// Native issuers must separately keep real original handles through each effect.
-pub(super) fn audit(
-    plan: &WebDavNativePlan,
-    record: &ReceiptDescription,
-    prior: &[ReceiptDescription],
-) -> Result<()> {
+pub(super) fn audit(record: &ReceiptDescription, prior: &VerifiedPrefix<'_>) -> Result<()> {
     use ReceiptStage as S;
-    if prior.len() < 10 || prior[9].stage != S::OwnerMarkerClosed {
+    let records = prior.records();
+    let plan = prior.plan();
+    if records.len() < 10 || records[9].stage != S::OwnerMarkerClosed {
         return Err(invalid());
     }
     if matches!(
         record.stage,
         S::HistoryCommitRequested(_) | S::HistoryCommitted(_)
     ) {
-        return super::final_history::audit_receipt(plan, record, prior);
+        return super::final_history::audit_receipt(record, prior);
     }
     if matches!(
         record.stage,
@@ -141,7 +133,7 @@ pub(super) fn audit(
             | S::StagingAbsent
             | S::Terminal
     ) {
-        return super::cleanup_receipts::audit(plan, record, prior);
+        return super::cleanup_receipts::audit(record, prior);
     }
     let action = action_of(record.stage)?;
     let step = plan
@@ -149,20 +141,25 @@ pub(super) fn audit(
         .get(action)
         .filter(|step| step.index == action)
         .ok_or_else(invalid)?;
-    if step.dependencies.iter().any(|dependency| {
-        *dependency >= action
-            || complete_stage(plan, *dependency)
-                .and_then(|stage| completed(prior, *dependency, stage))
-                .is_err()
-    }) {
+    // Once an action's dependencies passed, the exact plan and its verified
+    // predecessors are immutable for this prefix. Every later stage still
+    // checks its own object, template, evidence and immediate predecessor.
+    if !prior.dependencies_verified(action)
+        && step.dependencies.iter().any(|dependency| {
+            *dependency >= action
+                || complete_stage(plan, *dependency)
+                    .and_then(|stage| completed(prior, *dependency, stage))
+                    .is_err()
+        })
+    {
         return Err(invalid());
     }
-    let owner_parent = match &prior[3].evidence {
+    let owner_parent = match &records[3].evidence {
         ReceiptEvidence::DirectoryCreated { original, .. } => original,
         _ => return Err(invalid()),
     };
     let value = object(record)?;
-    let original_parent = destination_parent(plan, action, prior)?;
+    let original_parent = destination_parent(action, prior)?;
     value.parent.validate()?;
     value.source_parent.validate()?;
     if let Some(original) = &value.original {
@@ -216,7 +213,7 @@ pub(super) fn audit(
         }
         None => return Err(invalid()),
     }
-    let previous = prior.last().ok_or_else(invalid)?;
+    let previous = records.last().ok_or_else(invalid)?;
     match (&step.action, record.stage) {
         (
             WebDavNativeAction::QuarantineOriginal {

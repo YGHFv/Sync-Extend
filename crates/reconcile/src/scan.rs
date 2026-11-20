@@ -25,6 +25,14 @@ pub struct ScannedEntry {
 pub type Scan = BTreeMap<PortablePath, ScannedEntry>;
 
 pub fn scan(root: &Path, cas: &Cas, limits: &LocalLimits) -> Result<Scan> {
+    scan_with_content(root, Some(cas), limits)
+}
+
+pub(crate) fn observe(root: &Path, limits: &LocalLimits) -> Result<Scan> {
+    scan_with_content(root, None, limits)
+}
+
+fn scan_with_content(root: &Path, cas: Option<&Cas>, limits: &LocalLimits) -> Result<Scan> {
     let mut result = BTreeMap::new();
     let mut collisions = BTreeSet::new();
     let mut budget = Budget {
@@ -65,7 +73,7 @@ pub(crate) fn scan_native(
     visit(
         root,
         root,
-        cas,
+        Some(cas),
         &mut result,
         &mut collisions,
         &mut budget,
@@ -78,7 +86,7 @@ pub(crate) fn scan_native(
 fn visit(
     root: &Path,
     directory: &Path,
-    cas: &Cas,
+    cas: Option<&Cas>,
     result: &mut Scan,
     collisions: &mut BTreeSet<String>,
     budget: &mut Budget<'_>,
@@ -182,12 +190,22 @@ fn visit(
             }
             budget.reserve_bytes(metadata.len())?;
             checkpoint("after_scan_file_open");
-            let content = cas.import_bounded(
-                &observed.file,
-                metadata.len(),
-                budget.limits.max_scan_chunks - budget.chunks,
-            )?;
-            checkpoint("after_scan_file_import");
+            let content = match cas {
+                Some(cas) => {
+                    let content = cas.import_bounded(
+                        &observed.file,
+                        metadata.len(),
+                        budget.limits.max_scan_chunks - budget.chunks,
+                    )?;
+                    checkpoint("after_scan_file_import");
+                    content
+                }
+                None => sync_extend_cas::observe_bounded_content(
+                    &observed.file,
+                    metadata.len(),
+                    budget.limits.max_scan_chunks - budget.chunks,
+                )?,
+            };
             observed.verify(&full_path)?;
             if single_link != self::single_link(&observed.file)? {
                 return Err(ReconcileError::Unstable);

@@ -170,6 +170,7 @@ impl Journal {
             let native_issuance = native_publication::issuance::register(&connection)?;
             Ok(Self {
                 connection,
+                webdav_native_read_charges: crate::webdav_native::DavReadChargeCache::default(),
                 original_local_history_issuer: std::sync::Arc::new(()),
                 #[cfg(windows)]
                 original_restored_image: None,

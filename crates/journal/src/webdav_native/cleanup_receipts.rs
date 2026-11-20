@@ -1,21 +1,15 @@
 //! D05 exact original absence lineage. This audit never authorizes a path deletion.
-use super::receipt_protocol::{ReceiptDescription, ReceiptEvidence as E, ReceiptStage as S};
-use sync_extend_core_model::{
-    webdav_native::{WebDavNativeAction as A, WebDavNativePlan},
-    ModelError, Result,
+use super::receipt_protocol::{
+    ReceiptDescription, ReceiptEvidence as E, ReceiptStage as S, VerifiedPrefix,
 };
+use sync_extend_core_model::{webdav_native::WebDavNativeAction as A, ModelError, Result};
 fn invalid() -> ModelError {
     ModelError::InvalidData("original DAV cleanup receipt lineage")
 }
-pub(super) fn audit(
-    plan: &WebDavNativePlan,
-    record: &ReceiptDescription,
-    prior: &[ReceiptDescription],
-) -> Result<()> {
-    let final_record = prior
-        .iter()
-        .find(|row| matches!(row.stage, S::HistoryCommitted(_)))
-        .ok_or_else(invalid)?;
+pub(super) fn audit(record: &ReceiptDescription, prior: &VerifiedPrefix<'_>) -> Result<()> {
+    let plan = prior.plan();
+    let records = prior.records();
+    let final_record = prior.first_history_committed().ok_or_else(invalid)?;
     let E::History {
         history_hash,
         final_snapshot,
@@ -24,7 +18,7 @@ pub(super) fn audit(
     else {
         return Err(invalid());
     };
-    let previous = prior.last().ok_or_else(invalid)?;
+    let previous = records.last().ok_or_else(invalid)?;
     match (&record.stage, &record.evidence) {
         (
             S::DisposalRequested(action) | S::OriginalAbsent(action) | S::OwnerSlotCleared(action),
@@ -48,8 +42,7 @@ pub(super) fn audit(
                 return Err(invalid());
             };
             let moved = prior
-                .iter()
-                .find(|row| row.stage == S::QuarantineMoved(*quarantine_action))
+                .first(S::QuarantineMoved(*quarantine_action))
                 .ok_or_else(invalid)?;
             let E::CollectionObject { object } = &moved.evidence else {
                 return Err(invalid());
@@ -103,7 +96,7 @@ pub(super) fn audit(
                         parent,
                         component,
                         ..
-                    } = &prior.get(9).ok_or_else(invalid)?.evidence
+                    } = &records.get(9).ok_or_else(invalid)?.evidence
                     else {
                         return Err(invalid());
                     };
@@ -114,7 +107,7 @@ pub(super) fn audit(
                         original,
                         parent,
                         component,
-                    } = &prior.get(3).ok_or_else(invalid)?.evidence
+                    } = &records.get(3).ok_or_else(invalid)?.evidence
                     else {
                         return Err(invalid());
                     };
@@ -125,7 +118,7 @@ pub(super) fn audit(
                         original,
                         parent,
                         component,
-                    } = &prior.get(1).ok_or_else(invalid)?.evidence
+                    } = &records.get(1).ok_or_else(invalid)?.evidence
                     else {
                         return Err(invalid());
                     };
@@ -153,9 +146,7 @@ pub(super) fn audit(
             if matches!(record.stage, S::OwnerMarkerRemovalRequested) {
                 for step in plan.steps() {
                     if matches!(step.action, A::CleanupOriginal { .. })
-                        && !prior
-                            .iter()
-                            .any(|row| row.stage == S::OwnerSlotCleared(step.index))
+                        && prior.first(S::OwnerSlotCleared(step.index)).is_none()
                     {
                         return Err(invalid());
                     }
@@ -182,9 +173,7 @@ pub(super) fn audit(
                 }
                 S::Terminal
                     if previous.stage != S::StagingAbsent
-                        || !prior.iter().any(|row| {
-                            row.stage == S::ReferencesHandedOff && row.evidence == record.evidence
-                        }) =>
+                        || !prior.any_evidence(S::ReferencesHandedOff, &record.evidence) =>
                 {
                     return Err(invalid())
                 }

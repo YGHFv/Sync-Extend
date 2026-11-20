@@ -10,6 +10,7 @@ pub struct Connection {
     stream: TcpStream,
     deadline: Instant,
     timeout: Duration,
+    body_started: bool,
     pub response_started: bool,
 }
 
@@ -19,8 +20,20 @@ impl Connection {
             stream,
             deadline: Instant::now() + Duration::from_secs(seconds),
             timeout: Duration::from_secs(seconds),
+            body_started: false,
             response_started: false,
         }
+    }
+    pub fn begin_body(&mut self) -> io::Result<()> {
+        if self.body_started || self.response_started {
+            return Err(io::Error::other("request body phase already started"));
+        }
+        // Local admission and durable baseline work do not consume network
+        // reception time. Start exactly one bounded body phase after admission;
+        // individual reads never extend this deadline.
+        self.deadline = Instant::now() + self.timeout;
+        self.body_started = true;
+        Ok(())
     }
     fn begin_response(&mut self) {
         if !self.response_started {
@@ -230,6 +243,7 @@ pub fn head(
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         409 => "Conflict",
         412 => "Precondition Failed",
         413 => "Content Too Large",

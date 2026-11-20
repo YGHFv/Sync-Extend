@@ -1,5 +1,5 @@
 //! Descriptive namespace projection; only original live effect holders authorize IO.
-use super::receipt_protocol::{ReceiptDescription, ReceiptEvidence, ReceiptStage};
+use super::receipt_protocol::{ReceiptDescription, ReceiptEvidence, ReceiptStage, VerifiedPrefix};
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
     tree_restore_identity::TreeNativeIdentity,
@@ -21,17 +21,61 @@ pub(super) struct Projection {
     pub completed: BTreeSet<usize>,
 }
 
+/// An immutable descriptive result from this audit's exact plan and receipts.
+/// Consumers must still compare their live handles/namespace and exact inputs.
+pub(super) struct VerifiedProjection {
+    baseline: Manifest,
+    plan: WebDavNativePlan,
+    receipts: Vec<ReceiptDescription>,
+    projection: Projection,
+}
+
+impl VerifiedProjection {
+    pub(super) fn derive(baseline: &Manifest, receipts: &VerifiedPrefix<'_>) -> Result<Self> {
+        Ok(Self {
+            baseline: baseline.clone(),
+            plan: receipts.plan().clone(),
+            receipts: receipts.records().to_vec(),
+            projection: Projection::derive(baseline, receipts)?,
+        })
+    }
+
+    pub(super) fn get(
+        &self,
+        baseline: &Manifest,
+        plan: &WebDavNativePlan,
+        receipts: &[ReceiptDescription],
+    ) -> Result<&Projection> {
+        if self.baseline != *baseline || self.plan != *plan || self.receipts.as_slice() != receipts
+        {
+            return Err(invalid());
+        }
+        Ok(&self.projection)
+    }
+
+    /// Borrow only the baseline of this audit's exact plan and receipt snapshot.
+    /// The returned description carries no native or cleanup authority.
+    pub(super) fn baseline_for(
+        &self,
+        plan: &WebDavNativePlan,
+        receipts: &[ReceiptDescription],
+    ) -> Result<&Manifest> {
+        if self.plan != *plan || self.receipts.as_slice() != receipts {
+            return Err(invalid());
+        }
+        Ok(&self.baseline)
+    }
+}
+
 fn invalid() -> ModelError {
     ModelError::InvalidData("exact original DAV collection namespace projection")
 }
 
 impl Projection {
     /// Derive descriptive expectations from audited receipts. This never opens a path.
-    pub(super) fn derive(
-        baseline: &Manifest,
-        plan: &WebDavNativePlan,
-        receipts: &[ReceiptDescription],
-    ) -> Result<Self> {
+    fn derive(baseline: &Manifest, verified: &VerifiedPrefix<'_>) -> Result<Self> {
+        let plan = verified.plan();
+        let receipts = verified.records();
         let mut result = Self {
             user: BTreeMap::new(),
             quarantined: BTreeMap::new(),
@@ -70,7 +114,6 @@ impl Projection {
             return Ok(result);
         }
         for record in &receipts[10..] {
-            super::ordered_receipts::audit(plan, record, &receipts[..record.index])?;
             if let ReceiptEvidence::Disposal {
                 action,
                 quarantine_action,

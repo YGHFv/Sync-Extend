@@ -30,6 +30,8 @@ pub(super) struct CompleteManifest {
     pub additional_future: TreeStorageCharge,
     #[cfg(windows)]
     pub receipts: Vec<receipt_protocol::ReceiptDescription>,
+    #[cfg(windows)]
+    pub projection: super::collection_projection::VerifiedProjection,
 }
 
 fn invalid() -> JournalError {
@@ -404,7 +406,7 @@ pub(super) fn audit(
         let receipt_peak = templates.iter().try_fold(0_u64, |total, template| {
             add(total, template.max_receipt_json_bytes)
         })?;
-        receipt_protocol::audit_prefix(
+        let verified = receipt_protocol::verified_prefix(
             &plan,
             &templates,
             &receipts,
@@ -412,6 +414,10 @@ pub(super) fn audit(
             admitted_at_ms,
             receipt_peak,
         )?;
+        #[cfg(windows)]
+        let projection =
+            super::collection_projection::VerifiedProjection::derive(&baseline, &verified)?;
+        drop(verified);
         if !receipts.is_empty() && execution.records.is_empty() {
             return Err(invalid());
         }
@@ -730,6 +736,8 @@ pub(super) fn audit(
             additional_future,
             #[cfg(windows)]
             receipts,
+            #[cfg(windows)]
+            projection,
         });
     }
     Ok(result)

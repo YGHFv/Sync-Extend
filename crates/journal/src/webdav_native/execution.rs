@@ -180,6 +180,16 @@ fn request_space(connection: &Connection) -> Result<SpaceId> {
 
 /// Parent descriptions audit must remain separate to prevent budget/audit recursion.
 pub(super) fn audit(connection: &Connection) -> Result<Vec<WebDavDurableExecution>> {
+    let descriptions = super::read_phase::VerifiedDescriptions::read(connection)?;
+    audit_verified(&descriptions)
+}
+
+/// Reuse this read phase's complete, private description audit only.
+/// Every execution row, record, plan, receipt and scope check remains below.
+pub(super) fn audit_verified(
+    verified: &super::read_phase::VerifiedDescriptions<'_>,
+) -> Result<Vec<WebDavDurableExecution>> {
+    let connection = verified.connection()?;
     super::schema::validate(connection)?;
     preflight(
         connection,
@@ -187,7 +197,7 @@ pub(super) fn audit(connection: &Connection) -> Result<Vec<WebDavDurableExecutio
         crate::limits::MAX_ENTRIES,
         crate::limits::MAX_ENTRIES as u64 * 1024,
     )?;
-    let descriptions = super::audit_descriptions(connection)?;
+    let descriptions = verified.values(connection)?;
     let orphan: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM main.webdav_native_execution_records r
          LEFT JOIN main.webdav_native_execution_admissions e USING(transaction_id)
@@ -260,6 +270,7 @@ pub(super) fn audit(connection: &Connection) -> Result<Vec<WebDavDurableExecutio
         }
         result.push(execution);
     }
+    verified.verify(connection)?;
     Ok(result)
 }
 
@@ -325,10 +336,10 @@ impl Journal {
         if !self.connection.is_autocommit() {
             return Err(invalid());
         }
+        let _dav_read_scope = self.webdav_native_read_charges.scope();
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
-        let descriptions = super::audit_descriptions(&tx)?;
-        let rows = audit(&tx)?;
-        super::manifest_audit::audit(&tx, &descriptions, &rows)?;
+        let verified = self.webdav_native_read_charges.read(&tx)?;
+        let rows = verified.executions(&tx)?.to_vec();
         tx.commit()?;
         Ok(rows)
     }
@@ -345,15 +356,21 @@ impl Journal {
         }
         let mut coordination = self.acquire_cas_coordination()?;
         coordination.try_exclusive()?;
+        let _dav_read_scope = self.webdav_native_read_charges.scope();
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let description = super::audit_descriptions(&tx)?
-            .into_iter()
+        let verified = self.webdav_native_read_charges.read(&tx)?;
+        let description = verified
+            .descriptions(&tx)?
+            .iter()
             .find(|description| &description.description.request.transaction_id == id)
+            .cloned()
             .ok_or_else(invalid)?;
         scope(&tx, space, &description.description.request.origin_device)?;
-        if let Some(old) = audit(&tx)?
-            .into_iter()
+        if let Some(old) = verified
+            .executions(&tx)?
+            .iter()
             .find(|row| &row.transaction_id == id)
+            .cloned()
         {
             if old.limits != limits {
                 return Err(invalid());
@@ -416,9 +433,12 @@ impl Journal {
             ],
             time,
         )?;
-        let accepted = audit(&tx)?
-            .into_iter()
+        let accepted_read = self.webdav_native_read_charges.read(&tx)?;
+        let accepted = accepted_read
+            .executions(&tx)?
+            .iter()
             .find(|row| &row.transaction_id == id)
+            .cloned()
             .ok_or_else(invalid)?;
         super::checkpoint("webdav_execution_reserve_before_commit");
         tx.commit()?;
@@ -440,15 +460,21 @@ impl Journal {
         }
         let mut coordination = self.acquire_cas_coordination()?;
         coordination.try_exclusive()?;
+        let _dav_read_scope = self.webdav_native_read_charges.scope();
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let description = super::audit_descriptions(&tx)?
-            .into_iter()
+        let verified = self.webdav_native_read_charges.read(&tx)?;
+        let description = verified
+            .descriptions(&tx)?
+            .iter()
             .find(|description| &description.description.request.transaction_id == id)
+            .cloned()
             .ok_or_else(invalid)?;
         scope(&tx, space, &description.description.request.origin_device)?;
-        let old = audit(&tx)?
-            .into_iter()
+        let old = verified
+            .executions(&tx)?
+            .iter()
             .find(|row| &row.transaction_id == id)
+            .cloned()
             .ok_or_else(invalid)?;
         if old.cancelled {
             return Err(invalid());
@@ -534,9 +560,12 @@ impl Journal {
             ],
             time,
         )?;
-        let accepted = audit(&tx)?
-            .into_iter()
+        let accepted_read = self.webdav_native_read_charges.read(&tx)?;
+        let accepted = accepted_read
+            .executions(&tx)?
+            .iter()
             .find(|row| &row.transaction_id == id)
+            .cloned()
             .ok_or_else(invalid)?;
         super::checkpoint("webdav_execution_activate_before_commit");
         tx.commit()?;

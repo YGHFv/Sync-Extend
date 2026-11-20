@@ -110,14 +110,12 @@ impl WebDavLocalExecution<'_> {
                     sync_extend_journal::JournalError::Invariant("DAV collection clock unavailable")
                 })
             },
-            |held| {
-                local
-                    .reserve_native_internal_worktree(&held.inventory_file_view()?)
-                    .map_err(|_| {
-                        sync_extend_journal::JournalError::Invariant(
-                            "current held DAV internal storage policy",
-                        )
-                    })
+            |view| {
+                local.reserve_native_internal_worktree(view).map_err(|_| {
+                    sync_extend_journal::JournalError::Invariant(
+                        "current held DAV internal storage policy",
+                    )
+                })
             },
         )?;
         self.local
@@ -152,14 +150,12 @@ impl WebDavLocalExecution<'_> {
                     sync_extend_journal::JournalError::Invariant("DAV collection clock unavailable")
                 })
             },
-            |held| {
-                local
-                    .reserve_native_internal_worktree(&held.inventory_file_view()?)
-                    .map_err(|_| {
-                        sync_extend_journal::JournalError::Invariant(
-                            "current original DAV collection policy",
-                        )
-                    })
+            |view| {
+                local.reserve_native_internal_worktree(view).map_err(|_| {
+                    sync_extend_journal::JournalError::Invariant(
+                        "current original DAV collection policy",
+                    )
+                })
             },
         )?;
         Ok(())
@@ -175,14 +171,12 @@ impl WebDavLocalExecution<'_> {
                     sync_extend_journal::JournalError::Invariant("DAV collection clock unavailable")
                 })
             },
-            |held| {
-                local
-                    .reserve_native_internal_worktree(&held.inventory_file_view()?)
-                    .map_err(|_| {
-                        sync_extend_journal::JournalError::Invariant(
-                            "current original DAV Final policy",
-                        )
-                    })
+            |view| {
+                local.reserve_native_internal_worktree(view).map_err(|_| {
+                    sync_extend_journal::JournalError::Invariant(
+                        "current original DAV Final policy",
+                    )
+                })
             },
         )?;
         Ok(())
@@ -198,14 +192,12 @@ impl WebDavLocalExecution<'_> {
                     sync_extend_journal::JournalError::Invariant("DAV collection clock unavailable")
                 })
             },
-            |held| {
-                local
-                    .reserve_native_internal_worktree(&held.inventory_file_view()?)
-                    .map_err(|_| {
-                        sync_extend_journal::JournalError::Invariant(
-                            "current original DAV disposal policy",
-                        )
-                    })
+            |view| {
+                local.reserve_native_internal_worktree(view).map_err(|_| {
+                    sync_extend_journal::JournalError::Invariant(
+                        "current original DAV disposal policy",
+                    )
+                })
             },
         )?;
         Ok(())
@@ -221,14 +213,12 @@ impl WebDavLocalExecution<'_> {
                     sync_extend_journal::JournalError::Invariant("DAV collection clock unavailable")
                 })
             },
-            |held| {
-                local
-                    .reserve_native_internal_worktree(&held.inventory_file_view()?)
-                    .map_err(|_| {
-                        sync_extend_journal::JournalError::Invariant(
-                            "current original DAV owner cleanup policy",
-                        )
-                    })
+            |view| {
+                local.reserve_native_internal_worktree(view).map_err(|_| {
+                    sync_extend_journal::JournalError::Invariant(
+                        "current original DAV owner cleanup policy",
+                    )
+                })
             },
         )?;
         Ok(())
@@ -290,5 +280,18 @@ impl crate::native_file_view::NativeFileView
     }
     fn remaining_internal_bytes(&self) -> sync_extend_journal::Result<u64> {
         self.remaining_internal_bytes()
+    }
+}
+
+/// Borrow an immutable inventory view under the original root and quota policy.
+/// The view retains live ownership and grants no native effects.
+impl<'owner> WebDavLocalExecution<'owner> {
+    pub fn inventory_file_view(
+        &self,
+    ) -> Result<sync_extend_journal::WebDavInventoryFileView<'_, 'owner>> {
+        self.local.verify_root()?;
+        let view = self.held.inventory_file_view()?;
+        self.local.reserve_native_internal_worktree(&view)?;
+        Ok(view)
     }
 }

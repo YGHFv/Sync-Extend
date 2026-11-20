@@ -201,6 +201,7 @@ pub enum ReceiveOutcome {
 
 pub struct Journal {
     connection: Connection,
+    webdav_native_read_charges: webdav_native::DavReadChargeCache,
     #[cfg(target_os = "linux")]
     linux_metadata_vfs: Option<sync_extend_platform_fs::LinuxMetadataVfs>,
     original_local_history_issuer: std::sync::Arc<()>,
@@ -366,6 +367,7 @@ impl ReadOnlyJournal {
     fn read_view(&self) -> JournalReadView<'_> {
         JournalReadView {
             connection: &self.connection,
+            dav_read_charge_cache: None,
         }
     }
 
@@ -612,7 +614,8 @@ impl Journal {
             sync_extend_platform_fs::LinuxMetadataVfs,
         >,
     ) -> Result<Self> {
-        // Retain DEV32's bounded bytecode cache after the original identity check.
+        // Retain bounded bytecode and committed descriptive read proofs only
+        // after the original identity and Linux VFS opening checks.
         connection.set_prepared_statement_cache_capacity(256);
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -1077,6 +1080,7 @@ impl Journal {
         let native_issuance = native_publication::issuance::register(&connection)?;
         Ok(Self {
             connection,
+            webdav_native_read_charges: webdav_native::DavReadChargeCache::default(),
             #[cfg(target_os = "linux")]
             linux_metadata_vfs,
             original_local_history_issuer: std::sync::Arc::new(()),
@@ -1743,7 +1747,13 @@ impl Journal {
     }
 
     pub fn check_storage_metadata_limit(&self, max_entries: usize) -> Result<()> {
-        check_storage_metadata_limit(&self.connection, max_entries, 0, 0)
+        check_storage_metadata_limit_using_dav_read(
+            &self.connection,
+            max_entries,
+            0,
+            0,
+            Some(&self.webdav_native_read_charges),
+        )
     }
 
     pub fn cursor(&self, space: &SpaceId, device: &DeviceId) -> Result<u64> {
@@ -2379,7 +2389,24 @@ fn check_storage_metadata_limit(
     additional_rows: u64,
     additional_bytes: u64,
 ) -> Result<()> {
-    let (rows, bytes) = storage_metadata_budget_usage(connection)?;
+    // The original free writer entry never borrows an unrelated Journal cache.
+    check_storage_metadata_limit_using_dav_read(
+        connection,
+        max_entries,
+        additional_rows,
+        additional_bytes,
+        None,
+    )
+}
+
+fn check_storage_metadata_limit_using_dav_read(
+    connection: &Connection,
+    max_entries: usize,
+    additional_rows: u64,
+    additional_bytes: u64,
+    dav_read_cache: Option<&webdav_native::DavReadChargeCache>,
+) -> Result<()> {
+    let (rows, bytes) = storage_metadata_budget_usage_using_dav_read(connection, dav_read_cache)?;
     let max_bytes = (max_entries as u64)
         .checked_mul(1024)
         .ok_or(JournalError::Invariant("storage metadata budget overflow"))?;
@@ -2397,6 +2424,13 @@ fn check_storage_metadata_limit(
 
 // Legacy admission accounting includes reservations, not just persisted values.
 fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> {
+    storage_metadata_budget_usage_using_dav_read(connection, None)
+}
+
+fn storage_metadata_budget_usage_using_dav_read(
+    connection: &Connection,
+    dav_read_cache: Option<&webdav_native::DavReadChargeCache>,
+) -> Result<(u64, u64)> {
     let (rows, bytes): (i64, i64) = connection.query_row(
         "SELECT
             (SELECT count(*) FROM snapshots) + (SELECT count(*) FROM mutations)
@@ -2583,9 +2617,16 @@ fn storage_metadata_budget_usage(connection: &Connection) -> Result<(u64, u64)> 
         sync_extend_core_model::limits::MAX_ENTRIES,
         sync_extend_core_model::limits::MAX_ENTRIES as u64 * 1024,
     )?);
-    let cancellation = webdav_native::outstanding(connection)?;
-    let records = webdav_native::execution_outstanding(connection)?;
-    let internal = webdav_native::manifest_audit::outstanding(connection)?;
+    let dav_charges = match dav_read_cache {
+        Some(cache) => cache.charges(connection)?,
+        None => {
+            let dav_read = webdav_native::VerifiedDavReadAudit::read(connection)?;
+            dav_read.charges(connection)?
+        }
+    };
+    let cancellation = dav_charges.cancellation();
+    let records = dav_charges.execution();
+    let internal = dav_charges.internal();
     let execution = tree_storage_capacity::TreeStorageCharge {
         rows: storage_inventory::reader::add(records.rows, internal.rows)?,
         logical_bytes: storage_inventory::reader::add(
@@ -3237,6 +3278,7 @@ impl Journal {
         let native_issuance = native_publication::issuance::register(&connection)?;
         Ok(Self {
             connection,
+            webdav_native_read_charges: webdav_native::DavReadChargeCache::default(),
             original_local_history_issuer: std::sync::Arc::new(()),
             #[cfg(windows)]
             original_restored_image: None,

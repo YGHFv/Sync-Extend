@@ -16,13 +16,28 @@ pub struct Upload {
     length: u64,
 }
 
+pub enum ReceiveError {
+    Body(io::Error),
+    Storage,
+}
+
+impl From<io::Error> for ReceiveError {
+    fn from(_: io::Error) -> Self {
+        Self::Storage
+    }
+}
+
 impl Upload {
-    pub fn receive(stream: &mut impl Read, parent: &Path, length: u64) -> io::Result<Self> {
+    pub fn receive(
+        stream: &mut impl Read,
+        parent: &Path,
+        length: u64,
+    ) -> Result<Self, ReceiveError> {
         if !parent.is_absolute() {
-            return Err(io::Error::other("absolute private upload parent required"));
+            return Err(ReceiveError::Storage);
         }
         if fs2::available_space(parent)? < length {
-            return Err(io::Error::other("insufficient upload storage"));
+            return Err(ReceiveError::Storage);
         }
         #[cfg(windows)]
         let name = format!(
@@ -39,10 +54,7 @@ impl Upload {
         let mut original = sync_extend_platform_fs::create_anonymous_upload(parent)?;
         #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
         let mut original: File = {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "anonymous upload platform unavailable",
-            ));
+            return Err(ReceiveError::Storage);
         };
         #[cfg(windows)]
         let writer = original.writer();
@@ -52,7 +64,9 @@ impl Upload {
         let mut buffer = [0u8; 65536];
         while remaining > 0 {
             let size = remaining.min(buffer.len() as u64) as usize;
-            stream.read_exact(&mut buffer[..size])?;
+            stream
+                .read_exact(&mut buffer[..size])
+                .map_err(ReceiveError::Body)?;
             writer.write_all(&buffer[..size])?;
             remaining -= size as u64;
         }

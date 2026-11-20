@@ -317,7 +317,10 @@ fn bind(connection: &Connection, header: &Header, plan: &FileResolutionPlan) -> 
             "conflict admission requires exact local resolver/root",
         ));
     }
-    let view = crate::JournalReadView { connection };
+    let view = crate::JournalReadView {
+        connection,
+        dav_read_charge_cache: None,
+    };
     if view.current(&p.space_id)?.as_ref() != Some(&intent.baseline) {
         return Err(invalid("conflict admission current baseline changed"));
     }

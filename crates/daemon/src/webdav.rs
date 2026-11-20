@@ -4,7 +4,7 @@ use super::{
     webdav_credentials::Credentials,
     webdav_http::{self as http, Connection, Request},
     webdav_locks::Locks,
-    webdav_upload::Upload,
+    webdav_upload::{ReceiveError, Upload},
     webdav_xml::{self, Properties},
 };
 use std::{
@@ -433,6 +433,10 @@ fn dispatch(
             local
                 .admit_webdav_upload(request.content_length)
                 .map_err(core_status)?;
+            // Start reception after all local capacity and baseline checks.
+            // The configured ten-second body phase remains finite even when
+            // native admission took longer than the header phase.
+            stream.begin_body().map_err(|_| 400u16)?;
             if let Some(expect) = request.header("expect") {
                 if !expect.eq_ignore_ascii_case("100-continue") {
                     return Err(417);
@@ -442,7 +446,18 @@ fn dispatch(
                     .map_err(|_| 400u16)?;
             }
             let upload = Upload::receive(stream, &runtime.uploads, request.content_length)
-                .map_err(|_| 507u16)?;
+                .map_err(|error| match error {
+                    ReceiveError::Body(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        408u16
+                    }
+                    ReceiveError::Body(_) => 400u16,
+                    ReceiveError::Storage => 507u16,
+                })?;
             upload.verify().map_err(|_| 409u16)?;
             let result = local
                 .commit_webdav_upload(
@@ -586,7 +601,8 @@ fn core_status(error: ReconcileError) -> u16 {
     match error {
         ReconcileError::ResourceLimit(_) => 507,
         ReconcileError::Unstable => 412,
-        ReconcileError::Invariant(_) => 409,
+        ReconcileError::Invariant(_)
+        | ReconcileError::Journal(sync_extend_journal::JournalError::Invariant(_)) => 409,
         _ => 503,
     }
 }

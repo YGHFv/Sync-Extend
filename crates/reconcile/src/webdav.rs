@@ -39,12 +39,39 @@ impl WebDavBaseline {
 }
 
 impl LocalSpace {
+    fn require_webdav_idle(&self) -> Result<()> {
+        self.verify_root()?;
+        self.require_no_mutation()?;
+        if !self
+            .journal
+            .outstanding_publications(&self.space_id)?
+            .is_empty()
+        {
+            return Err(ReconcileError::Invariant(
+                "active publication requires explicit completion or forward recovery",
+            ));
+        }
+        Ok(())
+    }
+
+    fn observe_webdav_native(&self) -> Result<crate::scan::Scan> {
+        self.require_webdav_idle()?;
+        let first = crate::scan::observe(&self.worktree, &self.limits)?;
+        self.require_webdav_idle()?;
+        let second = crate::scan::observe(&self.worktree, &self.limits)?;
+        if first != second {
+            return Err(ReconcileError::Unstable);
+        }
+        self.require_webdav_idle()?;
+        Ok(second)
+    }
+
     pub fn capture_webdav_baseline(&mut self) -> Result<WebDavBaseline> {
-        self.scan()?;
+        self.require_webdav_idle()?;
         let manifest = self
             .manifest()?
             .ok_or(ReconcileError::Invariant("DAV baseline missing"))?;
-        let native = self.stable_scan()?;
+        let native = self.observe_webdav_native()?;
         if manifest.entries.len() != native.len()
             || manifest.entries.values().any(|entry| {
                 native
@@ -79,15 +106,14 @@ impl LocalSpace {
     }
 
     pub fn check_webdav_baseline(&self, baseline: &WebDavBaseline) -> Result<()> {
-        self.verify_root()?;
-        self.require_no_mutation()?;
+        self.require_webdav_idle()?;
         #[cfg(windows)]
         for parent in &baseline.parents {
             parent.key()?;
         }
         if baseline.manifest.space_id != self.space_id
             || self.manifest()?.as_ref() != Some(&baseline.manifest)
-            || self.stable_scan()? != baseline.native
+            || self.observe_webdav_native()? != baseline.native
         {
             return Err(ReconcileError::Unstable);
         }

@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{storage_inventory::reader::add, CasAccessGuard, Journal, Result};
 use rusqlite::{params, Transaction, TransactionBehavior};
-use std::path::Path;
+use std::{cell::RefCell, path::Path, sync::Arc};
 use sync_extend_core_model::{
     tree_restore_history::encode_history_record, webdav_mutation::WebDavMutationRequest,
     webdav_native::WebDavNativeLimits, ContentId, SpaceId,
@@ -32,6 +32,7 @@ pub struct LiveDavAdmission<'a> {
     failed_native_path: Option<sync_extend_core_model::PortablePath>,
     failed_native_status:
         Option<sync_extend_core_model::webdav_partial_response::WebDavCollectionFailure>,
+    file_read_audit: RefCell<Option<Arc<VerifiedFileAudit>>>,
 }
 
 impl Journal {
@@ -41,9 +42,8 @@ impl Journal {
         after: &crate::storage_capacity::CapacitySnapshot,
         manifest_hash: &ContentId,
     ) -> Result<()> {
-        let descriptions = super::audit_descriptions(&self.connection)?;
-        let executions = execution::audit(&self.connection)?;
-        let complete = manifest_audit::audit(&self.connection, &descriptions, &executions)?;
+        let audit = self.webdav_native_read_charges.read(&self.connection)?;
+        let complete = audit.manifests(&self.connection)?;
         let accepted = complete
             .iter()
             .find(|row| &row.budget.manifest_hash == manifest_hash)
@@ -88,10 +88,12 @@ impl Journal {
         worktree_owner.verify(&Path::new(&worktree).join(".sync-extend"))?;
         let mut coordination = self.acquire_cas_coordination()?;
         coordination.try_exclusive()?;
+        let _dav_read_scope = self.webdav_native_read_charges.scope();
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         scope(&tx, space, &request.origin_device)?;
         self.require_no_tree_restore(space, crate::limits::MAX_ENTRIES)?;
-        if super::audit(&tx)?.iter().any(|row| {
+        let initial = self.webdav_native_read_charges.read(&tx)?;
+        if initial.descriptions(&tx)?.iter().any(|row| {
             row.description.request.transaction_id == request.transaction_id || row.writer_gate_held
         }) {
             return Err(invalid());
@@ -375,14 +377,15 @@ impl Journal {
                     std::str::from_utf8(&budget.manifest_json).map_err(|_|invalid())?])?;
             Ok(())
         })?;
-        let executions = execution::audit(&tx)?;
-        let accepted = executions
+        let verified = self.webdav_native_read_charges.read(&tx)?;
+        let accepted = verified
+            .executions(&tx)?
             .iter()
             .find(|row| row.transaction_id == request.transaction_id)
             .ok_or_else(invalid)?
             .clone();
-        let complete = manifest_audit::audit(&tx, &super::audit_descriptions(&tx)?, &executions)?;
-        if !complete
+        if !verified
+            .manifests(&tx)?
             .iter()
             .any(|row| row.budget.manifest_hash == budget.manifest_hash)
         {
@@ -412,6 +415,7 @@ impl Journal {
             native_handle_limit: max_handles,
             failed_native_path: None,
             failed_native_status: None,
+            file_read_audit: RefCell::new(None),
             data_owner,
             worktree_owner,
             journal: self,
@@ -436,35 +440,26 @@ impl LiveDavAdmission<'_> {
 
     /// Read-only original guard view; no supplied observation or skip list.
     pub fn verify_file_view(&self) -> Result<()> {
-        if self.failed {
-            return Err(invalid());
-        }
-        self.verify_process_owners()?;
-        self.verify_held_handle_budget()?;
-        self.coordination.verify()?;
-        let descriptions = super::audit_descriptions(&self.journal.connection)?;
-        let executions = execution::audit(&self.journal.connection)?;
-        let audited = manifest_audit::audit(&self.journal.connection, &descriptions, &executions)?;
-        if !audited.iter().any(|row| {
-            row.budget.manifest_hash == self.manifest_hash
-                && row.budget.manifest.native_peak == self.native_peak
-                && row.budget.manifest.native_handles.admission_limit
-                    == self.native_handle_limit as u64
-        }) {
-            return Err(invalid());
-        }
-        self.verify_held_namespace()?;
-        self.verify_native_space()
+        let view = self.inventory_file_view()?;
+        // The public compatibility entry keeps its original live receipt read.
+        self.verify_native_space()?;
+        view.verify_sql_generation()
     }
     fn verify_held_namespace(&self) -> Result<()> {
+        self.verify_held_namespace_with_baseline(&self.baseline()?)
+    }
+    fn verify_held_namespace_with_baseline(
+        &self,
+        baseline: &sync_extend_core_model::Manifest,
+    ) -> Result<()> {
         match &self.collections {
             Some(collections) => {
                 self.originals
-                    .verify_collection(&self.baseline()?, &self.native_owner, collections)
+                    .verify_collection(baseline, &self.native_owner, collections)
             }
             None => self
                 .originals
-                .verify_with_owner(&self.baseline()?, &self.native_owner),
+                .verify_with_owner(baseline, &self.native_owner),
         }
         .map_err(|_| invalid())
     }
@@ -497,13 +492,22 @@ impl LiveDavAdmission<'_> {
         }
     }
     pub fn remaining_internal_bytes(&self) -> Result<u64> {
-        self.verify_file_view()?;
+        let view = self.inventory_file_view()?;
+        view.verify()?;
+        let remaining = self.remaining_internal_bytes_from_held()?;
+        view.verify_sql_generation()?;
+        Ok(remaining)
+    }
+    fn remaining_internal_bytes_from_held(&self) -> Result<u64> {
         if super::reference_handoff::terminal(
             &self.journal.connection,
             &self.execution.transaction_id,
         )? {
             return Ok(0);
         }
+        self.remaining_active_internal_bytes_from_held()
+    }
+    fn remaining_active_internal_bytes_from_held(&self) -> Result<u64> {
         let files = match &self.collections {
             Some(collections) => collections.materialized_bytes().map_err(|_| invalid())?,
             None => 0,
@@ -521,6 +525,21 @@ impl LiveDavAdmission<'_> {
         )? {
             return Ok(());
         }
+        self.verify_active_native_space()
+    }
+    fn verify_native_space_from_audit(&self, audit: &VerifiedFileAudit) -> Result<()> {
+        if audit.terminal(self)? {
+            return Ok(());
+        }
+        self.verify_active_native_space()
+    }
+    fn remaining_internal_bytes_from_audit(&self, audit: &VerifiedFileAudit) -> Result<u64> {
+        if audit.terminal(self)? {
+            return Ok(0);
+        }
+        self.remaining_active_internal_bytes_from_held()
+    }
+    fn verify_active_native_space(&self) -> Result<()> {
         let root = self.journal.state("worktree")?.ok_or_else(invalid)?;
         let space = sync_extend_platform_fs::held_disk_space(
             self.originals.root_parent().map_err(|_| invalid())?,
@@ -597,11 +616,13 @@ impl LiveDavAdmission<'_> {
         self.coordination.verify()?;
         let space: SpaceId = journal.state("space_id")?.ok_or_else(invalid)?.parse()?;
         let id = &self.execution.transaction_id;
+        let _dav_read_scope = journal.webdav_native_read_charges.scope();
         let tx = Transaction::new_unchecked(&journal.connection, TransactionBehavior::Immediate)?;
-        let descriptions = super::audit_descriptions(&tx)?;
-        let executions = execution::audit(&tx)?;
-        let complete = manifest_audit::audit(&tx, &descriptions, &executions)?;
-        let bound = complete
+        let verified = journal.webdav_native_read_charges.read(&tx)?;
+        let descriptions = verified.descriptions(&tx)?;
+        let executions = verified.executions(&tx)?;
+        let bound = verified
+            .manifests(&tx)?
             .iter()
             .find(|row| row.budget.manifest_hash == self.manifest_hash)
             .ok_or_else(invalid)?;
@@ -721,9 +742,12 @@ impl LiveDavAdmission<'_> {
             .map_err(|_| invalid())?;
         self.verify_process_owners()?;
         self.coordination.verify()?;
-        let accepted = execution::audit(&tx)?
-            .into_iter()
+        let accepted_read = journal.webdav_native_read_charges.read(&tx)?;
+        let accepted = accepted_read
+            .executions(&tx)?
+            .iter()
             .find(|row| &row.transaction_id == id)
+            .cloned()
             .ok_or_else(invalid)?;
         super::checkpoint("webdav_held_activation_before_commit");
         tx.commit()?;
@@ -754,17 +778,29 @@ impl LiveDavAdmission<'_> {
     }
 
     fn execution_request(&self) -> Result<WebDavMutationRequest> {
-        Ok(super::audit_descriptions(&self.journal.connection)?
-            .into_iter()
+        let audit = self
+            .journal
+            .webdav_native_read_charges
+            .read(&self.journal.connection)?;
+        Ok(audit
+            .descriptions(&self.journal.connection)?
+            .iter()
             .find(|row| row.description.request.transaction_id == self.execution.transaction_id)
+            .cloned()
             .ok_or_else(invalid)?
             .description
             .request)
     }
     fn execution_limits(&self) -> Result<WebDavNativeLimits> {
-        Ok(super::audit_descriptions(&self.journal.connection)?
-            .into_iter()
+        let audit = self
+            .journal
+            .webdav_native_read_charges
+            .read(&self.journal.connection)?;
+        Ok(audit
+            .descriptions(&self.journal.connection)?
+            .iter()
             .find(|row| row.description.request.transaction_id == self.execution.transaction_id)
+            .cloned()
             .ok_or_else(invalid)?
             .description
             .limits)
@@ -789,14 +825,14 @@ impl LiveDavAdmission<'_> {
         if self.failed || !self.journal.connection.is_autocommit() {
             return Err(invalid());
         }
+        let journal = self.journal;
         self.verify_process_owners()?;
         self.coordination.verify()?;
-        let journal = self.journal;
+        let _dav_read_scope = journal.webdav_native_read_charges.scope();
         let tx = Transaction::new_unchecked(&journal.connection, TransactionBehavior::Immediate)?;
-        let descriptions = super::audit_descriptions(&tx)?;
-        let executions = execution::audit(&tx)?;
-        let complete = manifest_audit::audit(&tx, &descriptions, &executions)?;
-        let bound = complete
+        let verified = journal.webdav_native_read_charges.read(&tx)?;
+        let bound = verified
+            .manifests(&tx)?
             .iter()
             .find(|row| row.budget.manifest_hash == self.manifest_hash)
             .ok_or_else(invalid)?;
@@ -959,7 +995,7 @@ impl LiveDavAdmission<'_> {
     pub fn create_initial_owner_with_policy(
         &mut self,
         now: impl Fn() -> Result<u64>,
-        inspect: impl Fn(&Self) -> Result<()>,
+        inspect: impl Fn(&WebDavInventoryFileView<'_, '_>) -> Result<()>,
     ) -> Result<()> {
         if self.failed {
             return Err(invalid());
@@ -974,14 +1010,16 @@ impl LiveDavAdmission<'_> {
     fn create_initial_owner_inner(
         &mut self,
         now: impl Fn() -> Result<u64>,
-        inspect: impl Fn(&Self) -> Result<()>,
+        inspect: impl Fn(&WebDavInventoryFileView<'_, '_>) -> Result<()>,
     ) -> Result<()> {
         use receipt_protocol::ReceiptStage as S;
         self.verify_process_owners()?;
-        let descriptions = super::audit_descriptions(&self.journal.connection)?;
-        let executions = execution::audit(&self.journal.connection)?;
-        let complete = manifest_audit::audit(&self.journal.connection, &descriptions, &executions)?;
-        let bound = complete
+        let verified = self
+            .journal
+            .webdav_native_read_charges
+            .read(&self.journal.connection)?;
+        let bound = verified
+            .manifests(&self.journal.connection)?
             .iter()
             .find(|row| row.budget.manifest_hash == self.manifest_hash)
             .ok_or_else(invalid)?;
@@ -1000,64 +1038,44 @@ impl LiveDavAdmission<'_> {
         self.verify_native_space()?;
         self.receipt(S::StagingCreationRequested, evidence, now()?)?;
         super::checkpoint("webdav_staging_requested");
-        self.verify_file_view()?;
-        inspect(self)?;
-        self.verify_file_view()?;
+        self.collection_policy(&inspect)?;
         let evidence = self
             .native_owner
             .create_staging(self.originals.root_parent().map_err(|_| invalid())?)?;
         super::checkpoint("webdav_staging_created");
-        self.verify_file_view()?;
-        inspect(self)?;
-        self.verify_file_view()?;
+        self.collection_policy(&inspect)?;
         self.receipt(S::StagingCreated, evidence, now()?)?;
         let evidence = self.native_owner.owner_intent()?;
         self.receipt(S::OwnerActivated, evidence, now()?)?;
         super::checkpoint("webdav_owner_requested");
-        self.verify_file_view()?;
-        inspect(self)?;
-        self.verify_file_view()?;
+        self.collection_policy(&inspect)?;
         let evidence = self.native_owner.create_owner()?;
         super::checkpoint("webdav_owner_created");
-        self.verify_file_view()?;
-        inspect(self)?;
-        self.verify_file_view()?;
+        self.collection_policy(&inspect)?;
         self.receipt(S::OwnerCreated, evidence, now()?)?;
         let evidence = self.native_owner.marker_intent()?;
         self.receipt(S::OwnerMarkerCreationRequested, evidence, now()?)?;
         super::checkpoint("webdav_marker_requested");
-        self.verify_file_view()?;
-        inspect(self)?;
-        self.verify_file_view()?;
+        self.collection_policy(&inspect)?;
         let evidence = self.native_owner.create_marker()?;
         super::checkpoint("webdav_marker_created");
-        self.verify_file_view()?;
-        inspect(self)?;
-        self.verify_file_view()?;
+        self.collection_policy(&inspect)?;
         self.receipt(S::OwnerMarkerCreated, evidence, now()?)?;
         let evidence = self.native_owner.write_intent()?;
         self.receipt(S::OwnerMarkerWriteRequested, evidence, now()?)?;
         super::checkpoint("webdav_marker_write_requested");
-        self.verify_file_view()?;
-        inspect(self)?;
-        self.verify_file_view()?;
+        self.collection_policy(&inspect)?;
         let evidence = self.native_owner.write_marker()?;
-        self.verify_file_view()?;
-        inspect(self)?;
-        self.verify_file_view()?;
+        self.collection_policy(&inspect)?;
         self.receipt(S::OwnerMarkerWritten, evidence, now()?)?;
         super::checkpoint("webdav_marker_written");
         let evidence = self.native_owner.close_intent()?;
         self.receipt(S::OwnerMarkerCloseRequested, evidence, now()?)?;
         super::checkpoint("webdav_marker_close_requested");
-        self.verify_file_view()?;
-        inspect(self)?;
-        self.verify_file_view()?;
+        self.collection_policy(&inspect)?;
         let evidence = self.native_owner.seal_marker()?;
         super::checkpoint("webdav_marker_closed");
-        self.verify_file_view()?;
-        inspect(self)?;
-        self.verify_file_view()?;
+        self.collection_policy(&inspect)?;
         self.receipt(S::OwnerMarkerClosed, evidence, now()?)?;
         self.verify_held_namespace()?;
         Ok(())
@@ -1078,16 +1096,19 @@ impl LiveDavAdmission<'_> {
         if self.failed || self.collections.is_none() || !self.journal.connection.is_autocommit() {
             return Err(invalid());
         }
-        self.verify_file_view()?;
         let journal = self.journal;
+        self.verify_file_view()?;
+        let _dav_read_scope = journal.webdav_native_read_charges.scope();
         let tx = Transaction::new_unchecked(&journal.connection, TransactionBehavior::Immediate)?;
-        let descriptions = super::audit_descriptions(&tx)?;
-        let description = descriptions
+        let verified = journal.webdav_native_read_charges.read(&tx)?;
+        let description = verified
+            .descriptions(&tx)?
             .iter()
             .find(|row| row.description.request.transaction_id == self.execution.transaction_id)
             .ok_or_else(invalid)?;
-        let current = execution::audit(&tx)?
-            .into_iter()
+        let current = verified
+            .executions(&tx)?
+            .iter()
             .find(|row| row.transaction_id == self.execution.transaction_id)
             .ok_or_else(invalid)?;
         if current.records != self.execution.records {
@@ -1134,8 +1155,9 @@ impl LiveDavAdmission<'_> {
             current.admitted_at_ms,
             records,
         )?;
-        let complete = manifest_audit::audit(&tx, &descriptions, &execution::audit(&tx)?)?;
-        let bound = complete
+        let post_write = journal.webdav_native_read_charges.read(&tx)?;
+        let bound = post_write
+            .manifests(&tx)?
             .iter()
             .find(|bound| bound.budget.manifest_hash == self.manifest_hash)
             .ok_or_else(invalid)?;
@@ -1200,9 +1222,12 @@ impl LiveDavAdmission<'_> {
         self.verify_process_owners()?;
         self.coordination.verify()?;
         self.verify_native_space()?;
-        let accepted = execution::audit(&tx)?
-            .into_iter()
+        let accepted_read = journal.webdav_native_read_charges.read(&tx)?;
+        let accepted = accepted_read
+            .executions(&tx)?
+            .iter()
             .find(|row| row.transaction_id == self.execution.transaction_id)
+            .cloned()
             .ok_or_else(invalid)?;
         super::checkpoint(&format!("webdav_action_record_{index}_before_commit"));
         tx.commit()?;
@@ -1218,7 +1243,7 @@ impl LiveDavAdmission<'_> {
     pub fn execute_collection_actions_with_policy(
         &mut self,
         now: impl Fn() -> Result<u64>,
-        inspect: impl Fn(&Self) -> Result<()>,
+        inspect: impl Fn(&WebDavInventoryFileView<'_, '_>) -> Result<()>,
     ) -> Result<()> {
         if self.failed {
             return Err(invalid());
@@ -1266,10 +1291,15 @@ impl LiveDavAdmission<'_> {
             }
         }
     }
-    fn collection_policy(&self, inspect: &impl Fn(&Self) -> Result<()>) -> Result<()> {
-        self.verify_file_view()?;
-        inspect(self)?;
-        self.verify_file_view()
+    fn collection_policy(
+        &self,
+        inspect: &impl Fn(&WebDavInventoryFileView<'_, '_>) -> Result<()>,
+    ) -> Result<()> {
+        let view = self.inventory_file_view()?;
+        view.verify()?;
+        inspect(&view)?;
+        view.verify()?;
+        Ok(())
     }
 
     fn collection_receipt(
@@ -1286,26 +1316,22 @@ impl LiveDavAdmission<'_> {
     }
 
     fn verify_durable_collection_projection(&self) -> Result<()> {
-        let complete = manifest_audit::audit(
-            &self.journal.connection,
-            &super::audit_descriptions(&self.journal.connection)?,
-            &execution::audit(&self.journal.connection)?,
-        )?;
-        let bound = complete
+        let audit = self.immutable_file_read_audit()?;
+        let bound = audit
+            .snapshot
+            .manifests(&self.journal.connection)?
             .iter()
             .find(|row| row.budget.manifest_hash == self.manifest_hash)
             .ok_or_else(invalid)?;
         let baseline = self.baseline()?;
-        let projection = super::collection_projection::Projection::derive(
-            &baseline,
-            self.originals.plan(),
-            &bound.receipts,
-        )
-        .map_err(|_| invalid())?;
+        let projection = bound
+            .projection
+            .get(&baseline, self.originals.plan(), &bound.receipts)
+            .map_err(|_| invalid())?;
         self.collections
             .as_ref()
             .ok_or_else(invalid)?
-            .verify_projection(&baseline, self.originals.plan(), &projection)
+            .verify_projection(&baseline, self.originals.plan(), projection)
             .map_err(|_| invalid())
     }
     fn actual_collection_parent(
@@ -1330,7 +1356,7 @@ impl LiveDavAdmission<'_> {
     fn execute_collection_actions_inner(
         &mut self,
         now: impl Fn() -> Result<u64>,
-        inspect: impl Fn(&Self) -> Result<()>,
+        inspect: impl Fn(&WebDavInventoryFileView<'_, '_>) -> Result<()>,
     ) -> Result<()> {
         use receipt_protocol::ReceiptStage as S;
         use sync_extend_core_model::webdav_native::WebDavNativeAction as A;
@@ -1339,12 +1365,10 @@ impl LiveDavAdmission<'_> {
         };
         if self.collections.is_none() {
             self.verify_file_view()?;
-            let complete = manifest_audit::audit(
-                &self.journal.connection,
-                &super::audit_descriptions(&self.journal.connection)?,
-                &execution::audit(&self.journal.connection)?,
-            )?;
-            let bound = complete
+            let audit = self.immutable_file_read_audit()?;
+            let bound = audit
+                .snapshot
+                .manifests(&self.journal.connection)?
                 .iter()
                 .find(|row| row.budget.manifest_hash == self.manifest_hash)
                 .ok_or_else(invalid)?;
@@ -1618,7 +1642,7 @@ impl LiveDavAdmission<'_> {
     pub fn commit_collection_final_with_policy(
         &mut self,
         now: impl Fn() -> Result<u64>,
-        inspect: impl Fn(&Self) -> Result<()>,
+        inspect: impl Fn(&WebDavInventoryFileView<'_, '_>) -> Result<()>,
     ) -> Result<()> {
         if self.failed {
             return Err(invalid());
@@ -1632,7 +1656,7 @@ impl LiveDavAdmission<'_> {
     fn commit_collection_final_inner(
         &mut self,
         now: impl Fn() -> Result<u64>,
-        inspect: impl Fn(&Self) -> Result<()>,
+        inspect: impl Fn(&WebDavInventoryFileView<'_, '_>) -> Result<()>,
     ) -> Result<()> {
         use receipt_protocol::{ReceiptEvidence as E, ReceiptStage as S};
         use sync_extend_core_model::webdav_native::WebDavNativeAction as A;
@@ -1658,21 +1682,18 @@ impl LiveDavAdmission<'_> {
         else {
             return Err(invalid());
         };
-        let complete = manifest_audit::audit(
-            &self.journal.connection,
-            &super::audit_descriptions(&self.journal.connection)?,
-            &execution::audit(&self.journal.connection)?,
-        )?;
-        let bound = complete
+        let audit = self.immutable_file_read_audit()?;
+        let bound = audit
+            .snapshot
+            .manifests(&self.journal.connection)?
             .iter()
             .find(|row| row.budget.manifest_hash == self.manifest_hash)
             .ok_or_else(invalid)?;
-        let projection = super::collection_projection::Projection::derive(
-            &self.baseline()?,
-            self.originals.plan(),
-            &bound.receipts,
-        )
-        .map_err(|_| invalid())?;
+        let baseline = self.baseline()?;
+        let projection = bound
+            .projection
+            .get(&baseline, self.originals.plan(), &bound.receipts)
+            .map_err(|_| invalid())?;
         let actual: std::collections::BTreeMap<_, _> = projection
             .user
             .iter()
@@ -1739,7 +1760,7 @@ impl LiveDavAdmission<'_> {
     pub fn dispose_collection_originals_with_policy(
         &mut self,
         now: impl Fn() -> Result<u64>,
-        inspect: impl Fn(&Self) -> Result<()>,
+        inspect: impl Fn(&WebDavInventoryFileView<'_, '_>) -> Result<()>,
     ) -> Result<()> {
         if self.failed {
             return Err(invalid());
@@ -1753,7 +1774,7 @@ impl LiveDavAdmission<'_> {
     fn dispose_collection_originals_inner(
         &mut self,
         now: impl Fn() -> Result<u64>,
-        inspect: impl Fn(&Self) -> Result<()>,
+        inspect: impl Fn(&WebDavInventoryFileView<'_, '_>) -> Result<()>,
     ) -> Result<()> {
         use receipt_protocol::ReceiptStage as S;
         use sync_extend_core_model::webdav_native::WebDavNativeAction as A;
@@ -1764,12 +1785,10 @@ impl LiveDavAdmission<'_> {
         if self.collections.is_none() || self.execution.unresolved_activation {
             return Err(invalid());
         }
-        let complete = manifest_audit::audit(
-            &self.journal.connection,
-            &super::audit_descriptions(&self.journal.connection)?,
-            &execution::audit(&self.journal.connection)?,
-        )?;
-        let bound = complete
+        let audit = self.immutable_file_read_audit()?;
+        let bound = audit
+            .snapshot
+            .manifests(&self.journal.connection)?
             .iter()
             .find(|row| row.budget.manifest_hash == self.manifest_hash)
             .ok_or_else(invalid)?;
@@ -1856,7 +1875,7 @@ impl LiveDavAdmission<'_> {
     pub fn finish_collection_cleanup_with_policy(
         &mut self,
         now: impl Fn() -> Result<u64>,
-        inspect: impl Fn(&Self) -> Result<()>,
+        inspect: impl Fn(&WebDavInventoryFileView<'_, '_>) -> Result<()>,
     ) -> Result<()> {
         if self.failed {
             return Err(invalid());
@@ -1870,7 +1889,7 @@ impl LiveDavAdmission<'_> {
     fn finish_collection_cleanup_inner(
         &mut self,
         now: impl Fn() -> Result<u64>,
-        inspect: impl Fn(&Self) -> Result<()>,
+        inspect: impl Fn(&WebDavInventoryFileView<'_, '_>) -> Result<()>,
     ) -> Result<()> {
         use receipt_protocol::ReceiptStage as S;
         self.collection_policy(&inspect)?;
@@ -1879,12 +1898,10 @@ impl LiveDavAdmission<'_> {
         {
             return Err(invalid());
         }
-        let complete = manifest_audit::audit(
-            &self.journal.connection,
-            &super::audit_descriptions(&self.journal.connection)?,
-            &execution::audit(&self.journal.connection)?,
-        )?;
-        let bound = complete
+        let audit = self.immutable_file_read_audit()?;
+        let bound = audit
+            .snapshot
+            .manifests(&self.journal.connection)?
             .iter()
             .find(|row| row.budget.manifest_hash == self.manifest_hash)
             .ok_or_else(invalid)?;
@@ -1962,78 +1979,242 @@ impl LiveDavAdmission<'_> {
         self.collection_policy(&inspect)?;
         self.receipt(S::Terminal, references, now()?)?;
         super::checkpoint("webdav_cleanup_terminal_committed");
-        self.execution = execution::audit(&self.journal.connection)?
-            .into_iter()
+        let verified = self
+            .journal
+            .webdav_native_read_charges
+            .read(&self.journal.connection)?;
+        self.execution = verified
+            .executions(&self.journal.connection)?
+            .iter()
             .find(|row| row.transaction_id == self.execution.transaction_id)
+            .cloned()
             .ok_or_else(invalid)?;
         self.collection_policy(&inspect)
     }
 }
 
-/// An immutable borrow for one double inventory scan. No effect authority,
-/// transcript injection, owned handles, cloning or public fields are exposed.
-pub struct WebDavInventoryFileView<'a, 'journal> {
-    held: &'a LiveDavAdmission<'journal>,
-    changes: u64,
-    data_version: u64,
+/// Exact owned descriptive data for one immutable policy and inventory phase.
+/// Construction performs every full audit; this private value issues no effects.
+struct VerifiedFileAudit {
+    snapshot: Arc<super::read_phase::VerifiedDavReadSnapshot>,
+    description_index: usize,
+    execution_index: usize,
+    manifest_index: usize,
+    baseline: sync_extend_core_model::Manifest,
+    live_execution: WebDavDurableExecution,
 }
 
-impl LiveDavAdmission<'_> {
-    /// Fully audit before lending a scoped inventory view. Each original file
-    /// observation retains the same handle/slot checks; full audit also remains
-    /// at every scan boundary and after the caller's policy returns.
-    pub fn inventory_file_view(&self) -> Result<WebDavInventoryFileView<'_, '_>> {
-        self.verify_file_view()?;
-        let changes = self.journal.connection.total_changes();
-        let data_version =
-            self.journal
-                .connection
-                .pragma_query_value(Some("main"), "data_version", |row| crate::sql_u64(row, 0))?;
-        Ok(WebDavInventoryFileView {
-            held: self,
-            changes,
-            data_version,
-        })
+impl VerifiedFileAudit {
+    fn read(held: &LiveDavAdmission<'_>) -> Result<Self> {
+        let journal = held.journal;
+        if held.failed || !journal.connection.is_autocommit() {
+            return Err(invalid());
+        }
+        held.verify_process_owners()?;
+        held.verify_held_handle_budget()?;
+        held.coordination.verify()?;
+        let snapshot = journal
+            .webdav_native_read_charges
+            .read(&journal.connection)?;
+        let descriptions = snapshot.descriptions(&journal.connection)?;
+        let executions = snapshot.executions(&journal.connection)?;
+        let manifests = snapshot.manifests(&journal.connection)?;
+        let description_index = descriptions
+            .iter()
+            .position(|row| row.description.request.transaction_id == held.execution.transaction_id)
+            .ok_or_else(invalid)?;
+        let execution_index = executions
+            .iter()
+            .position(|row| row.transaction_id == held.execution.transaction_id)
+            .ok_or_else(invalid)?;
+        let manifest_index = manifests
+            .iter()
+            .position(|row| {
+                row.budget.manifest_hash == held.manifest_hash
+                    && row.budget.manifest.scope.transaction_id == held.execution.transaction_id
+                    && row.budget.manifest.native_peak == held.native_peak
+                    && row.budget.manifest.native_handles.admission_limit
+                        == held.native_handle_limit as u64
+            })
+            .ok_or_else(invalid)?;
+        let description = &descriptions[description_index];
+        if held
+            .originals
+            .description(
+                &description.description.request,
+                description.description.limits,
+            )
+            .map_err(|_| invalid())?
+            != description.description
+        {
+            return Err(invalid());
+        }
+        let bound = &manifests[manifest_index];
+        let baseline = bound
+            .projection
+            .baseline_for(held.originals.plan(), &bound.receipts)
+            .map_err(|_| invalid())?
+            .clone();
+        let result = Self {
+            snapshot,
+            description_index,
+            execution_index,
+            manifest_index,
+            baseline,
+            live_execution: held.execution.clone(),
+        };
+        result.verify_binding(held)?;
+        Ok(result)
+    }
+
+    fn verify_binding(&self, held: &LiveDavAdmission<'_>) -> Result<()> {
+        let connection = &held.journal.connection;
+        self.snapshot.verify(connection)?;
+        if held.failed || !connection.is_autocommit() || self.live_execution != held.execution {
+            return Err(invalid());
+        }
+        let description = &self.snapshot.descriptions(connection)?[self.description_index];
+        let execution = &self.snapshot.executions(connection)?[self.execution_index];
+        let bound = &self.snapshot.manifests(connection)?[self.manifest_index];
+        if description.description.request.transaction_id != held.execution.transaction_id
+            || description.plan_hash != *held.originals.plan().fingerprint()
+            || description.description.inventory != *held.originals.plan().inventory()
+            || execution.transaction_id != held.execution.transaction_id
+            || execution.description_hash != held.execution.description_hash
+            || execution.request_hash != held.execution.request_hash
+            || execution.plan_hash != held.execution.plan_hash
+            || execution.limits != held.execution.limits
+            || execution.admitted_at_ms != held.execution.admitted_at_ms
+            || execution.admission_hash != held.execution.admission_hash
+            || execution.records != held.execution.records
+            || bound.budget.manifest_hash != held.manifest_hash
+            || bound.budget.manifest.native_peak != held.native_peak
+            || bound.budget.manifest.native_handles.admission_limit
+                != held.native_handle_limit as u64
+            || self.baseline.root()? != description.description.request.baseline
+        {
+            return Err(invalid());
+        }
+        bound
+            .projection
+            .get(&self.baseline, held.originals.plan(), &bound.receipts)
+            .map_err(|_| invalid())?;
+        // Pins remain live SQL observations at every view boundary, even when
+        // immutable decoded descriptions, execution and projection are reused.
+        let snapshot = crate::snapshot_retention::audit_snapshot(
+            connection,
+            &self.baseline.space_id,
+            &description.description.request.baseline,
+        )?;
+        if snapshot.manifest != self.baseline {
+            return Err(invalid());
+        }
+        for receipt in &bound.receipts {
+            if let receipt_protocol::ReceiptEvidence::History {
+                final_snapshot,
+                history_hash,
+                ..
+            } = &receipt.evidence
+            {
+                super::reference_handoff::audit(
+                    connection,
+                    &held.execution.transaction_id,
+                    &bound.receipts,
+                    final_snapshot,
+                    history_hash,
+                )?;
+            }
+        }
+        self.snapshot.verify(connection)
+    }
+
+    fn terminal(&self, held: &LiveDavAdmission<'_>) -> Result<bool> {
+        self.verify_binding(held)?;
+        Ok(
+            self.snapshot.manifests(&held.journal.connection)?[self.manifest_index]
+                .receipts
+                .last()
+                .is_some_and(|receipt| receipt.stage == receipt_protocol::ReceiptStage::Terminal),
+        )
+    }
+}
+
+/// An immutable borrow for one double inventory scan. The complete private
+/// descriptive audit is reused only within this view's unchanged SQL phase.
+/// No effects, transcript injection, owned handles, cloning or public fields.
+pub struct WebDavInventoryFileView<'a, 'journal> {
+    held: &'a LiveDavAdmission<'journal>,
+    audit: Arc<VerifiedFileAudit>,
+}
+
+impl<'journal> LiveDavAdmission<'journal> {
+    fn immutable_file_read_audit(&self) -> Result<Arc<VerifiedFileAudit>> {
+        let connection = &self.journal.connection;
+        let mut cached = self
+            .file_read_audit
+            .try_borrow_mut()
+            .map_err(|_| invalid())?;
+        if let Some(audit) = cached.as_ref() {
+            if !self.failed
+                && connection.is_autocommit()
+                && audit.live_execution == self.execution
+                && audit.snapshot.matches_generation(connection)?
+            {
+                audit.verify_binding(self)?;
+                return Ok(Arc::clone(audit));
+            }
+        }
+        // SQL writes, schema/data-version changes, transaction-state changes,
+        // and changed exact execution discard the old read before rebuilding.
+        *cached = None;
+        let audit = Arc::new(VerifiedFileAudit::read(self)?);
+        *cached = Some(Arc::clone(&audit));
+        Ok(audit)
+    }
+
+    /// Fully audit once before lending a scoped inventory view. Every original
+    /// handle, namespace, metadata and capacity check remains at all boundaries
+    /// and observations; changed SQL or transaction state rejects the whole view.
+    pub fn inventory_file_view(&self) -> Result<WebDavInventoryFileView<'_, 'journal>> {
+        let audit = self.immutable_file_read_audit()?;
+        let view = WebDavInventoryFileView { held: self, audit };
+        view.verify()?;
+        Ok(view)
     }
 }
 
 impl WebDavInventoryFileView<'_, '_> {
     fn verify_sql_generation(&self) -> Result<()> {
-        let version: u64 = self.held.journal.connection.pragma_query_value(
-            Some("main"),
-            "data_version",
-            |row| crate::sql_u64(row, 0),
-        )?;
-        if self.held.failed
-            || self.held.journal.connection.total_changes() != self.changes
-            || version != self.data_version
-        {
-            return Err(invalid());
-        }
-        Ok(())
+        self.audit.verify_binding(self.held)
     }
     pub fn verify(&self) -> Result<()> {
-        self.verify_sql_generation()?;
-        self.held.verify_file_view()?;
-        self.verify_sql_generation()
-    }
-    pub fn observe_file(
-        &self,
-        path: &Path,
-    ) -> Result<Option<crate::NativePublicationFileObservation>> {
         self.verify_sql_generation()?;
         self.held.verify_process_owners()?;
         self.held.verify_held_handle_budget()?;
         self.held.coordination.verify()?;
-        self.held.verify_held_namespace()?;
-        self.held.verify_native_space()?;
+        self.held
+            .verify_held_namespace_with_baseline(&self.audit.baseline)?;
+        self.held.verify_native_space_from_audit(&self.audit)?;
+        self.verify_sql_generation()
+    }
+
+    /// Read-only compatibility name for existing policy callbacks.
+    pub fn verify_file_view(&self) -> Result<()> {
+        self.verify()
+    }
+
+    pub fn observe_file(
+        &self,
+        path: &Path,
+    ) -> Result<Option<crate::NativePublicationFileObservation>> {
+        self.verify()?;
         let observation = self.held.observe_held_file(path)?;
         self.verify_sql_generation()?;
         Ok(observation)
     }
     pub fn remaining_internal_bytes(&self) -> Result<u64> {
-        self.verify_sql_generation()?;
-        let remaining = self.held.remaining_internal_bytes()?;
+        self.verify()?;
+        let remaining = self.held.remaining_internal_bytes_from_audit(&self.audit)?;
         self.verify_sql_generation()?;
         Ok(remaining)
     }

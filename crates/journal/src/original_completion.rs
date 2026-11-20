@@ -109,8 +109,15 @@ impl crate::JournalBackupImage {
         bounds: NodeInspectionBounds,
     ) -> Result<ContentId> {
         self.with_audited_readonly(space, bounds, |connection| {
-            let original = crate::JournalReadView { connection }
-                .audit_original_provenance_capacity(space, bounds.max_entries, bounds.capacity)?;
+            let original = crate::JournalReadView {
+                connection,
+                dav_read_charge_cache: None,
+            }
+            .audit_original_provenance_capacity(
+                space,
+                bounds.max_entries,
+                bounds.capacity,
+            )?;
             completion_rows_hash(&original.rows)
         })
     }

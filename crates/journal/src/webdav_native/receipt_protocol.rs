@@ -1,7 +1,7 @@
 //! D01-D05 draft: bounded exact internal stages for original native DAV actions.
 //! Descriptions and this audit never issue native, Final or disposal authority.
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
     tree_restore_history::encode_history_record,
     webdav_native::{WebDavNativeAction, WebDavNativePlan},
@@ -17,7 +17,7 @@ pub struct ReceiptScope {
     pub plan_hash: ContentId,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(
     tag = "stage",
     content = "action",
@@ -245,6 +245,94 @@ pub struct ReceiptDescription {
     pub evidence: ReceiptEvidence,
 }
 
+/// A description-only view of the exact immutable input that passed this audit.
+/// Only this module constructs or advances it, after all checks for a record.
+/// Stage buckets retain every occurrence: first/any queries must not overwrite
+/// an earlier receipt with a later duplicate.
+pub(super) struct VerifiedPrefix<'a> {
+    plan: &'a WebDavNativePlan,
+    records: &'a [ReceiptDescription],
+    verified_len: usize,
+    stages: BTreeMap<ReceiptStage, Vec<usize>>,
+    first_history_committed: Option<usize>,
+    verified_dependencies: BTreeSet<usize>,
+    end_hash: ContentId,
+}
+
+impl<'a> VerifiedPrefix<'a> {
+    pub(super) fn plan(&self) -> &'a WebDavNativePlan {
+        self.plan
+    }
+
+    pub(super) fn records(&self) -> &'a [ReceiptDescription] {
+        &self.records[..self.verified_len]
+    }
+
+    pub(super) fn first(&self, stage: ReceiptStage) -> Option<&'a ReceiptDescription> {
+        self.stages
+            .get(&stage)?
+            .first()
+            .and_then(|index| self.records().get(*index))
+    }
+
+    pub(super) fn first_history_committed(&self) -> Option<&'a ReceiptDescription> {
+        self.first_history_committed
+            .and_then(|index| self.records().get(index))
+    }
+
+    pub(super) fn any_evidence(&self, stage: ReceiptStage, evidence: &ReceiptEvidence) -> bool {
+        self.stages.get(&stage).is_some_and(|indices| {
+            indices.iter().any(|index| {
+                self.records()
+                    .get(*index)
+                    .is_some_and(|record| &record.evidence == evidence)
+            })
+        })
+    }
+
+    pub(super) fn dependencies_verified(&self, action: usize) -> bool {
+        self.verified_dependencies.contains(&action)
+    }
+
+    fn append(&mut self, index: usize, end_hash: ContentId) -> Result<()> {
+        if index != self.verified_len {
+            return Err(ModelError::InvalidData("exact verified DAV receipt prefix"));
+        }
+        let record = self
+            .records
+            .get(index)
+            .ok_or(ModelError::InvalidData("exact verified DAV receipt prefix"))?;
+        self.stages.entry(record.stage).or_default().push(index);
+        use ReceiptStage as S;
+        match record.stage {
+            S::QuarantineRequested(action)
+            | S::QuarantineMoved(action)
+            | S::DirectoryCreationRequested(action)
+            | S::DirectoryCreated(action)
+            | S::FileCreationRequested(action)
+            | S::FileCreated(action)
+            | S::FileWriteRequested(action)
+            | S::FileWritten(action)
+            | S::FileCloseRequested(action)
+            | S::FileClosed(action)
+            | S::FilePublicationRequested(action)
+            | S::FilePublished(action)
+            | S::HistoryCommitRequested(action)
+            | S::HistoryCommitted(action) => {
+                self.verified_dependencies.insert(action);
+            }
+            _ => {}
+        }
+        if matches!(record.stage, S::HistoryCommitted(_)) && self.first_history_committed.is_none()
+        {
+            self.first_history_committed = Some(index);
+        }
+        self.verified_len += 1;
+        self.end_hash = end_hash;
+        Ok(())
+    }
+}
+
 /// Validate bytes/order only. Each evidence_hash must separately be produced
 /// from an exact held private effect proof, not copied from this description.
 pub fn audit_prefix(
@@ -255,6 +343,28 @@ pub fn audit_prefix(
     admitted_at_ms: u64,
     max_total_receipt_bytes: u64,
 ) -> Result<ContentId> {
+    Ok(verified_prefix(
+        plan,
+        expected,
+        records,
+        initial_hash,
+        admitted_at_ms,
+        max_total_receipt_bytes,
+    )?
+    .end_hash)
+}
+
+/// The same full audit as the public boundary, with a view that consumers may
+/// reuse only for these immutable records and this original plan. This view
+/// cannot authorize an effect or survive mutation of its borrowed input.
+pub(super) fn verified_prefix<'a>(
+    plan: &'a WebDavNativePlan,
+    expected: &'a [ReceiptTemplate],
+    records: &'a [ReceiptDescription],
+    initial_hash: &ContentId,
+    admitted_at_ms: u64,
+    max_total_receipt_bytes: u64,
+) -> Result<VerifiedPrefix<'a>> {
     if expected.is_empty()
         || expected.len() > sync_extend_core_model::limits::MAX_ENTRIES
         || expected.iter().enumerate().any(|(index, template)| {
@@ -276,6 +386,15 @@ pub fn audit_prefix(
     let mut time = admitted_at_ms;
     let mut generations = BTreeSet::new();
     let mut total = 0_u64;
+    let mut verified = VerifiedPrefix {
+        plan,
+        records,
+        verified_len: 0,
+        stages: BTreeMap::new(),
+        first_history_committed: None,
+        verified_dependencies: BTreeSet::new(),
+        end_hash: initial_hash.clone(),
+    };
     for (index, record) in records.iter().enumerate() {
         let template = &expected[index];
         let hash = ContentId::hash(&encode_history_record(
@@ -310,9 +429,9 @@ pub fn audit_prefix(
             ));
         }
         if index < 10 {
-            audit_initial_owner_evidence(record, records.get(index.wrapping_sub(1)))?;
+            audit_initial_owner_evidence(record, verified.records().last())?;
         } else {
-            super::ordered_receipts::audit(plan, record, &records[..index])?;
+            super::ordered_receipts::audit(record, &verified)?;
         }
         let bytes = encode_history_record(record, template.max_receipt_json_bytes)?;
         total = total
@@ -323,8 +442,9 @@ pub fn audit_prefix(
             ))?;
         previous = ContentId::hash(&bytes);
         time = record.recorded_at_ms;
+        verified.append(index, previous.clone())?;
     }
-    Ok(previous)
+    Ok(verified)
 }
 
 /// Audit description lineage only. The private stage issuer must retain originals.

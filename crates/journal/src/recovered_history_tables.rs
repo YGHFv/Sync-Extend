@@ -65,7 +65,11 @@ impl JournalBackupImage {
         bounds: NodeInspectionBounds,
     ) -> Result<RecoveredHistoryTables> {
         self.with_audited_readonly(space, bounds, |connection| {
-            let audit = crate::JournalReadView { connection }.audit_original_provenance_capacity(
+            let audit = crate::JournalReadView {
+                connection,
+                dav_read_charge_cache: None,
+            }
+            .audit_original_provenance_capacity(
                 space,
                 bounds.max_entries,
                 bounds.capacity,
@@ -149,7 +153,11 @@ impl JournalBackupImage {
         bounds: NodeInspectionBounds,
     ) -> Result<RecoveredMainTables> {
         self.with_audited_readonly(space, bounds, |connection| {
-            let audit = crate::JournalReadView { connection }.audit_original_provenance_capacity(
+            let audit = crate::JournalReadView {
+                connection,
+                dav_read_charge_cache: None,
+            }
+            .audit_original_provenance_capacity(
                 space,
                 bounds.max_entries,
                 bounds.capacity,

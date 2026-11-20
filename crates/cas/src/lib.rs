@@ -290,43 +290,7 @@ impl Cas {
         max_chunks: usize,
     ) -> Result<FileManifest> {
         let _session = self.operation_session()?;
-        let max_chunks = max_chunks.min(MAX_CHUNKS);
-        let mut hasher = blake3::Hasher::new();
-        let mut chunks = Vec::new();
-        let mut length = 0u64;
-        // Probe one excess byte without consuming an unbounded, growing source.
-        for chunk in StreamCDC::with_level_and_seed(
-            reader.take(max_bytes.saturating_add(1)),
-            MIN_CHUNK,
-            AVG_CHUNK,
-            MAX_CHUNK,
-            Normalization::Level1,
-            0,
-        ) {
-            let chunk = chunk.map_err(|e| CasError::Chunking(e.to_string()))?;
-            length = length
-                .checked_add(chunk.length as u64)
-                .ok_or(CasError::Integrity)?;
-            if length > max_bytes {
-                return Err(CasError::ResourceLimit("file bytes"));
-            }
-            if chunks.len() >= max_chunks {
-                return Err(CasError::ResourceLimit("file chunks"));
-            }
-            hasher.update(&chunk.data);
-            chunks.push(self.put(&chunk.data)?);
-        }
-        let manifest = FileManifest {
-            format_version: FORMAT_VERSION,
-            chunking: "fastcdc-2020-v1".to_owned(),
-            hash_algorithm: "blake3".to_owned(),
-            compression: "none".to_owned(),
-            content_id: ContentId::from_hasher(&hasher),
-            length,
-            chunks,
-        };
-        manifest.validate()?;
-        Ok(manifest)
+        bounded_content(reader, max_bytes, max_chunks, |data| self.put(data))
     }
 
     pub fn write_file(&self, manifest: &FileManifest, mut writer: impl Write) -> Result<()> {
@@ -347,6 +311,65 @@ impl Cas {
     pub fn verify(&self, manifest: &FileManifest) -> Result<()> {
         self.write_file(manifest, std::io::sink())
     }
+}
+
+/// Observe bounded streaming content without a CAS session or chunk publication.
+pub fn observe_bounded_content(
+    reader: impl Read,
+    max_bytes: u64,
+    max_chunks: usize,
+) -> Result<FileManifest> {
+    bounded_content(reader, max_bytes, max_chunks, |data| {
+        Ok(ChunkRef {
+            content_id: ContentId::hash(data),
+            length: data.len() as u32,
+        })
+    })
+}
+
+fn bounded_content(
+    reader: impl Read,
+    max_bytes: u64,
+    max_chunks: usize,
+    mut chunk_reference: impl FnMut(&[u8]) -> Result<ChunkRef>,
+) -> Result<FileManifest> {
+    let max_chunks = max_chunks.min(MAX_CHUNKS);
+    let mut hasher = blake3::Hasher::new();
+    let mut chunks = Vec::new();
+    let mut length = 0u64;
+    // Probe one excess byte without consuming an unbounded, growing source.
+    for chunk in StreamCDC::with_level_and_seed(
+        reader.take(max_bytes.saturating_add(1)),
+        MIN_CHUNK,
+        AVG_CHUNK,
+        MAX_CHUNK,
+        Normalization::Level1,
+        0,
+    ) {
+        let chunk = chunk.map_err(|e| CasError::Chunking(e.to_string()))?;
+        length = length
+            .checked_add(chunk.length as u64)
+            .ok_or(CasError::Integrity)?;
+        if length > max_bytes {
+            return Err(CasError::ResourceLimit("file bytes"));
+        }
+        if chunks.len() >= max_chunks {
+            return Err(CasError::ResourceLimit("file chunks"));
+        }
+        hasher.update(&chunk.data);
+        chunks.push(chunk_reference(&chunk.data)?);
+    }
+    let manifest = FileManifest {
+        format_version: FORMAT_VERSION,
+        chunking: "fastcdc-2020-v1".to_owned(),
+        hash_algorithm: "blake3".to_owned(),
+        compression: "none".to_owned(),
+        content_id: ContentId::from_hasher(&hasher),
+        length,
+        chunks,
+    };
+    manifest.validate()?;
+    Ok(manifest)
 }
 
 #[cfg(unix)]

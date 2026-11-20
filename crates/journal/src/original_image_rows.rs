@@ -25,8 +25,15 @@ impl Journal {
             .read_view()
             .audit_original_provenance_capacity(space, bounds.max_entries, bounds.capacity)?;
         image.with_audited_readonly(space, bounds, |connection| {
-            let original = crate::JournalReadView { connection }
-                .audit_original_provenance_capacity(space, bounds.max_entries, bounds.capacity)?;
+            let original = crate::JournalReadView {
+                connection,
+                dav_read_charge_cache: None,
+            }
+            .audit_original_provenance_capacity(
+                space,
+                bounds.max_entries,
+                bounds.capacity,
+            )?;
             if actual.rows != original.rows {
                 return Err(JournalError::Invariant(
                     "actual original Journal complete row values differ",

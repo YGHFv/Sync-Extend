@@ -101,7 +101,10 @@ pub(super) fn exact_history(connection: &Connection, parent: &Header) -> Result<
             return Err(invalid("conflict Final exact history DML differs"));
         }
     }
-    let view = crate::JournalReadView { connection };
+    let view = crate::JournalReadView {
+        connection,
+        dav_read_charge_cache: None,
+    };
     if !terminal && view.current(&parent.target.space_id)?.as_ref() != Some(&parent.target) {
         return Err(invalid("conflict Final complete current target differs"));
     }

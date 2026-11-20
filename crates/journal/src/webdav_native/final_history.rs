@@ -1,5 +1,5 @@
 //! Exact original Final values and transaction statements; issuer retains natives.
-use super::receipt_protocol::{ReceiptDescription, ReceiptEvidence, ReceiptStage};
+use super::receipt_protocol::{ReceiptDescription, ReceiptEvidence, ReceiptStage, VerifiedPrefix};
 #[cfg(windows)]
 use super::{
     final_row_gate::Gate,
@@ -13,20 +13,18 @@ use rusqlite::Connection;
 use rusqlite::{params_from_iter, Transaction};
 #[cfg(windows)]
 use sync_extend_core_model::tree_restore_history::encode_history_record;
-use sync_extend_core_model::{
-    webdav_native::{WebDavNativeAction, WebDavNativePlan},
-    ContentId, ModelError,
-};
+use sync_extend_core_model::{webdav_native::WebDavNativeAction, ContentId, ModelError};
 fn invalid() -> JournalError {
     JournalError::Invariant("original complete DAV causal Final values")
 }
 
 pub(super) fn audit_receipt(
-    plan: &WebDavNativePlan,
     record: &ReceiptDescription,
-    prior: &[ReceiptDescription],
+    prior: &VerifiedPrefix<'_>,
 ) -> sync_extend_core_model::Result<()> {
     let bad = || ModelError::InvalidData("original DAV causal Final receipt");
+    let plan = prior.plan();
+    let records = prior.records();
     let action = match record.stage {
         ReceiptStage::HistoryCommitRequested(action) | ReceiptStage::HistoryCommitted(action) => {
             action
@@ -54,27 +52,29 @@ pub(super) fn audit_receipt(
         || snapshot != final_snapshot
         || count != operation_count
         || history_hash.as_str().len() != 64
-        || prior.len() < 10
+        || records.len() < 10
     {
         return Err(bad());
     }
-    for dependency in &step.dependencies {
-        let finished = match &plan.steps().get(*dependency).ok_or_else(bad)?.action {
-            WebDavNativeAction::QuarantineOriginal { .. } => {
-                ReceiptStage::QuarantineMoved(*dependency)
+    if !prior.dependencies_verified(action) {
+        for dependency in &step.dependencies {
+            let finished = match &plan.steps().get(*dependency).ok_or_else(bad)?.action {
+                WebDavNativeAction::QuarantineOriginal { .. } => {
+                    ReceiptStage::QuarantineMoved(*dependency)
+                }
+                WebDavNativeAction::CreateDirectory { .. } => {
+                    ReceiptStage::DirectoryCreated(*dependency)
+                }
+                WebDavNativeAction::PublishFile { .. } => ReceiptStage::FilePublished(*dependency),
+                _ => return Err(bad()),
+            };
+            if *dependency >= action || prior.first(finished).is_none() {
+                return Err(bad());
             }
-            WebDavNativeAction::CreateDirectory { .. } => {
-                ReceiptStage::DirectoryCreated(*dependency)
-            }
-            WebDavNativeAction::PublishFile { .. } => ReceiptStage::FilePublished(*dependency),
-            _ => return Err(bad()),
-        };
-        if *dependency >= action || !prior.iter().any(|record| record.stage == finished) {
-            return Err(bad());
         }
     }
     if matches!(record.stage, ReceiptStage::HistoryCommitted(_)) {
-        let previous = prior.last().ok_or_else(bad)?;
+        let previous = records.last().ok_or_else(bad)?;
         if previous.stage != ReceiptStage::HistoryCommitRequested(action)
             || previous.evidence != record.evidence
         {

@@ -26,6 +26,11 @@ pub(crate) mod final_row_gate;
 mod future_history;
 mod ordered_receipts;
 mod ordered_records;
+mod read_phase;
+pub(crate) use read_phase::{
+    DavReadChargeCache, DavReadChargeSource, DavReadCharges, VerifiedDavReadAudit,
+    VerifiedDavReadChargePhase,
+};
 mod receipt_protocol;
 mod reference_handoff;
 pub(crate) mod schema;
@@ -341,8 +346,13 @@ fn advance_clock(connection: &Connection, time: u64) -> Result<()> {
 
 impl Journal {
     pub fn webdav_native_admissions(&self) -> Result<Vec<WebDavNativeAdmission>> {
+        let _dav_read_scope = self.webdav_native_read_charges.scope();
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
-        let rows = audit(&tx)?;
+        let rows = self
+            .webdav_native_read_charges
+            .read(&tx)?
+            .descriptions(&tx)?
+            .to_vec();
         tx.commit()?;
         Ok(rows)
     }
@@ -362,10 +372,16 @@ impl Journal {
         if !self.connection.is_autocommit() {
             return Err(invalid().into());
         }
+        let _dav_read_scope = self.webdav_native_read_charges.scope();
         let find = || -> Result<Option<WebDavNativeAdmission>> {
-            let old = audit(&self.connection)?.into_iter().find(|row| {
-                row.description.request.transaction_id == description.request.transaction_id
-            });
+            let verified = self.webdav_native_read_charges.read(&self.connection)?;
+            let old = verified
+                .descriptions(&self.connection)?
+                .iter()
+                .find(|row| {
+                    row.description.request.transaction_id == description.request.transaction_id
+                })
+                .cloned();
             if old
                 .as_ref()
                 .is_some_and(|row| row.description != *description)
@@ -483,10 +499,14 @@ impl Journal {
         }
         let mut coordination = self.acquire_cas_coordination()?;
         coordination.try_exclusive()?;
+        let _dav_read_scope = self.webdav_native_read_charges.scope();
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let old = audit(&tx)?
-            .into_iter()
+        let verified = self.webdav_native_read_charges.read(&tx)?;
+        let old = verified
+            .descriptions(&tx)?
+            .iter()
             .find(|row| &row.description.request.transaction_id == id)
+            .cloned()
             .ok_or_else(invalid)?;
         scope(&tx, space, &old.description.request.origin_device)?;
         if old.cancelled_at_ms.is_some() {
@@ -496,7 +516,8 @@ impl Journal {
         if time < old.admitted_at_ms {
             return Err(invalid());
         }
-        if execution::audit(&tx)?
+        if verified
+            .executions(&tx)?
             .iter()
             .any(|row| &row.transaction_id == id && !row.records.is_empty())
         {
@@ -533,9 +554,12 @@ impl Journal {
             ],
             time,
         )?;
-        let accepted = audit(&tx)?
-            .into_iter()
+        let accepted_read = self.webdav_native_read_charges.read(&tx)?;
+        let accepted = accepted_read
+            .descriptions(&tx)?
+            .iter()
             .find(|row| &row.description.request.transaction_id == id)
+            .cloned()
             .ok_or_else(invalid)?;
         checkpoint("webdav_native_cancel_before_commit");
         tx.commit()?;

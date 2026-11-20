@@ -69,7 +69,7 @@ pub(super) fn audit(
         sum.checked_add(template.max_receipt_json_bytes)
             .ok_or_else(invalid)
     })?;
-    receipt_protocol::audit_prefix(
+    let verified = receipt_protocol::verified_prefix(
         plan,
         &templates,
         &receipts,
@@ -108,10 +108,7 @@ pub(super) fn audit(
                 ReceiptStage::OriginalAbsent(record.action_index)
             }
         };
-        let receipt = receipts
-            .iter()
-            .find(|receipt| receipt.stage == stage)
-            .ok_or_else(invalid)?;
+        let receipt = verified.first(stage).ok_or_else(invalid)?;
         if receipt.recorded_at_ms > record.recorded_at_ms {
             return Err(invalid());
         }

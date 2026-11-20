@@ -309,22 +309,33 @@ impl crate::JournalReadView<'_> {
             bounds.inventory.max_logical_bytes,
         )?;
         crate::tree_native_storage::preflight_all(self.connection, max)?;
+        // The private audit below performs reads only. Its complete DAV
+        // arithmetic can be borrowed by nested audits in this same SQL
+        // generation; the phase ends before any caller can write/commit.
+        let dav_phase = crate::webdav_native::VerifiedDavReadChargePhase::read(
+            self.connection,
+            self.dav_read_charge_cache,
+        )?;
+        let view = crate::JournalReadView {
+            connection: self.connection,
+            dav_read_charge_cache: Some(dav_phase.reader()),
+        };
         let audited = match owners {
-            OwnerAudit::Initialized => audit::owners(self, space, max)?,
-            OwnerAudit::LeaseTransaction => audit::lease_owners(self, space, max, &tables)?,
-            OwnerAudit::HistoryTransaction => audit::history_owners(self, space, max, &tables)?,
-            OwnerAudit::ReceiveTransaction => audit::receive_owners(self, space, max, &tables)?,
+            OwnerAudit::Initialized => audit::owners(&view, space, max)?,
+            OwnerAudit::LeaseTransaction => audit::lease_owners(&view, space, max, &tables)?,
+            OwnerAudit::HistoryTransaction => audit::history_owners(&view, space, max, &tables)?,
+            OwnerAudit::ReceiveTransaction => audit::receive_owners(&view, space, max, &tables)?,
             OwnerAudit::StorageReceiveTransaction => {
-                audit::storage_receive_owners(self, space, max, &tables)?
+                audit::storage_receive_owners(&view, space, max, &tables)?
             }
             OwnerAudit::LocalCommitTransaction => {
-                audit::local_commit_owners(self, space, max, &tables)?
+                audit::local_commit_owners(&view, space, max, &tables)?
             }
         };
         let mut rows = Vec::new();
         let mut actual = TreeStorageCharge::default();
         for (spec, expected) in specs.iter().zip(&tables) {
-            for row in read_table(self.connection, spec, expected)? {
+            for row in read_table(view.connection, spec, expected)? {
                 actual = plus(actual, row_charge(&row))?;
                 rows.push(row);
             }
@@ -337,9 +348,10 @@ impl crate::JournalReadView<'_> {
             &tables,
             &row_hashes,
         ))?;
-        let storage_originals = audit::storage_originals(self, space, max, &tables, &rows)?;
+        let storage_originals = audit::storage_originals(&view, space, max, &tables, &rows)?;
         let mut liabilities = ordinary::liabilities(&audited, &rows, &storage_originals)?;
-        let dav = crate::webdav_native::outstanding(self.connection)?;
+        let dav_charges = view.dav_read_charges()?;
+        let dav = dav_charges.cancellation();
         if dav.rows != 0 {
             liabilities.obligations.push(JournalCapacityObligation {
                 family: "webdav_native_description_cancellation",
@@ -347,7 +359,7 @@ impl crate::JournalReadView<'_> {
                 charge: dav,
             });
         }
-        let execution = crate::webdav_native::execution_outstanding(self.connection)?;
+        let execution = dav_charges.execution();
         if execution.rows != 0 {
             liabilities.obligations.push(JournalCapacityObligation {
                 family: "webdav_native_execution_future_records",
@@ -355,7 +367,7 @@ impl crate::JournalReadView<'_> {
                 charge: execution,
             });
         }
-        let internal = crate::webdav_native::manifest_audit::outstanding(self.connection)?;
+        let internal = dav_charges.internal();
         if internal.rows != 0 {
             liabilities.obligations.push(JournalCapacityObligation {
                 family: "webdav_native_internal_receipts_and_original_final_rows",
@@ -363,13 +375,13 @@ impl crate::JournalReadView<'_> {
                 charge: internal,
             });
         }
-        let retirement = crate::storage_retirement::outstanding(self.connection)?;
-        let retirement_owner = crate::storage_retirement::owner::outstanding(self.connection)?;
-        let retirement_payload = crate::storage_retirement::payload::outstanding(self.connection)?;
+        let retirement = crate::storage_retirement::outstanding(view.connection)?;
+        let retirement_owner = crate::storage_retirement::owner::outstanding(view.connection)?;
+        let retirement_payload = crate::storage_retirement::payload::outstanding(view.connection)?;
         let retirement_disposal =
-            crate::storage_retirement::disposal::outstanding(self.connection)?;
+            crate::storage_retirement::disposal::outstanding(view.connection)?;
         let retirement_terminal =
-            crate::storage_retirement::terminal::outstanding(self.connection)?;
+            crate::storage_retirement::terminal::outstanding(view.connection)?;
         if retirement_terminal.rows != 0 {
             liabilities.obligations.push(JournalCapacityObligation {
                 family: "storage_retirement_restored_marker_terminal",
@@ -405,35 +417,35 @@ impl crate::JournalReadView<'_> {
                 charge: retirement,
             });
         }
-        crate::original_provenance::audit(self.connection)?;
-        crate::original_page_inbox::audit(self.connection)?;
-        crate::forwarded_page_inbox::audit(self.connection)?;
-        crate::storage_page_handoff::audit(self.connection)?;
-        crate::storage_snapshot_handoff::audit(self.connection)?;
+        crate::original_provenance::audit(view.connection)?;
+        crate::original_page_inbox::audit(view.connection)?;
+        crate::forwarded_page_inbox::audit(view.connection)?;
+        crate::storage_page_handoff::audit(view.connection)?;
+        crate::storage_snapshot_handoff::audit(view.connection)?;
         liabilities
             .obligations
-            .extend(crate::remote_rename::obligations(&rows, self.connection)?);
+            .extend(crate::remote_rename::obligations(&rows, view.connection)?);
         liabilities
             .obligations
-            .extend(crate::remote_delete::obligations(&rows, self.connection)?);
+            .extend(crate::remote_delete::obligations(&rows, view.connection)?);
         liabilities
             .obligations
-            .extend(crate::remote_replace::obligations(&rows, self.connection)?);
+            .extend(crate::remote_replace::obligations(&rows, view.connection)?);
         liabilities
             .obligations
             .extend(crate::conflict_resolution::obligations(
                 &rows,
-                self.connection,
+                view.connection,
             )?);
-        crate::native_publication::validate_schema(self.connection)?;
-        crate::native_publication::scope(&rows, self.connection)?;
+        crate::native_publication::validate_schema(view.connection)?;
+        crate::native_publication::scope(&rows, view.connection)?;
         liabilities
             .obligations
             .extend(crate::native_publication::obligations(
                 &rows,
                 &audited.publications,
             )?);
-        let tree_owners = tree::owners(self.connection, &audited.trees, &rows, max)?;
+        let tree_owners = tree::owners(view.connection, &audited.trees, &rows, max)?;
         let mut attributed = BTreeSet::new();
         let mut accounted_total = TreeStorageCharge::default();
         for owner in &tree_owners {
@@ -503,6 +515,7 @@ impl crate::JournalReadView<'_> {
             accounted_total,
             fingerprint,
         };
+        dav_phase.verify(self.connection)?;
         Ok(CapacitySnapshot { report, rows })
     }
 }

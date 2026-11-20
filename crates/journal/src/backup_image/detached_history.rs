@@ -111,7 +111,11 @@ impl JournalBackupImage {
                     "detached mapping original client scope differs",
                 ));
             }
-            crate::JournalReadView { connection }.audit_original_provenance_capacity(
+            crate::JournalReadView {
+                connection,
+                dav_read_charge_cache: None,
+            }
+            .audit_original_provenance_capacity(
                 space,
                 bounds.max_entries,
                 bounds.capacity,
@@ -139,6 +143,7 @@ impl JournalBackupImage {
         }
         let after = crate::JournalReadView {
             connection: &memory,
+            dav_read_charge_cache: None,
         }
         .audit_original_provenance_capacity(space, bounds.max_entries, bounds.capacity)?;
         if before.rows.len() != after.rows.len() || history != inventory_without_root(&after.rows)?
@@ -276,7 +281,11 @@ impl JournalBackupImage {
             if actual != original_root {
                 return Err(JournalError::Invariant("retained original root differs"));
             }
-            let audit = crate::JournalReadView { connection }.audit_original_provenance_capacity(
+            let audit = crate::JournalReadView {
+                connection,
+                dav_read_charge_cache: None,
+            }
+            .audit_original_provenance_capacity(
                 space,
                 bounds.max_entries,
                 bounds.capacity,
@@ -340,7 +349,11 @@ impl RetainedOriginalNodeHistory {
         bounds: NodeInspectionBounds,
     ) -> Result<Vec<crate::ReadLease>> {
         self.inspect_original_history(bounds, |connection| {
-            crate::JournalReadView { connection }.read_leases(&self.space)
+            crate::JournalReadView {
+                connection,
+                dav_read_charge_cache: None,
+            }
+            .read_leases(&self.space)
         })
     }
     /// Read-only bounded explicit content queries reuse the original GC policy.
@@ -362,7 +375,10 @@ impl RetainedOriginalNodeHistory {
             ));
         }
         self.inspect_original_history(bounds, |connection| {
-            let view = crate::JournalReadView { connection };
+            let view = crate::JournalReadView {
+                connection,
+                dav_read_charge_cache: None,
+            };
             let source_image = ContentId::hash(self.original.bytes());
             content
                 .iter()

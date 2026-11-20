@@ -174,7 +174,10 @@ pub(crate) fn audit(connection: &Connection) -> Result<Vec<RecoveredRetentionAud
             ));
         }
     }
-    let view = crate::JournalReadView { connection };
+    let view = crate::JournalReadView {
+        connection,
+        dav_read_charge_cache: None,
+    };
     let mut result = Vec::new();
     for (id, mapping) in mappings {
         if view.state("space_id")?.as_deref() != Some(mapping.space_id.as_str())
@@ -227,7 +230,10 @@ pub(crate) fn no_pending(
     space: &SpaceId,
     bounds: NodeInspectionBounds,
 ) -> Result<()> {
-    let view = crate::JournalReadView { connection };
+    let view = crate::JournalReadView {
+        connection,
+        dav_read_charge_cache: None,
+    };
     let capacity =
         view.audit_original_provenance_capacity(space, bounds.max_entries, bounds.capacity)?;
     if crate::history_reservation::audit_recovered_attempt_rows(
@@ -329,7 +335,12 @@ impl JournalBackupImage {
     ) -> Result<()> {
         self.with_audited_readonly(space, bounds, |connection| {
             no_pending(connection, space, bounds)?;
-            if (crate::JournalReadView { connection }).gc_protected(id)? {
+            if (crate::JournalReadView {
+                connection,
+                dav_read_charge_cache: None,
+            })
+            .gc_protected(id)?
+            {
                 return Err(JournalError::Invariant(
                     "recovered GC admission content is pinned",
                 ));
@@ -357,7 +368,11 @@ impl JournalBackupImage {
                     "recovered retention complete nonempty pin set bound",
                 ));
             }
-            let marks = (crate::JournalReadView { connection }).gc_marks(space)?;
+            let marks = (crate::JournalReadView {
+                connection,
+                dav_read_charge_cache: None,
+            })
+            .gc_marks(space)?;
             if marks.iter().any(|mark| {
                 mark.state == crate::GcState::Marked && pins.contains(&mark.intent.content_id)
             }) {
@@ -394,9 +409,12 @@ pub(crate) fn insert_mapping(
             "recovered retention omitted an original history pin",
         ));
     }
-    if (crate::JournalReadView { connection })
-        .state("original_recovery_session")?
-        .as_deref()
+    if (crate::JournalReadView {
+        connection,
+        dav_read_charge_cache: None,
+    })
+    .state("original_recovery_session")?
+    .as_deref()
         != Some(mapping.session.as_str())
     {
         return Err(JournalError::Invariant(
@@ -435,9 +453,12 @@ pub(crate) fn insert_release(
         || current.release.is_some()
         || release.mapping_digest != expected.digest()?
         || release.pins_digest != expected.pins_digest()?
-        || (crate::JournalReadView { connection })
-            .state("original_recovery_session")?
-            .as_deref()
+        || (crate::JournalReadView {
+            connection,
+            dav_read_charge_cache: None,
+        })
+        .state("original_recovery_session")?
+        .as_deref()
             != Some(release.session.as_str())
     {
         return Err(JournalError::Invariant(

@@ -49,6 +49,7 @@ impl JournalBackupImage {
         let transaction = memory.unchecked_transaction()?;
         let original_view = crate::JournalReadView {
             connection: &memory,
+            dav_read_charge_cache: None,
         };
         let before = original_view.audit_original_provenance_capacity(
             space,

@@ -129,6 +129,7 @@ impl super::JournalBackupImage {
         let transaction = Transaction::new_unchecked(&database, TransactionBehavior::Deferred)?;
         let view = JournalReadView {
             connection: &database,
+            dav_read_charge_cache: None,
         };
         // Original audits remain mandatory even if an archive-specific callback is empty.
         let snapshot =
@@ -155,8 +156,11 @@ impl super::JournalBackupImage {
             space,
             bounds,
             |connection| {
-                crate::JournalReadView { connection }
-                    .reference_reservations(space, bounds.max_entries)
+                crate::JournalReadView {
+                    connection,
+                    dav_read_charge_cache: None,
+                }
+                .reference_reservations(space, bounds.max_entries)
             },
         )
         .map(|(_, references)| references)

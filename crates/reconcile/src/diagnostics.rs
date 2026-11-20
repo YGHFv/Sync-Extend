@@ -14,6 +14,14 @@ pub struct Diagnostics {
     pub unavailable_reference_owners: Vec<&'static str>,
     pub implementation_gaps: Vec<&'static str>,
     pub uncertified_safety_boundaries: Vec<&'static str>,
+    pub file_content_representation: &'static str,
+    pub tree_manifest_representation: &'static str,
+    pub windows_acl_captured: bool,
+    pub windows_acl_restored: bool,
+    pub alternate_data_streams_enumerated: bool,
+    pub alternate_data_streams_preserved: bool,
+    pub links_and_reparse_points_rejected: bool,
+    pub metadata_fidelity_disclosure: &'static str,
     pub production_safety_certified: bool,
 }
 
@@ -54,6 +62,14 @@ impl LocalSpace {
                 "trusted_elapsed_time",
                 "hardware_platform_and_network_matrix",
             ],
+            file_content_representation: "portable_unnamed_file_bytes",
+            tree_manifest_representation: "portable_tree_manifests",
+            windows_acl_captured: false,
+            windows_acl_restored: false,
+            alternate_data_streams_enumerated: false,
+            alternate_data_streams_preserved: false,
+            links_and_reparse_points_rejected: true,
+            metadata_fidelity_disclosure: "Content and history use portable unnamed file bytes and tree manifests. Windows ACLs are not captured or restored; alternate data streams are not enumerated or preserved. Links and reparse points are rejected.",
             production_safety_certified: false,
         })
     }
