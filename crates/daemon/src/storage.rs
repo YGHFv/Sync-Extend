@@ -107,6 +107,7 @@ pub async fn serve(config: StorageNodeConfig, forwarder: PeerIdentity) -> Result
     node.recover_forwarded_snapshots()?;
     let identity = node.transport_identity()?;
     let listener = Listener::bind(config.bind, &identity, &forwarder)?;
+    super::management::observe_storage(&node);
     super::shutdown::ready()?;
     println!(
         "{}",
@@ -380,6 +381,7 @@ pub async fn run(
             ) => { result.map_err(|_| "storage bounded session deadline")??; }
         }
         drop(connection);
+        super::management::observe_storage(&node);
         println!(
             "{}",
             serde_json::json!({

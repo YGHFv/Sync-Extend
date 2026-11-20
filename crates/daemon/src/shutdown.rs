@@ -33,12 +33,14 @@ pub async fn requested() -> io::Result<()> {
                 Ok(())
             }
             _ = local_control_requested() => Ok(()),
+            _ = management_stop_requested() => Ok(()),
         }
     }
     #[cfg(windows)]
     {
         tokio::select! {
             result = tokio::signal::ctrl_c() => result,
+            _ = management_stop_requested() => Ok(()),
             _ = async {
                 loop {
                     if sync_extend_platform_fs::service_stop_requested() {
@@ -50,5 +52,14 @@ pub async fn requested() -> io::Result<()> {
         }
     }
     #[cfg(not(any(unix, windows)))]
-    tokio::signal::ctrl_c().await
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        _ = management_stop_requested() => Ok(()),
+    }
+}
+
+async fn management_stop_requested() {
+    while !super::management::control_stop_requested() {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }

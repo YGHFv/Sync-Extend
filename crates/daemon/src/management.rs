@@ -10,13 +10,36 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
-use sync_extend_core_model::management::ManagementConfig;
+use sync_extend_core_model::{
+    management::{
+        authenticated_control_request, ControlOperation, ControlSession, ManagementConfig,
+    },
+    EntryId,
+};
+
+mod client;
+pub use client::{dashboard as control_dashboard, status as control_status, stop as control_stop};
+mod dashboard;
+pub use dashboard::{observe_gateway, observe_local_space, observe_storage};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 static READY: AtomicBool = AtomicBool::new(false);
+static CONTROL_STOP: AtomicBool = AtomicBool::new(false);
+
+fn request_stop() {
+    CONTROL_STOP.store(true, Ordering::Release);
+    READY.store(false, Ordering::Release);
+}
+
+pub fn control_stop_requested() -> bool {
+    CONTROL_STOP.load(Ordering::Acquire)
+}
 
 pub fn resources_ready() {
     READY.store(true, Ordering::Release);
+    if control_stop_requested() {
+        READY.store(false, Ordering::Release);
+    }
 }
 
 pub fn resources_deferred() {
@@ -35,6 +58,7 @@ impl Drop for ManagementGuard {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        dashboard::clear();
     }
 }
 
@@ -57,24 +81,52 @@ pub fn generate_credentials(path: &Path) -> Result<()> {
     super::management_credentials::generate(&config)
 }
 
+pub fn check_config(path: &Path) -> Result<()> {
+    let config = load(path)?;
+    let _credential = token(&config)?;
+    let policy = config.control.as_ref();
+    println!(
+        "{}",
+        serde_json::json!({
+            "configuration_valid": true, "private_credential_valid": true,
+            "listener_started": false, "token_protection": config.token_protection,
+            "status_allowed": policy.is_some_and(|value| value.status),
+            "stop_allowed": policy.is_some_and(|value| value.stop),
+            "dashboard_allowed": policy.is_some_and(|value| value.dashboard),
+        })
+    );
+    Ok(())
+}
+
 pub fn start(path: &Path, role: &'static str) -> Result<ManagementGuard> {
     let config = load(path)?;
     let token = token(&config)?;
+    let mut control = config
+        .control
+        .clone()
+        .map(|policy| ControlSession::new(EntryId::random()?, policy))
+        .transpose()?;
     let listener = TcpListener::bind(config.address)?;
     listener.set_nonblocking(true)?;
+    dashboard::configure(&config)?;
     READY.store(false, Ordering::Release);
+    CONTROL_STOP.store(false, Ordering::Release);
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let thread = std::thread::Builder::new()
         .name("syncd-local-health".to_owned())
         .spawn(move || {
             let mut count = 0u64;
-            while !thread_stop.load(Ordering::Acquire) && count < config.max_connections {
+            while !thread_stop.load(Ordering::Acquire)
+                && !control_stop_requested()
+                && count < config.max_connections
+            {
                 match listener.accept() {
                     Ok((mut stream, peer)) => {
                         count += 1;
-                        if peer.ip().is_loopback() {
-                            let _ = serve(&mut stream, &config, &token, role);
+                        // On Windows an accepted socket can inherit nonblocking mode.
+                        if peer.ip().is_loopback() && stream.set_nonblocking(false).is_ok() {
+                            let _ = serve(&mut stream, &config, &token, role, control.as_mut());
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -163,12 +215,69 @@ fn serve(
     config: &ManagementConfig,
     secret: &[u8],
     role: &str,
+    mut control: Option<&mut ControlSession>,
 ) -> Result<()> {
     let timeout = Duration::from_secs(config.request_timeout_secs);
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let bytes = request(stream, timeout)?;
-    let (status, body) = if authenticated(&bytes, config, secret) {
+    if bytes.starts_with(b"GET /v1/ui ") || bytes.starts_with(b"GET /v1/dashboard ") {
+        return dashboard::serve(
+            stream,
+            &bytes,
+            config,
+            secret,
+            control.as_deref().map(ControlSession::generation),
+        );
+    }
+    let is_stop = bytes.starts_with(b"POST /v1/control/stop ");
+    if is_stop
+        && std::str::from_utf8(&bytes).is_ok_and(|text| {
+            text.split("\r\n").any(|line| {
+                line.split_once(": ")
+                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case("sec-fetch-mode"))
+            })
+        })
+    {
+        return dashboard::stop(stream, &bytes, config, secret, control.take());
+    }
+    let (status, body) = if is_stop || bytes.starts_with(b"GET /v1/status ") {
+        let admitted = control.and_then(|session| {
+            let request = authenticated_control_request(&bytes, config.address, secret).ok()?;
+            let operation = session.accept(request).ok()?;
+            Some((
+                operation,
+                session.generation().clone(),
+                session.stop_requested(),
+            ))
+        });
+        match admitted {
+            Some((operation, generation, stopping)) => {
+                let accepted_stop = operation == ControlOperation::Stop;
+                if accepted_stop {
+                    request_stop();
+                }
+                (
+                    if accepted_stop {
+                        "202 Accepted"
+                    } else {
+                        "200 OK"
+                    },
+                    serde_json::to_vec(&serde_json::json!({
+                        "role": role, "owner_generation": generation,
+                        "resources_ready": READY.load(Ordering::Acquire),
+                        "stop_requested": stopping, "authenticated_local_management": true,
+                        "synchronization_complete": false, "remote_backup_complete": false,
+                        "content_integrity_certified": false,
+                    }))?,
+                )
+            }
+            None => (
+                "403 Forbidden",
+                b"{\"error\":\"local control refused\"}".to_vec(),
+            ),
+        }
+    } else if authenticated(&bytes, config, secret) {
         let ready = READY.load(Ordering::Acquire);
         (
             if ready {

@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SyncExtend 本机管理</title>
+<style>
+:root{font:16px/1.6 system-ui,sans-serif;color:#e7edf5;background:#101720}
+body{max-width:1040px;margin:40px auto;padding:0 20px}
+h1{font-size:28px;margin:0}p{color:#a8b6c9}
+button,input{font:inherit;padding:8px 12px;border:1px solid #50647c;border-radius:6px}
+input{background:#182332;color:#fff;min-width:280px}button{background:#9bdfc7;color:#10271e;cursor:pointer}
+.bar{display:flex;gap:10px;flex-wrap:wrap;margin:24px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
+section{background:#182332;padding:18px;border:1px solid #2a3b50;border-radius:10px;margin-top:18px}
+h2{font-size:18px;margin:0 0 12px}table{border-collapse:collapse;width:100%;font-size:14px}
+td,th{text-align:left;padding:8px;border-bottom:1px solid #304057;overflow-wrap:anywhere}
+#message{min-height:26px;color:#f1ca89}code{overflow-wrap:anywhere}.scroll{overflow:auto}
+</style>
+<h1>SyncExtend 本机管理</h1>
+<p>查看本机空间、历史和待处理工作。填入管理凭据后读取状态，凭据仅保留在本页内存中。</p>
+<div class="bar"><input id="token" type="password" autocomplete="off" aria-label="本机管理凭据" placeholder="本机管理凭据"><button id="refresh" type="button">读取状态</button><button id="stop" type="button" disabled>停止本机服务</button><button id="forget" type="button">清除凭据与展示</button></div>
+<div id="message" role="status">尚未读取本机状态。</div>
+<main id="content" hidden>
+<div class="grid">
+<section><h2>空间</h2><div id="space"></div></section>
+<section><h2>待处理工作</h2><div id="queue"></div></section>
+<section><h2>连接、路径与流量</h2><div id="network"></div></section>
+<section><h2>本机 WebDAV</h2><div id="dav"></div></section>
+</div>
+<section id="storage-section" hidden><h2>存储节点</h2><div id="storage"></div></section>
+<section><h2>缺块与读取检查</h2><div id="chunks"></div></section>
+<section><h2>冲突处置</h2><div id="conflicts" class="scroll"></div></section>
+<section><h2>历史快照</h2><div id="history" class="scroll"></div></section>
+<section><h2>当前路径</h2><div id="paths" class="scroll"></div></section>
+</main>
+<script>
+"use strict";
+const byId=id=>document.getElementById(id);
+const text=(id,value)=>{byId(id).textContent=value;};
+function table(id,heads,rows){const target=byId(id);target.replaceChildren();const t=document.createElement("table");const header=t.insertRow();for(const head of heads){const cell=document.createElement("th");cell.textContent=head;header.append(cell);}for(const row of rows){const tr=t.insertRow();for(const value of row){const cell=tr.insertCell();cell.textContent=String(value);}}target.append(t);}
+let requestEpoch=0;let activeController=null;let ownerGeneration=null;
+function forget(){ownerGeneration=null;byId("stop").disabled=true;byId("storage-section").hidden=true;byId("storage").replaceChildren();requestEpoch++;activeController?.abort();activeController=null;byId("refresh").disabled=false;byId("token").value="";byId("content").hidden=true;for(const id of ["space","queue","network","dav","chunks","conflicts","history","paths"]){byId(id).replaceChildren();}text("message","凭据与展示已清除。");}
+byId("forget").addEventListener("click",forget);
+byId("refresh").addEventListener("click",async()=>{
+const token=byId("token").value;if(!/^[0-9a-f]{64}$/.test(token)){text("message","请输入有效的本机管理凭据。");return;}
+byId("refresh").disabled=true;text("message","正在读取本机状态…");
+const epoch=++requestEpoch;const controller=new AbortController();activeController=controller;const timeout=setTimeout(()=>controller.abort(),5000);
+try{
+const response=await fetch("/v1/dashboard",{method:"GET",headers:{Authorization:"Bearer "+token},credentials:"omit",cache:"no-store",mode:"same-origin",redirect:"error",signal:controller.signal});
+if(!response.ok){throw Error("管理请求被拒绝。");}
+const reader=response.body.getReader();let size=0;const parts=[];while(true){const part=await reader.read();if(part.done)break;size+=part.value.length;if(size>1052672){await reader.cancel();throw Error("状态数据超过展示上限。");}parts.push(part.value);}
+const joined=new Uint8Array(size);let offset=0;for(const part of parts){joined.set(part,offset);offset+=part.length;}
+if(epoch!==requestEpoch)return;
+const value=JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(joined));
+if(value.dashboard_format_version!==1||value.remote_backup_complete!==false){throw Error("无法识别本机状态。");}
+ownerGeneration=/^[0-9a-f]{32}$/.test(value.owner_generation??"")?value.owner_generation:null;byId("stop").disabled=!ownerGeneration||value.stop_allowed!==true;
+const channel=value.connection?.actual;const gateway=value.webdav;const storage=value.storage?.actual;byId("content").hidden=false;byId("storage-section").hidden=!storage;
+text("storage",storage?"空间 "+storage.space_id+"；设备 "+storage.device_id+"；角色 "+storage.role+"；受保护内容 "+storage.protected_bytes+" 字节；实际块文件 "+storage.physical_cas_bytes+"/"+storage.stored_byte_limit+" 字节；逻辑交付累计 "+storage.charged_logical_delivery_bytes+"/"+storage.traffic_byte_limit+" 字节；检查 "+storage.checked_chunks+"/"+storage.protected_chunks+" 个块，不可读取 "+storage.unavailable_chunks.length+" 个；"+(storage.expired?"存储策略已到期。":"存储策略尚未到期。")+" 备份完整性尚未认证。":"");
+text("network",channel?"对端 "+channel.peer_device+"；连接 "+channel.remote_socket+"；UDP发送 "+channel.udp_sent_bytes+" 字节、接收 "+channel.udp_received_bytes+" 字节；采样距今 "+value.connection.age_ms+" 毫秒。实际选路与中继费用尚未确认。":"当前没有连接观测。");
+text("dav",gateway?"连接地址 http://"+gateway.address+"；认证已启用；授权导出 "+gateway.exports.map(x=>x.url+(x.writable?"（读写）":"（只读）")).join("、")+"。凭据通过本机配置管理。":"当前没有网关观测。");
+if(!value.observation){text("message","当前角色没有空间观测；连接和网关状态见下方。");for(const id of ["space","queue","chunks","conflicts","history","paths"]){byId(id).replaceChildren();}return;}
+const local=value.observation.local;
+text("message","观测距今 "+value.observation.age_ms+" 毫秒；"+(value.resources_ready?"本机资源已就绪。":"本机资源尚未就绪。")+" 远端备份状态尚未认证。");
+text("space","空间 "+local.space_id+"；设备 "+local.device_id+"；当前条目 "+local.total_entries);
+text("queue","待发布 "+local.outstanding_publications+"；待文件变更 "+local.outstanding_mutations);
+const leases=local.read_leases;if(leases){text("queue",byId("queue").textContent+"；活跃读租约 "+leases.active+"；到期待回收 "+leases.expired_pending_recovery);}
+const c=local.chunks;text("chunks","已检查 "+c.checked_chunks+"/"+c.total_current_chunks+" 个当前块，共 "+c.checked_bytes+" 字节；不可读取 "+c.unavailable_chunks.length+" 个。"+(c.all_current_chunks_checked?"已覆盖当前块。":"仅覆盖部分块。"));
+table("conflicts",["事务","状态","文件已物化"],local.conflict_admissions.map(x=>[x.transaction_id,x.resolution_applied?"已提交":"待处理",x.worktree_materialized?"是":"否"]));
+table("history",["快照","状态","当前"],local.snapshots.map(x=>[x.snapshot_id,x.state,x.current?"是":""]));
+table("paths",["相对路径","类型","逻辑字节"],local.entries.map(x=>[x.path,x.kind,x.logical_bytes??"—"]));
+if(local.entries_truncated||local.snapshots_truncated||local.conflict_admissions_truncated){text("message",byId("message").textContent+" 列表已按展示上限截取。");}
+}catch(error){if(epoch!==requestEpoch)return;ownerGeneration=null;byId("stop").disabled=true;byId("content").hidden=true;text("message",error.name==="AbortError"?"读取超时，请稍后重试。":error.message==="管理请求被拒绝。"?"管理请求被拒绝。":"无法读取本机状态，请检查服务和凭据。");}
+finally{clearTimeout(timeout);if(epoch===requestEpoch){activeController=null;byId("refresh").disabled=false;}}
+});
+byId("stop").addEventListener("click",async()=>{
+const token=byId("token").value;const generation=ownerGeneration;
+if(!/^[0-9a-f]{64}$/.test(token)||!generation){text("message","请先读取当前本机状态。");return;}
+activeController?.abort();const epoch=++requestEpoch;const controller=new AbortController();
+activeController=controller;byId("stop").disabled=true;byId("refresh").disabled=true;
+text("message","正在请求停止本机服务…");
+const requestId=Array.from(crypto.getRandomValues(new Uint8Array(16)),x=>x.toString(16).padStart(2,"0")).join("");
+const timeout=setTimeout(()=>controller.abort(),5000);
+try{
+const response=await fetch("/v1/control/stop",{method:"POST",headers:{Authorization:"Bearer "+token,
+"X-Sync-Owner":generation,"X-Sync-Request":requestId},credentials:"omit",cache:"no-store",
+mode:"same-origin",redirect:"error",signal:controller.signal});
+if(response.status!==202){throw Error("停止请求被拒绝。");}
+const reader=response.body.getReader();let size=0;const parts=[];
+while(true){const part=await reader.read();if(part.done)break;size+=part.value.length;
+if(size>4096){await reader.cancel();throw Error("响应超限。");}parts.push(part.value);}
+if(epoch!==requestEpoch)return;
+const joined=new Uint8Array(size);let offset=0;for(const part of parts){joined.set(part,offset);offset+=part.length;}
+const value=JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(joined));
+if(value.owner_generation!==generation||value.stop_requested!==true||value.resources_ready!==false||
+value.process_exit_verified!==false){throw Error("响应无法验证。");}
+ownerGeneration=null;byId("content").hidden=true;
+text("message","停止请求已接受，服务正在退出。");
+}catch(error){if(epoch!==requestEpoch)return;ownerGeneration=null;
+text("message",error.message==="停止请求被拒绝。"?"停止请求被拒绝，请重新读取状态。":
+"未能确认停止请求，请重新读取状态。");}
+finally{clearTimeout(timeout);if(epoch===requestEpoch){activeController=null;byId("refresh").disabled=false;}}
+});
+window.addEventListener("pagehide",forget);
+</script>
+</html>

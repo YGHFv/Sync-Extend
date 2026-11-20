@@ -32,6 +32,8 @@ const SOURCE_LIMIT: u64 = 64 * 1024 * 1024;
 pub enum Action {
     /// Verify and inspect only immutable archive state.
     Inspect,
+    /// Preview preserving archived read lease states and their CAS pins at new roots.
+    PreviewReadLeaseMigration,
     /// Capture explicitly selected config files from the verified original node.
     Capture {
         #[arg(long)]
@@ -452,6 +454,29 @@ pub fn run(descriptor_path: &Path, action: Action) -> Result<(), Box<dyn std::er
                     "cleanup": false,
                     "gc_release": false,
                     "pending_resume": false,
+                },
+            }))?;
+        }
+        Action::PreviewReadLeaseMigration => {
+            let max_image_bytes = descriptor
+                .archive_bounds
+                .archive_bytes
+                .min(256 * 1024 * 1024);
+            let preview = archive.preview_read_lease_migration(
+                &descriptor.worktree,
+                &descriptor.data,
+                descriptor.inspection(),
+                usize::try_from(max_image_bytes)?,
+            )?;
+            print(&serde_json::json!({
+                "descriptor_digest": ContentId::hash(&serde_json::to_vec(&descriptor)?),
+                "migration_preview": preview,
+                "mutation_authority": {
+                    "native": false,
+                    "cleanup": false,
+                    "gc_release": false,
+                    "pending_resume": false,
+                    "activate_read_leases": false,
                 },
             }))?;
         }

@@ -3115,7 +3115,9 @@ mod backup_image;
 mod recovered_history_tables;
 #[cfg(windows)]
 pub use backup_image::CreatedJournalRestore;
-pub use backup_image::{JournalBackupImage, NodeInspectionBounds, PortableNodeImageScope};
+pub use backup_image::{
+    ArchivedReadLeaseHold, JournalBackupImage, NodeInspectionBounds, PortableNodeImageScope,
+};
 pub use recovered_history_tables::{
     RecoveredArchiveTableSummaries, RecoveredHistoryTable, RecoveredHistoryTables,
     RecoveredMainTable, RecoveredMainTables,

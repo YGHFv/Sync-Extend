@@ -390,6 +390,12 @@ impl LocalSpace {
                 }
             }
         }
+        if let Some(file) = self
+            .journal
+            .original_pending_history_file(&self.space_id, self.limits.max_storage_entries)?
+        {
+            refs.add(&file, &mut expected)?;
+        }
         let protected: BTreeSet<_> = self.journal.protected_objects()?.into_iter().collect();
         if expected != protected {
             return Err(ReconcileError::Invariant(

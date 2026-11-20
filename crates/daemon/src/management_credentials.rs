@@ -178,7 +178,24 @@ pub fn load(config: &ManagementConfig) -> Result<Vec<u8>> {
         TokenProtection::Plain => 64,
         TokenProtection::WindowsUser => 4096,
     };
+    #[cfg(not(windows))]
     let bytes = super::config_file::read(&config.token_file, maximum)?;
+    #[cfg(windows)]
+    let bytes = {
+        let _parents = parents(&config.token_file)?;
+        let held = sync_extend_platform_fs::GuardedReadFile::open(&config.token_file)?;
+        sync_extend_platform_fs::verify_current_user_private_file(held.reader())?;
+        let mut bytes = Vec::new();
+        held.reader()
+            .take(maximum as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > maximum {
+            return Err("management credential exceeds bound".into());
+        }
+        held.verify_single_link()?;
+        sync_extend_platform_fs::verify_current_user_private_file(held.reader())?;
+        bytes
+    };
     let token = match config.token_protection {
         TokenProtection::Plain => bytes,
         TokenProtection::WindowsUser => unprotect(config, &bytes)?,

@@ -36,6 +36,7 @@ mod portable_source;
 pub use directories::CreatedNodeDirectorySet;
 pub use files::CreatedNodeFileSet;
 pub use layout_mapping::{NodeRestoreMappedLayout, NodeRestoreSlot, NodeTargetRoot};
+pub use portable_source::ReadLeaseMigrationPreview;
 
 mod assembly;
 mod data_locks;

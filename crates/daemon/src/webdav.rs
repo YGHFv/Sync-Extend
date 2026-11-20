@@ -21,6 +21,9 @@ use sync_extend_core_model::{
 };
 use sync_extend_reconcile::{LocalSpace, ReconcileError, WebDavBaseline, WebDavCommit};
 
+mod diagnostics;
+pub use diagnostics::{check, test_connection};
+
 #[cfg(windows)]
 #[path = "webdav_collections.rs"]
 mod collections;
@@ -67,6 +70,7 @@ pub fn serve(
     let credentials = Credentials::load(&runtime.credentials, &runtime.listener)?;
     let listener = TcpListener::bind(runtime.listener.address)?;
     listener.set_nonblocking(true)?;
+    super::management::observe_gateway(&runtime.listener);
     super::shutdown::ready()?;
     println!(
         "{}",
@@ -250,6 +254,7 @@ fn dispatch(
         return Err(503);
     }
     let baseline = local.capture_webdav_baseline().map_err(core_status)?;
+    super::management::observe_local_space(&local);
     let entry = find(&baseline, authorized.path.as_ref());
     if authorized.export_root && authorized.path.is_some() && entry.is_none() {
         return Err(503);

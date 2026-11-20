@@ -5,7 +5,7 @@ use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::{ContentId, DeviceId, EntryId, Manifest, SnapshotId, SpaceId};
 
-const NAMESPACE: &str = "original.local-history.cancelled.";
+pub(super) const NAMESPACE: &str = "original.local-history.cancelled.";
 const PREFIX: &str = "original.local-history.cancelled.v1.";
 const MAX_TERMINAL_BYTES: usize = 4096;
 

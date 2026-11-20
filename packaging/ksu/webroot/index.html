@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'none'">
+  <title>SyncExtend 模块管理</title>
+  <link rel="stylesheet" href="./style.css">
+  <script defer src="./app.js"></script>
+</head>
+<body>
+  <main class="layout">
+    <header class="header">
+      <span class="context">KernelSU 模块</span>
+      <h1>SyncExtend</h1>
+      <p>查看守护进程和本机 WebDAV。</p>
+    </header>
+
+    <section class="panel" aria-labelledby="service-title">
+      <div class="panel-title">
+        <h2 id="service-title">后台服务</h2>
+        <span id="service-state" class="pill" data-tone="neutral">正在读取</span>
+      </div>
+      <p id="service-detail" class="detail" role="status">等待模块返回状态。</p>
+      <div class="actions" aria-label="服务操作">
+        <button id="refresh" type="button" class="primary">刷新状态</button>
+        <button id="verify-stop" type="button">确认已停止</button>
+        <button id="ask-stop" type="button" class="danger" disabled>停止服务</button>
+      </div>
+      <div id="stop-confirmation" class="confirmation" hidden>
+        <p>停止当前后台服务？同步和该服务提供的 WebDAV 都会暂停。</p>
+        <div class="actions">
+          <button id="stop" type="button" class="danger">确认停止</button>
+          <button id="cancel-stop" type="button">取消</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="gateway-title">
+      <div class="panel-title">
+        <h2 id="gateway-title">本机 WebDAV</h2>
+        <span id="gateway-state" class="pill" data-tone="neutral">正在读取</span>
+      </div>
+      <p id="gateway-detail" class="detail">等待模块读取网关配置。</p>
+      <ul id="exports" class="exports" aria-label="已配置的导出目录" hidden></ul>
+    </section>
+
+    <footer>远端备份状态需在同步对端确认。</footer>
+  </main>
+</body>
+</html>

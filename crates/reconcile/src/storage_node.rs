@@ -1,4 +1,5 @@
 //! Storage role shares managed CAS/Journal but never constructs a local worktree.
+mod management;
 use crate::{identity, managed_cas, now_ms, ReconcileError, Result};
 use fs2::FileExt;
 use std::{

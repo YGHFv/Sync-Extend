@@ -1553,6 +1553,7 @@ pub use node_archive::ExplicitOriginalConfigMapping;
 mod explicit_credential_mapping;
 #[cfg(windows)]
 mod explicit_management_mapping;
+mod management_dashboard;
 #[cfg(windows)]
 pub use explicit_credential_mapping::{
     ExplicitWebDavCredentialMapping, InstalledExplicitWebDavCredential,
@@ -1749,6 +1750,8 @@ impl RecoveredLocalSpace {
     }
 }
 
+#[cfg(windows)]
+pub use node_archive::ReadLeaseMigrationPreview;
 #[cfg(windows)]
 pub use node_archive::RecoveredHistoryOperation;
 #[cfg(windows)]

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use sync_extend_core_model::{persisted_rename::RenameObservationMap, ContentId, EntryId};
 
-const PREFIX: &str = "original.native-create.cursor.v1.";
+pub(super) const PREFIX: &str = "original.native-create.cursor.v1.";
 const NAMESPACE: &str = "original.native-create.cursor.";
 
 #[derive(Serialize, Deserialize)]

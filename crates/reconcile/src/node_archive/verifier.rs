@@ -97,8 +97,16 @@ impl FramedNodeArchive {
             self.space_id(),
             inspection,
             |database, audited_rows, references| -> sync_extend_journal::Result<()> {
+                let pending_file = JournalBackupImage::verify_recovered_node_local_state(
+                    audited_rows,
+                    self.space_id(),
+                    inspection,
+                )?;
                 let state = database
-                    .prepare("SELECT key,value FROM local_state ORDER BY key")?
+                    .prepare(
+                        "SELECT key,value FROM main.local_state
+                         WHERE key IN ('space_id','device_id','worktree') ORDER BY key",
+                    )?
                     .query_map([], |row| {
                         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                     })?
@@ -316,6 +324,10 @@ impl FramedNodeArchive {
                 for row in rows {
                     let id: ContentId = row?.parse()?;
                     protected.insert(id);
+                }
+                if let Some(file) = pending_file {
+                    files.add(&file)?;
+                    protected.extend(file.chunks.into_iter().map(|chunk| chunk.content_id));
                 }
                 files.verify(&self, &protected)?;
                 audited_image_rows = Some(audited_rows.to_vec());

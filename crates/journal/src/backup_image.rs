@@ -205,7 +205,7 @@ pub use readonly::NodeInspectionBounds;
 
 mod map_worktree;
 mod portable_scope;
-pub use portable_scope::PortableNodeImageScope;
+pub use portable_scope::{ArchivedReadLeaseHold, PortableNodeImageScope};
 
 mod detached_history;
 pub use detached_history::{

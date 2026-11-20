@@ -39,7 +39,7 @@ load_config() {
         { fail 'private config is missing'; return 1; }
     [ "$(wc -c < "$CONFIG")" -le 4096 ] ||
         { fail 'config exceeds 4096 bytes'; return 1; }
-    chmod 600 "$CONFIG" || return 1
+    [ "${1-}" = read-only ] || chmod 600 "$CONFIG" || return 1
     enabled=
     worktree=
     scan_interval_secs=
@@ -148,7 +148,7 @@ validate_deployment() {
         "$STATE/"*) ;;
         *) fail 'resolved deployment config left private state'; return 1 ;;
     esac
-    chmod 600 "$deployment_config" || return 1
+    [ "${1-}" = read-only ] || chmod 600 "$deployment_config" || return 1
 }
 
 validate_worktree() {

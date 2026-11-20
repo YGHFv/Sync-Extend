@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sync_extend_core_model::{tree_storage_capacity::TreeStorageCharge, ContentId, EntryId};
 
 const NAMESPACE: &str = "original.native-create.liability.";
-const PREFIX: &str = "original.native-create.liability.v1.";
+pub(super) const PREFIX: &str = "original.native-create.liability.v1.";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

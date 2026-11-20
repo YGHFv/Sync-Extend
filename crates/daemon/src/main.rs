@@ -71,6 +71,9 @@ enum Command {
     DeploymentCheck {
         #[arg(long)]
         config: PathBuf,
+        /// Show only export names and loopback addresses from a private Windows or KSU configuration.
+        #[arg(long)]
+        describe_webdav: bool,
     },
     /// Run one preprovisioned role in this foreground process.
     DeploymentRun {
@@ -81,6 +84,30 @@ enum Command {
     ManagementHealth {
         #[arg(long)]
         config: PathBuf,
+    },
+    /// Validate the listener configuration and private credential without starting it.
+    ManagementCheck {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Get the authenticated state and generation of the current deployment owner.
+    ManagementStatus {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Read the current owner's bounded dashboard without displaying its credential.
+    ManagementDashboard {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Ask the exact authenticated foreground deployment owner to stop.
+    ManagementStop {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        owner_generation: sync_extend_core_model::EntryId,
+        #[arg(long)]
+        request_id: sync_extend_core_model::EntryId,
     },
     /// Create a new listener-bound management credential file without displaying its token.
     ManagementCredentialsGenerate {
@@ -290,6 +317,20 @@ enum Command {
     WebdavServe {
         #[arg(long)]
         config: PathBuf,
+    },
+    /// Check the gateway configuration and, when enabled, the local credential file.
+    WebdavCheck {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Verify access to one configured export with an authenticated OPTIONS request.
+    WebdavConnectionTest {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        username: String,
+        #[arg(long)]
+        export: String,
     },
     /// Create random per-listener local credentials without displaying secrets.
     WebdavCredentialsGenerate {
@@ -1444,17 +1485,19 @@ async fn execute(
         Command::WindowsService { .. } => {
             return Err("SCM command must use native dispatcher".into())
         }
-        Command::DeploymentCheck { config } => {
-            let config = deployment::load(&config)?;
-            print(&serde_json::json!({
-                "configuration_valid": true, "role": config.role_name(),
-                "identity_created": false, "services_started": false,
-            }))?;
+        Command::DeploymentCheck { config, describe_webdav } => {
+            print(&deployment::check(&config, describe_webdav)?)?;
         }
         Command::DeploymentRun { .. } => {
             return Err("deployment role was not expanded".into());
         }
         Command::ManagementHealth { config } => management::check(&config)?,
+        Command::ManagementCheck { config } => management::check_config(&config)?,
+        Command::ManagementStatus { config } => management::control_status(&config)?,
+        Command::ManagementDashboard { config } => management::control_dashboard(&config)?,
+        Command::ManagementStop { config, owner_generation, request_id } => {
+            management::control_stop(&config, &owner_generation, &request_id)?;
+        }
         Command::ManagementCredentialsGenerate { config } => {
             management::generate_credentials(&config)?;
             println!(
@@ -1719,6 +1762,10 @@ async fn execute(
                     .password(&username)
                     .ok_or("unknown local DAV account")?
             );
+        }
+        Command::WebdavCheck { config } => print(&webdav::check(&config)?)?,
+        Command::WebdavConnectionTest { config, username, export } => {
+            print(&webdav::test_connection(&config, &username, &export)?)?;
         }
         Command::WebdavServe { config } => {
             let runtime = webdav::load(&config)?;
@@ -2530,6 +2577,8 @@ async fn execute(
             let peer = local.read_transport_peer(&device)?;
             let identity = local.transport_identity()?;
             let listener = sync_extend_transport::Listener::bind(listen, &identity, &peer)?;
+            management::observe_local_space(&local);
+            shutdown::ready()?;
             print(&serde_json::json!({
                 "listening": listener.local_address()?,
                 "paired_device": device,
@@ -2547,6 +2596,7 @@ async fn execute(
                                 let result = async {
                                     // Stable local scans author only native local changes.
                                     local.scan()?;
+                                    management::observe_local_space(&local);
                                     local.serve_peer_metadata_cycle(&mut connection, max_rounds).await
                                 }.await;
                                 if let Err(error) = result {
@@ -2588,6 +2638,7 @@ async fn execute(
                 // failures retry. A settled native scan never applies remote rows.
                 local = tokio::task::spawn_blocking(move || {
                     local.scan()?;
+                    management::observe_local_space(&local);
                     Ok::<_, sync_extend_reconcile::ReconcileError>(local)
                 })
                 .await??;
@@ -3030,6 +3081,7 @@ async fn execute(
                         local = tokio::task::spawn_blocking(move || {
                             match local.scan() {
                                 Ok(result) => {
+                                    management::observe_local_space(&local);
                                     management::resources_ready();
                                     println!("{}", serde_json::to_string(&result).unwrap_or_default());
                                 }

@@ -1,5 +1,9 @@
 //! Separate local lifecycle observations; credentials confer no synchronization grant.
 use crate::{ModelError, Result, FORMAT_VERSION};
+mod control_protocol;
+pub use control_protocol::{
+    authenticated_control_request, ControlOperation, ControlPolicy, ControlRequest, ControlSession,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
@@ -24,10 +28,15 @@ pub struct ManagementConfig {
     pub token_protection: TokenProtection,
     pub request_timeout_secs: u64,
     pub max_connections: u64,
+    #[serde(default)]
+    pub control: Option<ControlPolicy>,
 }
 
 impl ManagementConfig {
     pub fn validate(&self) -> Result<()> {
+        if let Some(policy) = &self.control {
+            policy.validate()?;
+        }
         if self.format_version != FORMAT_VERSION
             || !self.address.ip().is_loopback()
             || self.address.port() == 0
