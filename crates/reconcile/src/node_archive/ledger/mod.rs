@@ -938,6 +938,13 @@ impl NodeRestoreLedger {
         &mut self,
         observation: OriginalNodeCompletionObservation<'_, '_>,
     ) -> Result<OriginalNodeCompletionEvidence> {
+        self.commit_original_completion_observation(&observation)
+    }
+
+    pub(super) fn commit_original_completion_observation(
+        &mut self,
+        observation: &OriginalNodeCompletionObservation<'_, '_>,
+    ) -> Result<OriginalNodeCompletionEvidence> {
         self.verify_original_completion_objects(&observation.manifest)?;
         // Close the original issuer before validating caller-held completion
         // memberships; refusal preserves targets and never permits retry minting.

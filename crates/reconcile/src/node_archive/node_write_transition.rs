@@ -8,6 +8,17 @@ use std::{
 };
 use sync_extend_core_model::{ContentId, SpaceId};
 use sync_extend_platform_fs::{FileKey, OriginalFileCreation, OwnedFileCreation};
+
+pub(super) const ORIGINAL_WRITE_SIDECAR_LIMIT: u64 = 8 * 1024 * 1024;
+
+pub(super) fn original_write_main_limit(main_bytes: u64) -> Result<u64> {
+    main_bytes
+        .checked_add(8 * 1024 * 1024)
+        .filter(|limit| main_bytes >= 512 && *limit <= 256 * 1024 * 1024)
+        .ok_or(ReconcileError::ResourceLimit(
+            "original write Journal byte bound",
+        ))
+}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct OriginalWriteScope {
@@ -158,6 +169,10 @@ impl OriginalWriteScope {
 }
 
 impl OriginalNodeWriteLedger {
+    pub(super) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     // Independent original scope and explicit budgets stay visible at issuance.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn create_for_completed_original(
@@ -1598,6 +1613,24 @@ impl super::VerifiedNodeStateArchive {
             return Err(ReconcileError::Invariant(
                 "recovery actual roots differ from original closed scope",
             ));
+        }
+        // Reject an unowned or differently cased SHM by directory membership
+        // before opening any SQLite file with exclusive sharing semantics.
+        // Windows may report a sharing violation while trying to reopen a
+        // foreign SHM, which would obscure the intended fail-closed result.
+        let has_expected_shm = fresh_evidence.is_some_and(|evidence| evidence.wal_shm.is_some());
+        for entry in std::fs::read_dir(data)? {
+            let name = entry?
+                .file_name()
+                .into_string()
+                .map_err(|_| ReconcileError::Invariant("recovery data member encoding"))?;
+            if name.eq_ignore_ascii_case("journal.sqlite-shm")
+                && (name != "journal.sqlite-shm" || !has_expected_shm)
+            {
+                return Err(ReconcileError::Invariant(
+                    "recovery exact main and nonhot sidecar scope required",
+                ));
+            }
         }
         let mut offset = 84 + scope_length;
         let mut terminal = None;

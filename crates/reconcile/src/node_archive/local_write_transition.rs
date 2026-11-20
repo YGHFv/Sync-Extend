@@ -65,6 +65,42 @@ struct OriginalNodeWriteOpening<'scope> {
     sidecar_failed: Option<sync_extend_platform_fs::OriginalSqliteSidecarHandoffFailure>,
 }
 impl<'scope> OriginalRestoredLocalSpace<'scope> {
+    /// Complete one freshly restored original Journal write and close it while
+    /// the exact CREATE handles remain owned by this process. Returned paths
+    /// identify historical evidence only; they do not carry live write rights.
+    pub fn complete_original_restore_with_first_write(
+        self,
+        archive: &super::VerifiedNodeStateArchive,
+        plan: &super::PreparedOriginalNodeRestore,
+        ledger: &mut super::NodeRestoreLedger,
+    ) -> Result<(super::OriginalNodeCompletionEvidence, std::path::PathBuf)> {
+        if plan.read_lease_hold.is_some() {
+            return Err(ReconcileError::Invariant(
+                "held read lease restore has no native write transition",
+            ));
+        }
+        let external = ledger
+            .path()
+            .parent()
+            .ok_or(ReconcileError::Invariant(
+                "original first-write ledger parent absent",
+            ))?
+            .to_owned();
+        let observation = self.observe_original_completion(archive, plan, ledger)?;
+        let completion = ledger.commit_original_completion_observation(&observation)?;
+        let manifest = observation.into_manifest();
+        let mut session = self
+            .begin_original_node_write_session(archive, plan, &manifest, ledger, &external)
+            .map_err(|failure| failure.error)?;
+        session.attempt_first_journal_write()?;
+        let closed = session.close_completed().map_err(|failure| match failure {
+            OriginalNodeWriteCloseFailure::Open { error, .. }
+            | OriginalNodeWriteCloseFailure::Closed { error, .. } => error,
+        })?;
+        closed.verify_retained_identity_evidence()?;
+        Ok((completion, closed.ledger.path().to_owned()))
+    }
+
     pub fn begin_original_node_write_session(
         self,
         archive: &super::VerifiedNodeStateArchive,
@@ -126,7 +162,10 @@ impl<'scope> OriginalNodeWriteOpening<'scope> {
             ));
         }
         let membership = OriginalWriteMembership::from_completed(manifest)?;
-        let max_main = plan.journal.bytes().len() as u64 + 8 * 1024 * 1024;
+        use super::node_write_transition::{
+            original_write_main_limit, ORIGINAL_WRITE_SIDECAR_LIMIT,
+        };
+        let max_main = original_write_main_limit(plan.journal.bytes().len() as u64)?;
 
         match super::node_write_transition::OriginalNodeWriteLedger::create_for_completed_original(
             external,
@@ -135,8 +174,8 @@ impl<'scope> OriginalNodeWriteOpening<'scope> {
             manifest,
             original_ledger,
             max_main,
-            8 * 1024 * 1024,
-            8 * 1024 * 1024,
+            ORIGINAL_WRITE_SIDECAR_LIMIT,
+            ORIGINAL_WRITE_SIDECAR_LIMIT,
         ) {
             Ok(value) => self.ledger = Some(value),
             Err(failed) => {
@@ -321,26 +360,11 @@ impl<'scope> OriginalNodeWriteOpening<'scope> {
             &plan.journal,
             archive.space(),
             inspection,
-            [max_main, 8 * 1024 * 1024, 8 * 1024 * 1024],
+            [max_main, ORIGINAL_WRITE_SIDECAR_LIMIT, ORIGINAL_WRITE_SIDECAR_LIMIT],
             1024 * 1024,
         ) {
             Ok(value) => self.original = Some(value),
             Err(failed) => {
-                use sync_extend_journal::OriginalJournalTransitionFailure as J;
-                use sync_extend_platform_fs::OriginalSqliteOpenFailure as S;
-                match &failed {
-                    J::InertClosed { error, .. } => eprintln!("DIAGNOSTIC node inertclosed: {error:?}"),
-                    J::Read { error, .. } => eprintln!("DIAGNOSTIC node read: {error:?}"),
-                    J::Closed { error, .. } => eprintln!("DIAGNOSTIC node closed: {error:?}"),
-                    J::Open { error, .. } => eprintln!("DIAGNOSTIC node open: {error:?}"),
-                    J::Opening { failed, .. } => match failed.as_ref() {
-                        S::Prepared { error, .. } => eprintln!("DIAGNOSTIC node prepared: {error:?}"),
-                        S::MainReleased { error, .. } => eprintln!("DIAGNOSTIC node mainreleased: {error:?}"),
-                        S::WalReleased { error, .. } => eprintln!("DIAGNOSTIC node walreleased: {error:?}"),
-                        S::Released { error, .. } => eprintln!("DIAGNOSTIC node released: {error:?}"),
-                        S::Open { error, .. } => eprintln!("DIAGNOSTIC node vfsopen: {error:?}"),
-                    },
-                }
                 self.journal_failed = Some(failed);
                 return Err(ReconcileError::Invariant(
                     "new opening actual original Journal refused",

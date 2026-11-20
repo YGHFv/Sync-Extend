@@ -620,10 +620,6 @@ impl FreshNativeWalConnection {
                 )));
             }
         }
-        eprintln!(
-            "R03_DIAG commit_fresh_session autocommit={}",
-            connection.is_autocommit()
-        );
         self.verify()
     }
 }
@@ -1202,10 +1198,6 @@ impl FreshNativeWalConnection {
             .connection
             .as_ref()
             .ok_or_else(|| io::Error::other("fresh history connection closed"))?;
-        eprintln!(
-            "R03_DIAG execute_planned_history before helper autocommit={}",
-            connection.is_autocommit()
-        );
         // Existing private VFS already retains all native objects and denies
         // namespace deletion; the original authorizer restricts every DML family.
         let result = super::sqlite_original::execute_fresh_planned_history(

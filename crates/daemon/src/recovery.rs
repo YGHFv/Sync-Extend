@@ -36,6 +36,12 @@ pub enum Action {
     Inspect,
     /// Preview preserving archived read lease states and their CAS pins at new roots.
     PreviewReadLeaseMigration,
+    /// Restore and close the first native Journal write in this process for Start.
+    RestoreForWrite {
+        /// Existing empty directory outside both target roots for the restore ledgers.
+        #[arg(long)]
+        ledger_directory: PathBuf,
+    },
     /// Restore the original state to new roots after strict history preflight.
     Restore {
         /// Existing directory outside both target roots for the restore ledger.
@@ -301,13 +307,19 @@ impl Descriptor {
         }
     }
 
-    fn next(&self, history_chain: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+    fn successor(&self) -> Result<Self, Box<dyn std::error::Error>> {
         let mut next = self.clone();
         next.generation = self
             .generation
             .checked_add(1)
+            .filter(|generation| *generation != u32::MAX)
             .ok_or("descriptor generation overflow")?;
         next.previous_descriptor_digest = Some(ContentId::hash(&serde_json::to_vec(self)?));
+        Ok(next)
+    }
+
+    fn next(&self, history_chain: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut next = self.successor()?;
         next.history_chain = history_chain;
         Ok(next)
     }
@@ -410,12 +422,27 @@ fn print(value: &impl Serialize) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+enum RestoreMode<'a> {
+    ReadOnly,
+    FirstWrite,
+    ReadLeaseHold(&'a ContentId),
+}
+
 fn restore_original(
     archive: &VerifiedNodeStateArchive,
     descriptor: &Descriptor,
     ledger_directory: &Path,
-    expected_hold_digest: Option<&ContentId>,
+    mode: RestoreMode<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let next = if matches!(mode, RestoreMode::FirstWrite) {
+        Some(descriptor.successor()?)
+    } else {
+        None
+    };
+    let expected_hold_digest = match mode {
+        RestoreMode::ReadLeaseHold(digest) => Some(digest),
+        RestoreMode::ReadOnly | RestoreMode::FirstWrite => None,
+    };
     let inspection = descriptor.inspection();
     let ledger_bounds = descriptor.ledger();
     let local_limits = LocalLimits {
@@ -443,8 +470,15 @@ fn restore_original(
             ledger_bounds,
         )?
     };
-    let mut ledger =
-        NodeRestoreLedger::create_external_for_prepared(ledger_directory, archive, &prepared)?;
+    let mut ledger = if next.is_some() {
+        NodeRestoreLedger::create_external_for_prepared_first_write(
+            ledger_directory,
+            archive,
+            &prepared,
+        )?
+    } else {
+        NodeRestoreLedger::create_external_for_prepared(ledger_directory, archive, &prepared)?
+    };
     let roots = prepared.create_original_roots(archive, &mut ledger)?;
     let marker = archive.create_worktree_marker(&roots, &mut ledger)?;
     let directories = archive.create_original_layout_directories(
@@ -464,9 +498,17 @@ fn restore_original(
         .manifest()?
         .ok_or("restored manifest absent")?
         .root()?;
-    let observation = local.observe_original_completion(archive, &prepared, &ledger)?;
-    let completion = ledger.commit_original_completion(observation)?;
-    print(&serde_json::json!({
+    let (completion, frames) = if let Some(mut next) = next {
+        let (completion, frames) =
+            local.complete_original_restore_with_first_write(archive, &prepared, &mut ledger)?;
+        next.restore_ledger = ledger.path().to_path_buf();
+        next.original_frames = frames.clone();
+        (completion, Some((frames, next)))
+    } else {
+        let observation = local.observe_original_completion(archive, &prepared, &ledger)?;
+        (ledger.commit_original_completion(observation)?, None)
+    };
+    let mut receipt = serde_json::json!({
         "archive_digest": archive.digest(),
         "hold_digest": expected_hold_digest,
         "snapshot_id": current,
@@ -481,7 +523,14 @@ fn restore_original(
             "pending_resume": false,
             "activate_read_leases": false,
         },
-    }))
+    });
+    if let Some((frames, next)) = frames {
+        receipt["original_frames"] = serde_json::to_value(frames)?;
+        receipt["first_journal_write_closed"] = true.into();
+        receipt["next_descriptor"] = serde_json::to_value(next)?;
+        receipt["old_descriptor_rewritten"] = false.into();
+    }
+    print(&receipt)
 }
 
 pub fn run(descriptor_path: &Path, action: Action) -> Result<(), Box<dyn std::error::Error>> {
@@ -577,7 +626,20 @@ pub fn run(descriptor_path: &Path, action: Action) -> Result<(), Box<dyn std::er
             }))?;
         }
         Action::Restore { ledger_directory } => {
-            restore_original(&archive, &descriptor, &ledger_directory, None)?;
+            restore_original(
+                &archive,
+                &descriptor,
+                &ledger_directory,
+                RestoreMode::ReadOnly,
+            )?;
+        }
+        Action::RestoreForWrite { ledger_directory } => {
+            restore_original(
+                &archive,
+                &descriptor,
+                &ledger_directory,
+                RestoreMode::FirstWrite,
+            )?;
         }
         Action::RestoreReadLeaseHold {
             expected_hold_digest,
@@ -587,7 +649,7 @@ pub fn run(descriptor_path: &Path, action: Action) -> Result<(), Box<dyn std::er
                 &archive,
                 &descriptor,
                 &ledger_directory,
-                Some(&expected_hold_digest),
+                RestoreMode::ReadLeaseHold(&expected_hold_digest),
             )?;
         }
         Action::InspectRestore { ledger } => {

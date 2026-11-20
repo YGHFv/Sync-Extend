@@ -103,6 +103,59 @@ impl NodeRestoreLedger {
         Self::create_external(external_directory, archive, prepared.ledger_bounds)
     }
 
+    /// Reserve fresh evidence for a restore that will attempt the first
+    /// original Journal write. Start relies on a new evidence directory with
+    /// no prior attempts or files.
+    pub fn create_external_for_prepared_first_write(
+        external_directory: &Path,
+        archive: &VerifiedNodeStateArchive,
+        prepared: &super::PreparedOriginalNodeRestore,
+    ) -> Result<Self> {
+        Self::require_prepared_external(external_directory, archive, prepared)?;
+        if prepared.read_lease_hold.is_some() {
+            return Err(ReconcileError::Invariant(
+                "held read lease restore has no native write transition",
+            ));
+        }
+        super::node_write_transition::original_write_main_limit(
+            prepared.journal.bytes().len() as u64
+        )?;
+        for target in [&prepared.worktree, &prepared.data] {
+            match std::fs::symlink_metadata(target) {
+                Ok(_) => {
+                    return Err(ReconcileError::Invariant(
+                        "restore target root slot occupied",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Self::create_external_scope_inner(
+            external_directory,
+            archive.digest(),
+            prepared.ledger_bounds,
+            true,
+        )
+    }
+
+    fn require_prepared_external(
+        external_directory: &Path,
+        archive: &VerifiedNodeStateArchive,
+        prepared: &super::PreparedOriginalNodeRestore,
+    ) -> Result<()> {
+        if prepared.archive_digest() != archive.digest()
+            || [&prepared.worktree, &prepared.data]
+                .into_iter()
+                .any(|root| super::portable_source::path_within(external_directory, root))
+        {
+            return Err(ReconcileError::Invariant(
+                "prepared restore requires its archive and independent external ledger directory",
+            ));
+        }
+        Ok(())
+    }
+
     /// Reserve new external evidence and a live exclusive ownerlock independently
     /// of all target roots. Errors preserve any original partial evidence files.
     /// Their random names never authorize adoption on a later process restart.
@@ -119,12 +172,31 @@ impl NodeRestoreLedger {
         archive_digest: &ContentId,
         bounds: LedgerBounds,
     ) -> Result<Self> {
+        Self::create_external_scope_inner(external_directory, archive_digest, bounds, false)
+    }
+
+    fn create_external_scope_inner(
+        external_directory: &Path,
+        archive_digest: &ContentId,
+        bounds: LedgerBounds,
+        require_empty: bool,
+    ) -> Result<Self> {
         bounds.validate().map_err(ReconcileError::from)?;
         let ancestors = hold_ancestors(external_directory)?;
         let parent = &ancestors
             .last()
             .ok_or(ReconcileError::Invariant("external ledger parent absent"))?
             .1;
+        if require_empty
+            && std::fs::read_dir(external_directory)?
+                .next()
+                .transpose()?
+                .is_some()
+        {
+            return Err(ReconcileError::Invariant(
+                "original first-write evidence directory must be empty",
+            ));
+        }
         let nonce = SpaceId::random()?;
         let lock_name = format!("node-restore-{nonce}.owner");
         let name = format!("node-restore-{nonce}.sqlite");

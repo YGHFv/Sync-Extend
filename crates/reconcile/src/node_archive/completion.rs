@@ -548,6 +548,10 @@ impl OriginalNodeCompletionObservation<'_, '_> {
     pub fn manifest(&self) -> &OriginalNodeCompletionManifest {
         &self.manifest
     }
+
+    pub(super) fn into_manifest(self) -> OriginalNodeCompletionManifest {
+        self.manifest
+    }
 }
 
 impl OriginalNodeCompletionObservation<'_, '_> {
