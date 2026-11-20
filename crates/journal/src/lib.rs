@@ -28,7 +28,9 @@ pub enum JournalError {
         #[source]
         error: Box<JournalError>,
     },
-    #[error("{action} {identity} is already committed; retained metadata verification failed: {error}")]
+    #[error(
+        "{action} {identity} is already committed; retained metadata verification failed: {error}"
+    )]
     RetentionMetadataAfterCommit {
         action: &'static str,
         identity: String,
@@ -116,9 +118,7 @@ fn immutable_readonly_uri(path: &Path) -> Result<String> {
     }
     let mut output = String::from("file:/");
     for byte in value.replace('\\', "/").bytes() {
-        if byte.is_ascii_alphanumeric()
-            || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~')
-        {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
             output.push(byte as char);
         } else {
             write!(output, "%{byte:02X}")
@@ -202,6 +202,10 @@ pub use storage_retirement::terminal::StorageRetirementTerminalReport;
 pub use storage_retirement::StorageRetirementAdmission;
 mod storage_traffic;
 pub use storage_traffic::StorageTrafficLedger;
+mod storage_pull_attempt_budget;
+pub use storage_pull_attempt_budget::{
+    StoragePullAttemptLedger, StoragePullAttemptPolicy, StoragePullAttemptStatus,
+};
 mod webdav_native;
 pub use webdav_native::WebDavBudgetLimits;
 pub use webdav_native::{
@@ -315,10 +319,7 @@ impl ReadOnlyJournal {
             Connection::open_with_flags_and_vfs(&uri, flags, "win32-none")?
         };
         #[cfg(not(windows))]
-        let connection = Connection::open_with_flags(
-            path,
-            flags,
-        )?;
+        let connection = Connection::open_with_flags(path, flags)?;
         #[cfg(windows)]
         if wal_present {
             // EXCLUSIVE plus win32-none uses an in-memory WAL index. Actual
@@ -1009,10 +1010,8 @@ impl Journal {
             tx.commit()?;
         }
         deletion_retention::validate_schema(&connection)?;
-        let deletion_retention_issuance = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_deletion_retention_issue",
-        )?;
+        let deletion_retention_issuance =
+            storage_retirement::gate::Gate::register(&connection, "sync_deletion_retention_issue")?;
         webdav_native::schema::validate(&connection)?;
         let webdav_native_execution_admission_issue = storage_retirement::gate::Gate::register(
             &connection,
@@ -3220,10 +3219,8 @@ impl Journal {
             return Err(JournalError::Invariant("original planning current schema"));
         }
         deletion_retention::validate_schema(&connection)?;
-        let deletion_retention_issuance = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_deletion_retention_issue",
-        )?;
+        let deletion_retention_issuance =
+            storage_retirement::gate::Gate::register(&connection, "sync_deletion_retention_issue")?;
         webdav_native::schema::validate(&connection)?;
         let webdav_native_execution_admission_issue = storage_retirement::gate::Gate::register(
             &connection,

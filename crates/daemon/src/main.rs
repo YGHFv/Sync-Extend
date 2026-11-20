@@ -298,6 +298,23 @@ enum Command {
         address: std::net::SocketAddr,
         #[arg(long)]
         after_sequence: u64,
+        /// Explicit initialized budget for each actual block request, on all paths.
+        #[arg(long)]
+        attempt_policy: Option<PathBuf>,
+    },
+    /// Create a fresh independent storage-pull attempt ledger; never resets one.
+    StoragePullBudgetInit {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+    },
+    /// Audit the existing attempt ledger read-only without advancing its clock.
+    StoragePullBudgetStatus {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
     },
     /// Verify both explicitly pinned local EasyTier binary hashes and versions.
     EasytierCheck {
@@ -1367,8 +1384,14 @@ fn run_cli(
         }
     };
     #[cfg(target_os = "linux")]
-    if let (Some(owner), Command::Publish { data_dir, source, path }) =
-        (linux_owner.as_mut(), &cli.command)
+    if let (
+        Some(owner),
+        Command::Publish {
+            data_dir,
+            source,
+            path,
+        },
+    ) = (linux_owner.as_mut(), &cli.command)
     {
         // No runtime/thread exists: open SQLite/CAS and retain the full native
         // plan, then launch original PREPARED helpers immediately before ARM.
@@ -1377,12 +1400,21 @@ fn run_cli(
                 return Err("local control requires an explicit foreground service command".into());
             }
             let limits = read_local_limits(cli.limits.as_deref())?;
-            print(&owner.publish_before_runtime(data_dir, source, PortablePath::new(path.clone())?, limits)?)?;
+            print(&owner.publish_before_runtime(
+                data_dir,
+                source,
+                PortablePath::new(path.clone())?,
+                limits,
+            )?)?;
             Ok(())
         })();
-        let outcome = match result { Ok(()) => ExitCode::SUCCESS, Err(error) => {
-            eprintln!("syncd: {error}"); ExitCode::FAILURE
-        }};
+        let outcome = match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("syncd: {error}");
+                ExitCode::FAILURE
+            }
+        };
         if let Some(owner) = linux_owner {
             if let Err(error) = owner.finish() {
                 eprintln!("syncd: Linux original owner terminal refused: {error}");
@@ -1442,7 +1474,9 @@ fn read_tree_budgets(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn read_local_limits(path: Option<&std::path::Path>) -> Result<sync_extend_core_model::limits::LocalLimits, Box<dyn std::error::Error>> {
+fn read_local_limits(
+    path: Option<&std::path::Path>,
+) -> Result<sync_extend_core_model::limits::LocalLimits, Box<dyn std::error::Error>> {
     let limits: sync_extend_core_model::limits::LocalLimits = if let Some(path) = path {
         let file = std::fs::File::open(path)?;
         let mut bytes = Vec::new();
@@ -1526,7 +1560,10 @@ async fn execute(
         Command::WindowsService { .. } => {
             return Err("SCM command must use native dispatcher".into())
         }
-        Command::DeploymentCheck { config, describe_webdav } => {
+        Command::DeploymentCheck {
+            config,
+            describe_webdav,
+        } => {
             print(&deployment::check(&config, describe_webdav)?)?;
         }
         Command::DeploymentRun { .. } => {
@@ -1536,7 +1573,11 @@ async fn execute(
         Command::ManagementCheck { config } => management::check_config(&config)?,
         Command::ManagementStatus { config } => management::control_status(&config)?,
         Command::ManagementDashboard { config } => management::control_dashboard(&config)?,
-        Command::ManagementStop { config, owner_generation, request_id } => {
+        Command::ManagementStop {
+            config,
+            owner_generation,
+            request_id,
+        } => {
             management::control_stop(&config, &owner_generation, &request_id)?;
         }
         Command::ManagementCredentialsGenerate { config } => {
@@ -1755,6 +1796,7 @@ async fn execute(
             origin,
             address,
             after_sequence,
+            attempt_policy,
         } => {
             storage::pull(
                 storage::load(&config)?,
@@ -1762,8 +1804,15 @@ async fn execute(
                 storage::load(&origin)?,
                 address,
                 after_sequence,
+                attempt_policy.as_deref().map(storage::load).transpose()?,
             )
             .await?;
+        }
+        Command::StoragePullBudgetInit { config, policy } => {
+            storage::init_pull_budget(storage::load(&config)?, storage::load(&policy)?)?;
+        }
+        Command::StoragePullBudgetStatus { config, policy } => {
+            storage::status_pull_budget(storage::load(&config)?, storage::load(&policy)?)?;
         }
         Command::EasytierCheck { config } => easytier::check(&easytier::load(&config)?)?,
         Command::EasytierObserve { config } => easytier::observe(&easytier::load(&config)?)?,
@@ -1805,7 +1854,11 @@ async fn execute(
             );
         }
         Command::WebdavCheck { config } => print(&webdav::check(&config)?)?,
-        Command::WebdavConnectionTest { config, username, export } => {
+        Command::WebdavConnectionTest {
+            config,
+            username,
+            export,
+        } => {
             print(&webdav::test_connection(&config, &username, &export)?)?;
         }
         Command::WebdavServe {
@@ -2909,10 +2962,10 @@ async fn execute(
                 history_budget_bytes,
                 deleted_min_retention_days,
             };
-            print(&ReadOnlyLocalSpace::open(&data_dir)?.retention_report(
-                policy,
-                limits.max_storage_entries,
-            )?)?;
+            print(
+                &ReadOnlyLocalSpace::open(&data_dir)?
+                    .retention_report(policy, limits.max_storage_entries)?,
+            )?;
         }
         Command::SetDeletionRetentionPolicy {
             data_dir,
@@ -3024,7 +3077,9 @@ async fn execute(
         } => {
             #[cfg(target_os = "linux")]
             if linux_owner.is_some() {
-                return Err("explicit Linux Publish must complete on the original pre-runtime owner".into());
+                return Err(
+                    "explicit Linux Publish must complete on the original pre-runtime owner".into(),
+                );
             }
             print(&open(&data_dir)?.publish_file(&source, PortablePath::new(path)?)?)?;
         }

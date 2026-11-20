@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use sync_extend_core_model::{storage_node::StorageNodeConfig, ChunkRef, ContentId};
+use sync_extend_journal::{StoragePullAttemptLedger, StoragePullAttemptPolicy};
 use sync_extend_reconcile::StorageNode;
 use sync_extend_transport::{
     Connection, ForwardedSnapshotEnvelope, Listener, PeerIdentity, SignedForwardStoreReceipt,
@@ -13,6 +14,39 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub fn load<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = super::config_file::read(path, 65_536)?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn attempt_now_ms() -> Result<u64> {
+    Ok(u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?)
+}
+
+pub fn init_pull_budget(config: StorageNodeConfig, policy: StoragePullAttemptPolicy) -> Result<()> {
+    policy.validate(&config, &policy.storage_device)?;
+    let node = StorageNode::open(config.clone())?;
+    let identity = node.transport_identity()?;
+    let ledger = StoragePullAttemptLedger::init(
+        &config,
+        &identity.peer_identity().device_id,
+        policy,
+        attempt_now_ms()?,
+    )?;
+    println!("{}", serde_json::to_string(&ledger.status()?)?);
+    Ok(())
+}
+
+pub fn status_pull_budget(
+    config: StorageNodeConfig,
+    policy: StoragePullAttemptPolicy,
+) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(&StoragePullAttemptLedger::read_status(&config, policy)?)?
+    );
+    Ok(())
 }
 
 pub fn load_snapshot_report(
@@ -405,10 +439,37 @@ pub async fn pull(
     origin: PeerIdentity,
     address: std::net::SocketAddr,
     after: u64,
+    attempt_policy: Option<StoragePullAttemptPolicy>,
 ) -> Result<()> {
+    if let Some(policy) = &attempt_policy {
+        policy.validate(&config, &policy.storage_device)?;
+    }
     let mut node = StorageNode::open(config.clone())?;
     node.verify_forwarding_peer(&source)?;
     let identity = node.transport_identity()?;
+    let attempt_ledger = if let Some(policy) = attempt_policy {
+        policy.validate(&config, &identity.peer_identity().device_id)?;
+        if policy.source_device != source.device_id || policy.source_public_key != source.public_key
+        {
+            return Err("storage pull attempt policy requires the approved source".into());
+        }
+        Some(StoragePullAttemptLedger::open(
+            &config,
+            &identity.peer_identity().device_id,
+            policy,
+        )?)
+    } else {
+        // An existing opt-in ledger cannot be bypassed by dropping the CLI flag.
+        match std::fs::symlink_metadata(StoragePullAttemptPolicy::fixed_ledger_path(&config)) {
+            Ok(_) => {
+                return Err(
+                    "initialized storage pull attempt ledger requires --attempt-policy".into(),
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        }
+    };
     let mut connection = Connection::connect(address, &identity, &source).await?;
     connection
         .send_json(&Request::PullPage {
@@ -425,6 +486,17 @@ pub async fn pull(
     };
     let received =
         node.receive_forwarded_page(&signed_page, &origin, &source, connection.channel_binding())?;
+    let verified_attempt_page = if attempt_ledger.is_some() {
+        Some(signed_page.verify(
+            &origin,
+            &source,
+            identity.peer_identity(),
+            connection.channel_binding(),
+            after,
+        )?)
+    } else {
+        None
+    };
     let id = signed_page.page.storage_id()?;
     let mut chunks = std::collections::BTreeMap::new();
     for signed in &signed_page.page.operations {
@@ -445,6 +517,9 @@ pub async fn pull(
             return Err("storage pull request quota".into());
         }
         node.admit_forwarded_chunk(&received, chunk)?;
+        if let (Some(ledger), Some(page)) = (&attempt_ledger, &verified_attempt_page) {
+            ledger.reserve_page(page, chunk, attempt_now_ms()?)?;
+        }
         connection
             .send_json(&Request::Chunk {
                 storage_id: id.clone(),
@@ -509,6 +584,16 @@ pub async fn pull(
                 return Err("storage pull request quota".into());
             }
             node.admit_snapshot_chunk(&snapshot, chunk)?;
+            if let Some(ledger) = &attempt_ledger {
+                ledger.reserve_snapshot(
+                    &envelope,
+                    &source,
+                    identity.peer_identity(),
+                    connection.channel_binding(),
+                    chunk,
+                    attempt_now_ms()?,
+                )?;
+            }
             connection
                 .send_json(&Request::SnapshotChunk {
                     storage_id: snapshot_id.clone(),
@@ -548,6 +633,15 @@ pub async fn pull(
     }
     connection.finish().await?;
     let mut output = serde_json::to_value(node.stored_receipt(&received)?)?;
+    if let Some(ledger) = &attempt_ledger {
+        output
+            .as_object_mut()
+            .ok_or("storage pull receipt output type")?
+            .insert(
+                "pull_attempt_budget".to_owned(),
+                serde_json::to_value(ledger.status()?)?,
+            );
+    }
     if let Some(evidence) = snapshot_storage_evidence {
         let object = output
             .as_object_mut()
