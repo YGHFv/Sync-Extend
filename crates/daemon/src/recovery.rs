@@ -14,15 +14,17 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use sync_extend_core_model::{management::ManagementConfig, webdav::WebDavListener};
+use sync_extend_core_model::{
+    limits::LocalLimits, management::ManagementConfig, webdav::WebDavListener,
+};
 use sync_extend_core_model::{ContentId, DeviceId, PortablePath, SpaceId};
 use sync_extend_journal::{
     JournalCapacityLimits, NodeInspectionBounds, TreeRestoreInventoryLimits,
 };
 use sync_extend_reconcile::{
     ArchiveBounds, ExplicitManagementCredentialMapping, ExplicitWebDavCredentialMapping,
-    FramedNodeArchive, LedgerBounds, RecoveredArchiveInspection, RecoveredHistoryOperation,
-    VerifiedNodeStateArchive,
+    FramedNodeArchive, LedgerBounds, NodeRestoreLedger, RecoveredArchiveInspection,
+    RecoveredHistoryOperation, VerifiedNodeStateArchive,
 };
 
 const DESCRIPTOR_LIMIT: usize = 256 * 1024;
@@ -34,6 +36,26 @@ pub enum Action {
     Inspect,
     /// Preview preserving archived read lease states and their CAS pins at new roots.
     PreviewReadLeaseMigration,
+    /// Restore the original state to new roots after strict history preflight.
+    Restore {
+        /// Existing directory outside both target roots for the restore ledger.
+        #[arg(long)]
+        ledger_directory: PathBuf,
+    },
+    /// Restore to new roots while holding the exact archived read lease owners.
+    RestoreReadLeaseHold {
+        #[arg(long)]
+        expected_hold_digest: ContentId,
+        /// Existing directory outside both target roots for the restore ledger.
+        #[arg(long)]
+        ledger_directory: PathBuf,
+    },
+    /// Verify an original restore ledger as historical evidence.
+    InspectRestore {
+        /// Ledger path printed by restore, or use the descriptor's restore ledger.
+        #[arg(long)]
+        ledger: Option<PathBuf>,
+    },
     /// Capture explicitly selected config files from the verified original node.
     Capture {
         #[arg(long)]
@@ -388,6 +410,80 @@ fn print(value: &impl Serialize) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn restore_original(
+    archive: &VerifiedNodeStateArchive,
+    descriptor: &Descriptor,
+    ledger_directory: &Path,
+    expected_hold_digest: Option<&ContentId>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let inspection = descriptor.inspection();
+    let ledger_bounds = descriptor.ledger();
+    let local_limits = LocalLimits {
+        max_storage_entries: inspection.max_entries,
+        ..LocalLimits::default()
+    };
+    local_limits.validate()?;
+    let prepared = if let Some(digest) = expected_hold_digest {
+        archive.prepare_original_node_restore_with_read_lease_hold(
+            &descriptor.worktree,
+            &descriptor.data,
+            inspection,
+            ledger_bounds.max_intents,
+            ledger_bounds.max_content_bytes,
+            ledger_bounds,
+            digest,
+        )?
+    } else {
+        archive.prepare_original_node_restore(
+            &descriptor.worktree,
+            &descriptor.data,
+            inspection,
+            ledger_bounds.max_intents,
+            ledger_bounds.max_content_bytes,
+            ledger_bounds,
+        )?
+    };
+    let mut ledger =
+        NodeRestoreLedger::create_external_for_prepared(ledger_directory, archive, &prepared)?;
+    let roots = prepared.create_original_roots(archive, &mut ledger)?;
+    let marker = archive.create_worktree_marker(&roots, &mut ledger)?;
+    let directories = archive.create_original_layout_directories(
+        &roots,
+        &marker,
+        &mut ledger,
+        prepared.original_layout(),
+        prepared.mapped_layout(),
+    )?;
+    let files = prepared.create_original_files(archive, &directories, &mut ledger, inspection)?;
+    files.verify_inventory()?;
+    let locks = roots.create_data_locks(&mut ledger)?;
+    let local = files
+        .into_original_read_assembly(inspection.max_entries, locks)?
+        .into_original_local_space(archive, local_limits)?;
+    let current = local
+        .manifest()?
+        .ok_or("restored manifest absent")?
+        .root()?;
+    let observation = local.observe_original_completion(archive, &prepared, &ledger)?;
+    let completion = ledger.commit_original_completion(observation)?;
+    print(&serde_json::json!({
+        "archive_digest": archive.digest(),
+        "hold_digest": expected_hold_digest,
+        "snapshot_id": current,
+        "completion_digest": completion.completion_digest(),
+        "restore_ledger": ledger.path(),
+        "worktree": descriptor.worktree,
+        "data": descriptor.data,
+        "mutation_authority": {
+            "native": false,
+            "cleanup": false,
+            "gc_release": false,
+            "pending_resume": false,
+            "activate_read_leases": false,
+        },
+    }))
+}
+
 pub fn run(descriptor_path: &Path, action: Action) -> Result<(), Box<dyn std::error::Error>> {
     let descriptor = load_descriptor(descriptor_path)?;
     let archive = load_archive(&descriptor)?;
@@ -474,6 +570,40 @@ pub fn run(descriptor_path: &Path, action: Action) -> Result<(), Box<dyn std::er
                 "mutation_authority": {
                     "native": false,
                     "cleanup": false,
+                    "gc_release": false,
+                    "pending_resume": false,
+                    "activate_read_leases": false,
+                },
+            }))?;
+        }
+        Action::Restore { ledger_directory } => {
+            restore_original(&archive, &descriptor, &ledger_directory, None)?;
+        }
+        Action::RestoreReadLeaseHold {
+            expected_hold_digest,
+            ledger_directory,
+        } => {
+            restore_original(
+                &archive,
+                &descriptor,
+                &ledger_directory,
+                Some(&expected_hold_digest),
+            )?;
+        }
+        Action::InspectRestore { ledger } => {
+            let ledger = ledger.as_deref().unwrap_or(&descriptor.restore_ledger);
+            let classification = archive.classify_original_node_restart(
+                ledger,
+                descriptor.ledger(),
+                descriptor.inspection(),
+            )?;
+            print(&serde_json::json!({
+                "archive_digest": archive.digest(),
+                "restore_ledger": ledger,
+                "classification": classification,
+                "mutation_authority": {
+                    "native": classification.native_restart_authority_available(),
+                    "cleanup": classification.cleanup_authority_available(),
                     "gc_release": false,
                     "pending_resume": false,
                     "activate_read_leases": false,

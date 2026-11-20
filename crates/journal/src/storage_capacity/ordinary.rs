@@ -77,6 +77,7 @@ pub(super) fn liabilities(
     rows: &[JournalStoredRow],
     storage_originals: &BTreeSet<String>,
 ) -> Result<Liabilities> {
+    crate::read_lease::recovery_hold::validate_rows(rows)?;
     for row in rows.iter().filter(|r| r.table() == "publications") {
         if integer(row, "cleaned")? > 1 {
             return Err(invalid("journal capacity publication cleanup flag"));

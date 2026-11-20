@@ -43,6 +43,8 @@ pub struct OriginalNodeCompletionManifest {
     pub(super) original_data_target: String,
     pub(super) mapped_journal_digest: ContentId,
     pub(super) journal_rows_digest: ContentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) read_lease_hold: Option<ContentId>,
     pub(super) membership_digest: ContentId,
     pub(super) file_bytes: u64,
     pub(super) object_count: usize,
@@ -336,6 +338,7 @@ impl<'scope> OriginalRestoredLocalSpace<'scope> {
                 .to_owned(),
             mapped_journal_digest: plan.journal.digest().parse()?,
             journal_rows_digest: self.original_complete_rows_digest()?,
+            read_lease_hold: plan.read_lease_hold.clone(),
             membership_digest: super::completion_codec::digest(&objects)?,
             file_bytes,
             object_count: objects.len(),
@@ -417,25 +420,18 @@ impl OriginalNodeCompletionManifest {
                 "completion restart exact source archive differs",
             ));
         }
-        let raw = archive
-            .archive
-            .section(&super::ArchiveRole::Journal)
-            .ok_or(ReconcileError::Invariant(
-                "completion restart source Journal absent",
-            ))?;
-        let image = sync_extend_journal::JournalBackupImage::from_current_node_image(
-            raw.to_vec(),
-            ContentId::hash(raw).as_str(),
-            raw.len(),
-            archive.space(),
-            inspection,
-        )?;
-        let mapped_image = image.mapped_portable_worktree_image(
-            archive.space(),
-            archive.original_worktree(),
-            std::path::Path::new(&self.original_worktree_target),
+        let worktree = std::path::Path::new(&self.original_worktree_target);
+        if self.read_lease_hold.is_some() {
+            archive.validate_read_lease_migration_roots(
+                worktree,
+                std::path::Path::new(&self.original_data_target),
+            )?;
+        }
+        let mapped_image = archive.map_original_restore_journal(
+            worktree,
             inspection,
             256 * 1024 * 1024,
+            self.read_lease_hold.as_ref(),
         )?;
         if mapped_image.digest() != self.mapped_journal_digest.as_str()
             || mapped_image.original_completion_rows_digest(archive.space(), inspection)?

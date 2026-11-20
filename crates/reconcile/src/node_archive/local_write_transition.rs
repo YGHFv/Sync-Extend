@@ -109,6 +109,11 @@ impl<'scope> OriginalNodeWriteOpening<'scope> {
         let local = self.local.as_ref().ok_or(ReconcileError::Invariant(
             "new opening original local absent",
         ))?;
+        if plan.read_lease_hold.is_some() || manifest.read_lease_hold.is_some() {
+            return Err(ReconcileError::Invariant(
+                "held read lease restore has no native write transition",
+            ));
+        }
         local.verify()?;
         local.verify_original_prepared_completion(plan)?;
         local.verify_original_completion_membership(manifest)?;

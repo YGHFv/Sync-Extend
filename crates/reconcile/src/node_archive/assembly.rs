@@ -16,6 +16,7 @@ pub struct OriginalNodeReadAssembly<'a> {
     pub(super) journal: Journal,
     pub(super) cas: Cas,
     pub(super) archive_digest: ContentId,
+    pub(super) read_lease_hold: Option<ContentId>,
     pub(super) space: SpaceId,
 }
 pub(super) type ReadContents = BTreeMap<(NodeTargetRoot, Vec<String>), ReadContent>;
@@ -180,6 +181,7 @@ impl<'a> CreatedNodeFileSet<'a> {
             journal,
             cas,
             archive_digest: self.archive_digest,
+            read_lease_hold: self.read_lease_hold,
             space: state.parse()?,
         };
         result.verify()?;

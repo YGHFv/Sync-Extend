@@ -16,6 +16,8 @@ pub enum OriginalNodeRestartClassification {
         records: u64,
         original_terminal: ContentId,
         completion_digest: ContentId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        read_lease_hold: Option<ContentId>,
     },
     /// Hot rollback, WAL/SHM, unknown version/schema or contradictory evidence.
     /// This is an explicit refusal; never translate it into CREATE or cleanup.

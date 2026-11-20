@@ -118,6 +118,13 @@ pub(crate) fn original_pins(connection: &Connection) -> Result<BTreeSet<ContentI
         }
         result.insert(row?.parse()?);
     }
+    // The pending plan and original liabilities can protect chunks without
+    // a pin table row. Use the original GC source for those references too.
+    for id in crate::history_reservation::original_reserved_content(connection)? {
+        if result.insert(id) && result.len() > MAX_RECOVERED_PINS {
+            return Err(JournalError::Invariant("recovered retention pin set bound"));
+        }
+    }
     Ok(result)
 }
 
@@ -248,6 +255,17 @@ pub(crate) fn no_pending(
             "recovered retention release has pending local history attempt",
         ));
     }
+    // An active lease of an empty file is still an independent owner.
+    let active_read_lease: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.read_leases WHERE state='active')",
+        [],
+        |row| row.get(0),
+    )?;
+    if active_read_lease {
+        return Err(JournalError::Invariant(
+            "recovered retention release has pending pinned owner",
+        ));
+    }
     for table in [
         "mutation_objects",
         "publication_objects",
@@ -313,6 +331,7 @@ impl JournalBackupImage {
         bounds: NodeInspectionBounds,
     ) -> Result<()> {
         self.with_audited_readonly(&mapping.space_id, bounds, |connection| {
+            no_pending(connection, &mapping.space_id, bounds)?;
             let current = audit(connection)?
                 .into_iter()
                 .find(|r| r.mapping.retention_id == mapping.retention_id)
@@ -324,7 +343,7 @@ impl JournalBackupImage {
                     "recovered release immutable mapping differs",
                 ));
             }
-            no_pending(connection, &mapping.space_id, bounds)
+            Ok(())
         })
     }
     pub fn preflight_recovered_gc(

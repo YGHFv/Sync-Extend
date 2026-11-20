@@ -6,6 +6,7 @@ use sync_extend_core_model::*;
 
 const MAX_TTL_MS: u64 = 86_400_000;
 mod capacity;
+pub(crate) mod recovery_hold;
 
 pub fn read_lease_expiry(now: u64, ttl_secs: u64) -> Result<u64> {
     if !(1..=86_400).contains(&ttl_secs) {
@@ -59,6 +60,7 @@ fn clock(connection: &Connection) -> Result<u64> {
 }
 
 fn observe(connection: &Connection, now: u64) -> Result<()> {
+    recovery_hold::require_mutable(connection)?;
     if now < clock(connection)? {
         return Err(JournalError::Invariant("read lease clock moved backwards"));
     }
@@ -93,6 +95,7 @@ impl Journal {
     ) -> Result<ReadLease> {
         let bounds = self.writer_capacity_limits(max_entries)?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        recovery_hold::require_mutable(&tx)?;
         let before = self
             .read_view()
             .audit_lease_capacity(&intent.space_id, bounds)?;

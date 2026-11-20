@@ -1,4 +1,5 @@
 //! Exact bounded node image portability preflight; never authorizes a target or writer.
+use crate::read_lease::recovery_hold;
 use crate::{
     JournalBackupImage, JournalError, JournalStorageColumnValue, JournalStoredRow,
     NodeInspectionBounds, Result,
@@ -38,7 +39,7 @@ pub struct ArchivedReadLeaseHold {
     pub root_bound_local_state: bool,
 }
 
-fn other_owner_tables(database: &rusqlite::Connection, preview: bool) -> Result<Vec<String>> {
+fn other_owner_tables(database: &rusqlite::Connection) -> Result<Vec<String>> {
     let mut tables = database.prepare(
         "SELECT name FROM main.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     )?;
@@ -56,6 +57,8 @@ fn other_owner_tables(database: &rusqlite::Connection, preview: bool) -> Result<
         "snapshot_objects",
         "snapshot_prunings",
         "read_lease_clock",
+        "read_leases",
+        "read_lease_objects",
         "gc_clock",
         "original_operation_provenance",
         "original_page_inbox",
@@ -63,9 +66,7 @@ fn other_owner_tables(database: &rusqlite::Connection, preview: bool) -> Result<
     ];
     let mut other = Vec::new();
     for name in names {
-        if PORTABLE.contains(&name.as_str())
-            || (preview && matches!(name.as_str(), "read_leases" | "read_lease_objects"))
-        {
+        if PORTABLE.contains(&name.as_str()) {
             continue;
         }
         let quoted = format!("\"{}\"", name.replace('"', "\"\""));
@@ -76,23 +77,15 @@ fn other_owner_tables(database: &rusqlite::Connection, preview: bool) -> Result<
         )?;
         if exists {
             other.push(name);
-            if !preview {
-                break;
-            }
         }
     }
     Ok(other)
 }
 
-fn portable_scope(
+fn client_identity(
     database: &rusqlite::Connection,
     space: &SpaceId,
 ) -> Result<PortableNodeImageScope> {
-    if !other_owner_tables(database, false)?.is_empty() {
-        return Err(JournalError::Invariant(
-            "node root mapping refuses unsupported original owner history",
-        ));
-    }
     let state = database
         .prepare("SELECT key,value FROM main.local_state ORDER BY key")?
         .query_map([], |row| {
@@ -144,8 +137,6 @@ fn read_lease_hold(
     let mut pin_rows = 0;
     let mut pins = BTreeSet::new();
     let mut root_bound_local_state = false;
-    let mut digest = blake3::Hasher::new();
-    digest.update(b"sync-extend.archived-read-lease-hold.v1");
     // The complete Journal audit has already established each exact lease,
     // clock and pin. The inventory commits even to distinct owners of one ID.
     for row in rows {
@@ -178,11 +169,9 @@ fn read_lease_hold(
                 ) {
                     root_bound_local_state = true;
                 }
-                continue;
             }
-            _ => continue,
+            _ => (),
         }
-        digest.update(row.fingerprint().as_str().as_bytes());
     }
     if active_leases + released_leases + expired_leases == 0 {
         return Err(JournalError::Invariant(
@@ -197,8 +186,8 @@ fn read_lease_hold(
         expired_leases,
         pin_rows,
         distinct_pinned_objects: pins.len(),
-        inventory_digest: ContentId::from_hasher(&digest),
-        other_owner_tables: other_owner_tables(database, true)?,
+        inventory_digest: recovery_hold::inventory(rows),
+        other_owner_tables: other_owner_tables(database)?,
         root_bound_local_state,
     })
 }
@@ -212,7 +201,56 @@ impl JournalBackupImage {
         space: &SpaceId,
         bounds: NodeInspectionBounds,
     ) -> Result<PortableNodeImageScope> {
-        self.with_audited_readonly(space, bounds, |database| portable_scope(database, space))
+        self.with_audited_readonly(space, bounds, |database| {
+            // Historical terminal rows have no pins after the complete audit.
+            // An active empty-file lease still has an owner without any pins.
+            let active: bool = database.query_row(
+                "SELECT EXISTS(SELECT 1 FROM main.read_leases WHERE state='active')",
+                [],
+                |row| row.get(0),
+            )?;
+            if active || !other_owner_tables(database)?.is_empty() {
+                return Err(JournalError::Invariant(
+                    "node root mapping refuses unsupported original owner history",
+                ));
+            }
+            client_identity(database, space)
+        })
+    }
+
+    pub(super) fn portable_node_scope_with_read_lease_hold(
+        &self,
+        space: &SpaceId,
+        bounds: NodeInspectionBounds,
+        expected: &ContentId,
+    ) -> Result<PortableNodeImageScope> {
+        Self::inspect_current_node_image_with_audit_rows(
+            self.bytes(),
+            self.digest(),
+            self.bytes().len(),
+            space,
+            bounds,
+            |database, rows, _| {
+                let hold = read_lease_hold(database, rows)?;
+                if &hold.inventory_digest != expected {
+                    return Err(JournalError::Invariant(
+                        "archived read lease hold digest differs",
+                    ));
+                }
+                if hold.active_leases == 0 {
+                    return Err(JournalError::Invariant(
+                        "archived read lease hold requires an active owner",
+                    ));
+                }
+                if hold.root_bound_local_state || !hold.other_owner_tables.is_empty() {
+                    return Err(JournalError::Invariant(
+                        "read lease hold refuses other original owner history",
+                    ));
+                }
+                client_identity(database, space)
+            },
+        )
+        .map(|(_, scope)| scope)
     }
 
     /// Inspect the preserved read lease clock and independent CAS pin owners.

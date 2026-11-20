@@ -1,7 +1,7 @@
 //! Whole source and ledger capacity checks before the first target root effect.
 use super::{
-    ArchiveRole, CreatedNodeRestoreRoots, LedgerBounds, NodeRestoreFile, NodeRestoreLayout,
-    NodeRestoreLedger, NodeRestoreMappedLayout, VerifiedNodeStateArchive,
+    CreatedNodeRestoreRoots, LedgerBounds, NodeRestoreFile, NodeRestoreLayout, NodeRestoreLedger,
+    NodeRestoreMappedLayout, VerifiedNodeStateArchive,
 };
 use crate::{ReconcileError, Result};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ pub struct PreparedOriginalNodeRestore {
     pub(super) original: NodeRestoreLayout,
     pub(super) mapped: NodeRestoreMappedLayout,
     pub(super) journal: JournalBackupImage,
+    pub(super) read_lease_hold: Option<ContentId>,
     pub(super) worktree: PathBuf,
     pub(super) data: PathBuf,
     pub(super) required_file_bytes: u64,
@@ -79,6 +80,52 @@ impl VerifiedNodeStateArchive {
         max_file_bytes: u64,
         ledger_bounds: LedgerBounds,
     ) -> Result<PreparedOriginalNodeRestore> {
+        self.prepare_original_node_restore_inner(
+            worktree,
+            data,
+            inspection,
+            max_creations,
+            max_file_bytes,
+            ledger_bounds,
+            None,
+        )
+    }
+
+    /// The exact preview inventory must be supplied for active lease owners.
+    /// Their source rows survive with a durable target hold and no new issuer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_original_node_restore_with_read_lease_hold(
+        &self,
+        worktree: &Path,
+        data: &Path,
+        inspection: NodeInspectionBounds,
+        max_creations: usize,
+        max_file_bytes: u64,
+        ledger_bounds: LedgerBounds,
+        expected_hold: &ContentId,
+    ) -> Result<PreparedOriginalNodeRestore> {
+        self.prepare_original_node_restore_inner(
+            worktree,
+            data,
+            inspection,
+            max_creations,
+            max_file_bytes,
+            ledger_bounds,
+            Some(expected_hold),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_original_node_restore_inner(
+        &self,
+        worktree: &Path,
+        data: &Path,
+        inspection: NodeInspectionBounds,
+        max_creations: usize,
+        max_file_bytes: u64,
+        ledger_bounds: LedgerBounds,
+        expected_hold: Option<&ContentId>,
+    ) -> Result<PreparedOriginalNodeRestore> {
         ledger_bounds.validate().map_err(ReconcileError::from)?;
         super::roots::split_target(worktree)?;
         super::roots::split_target(data)?;
@@ -87,31 +134,19 @@ impl VerifiedNodeStateArchive {
                 "original restore target roots overlap",
             ));
         }
-        self.require_portable_restore_source(inspection)?;
+        if expected_hold.is_some() {
+            self.validate_read_lease_migration_roots(worktree, data)?;
+        }
         let original =
             self.current_node_restore_layout(inspection, max_creations, max_file_bytes)?;
         let mapped = original.map_original_slots(max_creations)?;
-        let bytes =
-            self.archive
-                .section(&ArchiveRole::Journal)
-                .ok_or(ReconcileError::Invariant(
-                    "preflight original Journal absent",
-                ))?;
-        let digest = ContentId::hash(bytes);
-        let image = JournalBackupImage::from_current_node_image(
-            bytes.to_vec(),
-            digest.as_str(),
-            bytes.len(),
-            self.space(),
-            inspection,
-        )?;
-        let journal = image.mapped_portable_worktree_image(
-            self.space(),
-            self.original_worktree(),
+        let bytes = self.journal_bytes()?;
+        let journal = self.map_original_restore_journal(
             worktree,
             inspection,
             usize::try_from(max_file_bytes.min(256 * 1024 * 1024))
                 .map_err(|_| ReconcileError::ResourceLimit("preflight Journal byte bound"))?,
+            expected_hold,
         )?;
         // Layout already includes source Journal, marker, sections and all
         // current files. Substitute the exact precomputed mapped Journal length.
@@ -209,6 +244,7 @@ impl VerifiedNodeStateArchive {
             original,
             mapped,
             journal,
+            read_lease_hold: expected_hold.cloned(),
             worktree: worktree.to_owned(),
             data: data.to_owned(),
             required_file_bytes,

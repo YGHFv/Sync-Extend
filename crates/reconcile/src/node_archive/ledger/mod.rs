@@ -76,6 +76,11 @@ impl InitializedNodeLedger<'_> {
 }
 
 impl NodeRestoreLedger {
+    /// The path of this exact ledger; a reopened path does not recover its issuer.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Build the exact schema in memory, then write/sync/hash only the caller's
     /// actual empty exclusive CREATE. Partial errors preserve that creator.
     /// External root/ownerlock intent and ancestor retention remain caller duties.

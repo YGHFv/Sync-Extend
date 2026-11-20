@@ -35,10 +35,12 @@ impl crate::JournalBackupImage {
         } else {
             None
         };
+        crate::read_lease::recovery_hold::validate_rows(rows)?;
         let mut has_cancellations = false;
         for row in rows.iter().filter(|row| row.table() == "local_state") {
             match row.primary_key() {
                 [key] if matches!(key.as_str(), "space_id" | "device_id" | "worktree" | KEY) => (),
+                [key] if key == crate::read_lease::recovery_hold::KEY => (),
                 [key]
                     if pending_keys
                         .as_ref()

@@ -9,13 +9,14 @@ use std::{
     path::PathBuf,
 };
 use sync_extend_core_model::ContentId;
-use sync_extend_journal::{JournalBackupImage, NodeInspectionBounds};
+use sync_extend_journal::NodeInspectionBounds;
 use sync_extend_platform_fs::{FileKey, OwnedFileCreation};
 
 pub struct CreatedNodeFileSet<'a> {
     pub(super) directories: &'a CreatedNodeDirectorySet<'a>,
     pub(super) files: BTreeMap<(NodeTargetRoot, Vec<String>), CreatedFile>,
     pub(super) archive_digest: ContentId,
+    pub(super) read_lease_hold: Option<ContentId>,
     source_journal_digest: ContentId,
     mapped_journal_digest: ContentId,
 }
@@ -90,7 +91,7 @@ impl VerifiedNodeStateArchive {
         ledger: &mut NodeRestoreLedger,
         inspection: NodeInspectionBounds,
         max_file_bytes: u64,
-        prepared: Option<&JournalBackupImage>,
+        prepared: Option<&super::PreparedOriginalNodeRestore>,
     ) -> Result<CreatedNodeFileSet<'a>> {
         directories.verify()?;
         ledger.verify_external()?;
@@ -112,24 +113,14 @@ impl VerifiedNodeStateArchive {
         let source_digest = ContentId::hash(journal_bytes);
         let computed;
         let mapped = if let Some(mapped) = prepared {
-            mapped
+            &mapped.journal
         } else {
-            computed = {
-                let image = JournalBackupImage::from_current_node_image(
-                    journal_bytes.to_vec(),
-                    source_digest.as_str(),
-                    journal_bytes.len(),
-                    self.space(),
-                    inspection,
-                )?;
-                image.mapped_portable_worktree_image(
-                    self.space(),
-                    self.original_worktree(),
-                    &directories.roots.worktree_path,
-                    inspection,
-                    256 * 1024 * 1024,
-                )?
-            };
+            computed = self.map_original_restore_journal(
+                &directories.roots.worktree_path,
+                inspection,
+                256 * 1024 * 1024,
+                None,
+            )?;
             &computed
         };
         let mapped_digest: ContentId = mapped.digest().parse()?;
@@ -174,6 +165,7 @@ impl VerifiedNodeStateArchive {
             directories,
             files: BTreeMap::new(),
             archive_digest: self.digest().clone(),
+            read_lease_hold: prepared.and_then(|plan| plan.read_lease_hold.clone()),
             source_journal_digest: source_digest,
             mapped_journal_digest: mapped_digest,
         };

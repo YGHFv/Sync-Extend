@@ -7,6 +7,30 @@ use sync_extend_journal::{
     OriginalNodeHistoryMappingEvidence,
 };
 
+// Compare drive and ordinary components the same way for both slash
+// spellings and when the original is an extended-length Windows path.
+pub(super) fn path_within(path: &Path, parent: &Path) -> bool {
+    let parts = |value: &Path| {
+        value
+            .components()
+            .map(|part| match part {
+                Component::Prefix(prefix) => match prefix.kind() {
+                    std::path::Prefix::Disk(letter) | std::path::Prefix::VerbatimDisk(letter) => {
+                        format!("{}:", char::from(letter.to_ascii_uppercase()))
+                    }
+                    _ => prefix.as_os_str().to_string_lossy().to_uppercase(),
+                },
+                Component::Normal(name) => name
+                    .to_string_lossy()
+                    .trim_end_matches([' ', '.'])
+                    .to_uppercase(),
+                _ => part.as_os_str().to_string_lossy().into_owned(),
+            })
+            .collect::<Vec<_>>()
+    };
+    parts(path).starts_with(&parts(parent))
+}
+
 #[derive(serde::Serialize)]
 pub struct ReadLeaseMigrationPreview {
     pub archive_digest: ContentId,
@@ -45,16 +69,45 @@ impl super::VerifiedNodeStateArchive {
         Ok(())
     }
 
-    /// Prove that the archived lease clock, state and individual CAS pins
-    /// survive a detached worktree mapping. Only the ordinary portable image
-    /// families and the two read lease tables participate in this preview.
-    pub fn preview_read_lease_migration(
+    pub(super) fn map_original_restore_journal(
+        &self,
+        worktree: &Path,
+        inspection: NodeInspectionBounds,
+        max_image_bytes: usize,
+        expected_hold: Option<&ContentId>,
+    ) -> Result<JournalBackupImage> {
+        let image = JournalBackupImage::from_current_node_image(
+            self.journal_bytes()?.to_vec(),
+            self.journal_digest.as_str(),
+            max_image_bytes,
+            self.space(),
+            inspection,
+        )?;
+        Ok(if let Some(hold) = expected_hold {
+            image.mapped_portable_worktree_with_read_lease_hold(
+                self.space(),
+                self.original_worktree(),
+                worktree,
+                inspection,
+                max_image_bytes,
+                hold,
+            )?
+        } else {
+            image.mapped_portable_worktree_image(
+                self.space(),
+                self.original_worktree(),
+                worktree,
+                inspection,
+                max_image_bytes,
+            )?
+        })
+    }
+
+    pub(super) fn validate_read_lease_migration_roots(
         &self,
         worktree: &Path,
         data: &Path,
-        inspection: NodeInspectionBounds,
-        max_image_bytes: usize,
-    ) -> Result<ReadLeaseMigrationPreview> {
+    ) -> Result<()> {
         for path in [worktree, data] {
             super::roots::split_target(path)?;
             if path
@@ -66,17 +119,31 @@ impl super::VerifiedNodeStateArchive {
                 ));
             }
         }
-        if worktree.starts_with(data)
-            || data.starts_with(worktree)
-            || worktree.starts_with(self.original_worktree())
-            || self.original_worktree().starts_with(worktree)
-            || data.starts_with(self.original_worktree())
-            || self.original_worktree().starts_with(data)
+        if path_within(worktree, data)
+            || path_within(data, worktree)
+            || path_within(worktree, self.original_worktree())
+            || path_within(self.original_worktree(), worktree)
+            || path_within(data, self.original_worktree())
+            || path_within(self.original_worktree(), data)
         {
             return Err(ReconcileError::Invariant(
                 "read lease migration preview roots overlap",
             ));
         }
+        Ok(())
+    }
+
+    /// Prove that the archived lease clock, state and individual CAS pins
+    /// survive a detached worktree mapping. Only the ordinary portable image
+    /// families and the two read lease tables participate in this preview.
+    pub fn preview_read_lease_migration(
+        &self,
+        worktree: &Path,
+        data: &Path,
+        inspection: NodeInspectionBounds,
+        max_image_bytes: usize,
+    ) -> Result<ReadLeaseMigrationPreview> {
+        self.validate_read_lease_migration_roots(worktree, data)?;
         let separate_config_mapping_required = self
             .archive
             .roles()

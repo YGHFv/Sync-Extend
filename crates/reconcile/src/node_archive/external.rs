@@ -84,6 +84,25 @@ pub(super) fn hold_ancestors(path: &Path) -> Result<Vec<(PathBuf, LockedDirector
 }
 
 impl NodeRestoreLedger {
+    /// Reserve independent evidence for the exact prepared archive and bounds.
+    /// Refuse target roots and their descendants before creating any files.
+    pub fn create_external_for_prepared(
+        external_directory: &Path,
+        archive: &VerifiedNodeStateArchive,
+        prepared: &super::PreparedOriginalNodeRestore,
+    ) -> Result<Self> {
+        if prepared.archive_digest() != archive.digest()
+            || [&prepared.worktree, &prepared.data]
+                .into_iter()
+                .any(|root| super::portable_source::path_within(external_directory, root))
+        {
+            return Err(ReconcileError::Invariant(
+                "prepared restore requires its archive and independent external ledger directory",
+            ));
+        }
+        Self::create_external(external_directory, archive, prepared.ledger_bounds)
+    }
+
     /// Reserve new external evidence and a live exclusive ownerlock independently
     /// of all target roots. Errors preserve any original partial evidence files.
     /// Their random names never authorize adoption on a later process restart.

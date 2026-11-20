@@ -97,13 +97,6 @@ impl<'a> OriginalNodeReadAssembly<'a> {
                 "originalLocalSpace actual archive scope",
             ));
         }
-        let original_bytes = archive
-            .archive
-            .section(&super::ArchiveRole::Journal)
-            .ok_or(ReconcileError::Invariant(
-                "original Journal section absent beforeLocalSpace",
-            ))?;
-        let original_digest = ContentId::hash(original_bytes);
         let inspection = sync_extend_journal::NodeInspectionBounds {
             max_entries: limits.max_storage_entries,
             capacity: sync_extend_journal::JournalCapacityLimits {
@@ -117,19 +110,11 @@ impl<'a> OriginalNodeReadAssembly<'a> {
             max_vm_instructions: 100_000_000,
             max_query_time: std::time::Duration::from_secs(60),
         };
-        let image = sync_extend_journal::JournalBackupImage::from_current_node_image(
-            original_bytes.to_vec(),
-            original_digest.as_str(),
-            original_bytes.len(),
-            archive.space(),
-            inspection,
-        )?;
-        let mapped = image.mapped_portable_worktree_image(
-            archive.space(),
-            archive.original_worktree(),
+        let mapped = archive.map_original_restore_journal(
             &self.directories.roots.worktree_path,
             inspection,
             256 * 1024 * 1024,
+            self.read_lease_hold.as_ref(),
         )?;
         journal.verify_original_image_rows(&mapped, archive.space(), inspection)?;
         self.directories.marker.enable_original_readers()?;

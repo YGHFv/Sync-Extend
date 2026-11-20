@@ -144,6 +144,7 @@ impl VerifiedNodeStateArchive {
                     records: chain.count,
                     original_terminal: chain.previous.parse()?,
                     completion_digest: digest,
+                    read_lease_hold: manifest.read_lease_hold,
                 }
             } else {
                 OriginalNodeRestartClassification::PartialEvidence {

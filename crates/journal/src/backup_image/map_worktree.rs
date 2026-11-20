@@ -1,4 +1,5 @@
 //! Bounded owned memory image mapping; never changes live Journal or creates a target.
+use crate::read_lease::recovery_hold;
 use crate::{JournalBackupImage, JournalError, NodeInspectionBounds, Result};
 use std::path::Path;
 use sync_extend_core_model::{ContentId, SpaceId};
@@ -15,7 +16,52 @@ impl JournalBackupImage {
         bounds: NodeInspectionBounds,
         max_image_bytes: usize,
     ) -> Result<Self> {
-        let scope = self.portable_node_scope(space, bounds)?;
+        self.map_portable_worktree(
+            space,
+            original_worktree,
+            new_worktree,
+            bounds,
+            max_image_bytes,
+            None,
+        )
+    }
+
+    /// The caller must name the exact audited lease inventory from the source.
+    /// Keep those leases and all original pins in the image and record a hold
+    /// that prevents ordinary lease operations from changing the copied rows.
+    pub fn mapped_portable_worktree_with_read_lease_hold(
+        &self,
+        space: &SpaceId,
+        original_worktree: &Path,
+        new_worktree: &Path,
+        bounds: NodeInspectionBounds,
+        max_image_bytes: usize,
+        expected_hold: &ContentId,
+    ) -> Result<Self> {
+        self.map_portable_worktree(
+            space,
+            original_worktree,
+            new_worktree,
+            bounds,
+            max_image_bytes,
+            Some(expected_hold),
+        )
+    }
+
+    fn map_portable_worktree(
+        &self,
+        space: &SpaceId,
+        original_worktree: &Path,
+        new_worktree: &Path,
+        bounds: NodeInspectionBounds,
+        max_image_bytes: usize,
+        expected_hold: Option<&ContentId>,
+    ) -> Result<Self> {
+        let scope = if let Some(hold) = expected_hold {
+            self.portable_node_scope_with_read_lease_hold(space, bounds, hold)?
+        } else {
+            self.portable_node_scope(space, bounds)?
+        };
         if scope.original_worktree() != original_worktree
             || !new_worktree.is_absolute()
             || new_worktree.as_os_str().is_empty()
@@ -70,18 +116,45 @@ impl JournalBackupImage {
                 "portable node mapping must change exact original one row",
             ));
         }
+        if let Some(hold) = expected_hold {
+            transaction.execute(
+                "INSERT INTO main.local_state(key,value) VALUES(?1,?2)",
+                [recovery_hold::KEY, hold.as_str()],
+            )?;
+        }
         let after = original_view.audit_original_provenance_capacity(
             space,
             bounds.max_entries,
             bounds.capacity,
         )?;
+        if expected_hold.is_some() && !after.report.within_accounted_limits() {
+            return Err(JournalError::Invariant(
+                "node mapped read lease hold exceeds Journal capacity",
+            ));
+        }
         let mut altered = 0;
-        if before.rows.len() != after.rows.len() {
+        if before.rows.len() + usize::from(expected_hold.is_some()) != after.rows.len() {
             return Err(JournalError::Invariant(
                 "node mapping physical row count differs",
             ));
         }
-        for (old, new) in before.rows.iter().zip(&after.rows) {
+        let mut held = false;
+        let mut original_rows = before.rows.iter();
+        for new in &after.rows {
+            if new.table() == "local_state" && new.primary_key() == [recovery_hold::KEY] {
+                if held || expected_hold.is_none() {
+                    return Err(JournalError::Invariant(
+                        "node mapping unexpected read lease hold",
+                    ));
+                }
+                // The post-mapping capacity audit validates the row and its
+                // exact pin/owner/clock fingerprint against the live inventory.
+                held = true;
+                continue;
+            }
+            let old = original_rows
+                .next()
+                .ok_or(JournalError::Invariant("node mapping unexpected row"))?;
             if old.table() == "local_state" && old.primary_key() == ["worktree"] {
                 let expected = [
                     crate::JournalStorageColumn {
@@ -108,7 +181,7 @@ impl JournalBackupImage {
                 ));
             }
         }
-        if altered != 1 {
+        if altered != 1 || held != expected_hold.is_some() || original_rows.next().is_some() {
             return Err(JournalError::Invariant(
                 "node mapping original worktree key absent",
             ));

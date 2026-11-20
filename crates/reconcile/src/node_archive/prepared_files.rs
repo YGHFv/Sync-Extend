@@ -22,7 +22,7 @@ impl super::PreparedOriginalNodeRestore {
             ledger,
             inspection,
             self.required_file_bytes,
-            Some(&self.journal),
+            Some(self),
         )?;
         if result.mapped_journal_digest().as_str() != self.journal.digest() {
             return Err(crate::ReconcileError::Invariant(
