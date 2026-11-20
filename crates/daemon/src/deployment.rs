@@ -23,12 +23,17 @@ pub fn check(path: &Path, describe_webdav: bool) -> Result<serde_json::Value> {
         }));
     }
     let value = if let DeploymentRole::WebdavClient { gateway_config } = &config.role {
-        let parent = path.parent().ok_or("private deployment directory required")?;
-        let relative = gateway_config.strip_prefix(parent)
+        let parent = path
+            .parent()
+            .ok_or("private deployment directory required")?;
+        let relative = gateway_config
+            .strip_prefix(parent)
             .map_err(|_| "WebDAV configuration must be inside the private deployment directory")?;
         if parent.parent().is_none()
             || relative.as_os_str().is_empty()
-            || relative.components().any(|part| !matches!(part, Component::Normal(_)))
+            || relative
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
         {
             return Err("exact private WebDAV configuration path required".into());
         }
@@ -38,7 +43,7 @@ pub fn check(path: &Path, describe_webdav: bool) -> Result<serde_json::Value> {
             "enabled": listener.enabled,
             "exports": listener.exports.iter().map(|export| serde_json::json!({
                 "name": export.name,
-                "url": format!("http://{}/{}/", listener.address, export.name),
+                "url": format!("{}://{}/{}/", runtime.scheme(), listener.address, export.name),
                 "writable": export.writable,
             })).collect::<Vec<_>>(),
         }))

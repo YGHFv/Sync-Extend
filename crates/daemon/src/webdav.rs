@@ -22,6 +22,7 @@ use sync_extend_core_model::{
 use sync_extend_reconcile::{LocalSpace, ReconcileError, WebDavBaseline, WebDavCommit};
 
 mod diagnostics;
+mod host_tls;
 pub use diagnostics::{check, test_connection};
 
 #[cfg(windows)]
@@ -35,14 +36,28 @@ pub struct Runtime {
     pub credentials: PathBuf,
     pub uploads: PathBuf,
     pub spaces: BTreeMap<SpaceId, PathBuf>,
+    host_loopback_tls: Option<host_tls::HostLoopbackTls>,
     #[cfg(windows)]
     collection_limits: Option<collections::CollectionLimits>,
+}
+
+impl Runtime {
+    pub fn scheme(&self) -> &'static str {
+        if self.host_loopback_tls.is_some() {
+            "https"
+        } else {
+            "http"
+        }
+    }
 }
 
 pub fn load(path: &Path) -> Result<Runtime, Box<dyn std::error::Error>> {
     let bytes = super::config_file::read(path, 65_536)?;
     let runtime: Runtime = serde_json::from_slice(&bytes)?;
     runtime.listener.validate()?;
+    if let Some(policy) = &runtime.host_loopback_tls {
+        policy.validate(runtime.listener.address)?;
+    }
     if !runtime.credentials.is_absolute()
         || !runtime.uploads.is_absolute()
         || runtime.spaces.values().any(|path| !path.is_absolute())
@@ -66,16 +81,26 @@ pub fn serve(
     if !runtime.listener.enabled {
         return Err("DAV listener disabled".into());
     }
+    let tls = runtime
+        .host_loopback_tls
+        .as_ref()
+        .map(host_tls::HostLoopbackTls::server_config)
+        .transpose()?;
     private_upload_parent(&runtime.uploads)?;
     let credentials = Credentials::load(&runtime.credentials, &runtime.listener)?;
-    let listener = TcpListener::bind(runtime.listener.address)?;
+    let bind = runtime
+        .host_loopback_tls
+        .as_ref()
+        .map_or(runtime.listener.address, |policy| policy.bind.into());
+    let listener = TcpListener::bind(bind)?;
     listener.set_nonblocking(true)?;
-    super::management::observe_gateway(&runtime.listener);
+    super::management::observe_gateway(&runtime.listener, runtime.scheme());
     super::shutdown::ready()?;
     println!(
         "{}",
         serde_json::json!({"webdav_listening":listener.local_addr()?,
         "listener_id":runtime.listener.listener_id,"authenticated":true,
+        "scheme":runtime.scheme(),"authority":runtime.listener.address,
         "remote_backup_complete":false})
     );
     let mut locks = Locks::default();
@@ -91,14 +116,22 @@ pub fn serve(
             }
             Err(error) => return Err(error.into()),
         };
-        requests += 1;
-        if !peer.ip().is_loopback() {
+        if !runtime.host_loopback_tls.as_ref().map_or_else(
+            || peer.ip().is_loopback(),
+            |policy| policy.permits(peer.ip()),
+        ) {
             continue;
         }
+        requests += 1;
         // Accepted Windows sockets can inherit the nonblocking listener mode.
         // Request framing needs blocking reads with the connection deadline.
         stream.set_nonblocking(false)?;
-        let mut connection = Connection::new(stream, runtime.listener.request_timeout_secs);
+        let Ok(mut connection) =
+            Connection::new(stream, runtime.listener.request_timeout_secs, tls.as_ref())
+        else {
+            // Reject a failed TLS handshake before reading or writing any HTTP.
+            continue;
+        };
         let request = match Request::read(&mut connection, runtime.listener.max_header_bytes) {
             Ok(request) => request,
             Err(_) => {
@@ -661,7 +694,10 @@ fn resource(
     let target = if value.starts_with('/') {
         value
     } else {
-        let remainder = value.strip_prefix("http://").ok_or(403u16)?;
+        let remainder = value
+            .strip_prefix(runtime.scheme())
+            .and_then(|value| value.strip_prefix("://"))
+            .ok_or(403u16)?;
         let (authority, target) = remainder.split_once('/').ok_or(400u16)?;
         if authority != runtime.listener.address.to_string() {
             return Err(403);

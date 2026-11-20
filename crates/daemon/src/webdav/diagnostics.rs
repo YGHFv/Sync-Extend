@@ -15,10 +15,14 @@ pub fn check(path: &Path) -> Result<Value> {
     let listener = &runtime.listener;
     if listener.enabled {
         Credentials::load(&runtime.credentials, listener)?;
+        if let Some(policy) = &runtime.host_loopback_tls {
+            policy.server_config()?;
+        }
     }
     Ok(json!({
         "configuration_valid": true, "enabled": listener.enabled,
         "address": listener.address, "listener_id": listener.listener_id,
+        "scheme": runtime.scheme(),
         "credential_file_checked": listener.enabled,
         "accounts": listener.accounts, "exports": listener.exports,
     }))
@@ -26,6 +30,9 @@ pub fn check(path: &Path) -> Result<Value> {
 
 pub fn test_connection(path: &Path, username: &str, export: &str) -> Result<Value> {
     let runtime = load(path)?;
+    if runtime.host_loopback_tls.is_some() {
+        return Err("test the HTTPS export from the host with its trusted certificate".into());
+    }
     let listener = &runtime.listener;
     let target = format!("/{export}/");
     let authorized = listener.authorize(username, &target, false)?;

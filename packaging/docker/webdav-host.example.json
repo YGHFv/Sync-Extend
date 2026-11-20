@@ -1,0 +1,36 @@
+{
+  "listener": {
+    "format_version": 1,
+    "enabled": false,
+    "listener_id": "00000000000000000000000000000000",
+    "address": "127.0.0.1:17842",
+    "exports": [
+      {
+        "name": "files",
+        "space_id": "00000000000000000000000000000000",
+        "subtree": null,
+        "writable": false,
+        "max_upload_bytes": 1,
+        "allow_native_windows_writes": false
+      }
+    ],
+    "accounts": [
+      {"username": "local", "exports": ["files"], "writable_exports": []}
+    ],
+    "request_timeout_secs": 20,
+    "max_header_bytes": 8192,
+    "max_requests": 1000000
+  },
+  "host_loopback_tls": {
+    "allow_remote": true,
+    "bind": "172.30.242.2:17842",
+    "allowed_source": "172.30.242.1",
+    "certificate": "/config/webdav-certificate.pem",
+    "private_key": "/config/webdav-key.pem"
+  },
+  "credentials": "/state/webdav.credentials",
+  "uploads": "/state/webdav-uploads",
+  "spaces": {
+    "00000000000000000000000000000000": "/state/client"
+  }
+}

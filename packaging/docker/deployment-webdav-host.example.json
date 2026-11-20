@@ -1,0 +1,8 @@
+{
+  "format_version": 1,
+  "management": "/config/management.json",
+  "role": {
+    "kind": "webdav_client",
+    "gateway_config": "/config/webdav-host.json"
+  }
+}

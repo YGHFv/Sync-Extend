@@ -1,0 +1,27 @@
+# Overlay on compose.yaml; use Docker Engine 28 or newer for localhost publishing.
+# The gateway and service IPs must agree with webdav-host.example.json.
+services:
+  sync:
+    profiles: [webdav-host]
+    environment:
+      SYNCEXTEND_DEPLOYMENT_PROFILE: webdav-host
+    ports:
+      - target: 17842
+        published: "17842"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    networks:
+      dav-host:
+        ipv4_address: 172.30.242.2
+
+networks:
+  dav-host:
+    driver: bridge
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: nat
+      com.docker.network.bridge.host_binding_ipv4: 127.0.0.1
+    ipam:
+      config:
+        - subnet: 172.30.242.0/29
+          gateway: 172.30.242.1

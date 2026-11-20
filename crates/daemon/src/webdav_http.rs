@@ -1,28 +1,91 @@
 //! Bounded one-request HTTP transport; no ambiguous message framing.
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use std::{
     collections::BTreeMap,
     io::{self, Read, Write},
     net::{Shutdown, TcpStream},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 pub struct Connection {
-    stream: TcpStream,
-    deadline: Instant,
+    stream: Transport,
     timeout: Duration,
     body_started: bool,
     pub response_started: bool,
 }
 
+enum Transport {
+    Plain(DeadlineSocket),
+    Tls(Box<StreamOwned<ServerConnection, DeadlineSocket>>),
+}
+
+impl Transport {
+    fn socket(&mut self) -> &mut DeadlineSocket {
+        match self {
+            Self::Plain(socket) => socket,
+            Self::Tls(stream) => &mut stream.sock,
+        }
+    }
+}
+
+struct DeadlineSocket {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl DeadlineSocket {
+    fn remaining(&self) -> io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request deadline"))
+    }
+}
+
+impl Read for DeadlineSocket {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.stream.read(bytes)
+    }
+}
+
+impl Write for DeadlineSocket {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 impl Connection {
-    pub fn new(stream: TcpStream, seconds: u64) -> Self {
-        Self {
+    pub fn new(
+        stream: TcpStream,
+        seconds: u64,
+        tls: Option<&Arc<ServerConfig>>,
+    ) -> io::Result<Self> {
+        let timeout = Duration::from_secs(seconds);
+        let mut socket = DeadlineSocket {
             stream,
-            deadline: Instant::now() + Duration::from_secs(seconds),
-            timeout: Duration::from_secs(seconds),
+            deadline: Instant::now() + timeout,
+        };
+        let stream = if let Some(config) = tls {
+            let mut conn = ServerConnection::new(Arc::clone(config)).map_err(io::Error::other)?;
+            while conn.is_handshaking() {
+                conn.complete_io(&mut socket)?;
+            }
+            Transport::Tls(Box::new(StreamOwned::new(conn, socket)))
+        } else {
+            Transport::Plain(socket)
+        };
+        Ok(Self {
+            stream,
+            timeout,
             body_started: false,
             response_started: false,
-        }
+        })
     }
     pub fn begin_body(&mut self) -> io::Result<()> {
         if self.body_started || self.response_started {
@@ -31,7 +94,7 @@ impl Connection {
         // Local admission and durable baseline work do not consume network
         // reception time. Start exactly one bounded body phase after admission;
         // individual reads never extend this deadline.
-        self.deadline = Instant::now() + self.timeout;
+        self.stream.socket().deadline = Instant::now() + self.timeout;
         self.body_started = true;
         Ok(())
     }
@@ -39,14 +102,9 @@ impl Connection {
         if !self.response_started {
             // Durable native commit is not network reception. Reserve one
             // bounded response phase so a committed write can return its receipt.
-            self.deadline = Instant::now() + self.timeout;
+            self.stream.socket().deadline = Instant::now() + self.timeout;
             self.response_started = true;
         }
-    }
-    fn remaining(&self) -> io::Result<Duration> {
-        self.deadline
-            .checked_duration_since(Instant::now())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "request deadline"))
     }
 }
 impl Drop for Connection {
@@ -54,21 +112,21 @@ impl Drop for Connection {
         // Send FIN only after the complete response. An early refusal can leave
         // request bytes unread; bounded draining avoids discarding the response
         // with a reset while preserving the one-request byte/time limits.
-        let _ = self.stream.shutdown(Shutdown::Write);
-        let deadline = self
+        let socket = self.stream.socket();
+        socket.deadline = socket
             .deadline
             .min(Instant::now() + Duration::from_millis(100));
+        if let Transport::Tls(stream) = &mut self.stream {
+            stream.conn.send_close_notify();
+            let _ = stream.flush();
+        }
+        let socket = self.stream.socket();
+        let _ = socket.stream.shutdown(Shutdown::Write);
         let mut remaining = 8192usize;
         let mut bytes = [0u8; 1024];
         while remaining != 0 {
-            let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
-                break;
-            };
-            if self.stream.set_read_timeout(Some(timeout)).is_err() {
-                break;
-            }
             let capacity = remaining.min(bytes.len());
-            match self.stream.read(&mut bytes[..capacity]) {
+            match socket.read(&mut bytes[..capacity]) {
                 Ok(0) | Err(_) => break,
                 Ok(count) => remaining -= count,
             }
@@ -77,17 +135,26 @@ impl Drop for Connection {
 }
 impl Read for Connection {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.remaining()?))?;
-        self.stream.read(bytes)
+        self.stream.socket().remaining()?;
+        match &mut self.stream {
+            Transport::Plain(stream) => stream.read(bytes),
+            Transport::Tls(stream) => stream.read(bytes),
+        }
     }
 }
 impl Write for Connection {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.remaining()?))?;
-        self.stream.write(bytes)
+        self.stream.socket().remaining()?;
+        match &mut self.stream {
+            Transport::Plain(stream) => stream.write(bytes),
+            Transport::Tls(stream) => stream.write(bytes),
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
+        match &mut self.stream {
+            Transport::Plain(stream) => stream.flush(),
+            Transport::Tls(stream) => stream.flush(),
+        }
     }
 }
 

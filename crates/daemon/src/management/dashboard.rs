@@ -38,7 +38,7 @@ pub fn configure(config: &ManagementConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn observe_gateway(listener: &sync_extend_core_model::webdav::WebDavListener) {
+pub fn observe_gateway(listener: &sync_extend_core_model::webdav::WebDavListener, scheme: &str) {
     if !ENABLED.load(Ordering::Acquire) {
         return;
     }
@@ -56,7 +56,7 @@ pub fn observe_gateway(listener: &sync_extend_core_model::webdav::WebDavListener
             serde_json::json!({
                 "name": export.name, "space_id": export.space_id,
                 "subtree": export.subtree, "writable": export.writable,
-                "url": format!("http://{}/{}/", listener.address, export.name),
+                "url": format!("{scheme}://{}/{}/", listener.address, export.name),
                 "max_upload_bytes": export.max_upload_bytes,
             })
         })

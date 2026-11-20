@@ -8,6 +8,7 @@ fi
 case "${SYNCEXTEND_DEPLOYMENT_PROFILE-}" in
     '') config=/config/deployment.json ;;
     webdav) config=/config/deployment-webdav.json ;;
+    webdav-host) config=/config/deployment-webdav-host.json ;;
     *) printf '%s\n' 'Unknown SyncExtend deployment profile' >&2; exit 2 ;;
 esac
 if [ ! -f "$config" ] || [ -L "$config" ] || [ ! -r "$config" ]; then
