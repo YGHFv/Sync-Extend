@@ -175,12 +175,26 @@ impl StorageTrafficLedger {
         Self::verify_file(&self.file, &self.path)?;
         let expected = Connection::open_in_memory()?;
         expected.execute_batch(include_str!("storage-traffic-schema.sql"))?;
-        fn schema(connection: &Connection) -> Result<Vec<(String, String, String)>> {
-            Ok(connection.prepare("SELECT type,name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")?
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                .collect::<rusqlite::Result<_>>()?)
+        fn schema(
+            connection: &Connection,
+            max_objects: usize,
+        ) -> Result<Vec<(String, String, String, Option<String>)>> {
+            let limit = i64::try_from(max_objects)
+                .map_err(|_| JournalError::Invariant("storage traffic schema limit overflow"))?;
+            let mut query = connection.prepare(
+                "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name LIMIT ?1",
+            )?;
+            let rows = query
+                .query_map([limit], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(rows)
         }
-        if schema(&expected)? != schema(&self.connection)?
+        let expected_schema = schema(&expected, 65)?;
+        if expected_schema.is_empty()
+            || expected_schema.len() > 64
+            || schema(&self.connection, expected_schema.len() + 1)? != expected_schema
             || self
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?
