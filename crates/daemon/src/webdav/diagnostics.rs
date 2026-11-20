@@ -7,6 +7,9 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::{net::TcpListener, sync::Arc};
+use sync_extend_core_model::webdav::WebDavListener;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -33,18 +36,32 @@ pub fn test_connection(path: &Path, username: &str, export: &str) -> Result<Valu
     if runtime.host_loopback_tls.is_some() {
         return Err("test the HTTPS export from the host with its trusted certificate".into());
     }
-    let listener = &runtime.listener;
+    let credentials = Credentials::load(&runtime.credentials, &runtime.listener)?;
+    test_export(&runtime.listener, &credentials, username, export, 5)?;
+    Ok(json!({
+        "authenticated": true, "export_accessible": true,
+        "url": format!("http://{}/{export}/", runtime.listener.address),
+        "username": username, "export": export, "remote_backup_complete": false,
+    }))
+}
+
+fn test_export(
+    listener: &WebDavListener,
+    credentials: &Credentials,
+    username: &str,
+    export: &str,
+    max_timeout_secs: u64,
+) -> Result<()> {
     let target = format!("/{export}/");
     let authorized = listener.authorize(username, &target, false)?;
     // Probe exactly the selected export root and never accept an arbitrary URL.
     if !authorized.export_root || authorized.export_name != export {
         return Err("exact configured DAV export required".into());
     }
-    let credentials = Credentials::load(&runtime.credentials, listener)?;
     let password = credentials
         .password(username)
         .ok_or("unknown DAV account")?;
-    let timeout = Duration::from_secs(listener.request_timeout_secs.min(5));
+    let timeout = Duration::from_secs(listener.request_timeout_secs.min(max_timeout_secs));
     let deadline = Instant::now() + timeout;
     let mut stream = TcpStream::connect_timeout(&listener.address, timeout)?;
     stream.set_write_timeout(Some(timeout))?;
@@ -65,11 +82,51 @@ pub fn test_connection(path: &Path, username: &str, export: &str) -> Result<Valu
     if lines.next() != Some("HTTP/1.1 200 OK") || !lines.any(|line| line == "DAV: 1, 2") {
         return Err("DAV listener did not authorize the selected export".into());
     }
-    Ok(json!({
-        "authenticated": true, "export_accessible": true,
-        "url": format!("http://{}{target}", listener.address),
-        "username": username, "export": export, "remote_backup_complete": false,
-    }))
+    Ok(())
+}
+
+/// A same-owner probe uses the running gateway's credentials and keeps its
+/// actual bound socket alive so a stale configuration cannot target a new owner.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub struct GatewayProbe {
+    bound: Arc<TcpListener>,
+    config: WebDavListener,
+    credentials: Arc<Credentials>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl GatewayProbe {
+    pub fn new(
+        bound: Arc<TcpListener>,
+        config: WebDavListener,
+        credentials: Arc<Credentials>,
+    ) -> Self {
+        Self {
+            bound,
+            config,
+            credentials,
+        }
+    }
+
+    pub fn test(&self, export: &str) -> Result<String> {
+        if self.bound.local_addr()? != self.config.address {
+            return Err("live DAV listener authority differs".into());
+        }
+        let account = self
+            .config
+            .accounts
+            .iter()
+            .find(|account| account.exports.contains(export))
+            .ok_or("unknown or ungranted live DAV export")?;
+        test_export(
+            &self.config,
+            &self.credentials,
+            &account.username,
+            export,
+            2,
+        )?;
+        Ok(format!("http://{}/{export}/", self.config.address))
+    }
 }
 
 fn encode_base64(bytes: &[u8]) -> String {

@@ -3,6 +3,7 @@
   "management": "/config/management.json",
   "role": {
     "kind": "webdav_client",
-    "gateway_config": "/config/webdav.json"
+    "gateway_config": "/config/webdav.json",
+    "scan_interval_secs": 30
   }
 }

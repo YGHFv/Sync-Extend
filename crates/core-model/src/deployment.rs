@@ -44,6 +44,8 @@ pub enum DeploymentRole {
     },
     WebdavClient {
         gateway_config: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scan_interval_secs: Option<u64>,
     },
 }
 
@@ -106,7 +108,13 @@ impl DeploymentConfig {
                     && (1..=86_400).contains(session_timeout_secs)
                     && (1..=3_600).contains(between_sessions_secs)
             }
-            DeploymentRole::WebdavClient { gateway_config } => path(gateway_config),
+            DeploymentRole::WebdavClient {
+                gateway_config,
+                scan_interval_secs,
+            } => {
+                path(gateway_config)
+                    && scan_interval_secs.is_none_or(|interval| (1..=86_400).contains(&interval))
+            }
         };
         if !valid {
             return Err(ModelError::InvalidConfig(

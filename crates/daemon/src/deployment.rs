@@ -22,7 +22,11 @@ pub fn check(path: &Path, describe_webdav: bool) -> Result<serde_json::Value> {
             "identity_created": false, "services_started": false,
         }));
     }
-    let value = if let DeploymentRole::WebdavClient { gateway_config } = &config.role {
+    let value = if let DeploymentRole::WebdavClient {
+        gateway_config,
+        scan_interval_secs,
+    } = &config.role
+    {
         let parent = path
             .parent()
             .ok_or("private deployment directory required")?;
@@ -38,15 +42,20 @@ pub fn check(path: &Path, describe_webdav: bool) -> Result<serde_json::Value> {
             return Err("exact private WebDAV configuration path required".into());
         }
         let runtime = super::webdav::load(gateway_config)?;
+        runtime.validate_polling(*scan_interval_secs)?;
         let listener = &runtime.listener;
-        Some(serde_json::json!({
+        let mut summary = serde_json::json!({
             "enabled": listener.enabled,
             "exports": listener.exports.iter().map(|export| serde_json::json!({
                 "name": export.name,
                 "url": format!("{}://{}/{}/", runtime.scheme(), listener.address, export.name),
                 "writable": export.writable,
             })).collect::<Vec<_>>(),
-        }))
+        });
+        if let Some(interval) = scan_interval_secs {
+            summary["scan_interval_secs"] = serde_json::json!(interval);
+        }
+        Some(summary)
     } else {
         None
     };
@@ -108,8 +117,12 @@ pub fn prepare(cli: Cli) -> Result<(Cli, Option<super::management::ManagementGua
             session_timeout_secs,
             between_sessions_secs,
         },
-        DeploymentRole::WebdavClient { gateway_config } => Command::WebdavServe {
+        DeploymentRole::WebdavClient {
+            gateway_config,
+            scan_interval_secs,
+        } => Command::WebdavServe {
             config: gateway_config,
+            scan_interval_secs,
         },
     };
     Ok((

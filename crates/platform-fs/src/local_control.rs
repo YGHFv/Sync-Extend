@@ -11,13 +11,26 @@ use std::{
         },
     },
     path::{Component, Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalControlOperation {
     Status,
     Stop,
+    ProbeWebDav(String),
+}
+
+const PROBE_PREFIX: &[u8] = b"PROBE ";
+const MAX_EXPORT_BYTES: usize = 64;
+const MAX_COMMAND_BYTES: usize = PROBE_PREFIX.len() + MAX_EXPORT_BYTES + 1;
+
+fn valid_export(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_EXPORT_BYTES
+        && name
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(byte))
 }
 
 fn refuse(message: &'static str) -> io::Error {
@@ -173,9 +186,15 @@ pub struct LocalControlConnection {
 impl LocalControlConnection {
     pub fn operation(&mut self) -> io::Result<LocalControlOperation> {
         let mut bytes = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(250);
         loop {
             let mut byte = [0];
-            if self.stream.read(&mut byte)? != 1 || bytes.len() >= 7 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || bytes.len() >= MAX_COMMAND_BYTES {
+                return Err(refuse("bounded local control command required"));
+            }
+            self.stream.set_read_timeout(Some(remaining))?;
+            if self.stream.read(&mut byte)? != 1 {
                 return Err(refuse("bounded local control command required"));
             }
             bytes.push(byte[0]);
@@ -183,7 +202,16 @@ impl LocalControlConnection {
                 return match bytes.as_slice() {
                     b"STATUS\n" => Ok(LocalControlOperation::Status),
                     b"STOP\n" => Ok(LocalControlOperation::Stop),
-                    _ => Err(refuse("unknown local control command")),
+                    line => match line
+                        .strip_suffix(b"\n")
+                        .and_then(|line| line.strip_prefix(PROBE_PREFIX))
+                    {
+                        Some(name) if valid_export(name) => Ok(LocalControlOperation::ProbeWebDav(
+                            String::from_utf8(name.to_vec())
+                                .map_err(|_| refuse("invalid WebDAV export name"))?,
+                        )),
+                        _ => Err(refuse("unknown local control command")),
+                    },
                 };
             }
         }
@@ -217,7 +245,12 @@ pub fn request_local_control(
     }
     // SAFETY: the new descriptor transfers sole close ownership to UnixStream.
     let mut stream = unsafe { UnixStream::from_raw_fd(fd) };
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let timeout = if matches!(&operation, LocalControlOperation::ProbeWebDav(_)) {
+        5
+    } else {
+        2
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(timeout)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     // SAFETY: live sockaddr_un with the precisely initialized abstract-name length.
     if unsafe {
@@ -231,10 +264,18 @@ pub fn request_local_control(
         return Err(io::Error::last_os_error());
     }
     let peer_pid = peer(&stream, identity.2)?;
-    stream.write_all(match operation {
-        LocalControlOperation::Status => b"STATUS\n",
-        LocalControlOperation::Stop => b"STOP\n",
-    })?;
+    match operation {
+        LocalControlOperation::Status => stream.write_all(b"STATUS\n")?,
+        LocalControlOperation::Stop => stream.write_all(b"STOP\n")?,
+        LocalControlOperation::ProbeWebDav(name) if valid_export(name.as_bytes()) => {
+            let mut line = Vec::with_capacity(MAX_COMMAND_BYTES);
+            line.extend_from_slice(PROBE_PREFIX);
+            line.extend_from_slice(name.as_bytes());
+            line.push(b'\n');
+            stream.write_all(&line)?;
+        }
+        LocalControlOperation::ProbeWebDav(_) => return Err(refuse("invalid WebDAV export name")),
+    }
     let mut bytes = Vec::new();
     (&mut stream).take(4097).read_to_end(&mut bytes)?;
     if bytes.len() > 4096 || !bytes.ends_with(b"\n") {

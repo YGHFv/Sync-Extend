@@ -1086,6 +1086,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "ed25519-dalek",
+ "fs2",
  "rusqlite",
  "serde",
  "serde_json",

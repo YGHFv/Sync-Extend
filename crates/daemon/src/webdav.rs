@@ -11,11 +11,16 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{Read, Write},
-    net::TcpListener,
+    net::{SocketAddr, TcpListener},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use sync_extend_core_model::{
+    limits::LocalLimits,
     webdav::{self, AuthorizedWebDavPath, WebDavListener},
     Entry, EntryKind, PortablePath, SpaceId,
 };
@@ -23,6 +28,9 @@ use sync_extend_reconcile::{LocalSpace, ReconcileError, WebDavBaseline, WebDavCo
 
 mod diagnostics;
 mod host_tls;
+mod polling;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use diagnostics::GatewayProbe;
 pub use diagnostics::{check, test_connection};
 
 #[cfg(windows)]
@@ -49,6 +57,22 @@ impl Runtime {
             "http"
         }
     }
+
+    pub fn validate_polling(
+        &self,
+        interval_secs: Option<u64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if interval_secs.is_some_and(|interval| {
+            !(1..=86_400).contains(&interval)
+                || self.spaces.is_empty()
+                || self.spaces.len() > polling::MAX_SPACES
+        }) {
+            return Err(
+                "WebDAV polling requires a 1–86400 second interval and 1–64 local spaces".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 pub fn load(path: &Path) -> Result<Runtime, Box<dyn std::error::Error>> {
@@ -74,41 +98,79 @@ pub fn load(path: &Path) -> Result<Runtime, Box<dyn std::error::Error>> {
 
 pub fn serve(
     runtime: Runtime,
-    limits: sync_extend_core_model::limits::LocalLimits,
-    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    limits: LocalLimits,
+    scan_interval_secs: Option<u64>,
+    shutdown: Arc<AtomicBool>,
+    #[cfg(any(target_os = "linux", target_os = "android"))] control: Option<
+        crate::local_control::GatewaySlot,
+    >,
 ) -> Result<(), Box<dyn std::error::Error>> {
     runtime.listener.validate()?;
-    if !runtime.listener.enabled {
+    runtime.validate_polling(scan_interval_secs)?;
+    if !runtime.listener.enabled && scan_interval_secs.is_none() {
         return Err("DAV listener disabled".into());
     }
     let tls = runtime
-        .host_loopback_tls
-        .as_ref()
-        .map(host_tls::HostLoopbackTls::server_config)
+        .listener
+        .enabled
+        .then(|| {
+            runtime
+                .host_loopback_tls
+                .as_ref()
+                .map(host_tls::HostLoopbackTls::server_config)
+                .transpose()
+        })
+        .transpose()?
+        .flatten();
+    // Bind and authenticate before opening long-lived worktree owners, so a
+    // rejected listener cannot initiate unattended recovery or scanning.
+    let mut gateway = runtime
+        .listener
+        .enabled
+        .then(|| Gateway::bind(&runtime))
         .transpose()?;
-    private_upload_parent(&runtime.uploads)?;
-    let credentials = Credentials::load(&runtime.credentials, &runtime.listener)?;
-    let bind = runtime
-        .host_loopback_tls
-        .as_ref()
-        .map_or(runtime.listener.address, |policy| policy.bind.into());
-    let listener = TcpListener::bind(bind)?;
-    listener.set_nonblocking(true)?;
-    super::management::observe_gateway(&runtime.listener, runtime.scheme());
-    super::shutdown::ready()?;
-    println!(
-        "{}",
-        serde_json::json!({"webdav_listening":listener.local_addr()?,
-        "listener_id":runtime.listener.listener_id,"authenticated":true,
-        "scheme":runtime.scheme(),"authority":runtime.listener.address,
-        "remote_backup_complete":false})
-    );
+    let mut polling = scan_interval_secs
+        .map(|interval| polling::Polling::open(&runtime, &limits, interval))
+        .transpose()?;
     let mut locks = Locks::default();
     let mut requests = 0u64;
-    while requests < runtime.listener.max_requests
-        && !shutdown.load(std::sync::atomic::Ordering::Acquire)
-    {
-        let (stream, peer) = match listener.accept() {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let mut registration = gateway.as_ref().and_then(|active| {
+        (tls.is_none()).then_some(())?;
+        control.map(|slot| {
+            crate::local_control::GatewayRegistration::register(
+                slot,
+                GatewayProbe::new(
+                    Arc::clone(&active.listener),
+                    runtime.listener.clone(),
+                    Arc::clone(&active.credentials),
+                ),
+            )
+        })
+    });
+    super::shutdown::started(polling.is_none())?;
+    if let Some(active) = &gateway {
+        super::management::observe_gateway(Some(&runtime.listener), runtime.scheme());
+        println!(
+            "{}",
+            serde_json::json!({"webdav_listening":active.listener.local_addr()?,
+            "listener_id":runtime.listener.listener_id,"authenticated":true,
+            "scheme":runtime.scheme(),"authority":runtime.listener.address,
+            "remote_backup_complete":false})
+        );
+    }
+    while !shutdown.load(Ordering::Acquire) {
+        if let Some(polling) = &mut polling {
+            polling.scan_due(&shutdown);
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+        }
+        let Some(active) = &gateway else {
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        };
+        let (stream, peer) = match active.listener.accept() {
             Ok(value) => value,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(25));
@@ -116,75 +178,130 @@ pub fn serve(
             }
             Err(error) => return Err(error.into()),
         };
-        if !runtime.host_loopback_tls.as_ref().map_or_else(
-            || peer.ip().is_loopback(),
-            |policy| policy.permits(peer.ip()),
-        ) {
-            continue;
-        }
-        requests += 1;
-        // Accepted Windows sockets can inherit the nonblocking listener mode.
-        // Request framing needs blocking reads with the connection deadline.
-        stream.set_nonblocking(false)?;
-        let Ok(mut connection) =
-            Connection::new(stream, runtime.listener.request_timeout_secs, tls.as_ref())
-        else {
-            // Reject a failed TLS handshake before reading or writing any HTTP.
-            continue;
-        };
-        let request = match Request::read(&mut connection, runtime.listener.max_header_bytes) {
-            Ok(request) => request,
-            Err(_) => {
-                let _ = http::response(&mut connection, 400, b"invalid request", &[], false);
-                continue;
-            }
-        };
-        let Some(account) = request
-            .header("authorization")
-            .and_then(|header| credentials.authenticate(header))
-        else {
-            let _ = http::response(
-                &mut connection,
-                401,
-                b"authentication required",
-                &[(
-                    "WWW-Authenticate",
-                    format!(
-                        "Basic realm=\"SyncExtend {}\"",
-                        runtime.listener.listener_id
-                    ),
-                )],
-                request.method == "HEAD",
-            );
-            continue;
-        };
-        if request.header("host") != Some(runtime.listener.address.to_string().as_str()) {
-            let _ = http::response(
-                &mut connection,
-                400,
-                b"listener authority differs",
-                &[],
-                false,
-            );
-            continue;
-        }
-        if let Err(status) = dispatch(
+        handle_connection(
             &runtime,
             &limits,
             &mut locks,
-            account,
-            &request,
-            &mut connection,
-        ) {
-            if !connection.response_started {
-                let _ = http::response(
-                    &mut connection,
-                    status,
-                    b"request refused; recheck resource state",
-                    &[],
-                    request.method == "HEAD",
-                );
+            &active.credentials,
+            polling.as_mut(),
+            stream,
+            peer,
+            tls.as_ref(),
+        )?;
+        requests += 1;
+        if requests == runtime.listener.max_requests {
+            if polling.is_none() {
+                break;
             }
+            // Preserve the explicit request bound without stopping local sync.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            drop(registration.take());
+            gateway = None;
+            super::management::observe_gateway(None, runtime.scheme());
+        }
+    }
+    Ok(())
+}
+
+struct Gateway {
+    listener: Arc<TcpListener>,
+    credentials: Arc<Credentials>,
+}
+
+impl Gateway {
+    fn bind(runtime: &Runtime) -> Result<Self, Box<dyn std::error::Error>> {
+        private_upload_parent(&runtime.uploads)?;
+        let credentials = Arc::new(Credentials::load(&runtime.credentials, &runtime.listener)?);
+        let bind = runtime
+            .host_loopback_tls
+            .as_ref()
+            .map_or(runtime.listener.address, |policy| policy.bind.into());
+        let listener = Arc::new(TcpListener::bind(bind)?);
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+            credentials,
+        })
+    }
+}
+
+fn handle_connection(
+    runtime: &Runtime,
+    limits: &LocalLimits,
+    locks: &mut Locks,
+    credentials: &Credentials,
+    polling: Option<&mut polling::Polling>,
+    stream: std::net::TcpStream,
+    peer: SocketAddr,
+    tls: Option<&Arc<rustls::ServerConfig>>,
+) -> std::io::Result<()> {
+    if !runtime.host_loopback_tls.as_ref().map_or_else(
+        || peer.ip().is_loopback(),
+        |policy| policy.permits(peer.ip()),
+    ) {
+        return Ok(());
+    }
+    // Accepted Windows sockets can inherit the nonblocking listener mode.
+    // Request framing needs blocking reads with the connection deadline.
+    stream.set_nonblocking(false)?;
+    let Ok(mut connection) = Connection::new(stream, runtime.listener.request_timeout_secs, tls)
+    else {
+        // Reject a failed TLS handshake without taking down the listener.
+        return Ok(());
+    };
+    let request = match Request::read(&mut connection, runtime.listener.max_header_bytes) {
+        Ok(request) => request,
+        Err(_) => {
+            let _ = http::response(&mut connection, 400, b"invalid request", &[], false);
+            return Ok(());
+        }
+    };
+    let Some(account) = request
+        .header("authorization")
+        .and_then(|header| credentials.authenticate(header))
+    else {
+        let _ = http::response(
+            &mut connection,
+            401,
+            b"authentication required",
+            &[(
+                "WWW-Authenticate",
+                format!(
+                    "Basic realm=\"SyncExtend {}\"",
+                    runtime.listener.listener_id
+                ),
+            )],
+            request.method == "HEAD",
+        );
+        return Ok(());
+    };
+    if request.header("host") != Some(runtime.listener.address.to_string().as_str()) {
+        let _ = http::response(
+            &mut connection,
+            400,
+            b"listener authority differs",
+            &[],
+            false,
+        );
+        return Ok(());
+    }
+    if let Err(status) = dispatch(
+        runtime,
+        limits,
+        locks,
+        account,
+        &request,
+        &mut connection,
+        polling,
+    ) {
+        if !connection.response_started {
+            let _ = http::response(
+                &mut connection,
+                status,
+                b"request refused; recheck resource state",
+                &[],
+                request.method == "HEAD",
+            );
         }
     }
     Ok(())
@@ -243,11 +360,12 @@ fn private_upload_parent(path: &Path) -> Result<(), Box<dyn std::error::Error>> 
 
 fn dispatch(
     runtime: &Runtime,
-    limits: &sync_extend_core_model::limits::LocalLimits,
+    limits: &LocalLimits,
     locks: &mut Locks,
     account: &str,
     request: &Request,
     stream: &mut Connection,
+    polling: Option<&mut polling::Polling>,
 ) -> Result<(), u16> {
     let write = !matches!(
         request.method.as_str(),
@@ -282,12 +400,18 @@ fn dispatch(
     } else {
         None
     };
-    let mut local = LocalSpace::open_with_limits(data, limits.clone()).map_err(|_| 503u16)?;
+    let mut transient;
+    let local = if let Some(polling) = polling {
+        polling.local(&authorized.space_id)?
+    } else {
+        transient = LocalSpace::open_with_limits(data, limits.clone()).map_err(|_| 503u16)?;
+        &mut transient
+    };
     if local.space_id != authorized.space_id {
         return Err(503);
     }
     let baseline = local.capture_webdav_baseline().map_err(core_status)?;
-    super::management::observe_local_space(&local);
+    super::management::observe_local_space(local);
     let entry = find(&baseline, authorized.path.as_ref());
     if authorized.export_root && authorized.path.is_some() && entry.is_none() {
         return Err(503);
@@ -337,7 +461,7 @@ fn dispatch(
             &authorized,
             &tokens,
             request,
-            &local,
+            local,
             baseline,
             stream,
         );
@@ -694,10 +818,8 @@ fn resource(
     let target = if value.starts_with('/') {
         value
     } else {
-        let remainder = value
-            .strip_prefix(runtime.scheme())
-            .and_then(|value| value.strip_prefix("://"))
-            .ok_or(403u16)?;
+        let scheme_prefix = format!("{}://", runtime.scheme());
+        let remainder = value.strip_prefix(&scheme_prefix).ok_or(403u16)?;
         let (authority, target) = remainder.split_once('/').ok_or(400u16)?;
         if authority != runtime.listener.address.to_string() {
             return Err(403);

@@ -1,9 +1,37 @@
 use crate::{Journal, JournalError, Result};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     path::{Path, PathBuf},
 };
 use sync_extend_core_model::ContentId;
+
+fn try_lock(file: &File, shared: bool, busy: &'static str) -> Result<()> {
+    // Rust 1.92's File locks return Unsupported on Android. Use the same
+    // kernel flock API as the local writer locks for every operation there.
+    #[cfg(target_os = "android")]
+    let acquired = (if shared {
+        fs2::FileExt::try_lock_shared(file)
+    } else {
+        fs2::FileExt::try_lock_exclusive(file)
+    })
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            TryLockError::WouldBlock
+        } else {
+            TryLockError::Error(error)
+        }
+    });
+    #[cfg(not(target_os = "android"))]
+    let acquired = if shared {
+        file.try_lock_shared()
+    } else {
+        file.try_lock()
+    };
+    acquired.map_err(|error| match error {
+        TryLockError::WouldBlock => JournalError::Invariant(busy),
+        TryLockError::Error(error) => error.into(),
+    })
+}
 
 /// Cooperative process-lifetime CAS coordination, not a content pin or delete right.
 pub struct CasAccessGuard {
@@ -51,8 +79,7 @@ impl CasAccessGuard {
             options.share_mode(0x1 | 0x2).custom_flags(0x00200000);
         }
         let file = options.open(&path)?;
-        file.try_lock_shared()
-            .map_err(|_| JournalError::Invariant("CAS exclusive access is running"))?;
+        try_lock(&file, true, "CAS exclusive access is running")?;
         let guard = Self {
             file,
             path,
@@ -65,10 +92,11 @@ impl CasAccessGuard {
 
     pub(crate) fn try_exclusive(&mut self) -> Result<()> {
         // A failed upgrade grants nothing; callers roll back their DB transaction.
+        #[cfg(target_os = "android")]
+        fs2::FileExt::unlock(&self.file)?;
+        #[cfg(not(target_os = "android"))]
         self.file.unlock()?;
-        self.file
-            .try_lock()
-            .map_err(|_| JournalError::Invariant("CAS readers are running"))?;
+        try_lock(&self.file, false, "CAS readers are running")?;
         self.verify()
     }
 
@@ -168,8 +196,7 @@ impl CasAccessGuard {
             directories.push(directory);
         }
         let file = original.open_for_shared_coordination(&path)?;
-        file.try_lock_shared()
-            .map_err(|_| JournalError::Invariant("original CAS exclusive access running"))?;
+        try_lock(&file, true, "original CAS exclusive access running")?;
         let guard = Self {
             file,
             path,

@@ -24,5 +24,8 @@ sync-extend-platform-fs = { path = "../platform-fs" }
 [target.'cfg(target_os = "linux")'.dependencies]
 sync-extend-platform-fs = { path = "../platform-fs" }
 
+[target.'cfg(target_os = "android")'.dependencies]
+fs2.workspace = true
+
 [lints]
 workspace = true

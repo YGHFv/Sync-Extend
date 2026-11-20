@@ -2,10 +2,12 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [ValidateSet('install', 'start', 'status', 'stop', 'upgrade', 'rollback', 'uninstall')][string]$Action,
+    [ValidateSet('install', 'start', 'status', 'stop', 'upgrade', 'rollback', 'uninstall', 'webdav-enable', 'webdav-disable')][string]$Action,
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'SyncExtend\install'),
     [string]$Package = (Join-Path $PSScriptRoot 'package.json'),
-    [string]$Deployment = (Join-Path $env:LOCALAPPDATA 'SyncExtend\client\deployment.json')
+    [string]$Deployment = (Join-Path $env:LOCALAPPDATA 'SyncExtend\client\deployment.json'),
+    [ValidateRange(1024, 65535)][int]$WebdavPort = 17842,
+    [ValidatePattern('\A[0-9a-f]{32}\z')][string]$OwnerGeneration
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'windows-common.ps1')
@@ -103,6 +105,16 @@ function Save-State($Record) {
     Write-SyncExtendJson $statePath $Record -Replace
 }
 
+function Get-GatewayBinding([string]$Image, [string]$Config, $Profile) {
+    if ($Profile.role.kind -cne 'webdav_client') { return }
+    # The CLI checks that the gateway config remains inside this deployment's
+    # private directory. Remember its exact content alongside the deployment.
+    $summary = Invoke-SyncExtendJson $Image @('deployment-check', '--config', $Config, '--describe-webdav')
+    $path = Resolve-SyncExtendPath $Profile.role.gateway_config -File
+    return [pscustomobject]@{ path = $path; sha256 = (Get-FileHash -LiteralPath $path).Hash;
+        enabled = $summary.webdav.enabled }
+}
+
 function Start-Installed {
     param($Selected, [string]$Config, $Previous)
     $image = Confirm-PackageImage (Get-PackageImage $Selected) $Selected
@@ -110,6 +122,7 @@ function Start-Installed {
     $profile = Read-SyncExtendJson $deploymentPath
     $managementPath = Resolve-SyncExtendPath $profile.management -File
     $null = Invoke-SyncExtendJson $image @('deployment-check', '--config', $deploymentPath)
+    $gateway = Get-GatewayBinding $image $deploymentPath $profile
     $check = Invoke-SyncExtendJson $image @('management-check', '--config', $managementPath)
     if (!$check.status_allowed -or !$check.stop_allowed -or $check.token_protection -ne 'windows_user') {
         throw 'Enable status and stop with a current-user protected management credential in the profile.'
@@ -126,6 +139,10 @@ function Start-Installed {
         deployment = $deploymentPath; management = $managementPath
         deployment_sha256 = (Get-FileHash -LiteralPath $deploymentPath -Algorithm SHA256).Hash
         management_sha256 = (Get-FileHash -LiteralPath $managementPath -Algorithm SHA256).Hash
+    }
+    if ($gateway) {
+        $record.gateway = $gateway.path
+        $record.gateway_sha256 = $gateway.sha256
     }
     $child = Start-Process -FilePath $image -ArgumentList @('deployment-run', '--config', ('"' + $deploymentPath + '"')) `
         -WorkingDirectory ([IO.Path]::GetDirectoryName($image)) -WindowStyle Hidden -PassThru `
@@ -158,13 +175,17 @@ function Start-Installed {
 
 function Confirm-Configuration($Record) {
     if ((Get-FileHash -LiteralPath $Record.deployment -Algorithm SHA256).Hash -cne $Record.deployment_sha256 -or
-        (Get-FileHash -LiteralPath $Record.management -Algorithm SHA256).Hash -cne $Record.management_sha256) {
+        (Get-FileHash -LiteralPath $Record.management -Algorithm SHA256).Hash -cne $Record.management_sha256 -or
+        ($Record.gateway -and ((Get-FileHash -LiteralPath (Resolve-SyncExtendPath $Record.gateway -File)).Hash -cne $Record.gateway_sha256))) {
         throw 'The active configuration changed. Restore its file contents before stopping or switching versions.'
     }
 }
 
 function Stop-Installed($Record) {
     if ($Record.state -cne 'running') { throw 'No healthy current-user deployment is recorded.' }
+    if ($OwnerGeneration -and $OwnerGeneration -cne $Record.owner_generation) {
+        throw 'The running client no longer matches this session. Refresh and retry.'
+    }
     Confirm-Configuration $Record
     $process = Get-OwnedProcess $Record.process
     if (!$process) { throw 'The recorded deployment process is unavailable.' }
@@ -181,6 +202,68 @@ function Stop-Installed($Record) {
         if ($process.ExitCode -ne 0) { throw 'The recorded deployment exited with an error.' }
         return $Record
     } finally { $process.Dispose() }
+}
+
+function Set-InstalledGateway($Record, [bool]$Enable, [int]$Port) {
+    if (!$Record -or $Record.state -cne 'running') { throw 'Start the installed local client before changing WebDAV.' }
+    if (![string]::Equals((Resolve-SyncExtendPath $Deployment -File), $Record.deployment, [StringComparison]::OrdinalIgnoreCase) -or
+        ($OwnerGeneration -and $OwnerGeneration -cne $Record.owner_generation)) {
+        throw 'The running client no longer matches this profile. Refresh and retry.'
+    }
+    Confirm-Configuration $Record
+    $image = Confirm-PackageImage (Get-PackageImage $Record.selected) $Record.selected
+    $deploymentPath = Resolve-SyncExtendPath $Record.deployment -File
+    $profile = Read-SyncExtendJson $deploymentPath
+    $role = $profile.role
+    if ($role.kind -cnotin @('local_polling', 'webdav_client')) {
+        throw 'WebDAV can be changed here only for a local client profile.'
+    }
+    $gateway = Get-GatewayBinding $image $deploymentPath $profile
+    if ($Enable -and $gateway -and $gateway.enabled) { throw 'WebDAV is already enabled in this profile.' }
+    if (!$Enable -and (!$gateway -or !$gateway.enabled)) { throw 'WebDAV is already disabled in this profile.' }
+    if ($Enable -and !$gateway -and $Port -eq [Net.IPEndPoint]::Parse((Read-SyncExtendJson $Record.management).address).Port) {
+        throw 'Use a different WebDAV port from local management.'
+    }
+    if ($gateway -and !$role.scan_interval_secs) {
+        throw 'Set a polling interval in the stopped gateway-only deployment before using this switch.'
+    }
+    # Verify the live process through its authenticated generation and wait
+    # for it to release the worktree before editing the existing deployment.
+    $null = Stop-Installed $Record
+    $restorePath = $null
+    $original = $null
+    try {
+        if ($gateway) {
+            $config = Read-SyncExtendJson $gateway.path
+            $config.listener.enabled = $Enable
+            $restorePath = $gateway.path
+            $original = [IO.File]::ReadAllBytes($restorePath)
+            Write-SyncExtendJson $restorePath $config -Replace
+            $null = Invoke-SyncExtendJson $image @('webdav-check', '--config', $restorePath)
+        } else {
+            $directory = [IO.Path]::GetDirectoryName($deploymentPath)
+            $data = Resolve-SyncExtendPath $role.data_dir -Directory
+            $space = Invoke-SyncExtendJson $image @('status', '--data-dir', $data)
+            $gatewayPath = New-SyncExtendReadOnlyGateway $directory $data $space.space_id $Port $image
+            $restorePath = $deploymentPath
+            $original = [IO.File]::ReadAllBytes($restorePath)
+            $profile.role = @{ kind = 'webdav_client'; gateway_config = $gatewayPath;
+                scan_interval_secs = $role.scan_interval_secs }
+            Write-SyncExtendJson $restorePath $profile -Replace
+        }
+        $running = Start-Installed $Record.selected $deploymentPath $Record.previous
+        return [pscustomobject]@{ enabled = $Enable; deployment = $deploymentPath; gateway = $running.gateway;
+            owner_generation = $running.owner_generation }
+    } catch {
+        $failure = $_.Exception.Message
+        try {
+            if ($original) { Write-SyncExtendBytes $restorePath $original -Replace }
+            $null = Start-Installed $Record.selected $deploymentPath $Record.previous
+        } catch {
+            throw "The WebDAV change failed and the previous deployment could not restart. Check this profile and its logs. $failure"
+        }
+        throw "The WebDAV setting was not applied. The previous local deployment was restarted. $failure"
+    }
 }
 
 $lockPath = Resolve-SyncExtendPath (Join-Path $root 'operation.lock')
@@ -212,7 +295,15 @@ try {
                     process_active = [bool]$process; management = $health }
             } finally { if ($process) { $process.Dispose() } }
         }
-        'stop' { Stop-Installed $record }
+        'stop' {
+            if ($OwnerGeneration -and ![string]::Equals((Resolve-SyncExtendPath $Deployment -File),
+                    $record.deployment, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'The running client no longer matches this profile. Refresh and retry.'
+            }
+            Stop-Installed $record
+        }
+        'webdav-enable' { Set-InstalledGateway $record $true $WebdavPort }
+        'webdav-disable' { Set-InstalledGateway $record $false $WebdavPort }
         { $_ -in @('upgrade', 'rollback') } {
             if ($record.state -cne 'running') { throw 'Start the installed version before switching versions.' }
             $selected = if ($Action -eq 'upgrade') { Install-Package $Package } else { $record.previous }

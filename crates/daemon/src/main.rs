@@ -58,6 +58,9 @@ enum Command {
         directory: PathBuf,
         #[arg(value_enum)]
         action: LocalControlAction,
+        /// Select an export from the live owner. Required for probe-webdav only.
+        #[arg(long)]
+        export: Option<String>,
     },
     /// Enter the native Windows SCM dispatcher with an existing deployment identity.
     #[cfg(windows)]
@@ -313,10 +316,12 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Run one bounded authenticated loopback gateway from local configuration.
+    /// Run an authenticated loopback gateway, optionally polling its local spaces.
     WebdavServe {
         #[arg(long)]
         config: PathBuf,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=86400))]
+        scan_interval_secs: Option<u64>,
     },
     /// Check the gateway configuration and, when enabled, the local credential file.
     WebdavCheck {
@@ -1258,6 +1263,8 @@ enum LocalControlAction {
     Status,
     Stop,
     WaitStopped,
+    #[value(name = "probe-webdav")]
+    ProbeWebDav,
 }
 
 #[derive(Subcommand)]
@@ -1448,7 +1455,7 @@ async fn execute(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let limits = read_local_limits(cli.limits.as_deref())?;
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    let _local_control = if let Some(directory) = cli.control_directory {
+    let local_control = if let Some(directory) = cli.control_directory {
         if !matches!(
             &cli.command,
             Command::Run { .. }
@@ -1476,12 +1483,24 @@ async fn execute(
     };
     match cli.command {
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        Command::LocalControl { directory, action } => {
+        Command::LocalControl {
+            directory,
+            action,
+            export,
+        } => {
+            if export.is_some() != matches!(action, LocalControlAction::ProbeWebDav) {
+                return Err("--export is required only for probe-webdav".into());
+            }
             let action = match action {
                 LocalControlAction::Status => {
                     sync_extend_platform_fs::LocalControlOperation::Status
                 }
                 LocalControlAction::Stop => sync_extend_platform_fs::LocalControlOperation::Stop,
+                LocalControlAction::ProbeWebDav => {
+                    sync_extend_platform_fs::LocalControlOperation::ProbeWebDav(
+                        export.ok_or("WebDAV export required")?,
+                    )
+                }
                 LocalControlAction::WaitStopped => {
                     let owner = sync_extend_platform_fs::LocalControlListener::bind(&directory)?;
                     drop(owner);
@@ -1780,14 +1799,28 @@ async fn execute(
         Command::WebdavConnectionTest { config, username, export } => {
             print(&webdav::test_connection(&config, &username, &export)?)?;
         }
-        Command::WebdavServe { config } => {
+        Command::WebdavServe {
+            config,
+            scan_interval_secs,
+        } => {
             let runtime = webdav::load(&config)?;
             let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let worker_shutdown = shutdown.clone();
             let dav_limits = limits.clone();
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let gateway = local_control
+                .as_ref()
+                .map(local_control::LocalControl::gateway_slot);
             let mut worker = tokio::task::spawn_blocking(move || {
-                webdav::serve(runtime, dav_limits, worker_shutdown)
-                    .map_err(|error| error.to_string())
+                webdav::serve(
+                    runtime,
+                    dav_limits,
+                    scan_interval_secs,
+                    worker_shutdown,
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    gateway,
+                )
+                .map_err(|error| error.to_string())
             });
             tokio::select! {
                 result = &mut worker => { result?.map_err(std::io::Error::other)?; }

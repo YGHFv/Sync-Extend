@@ -38,17 +38,20 @@ pub fn configure(config: &ManagementConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn observe_gateway(listener: &sync_extend_core_model::webdav::WebDavListener, scheme: &str) {
+pub fn observe_gateway(
+    listener: Option<&sync_extend_core_model::webdav::WebDavListener>,
+    scheme: &str,
+) {
     if !ENABLED.load(Ordering::Acquire) {
         return;
     }
     // Observe only a bounded inventory. Never cache a partial export list.
-    if listener.exports.len() > 128 {
+    let Some(listener) = listener.filter(|listener| listener.exports.len() <= 128) else {
         if let Ok(mut slot) = GATEWAY.lock() {
             *slot = None;
         }
         return;
-    }
+    };
     let exports: Vec<_> = listener
         .exports
         .iter()
@@ -64,6 +67,7 @@ pub fn observe_gateway(listener: &sync_extend_core_model::webdav::WebDavListener
     if let Ok(mut slot) = GATEWAY.lock() {
         let value = serde_json::json!({
             "listener_id": listener.listener_id, "address": listener.address,
+            "scheme": scheme,
             "listening": true, "authenticated": true, "exports": exports,
             "accounts": listener.accounts.iter().map(|account| &account.username).collect::<Vec<_>>(),
         });

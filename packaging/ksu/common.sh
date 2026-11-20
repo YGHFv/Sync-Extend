@@ -31,7 +31,7 @@ module_enabled() {
 control() {
     [ -x "$MODDIR/bin/syncd" ] && [ ! -L "$MODDIR/bin/syncd" ] ||
         { fail 'module daemon is unavailable'; return 1; }
-    "$MODDIR/bin/syncd" local-control --directory "$CONTROL" "$1"
+    "$MODDIR/bin/syncd" local-control --directory "$CONTROL" "$@"
 }
 
 load_config() {

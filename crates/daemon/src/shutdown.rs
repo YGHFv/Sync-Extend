@@ -13,12 +13,25 @@ async fn local_control_requested() {
 
 /// Resource readiness is separate from parsing configuration and constructing a runtime.
 pub fn ready() -> io::Result<()> {
+    started(true)
+}
+
+/// Report a controllable service before its first worktree scan has completed.
+pub fn started(resources_ready: bool) -> io::Result<()> {
     #[cfg(windows)]
     sync_extend_platform_fs::report_service_ready()?;
-    super::management::resources_ready();
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    super::local_control::READY.store(true, std::sync::atomic::Ordering::Release);
+    set_resources_ready(resources_ready);
     Ok(())
+}
+
+pub fn set_resources_ready(ready: bool) {
+    if ready {
+        super::management::resources_ready();
+    } else {
+        super::management::resources_deferred();
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    super::local_control::READY.store(ready, std::sync::atomic::Ordering::Release);
 }
 
 pub async fn requested() -> io::Result<()> {

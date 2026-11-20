@@ -105,6 +105,7 @@ button:disabled { opacity: 0.54; }
 .exports li { background: var(--surface); border-radius: 9px; padding: 10px 12px; }
 .export-summary { font-weight: 620; }
 .export-access { color: var(--muted); font-size: 0.875rem; }
+.export-probe { margin-top: 8px; }
 code { display: block; margin-top: 4px; white-space: normal; overflow-wrap: anywhere; user-select: all; }
 footer { padding: 15px 6px 0; font-size: 0.8125rem; }
 

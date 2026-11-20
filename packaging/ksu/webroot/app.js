@@ -10,18 +10,28 @@ const commands = Object.freeze({
 const fields = {};
 [
   "service-state", "service-detail", "gateway-state", "gateway-detail", "exports", "refresh",
-  "verify-stop", "ask-stop", "stop-confirmation", "stop", "cancel-stop",
+  "verify-stop", "ask-stop", "stop-confirmation", "stop", "cancel-stop", "probe-result",
 ].forEach((id) => { fields[id] = document.getElementById(id); });
 
 const canUseBridge = Boolean(window.ksu && typeof window.ksu.exec === "function");
 let nextRequest = 0;
 let busy = false;
 let activeOwner = false;
+let ownerReady = false;
+let probeButtons = [];
+const validExportName = (name) => typeof name === "string" && name.length >= 1 &&
+  name.length <= 64 && !/[^A-Za-z0-9_-]/.test(name);
 
-function readJson(operation) {
+function readJson(operation, selectedExport) {
   return new Promise((resolve, reject) => {
-    const command = commands[operation];
-    if (!canUseBridge || !Object.prototype.hasOwnProperty.call(commands, operation)) {
+    let command;
+    if (Object.prototype.hasOwnProperty.call(commands, operation)) {
+      command = commands[operation];
+    } else if (operation === "probe" && validExportName(selectedExport)) {
+      // The only dynamic command segment is a validated literal export name.
+      command = `/system/bin/sh /data/adb/modules/sync_extend/action.sh probe-webdav '${selectedExport}'`;
+    }
+    if (!canUseBridge || !command) {
       reject(new Error("KernelSU bridge unavailable"));
       return;
     }
@@ -68,6 +78,7 @@ function setBusy(value) {
   fields["verify-stop"].disabled = busy || !canUseBridge;
   fields["ask-stop"].disabled = busy || !activeOwner || !canUseBridge;
   fields.stop.disabled = busy || !activeOwner || !canUseBridge;
+  for (const button of probeButtons) button.disabled = busy || !ownerReady || !canUseBridge;
 }
 
 function hideConfirmation() {
@@ -81,6 +92,7 @@ function showOwner(value) {
     throw new Error("Invalid lifecycle response");
   }
   activeOwner = !value.stop_requested;
+  ownerReady = activeOwner && value.ready;
   if (value.stop_requested) {
     setStatus("service", "正在停止", "停止请求已接受。进程退出后可确认停止。");
   } else if (value.ready) {
@@ -91,7 +103,7 @@ function showOwner(value) {
 }
 
 function exportRow(item) {
-  if (!item || !/^[A-Za-z0-9_-]{1,64}$/.test(item.name) ||
+  if (!item || !validExportName(item.name) ||
       typeof item.writable !== "boolean" || typeof item.url !== "string") {
     throw new Error("Invalid export response");
   }
@@ -107,14 +119,21 @@ function exportRow(item) {
   const name = document.createElement("span");
   const access = document.createElement("span");
   const url = document.createElement("code");
+  const probe = document.createElement("button");
   heading.className = "export-summary";
   access.className = "export-access";
   name.textContent = item.name;
-  access.textContent = item.writable ? "读写许可" : "只读";
+  access.textContent = item.writable ? "配置允许写入（此模块仅支持读取）" : "只读";
   url.textContent = address.href;
+  probe.type = "button";
+  probe.className = "export-probe";
+  probe.textContent = "测试连接";
+  probe.setAttribute("aria-label", `测试 ${item.name} 的连接`);
+  probe.addEventListener("click", () => testExport(item.name, address.href));
+  probe.disabled = true;
   heading.append(name, access);
-  row.append(heading, url);
-  return row;
+  row.append(heading, url, probe);
+  return { row, probe };
 }
 
 function showGateway(value) {
@@ -130,7 +149,10 @@ function showGateway(value) {
     throw new Error("Invalid gateway export list");
   }
   const rows = value.webdav.exports.map(exportRow);
-  for (const row of rows) fields.exports.appendChild(row);
+  for (const { row, probe } of rows) {
+    fields.exports.appendChild(row);
+    probeButtons.push(probe);
+  }
   fields.exports.hidden = false;
   setStatus("gateway", "配置已开启", "在本机 WebDAV 应用中填入导出地址和已授予的账号。", "ready");
 }
@@ -140,8 +162,11 @@ async function refresh() {
   hideConfirmation();
   setBusy(true);
   activeOwner = false;
+  ownerReady = false;
+  probeButtons = [];
   fields.exports.textContent = "";
   fields.exports.hidden = true;
+  fields["probe-result"].hidden = true;
   try {
     await readJson("status").then(showOwner).catch(() => {
       setStatus("service", "无法读取", "未收到服务状态。若已停止，可使用“确认已停止”。", "warn");
@@ -149,6 +174,28 @@ async function refresh() {
     await readJson("gateway").then(showGateway).catch(() => {
       setStatus("gateway", "无法读取", "请检查模块私有目录中的部署和网关配置。", "warn");
     });
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function testExport(name, expectedUrl) {
+  if (busy || !ownerReady) return;
+  hideConfirmation();
+  setBusy(true);
+  const result = fields["probe-result"];
+  result.hidden = false;
+  result.textContent = `正在测试 ${name}…`;
+  try {
+    const value = await readJson("probe", name);
+    showOwner(value);
+    if (!ownerReady || value.webdav?.export !== name || value.webdav.export_accessible !== true ||
+        value.webdav.remote_backup_complete !== false || new URL(value.webdav.url).href !== expectedUrl) {
+      throw new Error("Export did not match the live gateway");
+    }
+    result.textContent = `${name} 可访问，已验证本机认证；远端备份需在对端确认。`;
+  } catch (error) {
+    result.textContent = `${name} 无法通过连接测试。请刷新状态，并检查导出和账号配置。`;
   } finally {
     setBusy(false);
   }
@@ -170,8 +217,10 @@ fields.stop.addEventListener("click", async () => {
     const value = await readJson("stop");
     if (!value || value.stop_requested !== true) throw new Error("Stop was not accepted");
     showOwner(value);
+    fields["probe-result"].hidden = true;
   } catch (error) {
     activeOwner = false;
+    ownerReady = false;
     setStatus("service", "未确认停止", "无法确认停止请求，请刷新状态。", "warn");
   } finally {
     setBusy(false);
@@ -187,6 +236,8 @@ fields["verify-stop"].addEventListener("click", async () => {
       throw new Error("The service is not confirmed stopped");
     }
     activeOwner = false;
+    ownerReady = false;
+    fields["probe-result"].hidden = true;
     setStatus("service", "已停止", "当前没有持有模块控制权的后台服务。", "ready");
   } catch (error) {
     setStatus("service", "未确认停止", "后台服务可能仍在运行或正在退出。", "warn");

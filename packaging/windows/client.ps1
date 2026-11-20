@@ -3,16 +3,17 @@
 param(
     [string]$Deployment = (Join-Path $env:LOCALAPPDATA 'SyncExtend\client\deployment.json'),
     [string]$Binary = (Join-Path $PSScriptRoot 'syncd.exe'),
+    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'SyncExtend\install'),
+    [ValidateRange(1024, 65535)][int]$WebdavPort = 17842,
+    [switch]$Managed,
     [switch]$Snapshot
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'windows-common.ps1')
 $binaryPath = Resolve-SyncExtendPath $Binary -File
-$deploymentFile = Read-SyncExtendJson $Deployment
+$deploymentPath = Resolve-SyncExtendPath $Deployment -File
+$deploymentFile = Read-SyncExtendJson $deploymentPath
 $managementPath = Resolve-SyncExtendPath $deploymentFile.management -File
-$gatewayPath = if ($deploymentFile.role.kind -eq 'webdav_client') {
-    Resolve-SyncExtendPath $deploymentFile.role.gateway_config -File
-}
 
 function Get-ClientSnapshot {
     Invoke-SyncExtendJson $binaryPath @('management-dashboard', '--config', $managementPath)
@@ -112,6 +113,7 @@ function Update-Client {
     $form.UseWaitCursor = $true
     $stopButton.Enabled = $false
     $testButton.Enabled = $false
+    if ($Managed) { $gatewayButton.Enabled = $false }
     $form.Refresh()
     try {
         $script:current = Get-ClientSnapshot
@@ -142,17 +144,34 @@ function Update-Client {
             Add-ClientRow 'Status' @('Storage node', $storage.role)
             Add-ClientRow 'Status' @('Physical CAS / limit', "$($storage.physical_cas_bytes) / $($storage.stored_byte_limit)")
         }
+        $profile = Read-SyncExtendJson $deploymentPath
+        $role = $profile.role
+        $script:gatewayPath = if ($role.kind -ceq 'webdav_client') {
+            Resolve-SyncExtendPath $role.gateway_config -File
+        }
+        $script:gatewayEnabled = $false
+        if ($script:gatewayPath) {
+            $configuration = Invoke-SyncExtendJson $binaryPath @('deployment-check', '--config', $deploymentPath, '--describe-webdav')
+            $script:gatewayEnabled = $configuration.webdav.enabled
+        }
         if ($current.webdav) {
             Add-ClientRow 'Status' @('WebDAV accounts', ($current.webdav.accounts -join ', '))
             foreach ($row in $current.webdav.exports) {
                 $access = if ($row.writable) { 'Read / write' } else { 'Read only' }
                 Add-ClientRow 'WebDAV' @($row.url, $access, $row.max_upload_bytes)
             }
+        } elseif ($script:gatewayEnabled) {
+            Add-ClientRow 'Status' @('WebDAV', 'Enabled in the profile; no active listener')
         } else {
             Add-ClientRow 'Status' @('WebDAV', 'No active gateway in this deployment')
         }
-        $testButton.Enabled = [bool]($gatewayPath -and $current.webdav)
+        $testButton.Enabled = [bool]($script:gatewayPath -and $current.webdav)
         $stopButton.Enabled = $current.stop_allowed
+        if ($Managed) {
+            $gatewayButton.Text = if ($script:gatewayEnabled) { 'Disable WebDAV' } else { 'Enable read-only WebDAV' }
+            $gatewayButton.Enabled = [bool]($current.stop_allowed -and
+                ($role.kind -ceq 'local_polling' -or ($role.kind -ceq 'webdav_client' -and $role.scan_interval_secs)))
+        }
     } catch {
         $script:current = $null
         foreach ($list in $lists.Values) { $list.Items.Clear() }
@@ -166,13 +185,19 @@ $stopButton = Add-ClientButton 'Stop deployment' {
     $choice = [Windows.Forms.MessageBox]::Show($form, 'Stop this local deployment?', 'SyncExtend', 'YesNo', 'Question')
     if ($choice -ne 'Yes') { return }
     try {
-        $null = Invoke-SyncExtendJson $binaryPath @('management-stop', '--config', $managementPath,
-            '--owner-generation', $script:current.owner_generation, '--request-id', [Guid]::NewGuid().ToString('N'))
+        if ($Managed) {
+            $null = & (Join-Path $PSScriptRoot 'manage-user.ps1') stop -InstallRoot $InstallRoot -Deployment $deploymentPath `
+                -OwnerGeneration $script:current.owner_generation
+        } else {
+            $null = Invoke-SyncExtendJson $binaryPath @('management-stop', '--config', $managementPath,
+                '--owner-generation', $script:current.owner_generation, '--request-id', [Guid]::NewGuid().ToString('N'))
+        }
         foreach ($list in $lists.Values) { $list.Items.Clear() }
         $script:current = $null
         $stopButton.Enabled = $false
         $testButton.Enabled = $false
-        $summary.Text = 'Stop accepted. The deployment is now shutting down.'
+        if ($Managed) { $gatewayButton.Enabled = $false }
+        $summary.Text = if ($Managed) { 'The deployment has stopped.' } else { 'Stop accepted. The deployment is now shutting down.' }
     } catch { $summary.Text = 'The stop was refused. Refresh before trying again.' }
 }
 $testButton = Add-ClientButton 'Test selected WebDAV export' {
@@ -184,16 +209,45 @@ $testButton = Add-ClientButton 'Test selected WebDAV export' {
     }
     try {
         $selected = $script:current.webdav.exports[$list.SelectedIndices[0]]
-        $gateway = Invoke-SyncExtendJson $binaryPath @('webdav-check', '--config', $gatewayPath)
+        $gateway = Invoke-SyncExtendJson $binaryPath @('webdav-check', '--config', $script:gatewayPath)
         $account = $gateway.accounts | Where-Object { $_.exports -contains $selected.name } | Select-Object -First 1
         if (!$account) { throw 'No configured account can access this export.' }
-        $result = Invoke-SyncExtendJson $binaryPath @('webdav-connection-test', '--config', $gatewayPath,
+        $result = Invoke-SyncExtendJson $binaryPath @('webdav-connection-test', '--config', $script:gatewayPath,
             '--username', $account.username, '--export', $selected.name)
+        if ($result.url -cne $selected.url) { throw 'The running export differs from this configuration.' }
         $summary.Text = "Authenticated as $($result.username)`r`n$($result.url)"
     } catch { $summary.Text = 'The selected WebDAV export did not pass its connection test.' }
 }
+if ($Managed) {
+    $gatewayButton = Add-ClientButton 'Enable read-only WebDAV' {
+        if (!$script:current) { return }
+        $enable = !$script:gatewayEnabled
+        $question = if (!$enable) {
+            'Disable WebDAV and briefly restart the local client? File scanning will resume automatically.'
+        } elseif ($script:gatewayPath) {
+            'Enable the existing WebDAV exports and briefly restart the local client? Existing access permissions will apply.'
+        } else {
+            'Enable authenticated read-only WebDAV for this worktree and briefly restart the local client?'
+        }
+        $choice = [Windows.Forms.MessageBox]::Show($form, $question, 'SyncExtend', 'YesNo', 'Question')
+        if ($choice -ne 'Yes') { return }
+        $gatewayButton.Enabled = $false
+        $form.UseWaitCursor = $true
+        $summary.Text = 'Applying WebDAV settings…'
+        $form.Refresh()
+        $failure = $null
+        try {
+            $action = if ($enable) { 'webdav-enable' } else { 'webdav-disable' }
+            $null = & (Join-Path $PSScriptRoot 'manage-user.ps1') $action -InstallRoot $InstallRoot -Deployment $deploymentPath `
+                -WebdavPort $WebdavPort -OwnerGeneration $script:current.owner_generation
+        } catch { $failure = $_.Exception.Message }
+        Update-Client
+        if ($failure) { $summary.Text = $failure }
+    }
+    $gatewayButton.Enabled = $false
+}
 $null = Add-ClientButton 'Open profile folder' {
-    Invoke-Item -LiteralPath ([IO.Path]::GetDirectoryName((Resolve-SyncExtendPath $Deployment -File)))
+    Invoke-Item -LiteralPath ([IO.Path]::GetDirectoryName($deploymentPath))
 }
 
 $stopButton.Enabled = $false

@@ -5,6 +5,8 @@ param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'SyncExtend\install'),
     [string]$Worktree,
     [ValidateRange(1024, 65535)][int]$ManagementPort = 17423,
+    [switch]$EnableReadOnlyWebdav,
+    [ValidateRange(1024, 65535)][int]$WebdavPort = 17842,
     [switch]$Snapshot
 )
 $ErrorActionPreference = 'Stop'
@@ -13,7 +15,11 @@ $profilePath = Resolve-SyncExtendPath $ProfileDirectory
 $deploymentPath = Join-Path $profilePath 'deployment.json'
 $binaryPath = Join-Path $PSScriptRoot 'syncd.exe'
 $manage = Join-Path $PSScriptRoot 'manage-user.ps1'
-if (!(Test-Path -LiteralPath $deploymentPath -PathType Leaf)) {
+$existingProfile = Test-Path -LiteralPath $deploymentPath -PathType Leaf
+if ($existingProfile -and $EnableReadOnlyWebdav) {
+    throw '-EnableReadOnlyWebdav applies when creating a new client profile.'
+}
+if (!$existingProfile) {
     if (!$Worktree) {
         if ($Snapshot) { throw 'Specify -Worktree when creating a client without the folder picker.' }
         Add-Type -AssemblyName System.Windows.Forms
@@ -25,9 +31,9 @@ if (!(Test-Path -LiteralPath $deploymentPath -PathType Leaf)) {
         } finally { $picker.Dispose() }
     }
     $null = & (Join-Path $PSScriptRoot 'configure-client.ps1') -Worktree $Worktree `
-        -ProfileDirectory $profilePath -Binary $binaryPath -ManagementPort $ManagementPort
+        -ProfileDirectory $profilePath -Binary $binaryPath -ManagementPort $ManagementPort `
+        -EnableReadOnlyWebdav:$EnableReadOnlyWebdav -WebdavPort $WebdavPort
 }
-$profile = Read-SyncExtendJson $deploymentPath
 if (!(Test-Path -LiteralPath (Join-Path $InstallRoot 'state.json') -PathType Leaf)) {
     $null = & $manage start -InstallRoot $InstallRoot -Deployment $deploymentPath
 } else {
@@ -36,4 +42,5 @@ if (!(Test-Path -LiteralPath (Join-Path $InstallRoot 'state.json') -PathType Lea
         $null = & $manage start -InstallRoot $InstallRoot -Deployment $deploymentPath
     }
 }
-& (Join-Path $PSScriptRoot 'client.ps1') -Deployment $deploymentPath -Binary $binaryPath -Snapshot:$Snapshot
+& (Join-Path $PSScriptRoot 'client.ps1') -Deployment $deploymentPath -Binary $binaryPath -InstallRoot $InstallRoot `
+    -WebdavPort $WebdavPort -Managed -Snapshot:$Snapshot
