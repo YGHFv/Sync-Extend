@@ -63,6 +63,11 @@ impl Journal {
                     "readonly original Journal exact current version required",
                 ));
             }
+            deletion_retention::validate_schema(&connection)?;
+            let deletion_retention_issuance = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_deletion_retention_issue",
+            )?;
             webdav_native::schema::validate(&connection)?;
             let webdav_native_execution_admission_issue = storage_retirement::gate::Gate::register(
                 &connection,
@@ -184,6 +189,7 @@ impl Journal {
                 original_operation_issuance,
                 storage_retirement_issuance,
                 storage_retirement_cancellation,
+                deletion_retention_issuance,
                 webdav_native_description_issue,
                 webdav_native_object_issue,
                 webdav_native_cancel_issue,

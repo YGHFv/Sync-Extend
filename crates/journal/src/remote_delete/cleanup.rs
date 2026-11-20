@@ -82,7 +82,7 @@ impl Journal {
             .find(|r| r.transaction_id == *id)
             .ok_or(invalid("remote Delete cleanup receipt missing"))?;
         if receipt.native_cleanup_complete {
-            return Ok(());
+            return self.observe_after_current(&header.target.space_id, &header.target_root);
         }
         if !receipt.local_committed {
             return Err(invalid("remote Delete cleanup requires original Final"));
@@ -265,6 +265,7 @@ impl Journal {
             phase_values(&header, "cleanup")?,
             true,
             || Ok(()),
-        )
+        )?;
+        self.observe_after_current(&header.target.space_id, &header.target_root)
     }
 }

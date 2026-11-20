@@ -96,6 +96,7 @@ impl JournalStorageInventory {
 pub(crate) fn tables() -> Vec<TableSpec> {
     [
         schema::TABLES,
+        crate::deletion_retention::schema::TABLES,
         crate::original_provenance::TABLES,
         crate::original_page_inbox::TABLES,
         crate::forwarded_page_inbox::TABLES,
@@ -158,6 +159,7 @@ impl Journal {
             bounds.max_rows,
             bounds.max_logical_bytes,
         )?;
+        crate::deletion_retention::audit(&self.connection, space, max)?;
         // The all-owner audit is deliberately after the whole-database preflight.
         let preparations = self.tree_restore_preparations(space, max)?;
         crate::webdav_native::audit(&self.connection)?;

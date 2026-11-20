@@ -308,6 +308,7 @@ impl crate::JournalReadView<'_> {
             bounds.inventory.max_rows,
             bounds.inventory.max_logical_bytes,
         )?;
+        crate::deletion_retention::audit(self.connection, space, max)?;
         crate::tree_native_storage::preflight_all(self.connection, max)?;
         // The private audit below performs reads only. Its complete DAV
         // arithmetic can be borrowed by nested audits in this same SQL

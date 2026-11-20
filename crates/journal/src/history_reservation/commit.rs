@@ -180,6 +180,9 @@ impl Journal {
         let after = view.audit_local_commit_capacity(&manifest.space_id, bounds)?;
         projection.receipt(&after)?;
         tx.commit()?;
+        if reservation.is_none() {
+            self.observe_after_current(&manifest.space_id, &root)?;
+        }
         Ok((
             LocalHistoryCommitReceipt::issued(
                 root,

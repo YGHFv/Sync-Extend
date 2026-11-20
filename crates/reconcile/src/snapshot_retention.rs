@@ -43,6 +43,12 @@ pub struct RetentionReport {
     pub gc_enabled: bool,
     pub pruned_snapshots: usize,
     pub explicit_snapshot_pruning_available: bool,
+    pub durable_deletion_retention: Option<sync_extend_journal::DeletionRetentionPolicy>,
+    pub deletion_retention_age_basis: &'static str,
+    pub deletion_retention_clock_limit: &'static str,
+    pub explicit_prune_minimum_history_snapshots: u32,
+    pub explicit_prune_floor_candidates: Vec<SnapshotId>,
+    pub explicit_prune_requires_transaction_revalidation: bool,
 }
 
 impl LocalSpace {
@@ -118,146 +124,167 @@ impl LocalSpace {
 
     pub fn retention_report(&self, policy: HistoryPolicy) -> Result<RetentionReport> {
         self.verify_root()?;
-        self.journal.integrity_check()?;
-        let pruned_snapshots = self
-            .snapshot_audit()?
-            .iter()
-            .filter(|s| !s.content_retained)
-            .count();
-        if policy.deleted_min_retention_days != 0 {
-            return Err(ReconcileError::Invariant(
-                "minimum-days retention is not implemented",
-            ));
-        }
-        let snapshots = self
-            .journal
-            .retained_snapshots(&self.space_id, self.limits.max_storage_entries)?;
-        let by_id: BTreeMap<_, _> = snapshots.iter().map(|s| (&s.snapshot_id, s)).collect();
-        let mut reasons: BTreeMap<_, BTreeSet<_>> = snapshots
-            .iter()
-            .map(|snapshot| {
-                let mut reasons = BTreeSet::new();
-                if snapshot.locked {
-                    reasons.insert("user_locked");
-                }
-                if snapshot.state != "materialized" {
-                    reasons.insert("not_materialized");
-                }
-                (snapshot.snapshot_id.clone(), reasons)
-            })
-            .collect();
-        self.journal.cleanup_plans(&self.space_id)?;
-        for tree in self
-            .journal
-            .tree_restore_preparations(&self.space_id, self.limits.max_storage_entries)?
-        {
-            if tree.writer_gate_held {
-                for root in [
-                    &tree.intent.scope.baseline_snapshot,
-                    &tree.intent.scope.target_snapshot,
-                ] {
-                    protect(&mut reasons, root, "prepared_tree_restore_input")?;
-                }
-            }
-        }
-        for lease in self
-            .journal
-            .read_leases(&self.space_id, self.limits.max_storage_entries)?
-        {
-            protect(
-                &mut reasons,
-                &lease.intent.snapshot_id,
-                if lease.state == ReadLeaseState::Active {
-                    "active_read_lease"
-                } else {
-                    "read_lease_audit_dependency"
-                },
-            )?;
-        }
-        for mutation in self.journal.mutations(&self.space_id)? {
-            self.journal
-                .verify_mutation_references(&mutation.intent.transaction_id)?;
-            protect(
-                &mut reasons,
-                &mutation.intent.baseline_root,
-                "mutation_baseline_dependency",
-            )?;
-            if let Some(id) = &mutation.committed_snapshot {
-                protect(&mut reasons, id, "mutation_completion_dependency")?;
-            }
-        }
-        for publication in self
-            .journal
-            .publications(&self.space_id, self.limits.max_storage_entries)?
-        {
-            let intent = &publication.intent;
-            let baseline = by_id
-                .get(&intent.baseline_root)
-                .ok_or(ReconcileError::Invariant("publication baseline missing"))?;
-            if baseline
-                .manifest
-                .entries
-                .values()
-                .find(|e| e.path == intent.requested_path)
-                != intent.requested_baseline.as_ref()
-                || baseline.manifest.entries.contains_key(&intent.entry_id)
-            {
-                return Err(ReconcileError::Invariant("publication baseline mismatch"));
-            }
-            protect(
-                &mut reasons,
-                &intent.baseline_root,
-                "publication_baseline_dependency",
-            )?;
-            if let Some(id) = &intent.source_snapshot {
-                let source = by_id
-                    .get(id)
-                    .ok_or(ReconcileError::Invariant("publication source missing"))?;
-                if !source
-                    .manifest
-                    .entries
-                    .values()
-                    .any(|e| e.content.as_ref() == Some(&intent.content))
-                {
-                    return Err(ReconcileError::Invariant("publication source mismatch"));
-                }
-                protect(&mut reasons, id, "publication_source_dependency")?;
-            }
-            if let Some(id) = &publication.committed_snapshot {
-                let completed = by_id
-                    .get(id)
-                    .ok_or(ReconcileError::Invariant("publication completion missing"))?;
-                let entry = completed.manifest.entries.get(&intent.entry_id).ok_or(
-                    ReconcileError::Invariant("publication completed entry missing"),
-                )?;
-                if entry.path != intent.target_path
-                    || entry.content.as_ref() != Some(&intent.content)
-                {
-                    return Err(ReconcileError::Invariant("publication completion mismatch"));
-                }
-                protect(&mut reasons, id, "publication_completion_dependency")?;
-            }
-        }
-        let current = self.manifest()?.map(|m| m.root()).transpose()?;
-        if let Some(id) = &current {
-            protect(&mut reasons, id, "current")?;
-        } else if !snapshots.is_empty() {
-            return Err(ReconcileError::Invariant(
-                "retained history has no current snapshot",
-            ));
-        }
-        let mut report = proposal(
-            snapshots,
-            current,
-            reasons,
-            policy,
-            self.limits.max_storage_entries,
+        let inputs = self.journal.retention_preview_inputs(
+            &self.space_id, policy, self.limits.max_storage_entries,
         )?;
-        report.pruned_snapshots = pruned_snapshots;
+        let report = report_from_inputs(inputs, self.limits.max_storage_entries)?;
         self.verify_root()?;
         Ok(report)
     }
+
+    pub fn set_deletion_retention_policy(
+        &mut self, minimum_days: u32, expected_revision: u64,
+    ) -> Result<sync_extend_journal::DeletionRetentionPolicy> {
+        self.verify_root()?;
+        let result = self.journal.set_deletion_retention_policy(
+            &self.space_id, minimum_days, expected_revision, self.limits.max_storage_entries,
+        )?;
+        self.verify_root()?;
+        Ok(result)
+    }
 }
+
+impl crate::ReadOnlyLocalSpace {
+    pub fn retention_report(
+        &self, policy: HistoryPolicy, max_entries: usize,
+    ) -> Result<RetentionReport> {
+        report_from_inputs(
+            self.journal.retention_preview_inputs(&self.space_id, policy, max_entries)?,
+            max_entries,
+        )
+    }
+}
+
+fn report_from_inputs(
+    inputs: sync_extend_journal::RetentionPreviewInputs, limit: usize,
+) -> Result<RetentionReport> {
+    let sync_extend_journal::RetentionPreviewInputs {
+        policy, deletion_policy, snapshots, current, pruned_snapshots,
+        trees, leases, mutations, publications, deletion_protection,
+    } = inputs;
+    let by_id: BTreeMap<_, _> = snapshots.iter().map(|s| (&s.snapshot_id, s)).collect();
+    let mut reasons: BTreeMap<_, BTreeSet<_>> = snapshots
+        .iter()
+        .map(|snapshot| {
+            let mut reasons = BTreeSet::new();
+            if snapshot.locked {
+                reasons.insert("user_locked");
+            }
+            if snapshot.state != "materialized" {
+                reasons.insert("not_materialized");
+            }
+            (snapshot.snapshot_id.clone(), reasons)
+        })
+        .collect();
+    for tree in trees
+    {
+        if tree.writer_gate_held {
+            for root in [
+                &tree.intent.scope.baseline_snapshot,
+                &tree.intent.scope.target_snapshot,
+            ] {
+                protect(&mut reasons, root, "prepared_tree_restore_input")?;
+            }
+        }
+    }
+    for lease in leases
+    {
+        protect(
+            &mut reasons,
+            &lease.intent.snapshot_id,
+            if lease.state == ReadLeaseState::Active {
+                "active_read_lease"
+            } else {
+                "read_lease_audit_dependency"
+            },
+        )?;
+    }
+    for mutation in mutations {
+        protect(
+            &mut reasons,
+            &mutation.intent.baseline_root,
+            "mutation_baseline_dependency",
+        )?;
+        if let Some(id) = &mutation.committed_snapshot {
+            protect(&mut reasons, id, "mutation_completion_dependency")?;
+        }
+    }
+    for publication in publications
+    {
+        let intent = &publication.intent;
+        let baseline = by_id
+            .get(&intent.baseline_root)
+            .ok_or(ReconcileError::Invariant("publication baseline missing"))?;
+        if baseline
+            .manifest
+            .entries
+            .values()
+            .find(|e| e.path == intent.requested_path)
+            != intent.requested_baseline.as_ref()
+            || baseline.manifest.entries.contains_key(&intent.entry_id)
+        {
+            return Err(ReconcileError::Invariant("publication baseline mismatch"));
+        }
+        protect(
+            &mut reasons,
+            &intent.baseline_root,
+            "publication_baseline_dependency",
+        )?;
+        if let Some(id) = &intent.source_snapshot {
+            let source = by_id
+                .get(id)
+                .ok_or(ReconcileError::Invariant("publication source missing"))?;
+            if !source
+                .manifest
+                .entries
+                .values()
+                .any(|e| e.content.as_ref() == Some(&intent.content))
+            {
+                return Err(ReconcileError::Invariant("publication source mismatch"));
+            }
+            protect(&mut reasons, id, "publication_source_dependency")?;
+        }
+        if let Some(id) = &publication.committed_snapshot {
+            let completed = by_id
+                .get(id)
+                .ok_or(ReconcileError::Invariant("publication completion missing"))?;
+            let entry = completed.manifest.entries.get(&intent.entry_id).ok_or(
+                ReconcileError::Invariant("publication completed entry missing"),
+            )?;
+            if entry.path != intent.target_path
+                || entry.content.as_ref() != Some(&intent.content)
+            {
+                return Err(ReconcileError::Invariant("publication completion mismatch"));
+            }
+            protect(&mut reasons, id, "publication_completion_dependency")?;
+        }
+    }
+
+    for (id, additional) in deletion_protection {
+        let target = reasons.get_mut(&id)
+            .ok_or(ReconcileError::Invariant("deletion retention snapshot missing"))?;
+        target.extend(additional);
+    }
+    let current = current.map(|m| m.root()).transpose()?;
+    if let Some(id) = &current {
+        protect(&mut reasons, id, "current")?;
+    } else if !snapshots.is_empty() {
+        return Err(ReconcileError::Invariant(
+            "retained history has no current snapshot",
+        ));
+    }
+    let mut report = proposal(
+        snapshots,
+        current,
+        reasons,
+        policy,
+        limit,
+    )?;
+    report.pruned_snapshots = pruned_snapshots;
+    report.durable_deletion_retention = Some(deletion_policy);
+    Ok(report)
+}
+
 
 fn protect(
     reasons: &mut BTreeMap<SnapshotId, BTreeSet<&'static str>>,
@@ -408,10 +435,25 @@ fn proposal(
         .iter()
         .filter(|id| Some(*id) != current.as_ref())
         .count();
-    let candidates = historical
+    let candidates: Vec<_> = historical
         .iter()
         .filter(|id| !selected.contains(**id))
         .map(|id| (*id).clone())
+        .collect();
+    // The hypothetical count/budget proposal remains independent of the
+    // actual prune floor. These candidates have passed only the report and
+    // current-plus-three checks, not the owned write transaction.
+    let floor: BTreeSet<_> = ordered.iter().rev().take(4).map(|s| s.1).collect();
+    let floor_materialized = floor.iter().all(|id| by_id[id].state == "materialized");
+    let explicit_prune_floor_candidates = candidates
+        .iter()
+        .filter(|id| {
+            ordering_blockers.is_empty()
+                && floor_materialized
+                && !floor.contains(id)
+                && by_id[id].state == "materialized"
+        })
+        .cloned()
         .collect();
     let report_snapshots = ordered
         .iter()
@@ -454,5 +496,11 @@ fn proposal(
         gc_enabled: false,
         pruned_snapshots: 0,
         explicit_snapshot_pruning_available: true,
+        durable_deletion_retention: None,
+        deletion_retention_age_basis: "first_durable_local_effective_deletion_observation",
+        deletion_retention_clock_limit: "local_wall_clock_watermark_cannot_certify_undetected_forward_jumps",
+        explicit_prune_minimum_history_snapshots: 3,
+        explicit_prune_floor_candidates,
+        explicit_prune_requires_transaction_revalidation: true,
     })
 }

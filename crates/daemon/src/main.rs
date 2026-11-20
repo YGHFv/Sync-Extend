@@ -975,6 +975,8 @@ enum Command {
         snapshot: String,
         #[arg(long)]
         baseline: String,
+        #[arg(long, default_value_t = 0)]
+        deleted_min_retention_days: u32,
     },
     /// Protect a retained materialized snapshot after validating its references and content.
     LockSnapshot {
@@ -998,6 +1000,17 @@ enum Command {
         history_snapshots: u32,
         #[arg(long, default_value_t = HistoryPolicy::default().history_budget_bytes)]
         history_budget_bytes: u64,
+        #[arg(long, default_value_t = 0)]
+        deleted_min_retention_days: u32,
+    },
+    /// Set or lower the durable deletion-retention floor at an explicit policy revision.
+    SetDeletionRetentionPolicy {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        days: u32,
+        #[arg(long)]
+        expected_revision: u64,
     },
     /// Persist exact retained-file read pins; does not release overdue leases.
     AcquireReadLease {
@@ -2826,8 +2839,13 @@ async fn execute(
             data_dir,
             snapshot,
             baseline,
+            deleted_min_retention_days,
         } => {
-            print(&open(&data_dir)?.prune_snapshot(&snapshot.parse()?, &baseline.parse()?)?)?;
+            print(&open(&data_dir)?.prune_snapshot_with_minimum_days(
+                &snapshot.parse()?,
+                &baseline.parse()?,
+                deleted_min_retention_days,
+            )?)?;
         }
         Command::LockSnapshot { data_dir, snapshot } => {
             print(&open(&data_dir)?.lock_snapshot(&snapshot.parse()?)?)?;
@@ -2839,13 +2857,24 @@ async fn execute(
             data_dir,
             history_snapshots,
             history_budget_bytes,
+            deleted_min_retention_days,
         } => {
             let policy = HistoryPolicy {
                 history_snapshots,
                 history_budget_bytes,
-                ..Default::default()
+                deleted_min_retention_days,
             };
-            print(&open(&data_dir)?.retention_report(policy)?)?;
+            print(&ReadOnlyLocalSpace::open(&data_dir)?.retention_report(
+                policy,
+                limits.max_storage_entries,
+            )?)?;
+        }
+        Command::SetDeletionRetentionPolicy {
+            data_dir,
+            days,
+            expected_revision,
+        } => {
+            print(&open(&data_dir)?.set_deletion_retention_policy(days, expected_revision)?)?;
         }
         Command::AcquireReadLease {
             data_dir,

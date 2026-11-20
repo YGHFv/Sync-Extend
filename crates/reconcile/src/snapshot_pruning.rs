@@ -15,6 +15,15 @@ impl LocalSpace {
         id: &SnapshotId,
         baseline: &SnapshotId,
     ) -> Result<SnapshotPruning> {
+        self.prune_snapshot_with_minimum_days(id, baseline, 0)
+    }
+
+    pub fn prune_snapshot_with_minimum_days(
+        &mut self,
+        id: &SnapshotId,
+        baseline: &SnapshotId,
+        minimum_days: u32,
+    ) -> Result<SnapshotPruning> {
         self.verify_root()?;
         if let Some(record) = self.journal.snapshot_pruning(&self.space_id, id)? {
             if record.baseline_root != *baseline {
@@ -24,8 +33,13 @@ impl LocalSpace {
             }
             return Ok(record);
         }
-        let report = self.retention_report(Default::default())?;
-        if !report.ordering_blockers.is_empty() || !report.candidate_snapshots.contains(id) {
+        let report = self.retention_report(sync_extend_core_model::config::HistoryPolicy {
+            deleted_min_retention_days: minimum_days,
+            ..Default::default()
+        })?;
+        if !report.ordering_blockers.is_empty()
+            || !report.explicit_prune_floor_candidates.contains(id)
+        {
             return Err(ReconcileError::Invariant(
                 "snapshot is not a default retention candidate",
             ));
@@ -33,7 +47,7 @@ impl LocalSpace {
         checkpoint("before_snapshot_prune");
         self.verify_root()?;
         self.verify()?;
-        let record = self.journal.prune_snapshot(
+        let record = self.journal.prune_snapshot_with_minimum_days(
             &SnapshotPruning {
                 format_version: FORMAT_VERSION,
                 space_id: self.space_id.clone(),
@@ -42,6 +56,7 @@ impl LocalSpace {
                 pruned_at_ms: now_ms()?,
             },
             self.limits.max_storage_entries,
+            minimum_days,
         )?;
         checkpoint("after_snapshot_prune");
         Ok(record)

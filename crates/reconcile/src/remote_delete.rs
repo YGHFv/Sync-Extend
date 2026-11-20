@@ -75,7 +75,8 @@ impl LocalSpace {
                 ));
             }
             if receipt.native_cleanup_complete {
-                return self.delete_result(&id, None);
+                let error = self.journal.cleanup_remote_delete(&id).err().map(|e| e.to_string());
+                return self.delete_result(&id, error);
             }
             return self.recover_remote_delete(&id);
         }
@@ -172,7 +173,8 @@ impl LocalSpace {
         self.delete_approval(&proof)?;
         let current = self.delete_result(id, None)?;
         if current.receipt.native_cleanup_complete {
-            return Ok(current);
+            let error = self.journal.cleanup_remote_delete(id).err().map(|e| e.to_string());
+            return self.delete_result(id, error);
         }
         if current.receipt.local_committed {
             let error = self

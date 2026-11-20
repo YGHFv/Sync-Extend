@@ -110,6 +110,7 @@ impl Journal {
             }
             observed.verify_content()?;
             tx.commit()?;
+            self.observe_after_current(&record.target.space_id, &record.target.root()?)?;
             return record.receipt();
         }
         if records.len() >= 32 {
@@ -524,6 +525,7 @@ impl Journal {
         observed.verify_content()?;
         self.verify_conflict_creator_cas(admission)?;
         tx.commit()?;
+        self.observe_after_current(&record.target.space_id, &record.target.root()?)?;
         record.receipt()
     }
 }

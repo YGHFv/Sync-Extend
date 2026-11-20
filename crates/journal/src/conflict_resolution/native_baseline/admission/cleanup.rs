@@ -96,6 +96,8 @@ impl Journal {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         execution.recovery_state = self.conflict_forward_state(&execution)?;
         tx.commit()?;
+        let target = &execution.held.admission.selected.header.target;
+        self.observe_after_current(&target.space_id, &target.root()?)?;
         Ok(execution)
     }
 }

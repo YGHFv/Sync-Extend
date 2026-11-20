@@ -1927,6 +1927,8 @@ impl LiveDavAdmission<'_> {
         else {
             return Err(invalid());
         };
+        let retention_snapshot = final_snapshot.clone();
+        let retention_space = self.baseline()?.space_id;
         let references = super::reference_handoff::evidence(
             &self.journal.connection,
             &self.execution.transaction_id,
@@ -1989,7 +1991,8 @@ impl LiveDavAdmission<'_> {
             .find(|row| row.transaction_id == self.execution.transaction_id)
             .cloned()
             .ok_or_else(invalid)?;
-        self.collection_policy(&inspect)
+        self.collection_policy(&inspect)?;
+        self.journal.observe_after_current(&retention_space, &retention_snapshot)
     }
 }
 

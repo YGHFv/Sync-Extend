@@ -3,6 +3,7 @@ pub mod config;
 pub mod conflict_native_layout;
 pub mod conflict_resolution;
 pub mod deployment;
+pub mod deletion_retention;
 pub mod easytier;
 pub mod gc_recovery;
 pub mod ids;

@@ -218,37 +218,9 @@ impl Journal {
         space: &SpaceId,
         max: usize,
     ) -> Result<Vec<TreeRestorePreparation>> {
-        if max == 0 || max > limits::MAX_ENTRIES {
-            return Err(JournalError::Invariant(
-                "tree restore audit inventory limit",
-            ));
-        }
-        crate::tree_native_storage::preflight_all(&self.connection, max)?;
-        let native_progress: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM main.tree_native_action_attempts)",
-            [],
-            |row| row.get(0),
-        )?;
-        if !native_progress {
-            self.check_storage_metadata_limit(max)?;
-        }
-        let preparations = self
-            .read_view()
-            .audit_tree_restore_preparations(space, max)?;
-        crate::tree_native_effects::validate_all(&self.connection, &preparations, max)?;
-        if native_progress {
-            let capacity = self
-                .read_view()
-                .audit_local_commit_capacity(space, self.writer_capacity_limits(max)?)?;
-            if !capacity.report.within_accounted_limits()
-                || !capacity.report.coverage_gaps().is_empty()
-            {
-                return Err(JournalError::Invariant(
-                    "tree native exact capacity refused",
-                ));
-            }
-        }
-        Ok(preparations)
+        self.read_view().complete_tree_restore_audit(
+            space, max, self.writer_capacity_limits(max)?,
+        )
     }
 
     pub fn require_no_tree_restore(&self, space: &SpaceId, max: usize) -> Result<()> {

@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 65;
+const SCHEMA_VERSION: u32 = 66;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -18,6 +18,23 @@ pub enum JournalError {
     Model(#[from] ModelError),
     #[error("journal invariant failed: {0}")]
     Invariant(&'static str),
+    #[error("retention observation deferred; age remains unknown: {0}")]
+    RetentionAdmissionDeferred(&'static str),
+    #[error("retention clock uncertain; age remains protected: {0}")]
+    RetentionClockUncertain(&'static str),
+    #[error("current snapshot {snapshot_id} is already committed; retention observation failed: {error}")]
+    RetentionObservationAfterCommit {
+        snapshot_id: SnapshotId,
+        #[source]
+        error: Box<JournalError>,
+    },
+    #[error("{action} {identity} is already committed; retained metadata verification failed: {error}")]
+    RetentionMetadataAfterCommit {
+        action: &'static str,
+        identity: String,
+        #[source]
+        error: Box<JournalError>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, JournalError>;
@@ -113,6 +130,8 @@ fn immutable_readonly_uri(path: &Path) -> Result<String> {
 }
 
 mod causal_log;
+mod deletion_retention;
+pub use deletion_retention::{DeletionRetentionPolicy, RetentionPreviewInputs};
 mod conflict_resolution;
 #[cfg(windows)]
 pub use conflict_resolution::{
@@ -221,6 +240,7 @@ pub struct Journal {
     original_operation_issuance: original_provenance::Gate,
     storage_retirement_issuance: storage_retirement::gate::Gate,
     storage_retirement_cancellation: storage_retirement::gate::Gate,
+    deletion_retention_issuance: storage_retirement::gate::Gate,
     webdav_native_description_issue: storage_retirement::gate::Gate,
     webdav_native_object_issue: storage_retirement::gate::Gate,
     webdav_native_cancel_issue: storage_retirement::gate::Gate,
@@ -314,7 +334,7 @@ impl ReadOnlyJournal {
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version != SCHEMA_VERSION {
             return Err(JournalError::Invariant(
-                "readonly Journal current schema required",
+                "read-only Journal requires schema 66; an explicit writer open upgrades older schemas",
             ));
         }
         let journal = Self {
@@ -965,6 +985,16 @@ impl Journal {
             tx.execute_batch(include_str!("migration-065.sql"))?;
             tx.commit()?;
         }
+        if version < 66 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-066.sql"))?;
+            tx.commit()?;
+        }
+        deletion_retention::validate_schema(&connection)?;
+        let deletion_retention_issuance = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_deletion_retention_issue",
+        )?;
         webdav_native::schema::validate(&connection)?;
         let webdav_native_execution_admission_issue = storage_retirement::gate::Gate::register(
             &connection,
@@ -1100,6 +1130,7 @@ impl Journal {
             original_operation_issuance,
             storage_retirement_issuance,
             storage_retirement_cancellation,
+            deletion_retention_issuance,
             webdav_native_description_issue,
             webdav_native_object_issue,
             webdav_native_cancel_issue,
@@ -2161,6 +2192,7 @@ impl Journal {
         let after = view.audit_local_commit_capacity(&manifest.space_id, bounds)?;
         projection.receipt(&after)?;
         tx.commit()?;
+        self.observe_after_current(&manifest.space_id, &root)?;
         Ok(root)
     }
 
@@ -2188,6 +2220,7 @@ impl Journal {
             completion,
         )?;
         tx.commit()?;
+        self.observe_after_current(&manifest.space_id, &root)?;
         Ok(root)
     }
 
@@ -2596,6 +2629,7 @@ fn storage_metadata_budget_usage_using_dav_read(
     let (rename_rows, rename_bytes) = remote_rename::metadata_budget(connection)?;
     let (delete_rows, delete_bytes) = remote_delete::metadata_budget(connection)?;
     let (replace_rows, replace_bytes) = remote_replace::metadata_budget(connection)?;
+    let (retention_rows, retention_bytes) = deletion_retention::metadata_budget(connection)?;
     let (conflict_rows, conflict_bytes) = conflict_resolution::metadata_budget(connection)?;
     let dav_tables = storage_inventory::reader::preflight(
         connection,
@@ -2657,6 +2691,7 @@ fn storage_metadata_budget_usage_using_dav_read(
             .and_then(|n| n.checked_add(rename_rows))
             .and_then(|n| n.checked_add(delete_rows))
             .and_then(|n| n.checked_add(replace_rows))
+            .and_then(|n| n.checked_add(retention_rows))
             .and_then(|n| n.checked_add(conflict_rows))
             .and_then(|n| n.checked_add(dav_rows))
             .and_then(|n| n.checked_add(original_history.rows))
@@ -2667,6 +2702,7 @@ fn storage_metadata_budget_usage_using_dav_read(
             .and_then(|n| n.checked_add(rename_bytes))
             .and_then(|n| n.checked_add(delete_bytes))
             .and_then(|n| n.checked_add(replace_bytes))
+            .and_then(|n| n.checked_add(retention_bytes))
             .and_then(|n| n.checked_add(conflict_bytes))
             .and_then(|n| n.checked_add(dav_bytes))
             .and_then(|n| n.checked_add(original_history.logical_bytes))
@@ -3165,6 +3201,11 @@ impl Journal {
         if version != SCHEMA_VERSION {
             return Err(JournalError::Invariant("original planning current schema"));
         }
+        deletion_retention::validate_schema(&connection)?;
+        let deletion_retention_issuance = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_deletion_retention_issue",
+        )?;
         webdav_native::schema::validate(&connection)?;
         let webdav_native_execution_admission_issue = storage_retirement::gate::Gate::register(
             &connection,
@@ -3298,6 +3339,7 @@ impl Journal {
             original_operation_issuance,
             storage_retirement_issuance,
             storage_retirement_cancellation,
+            deletion_retention_issuance,
             webdav_native_description_issue,
             webdav_native_object_issue,
             webdav_native_cancel_issue,

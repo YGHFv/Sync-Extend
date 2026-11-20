@@ -157,11 +157,14 @@ impl Journal {
     /// Dispose only exact original staging objects after durable original Final.
     /// Unknown children, foreign replacements and delayed absence are preserved.
     /// A completed repeat is metadata-only and never reopens old native slots.
+    /// Optional deletion observations use a separate owned write transaction
+    /// only after the original cleanup terminal has been checked.
     pub fn cleanup_native_publication(&mut self, id: &EntryId) -> Result<()> {
         if !self.connection.is_autocommit() {
             return Err(invalid("native cleanup refuses caller-owned transaction"));
         }
-        self.native_publication_final_snapshot(id)?;
+        let root = self.native_publication_final_snapshot(id)?;
+        let space = self.publication(id)?.intent.space_id;
         let bounds = storage_policy::capacity_limits(self.max_storage_entries)?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let snapshot = self
@@ -169,6 +172,7 @@ impl Journal {
             .audit_local_commit_capacity(&self.publication(id)?.intent.space_id, bounds)?;
         if self.publication(id)?.cleaned {
             tx.commit()?;
+            self.observe_after_current(&space, &root)?;
             return Ok(());
         }
         let row = snapshot
@@ -383,6 +387,7 @@ impl Journal {
             true,
             || Ok(()),
         )?;
+        self.observe_after_current(&space, &root)?;
         Ok(())
     }
 }

@@ -472,8 +472,9 @@ impl Journal {
                 ));
             }
         }
+        let stored: Stored = parse(&permit.final_record.reservation_json)?;
         if permit.cleaned_json.is_some() {
-            return Ok(());
+            return self.observe_after_current(&stored.planned.space_id, &stored.planned.root()?);
         }
         let progress = Progress {
             version: 1,
@@ -494,7 +495,6 @@ impl Journal {
             &permit.final_record,
             Some(prepared),
         )?;
-        let stored: Stored = parse(&permit.final_record.reservation_json)?;
         self.append_original_linux_state(
             &key(CLEANED, &permit.final_record.attempt),
             &json,
@@ -504,7 +504,7 @@ impl Journal {
         for observed in absent {
             observed.verify()?;
         }
-        Ok(())
+        self.observe_after_current(&stored.planned.space_id, &stored.planned.root()?)
     }
 }
 

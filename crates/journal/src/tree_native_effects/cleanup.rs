@@ -281,7 +281,8 @@ impl Journal {
     }
 
     /// The Final is immutable and never replayed. Resume only exact original
-    /// disposition or confirm the already audited cleanup terminal read-only.
+    /// disposition or confirm the already audited cleanup terminal. Optional
+    /// deletion observations are admitted separately after the terminal audit.
     pub fn resume_tree_native_cleanup(
         &self,
         space: &SpaceId,
@@ -312,6 +313,7 @@ impl Journal {
         let snapshot_id = final_plan.rows().intent.final_snapshot_id.clone();
         if preparation.state == "native_cleaned" {
             tx.commit()?;
+            self.observe_after_current(space, &snapshot_id)?;
             return Ok(TreeNativeCleanupReceipt {
                 transaction: id.clone(),
                 snapshot_id,
@@ -626,6 +628,7 @@ impl Journal {
             },
         )?;
         checkpoint("after_tree_owner_cleanup_complete");
+        self.observe_after_current(space, &snapshot_id)?;
         Ok(TreeNativeCleanupReceipt {
             transaction: id.clone(),
             snapshot_id,

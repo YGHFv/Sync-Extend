@@ -45,6 +45,9 @@ pub(super) fn lease_owners(
     // Trusted standalone snapshots predate initialize. This compatibility
     // contract admits no identity row or unsupported owner, not an audit bypass.
     const IDENTITYLESS_LEASE_TABLES: &[&str] = &[
+        "deletion_retention_clock",
+        "deletion_retention_policies",
+        "deletion_retention_observations",
         "operations",
         "receive_cursors",
         "snapshots",
@@ -75,6 +78,9 @@ pub(super) fn history_owners(
         return owners(view, space, max);
     }
     const IDENTITYLESS_HISTORY_TABLES: &[&str] = &[
+        "deletion_retention_clock",
+        "deletion_retention_policies",
+        "deletion_retention_observations",
         "operations",
         "receive_cursors",
         "snapshots",
@@ -109,6 +115,9 @@ pub(super) fn receive_owners(
         return owners(view, space, max);
     }
     const IDENTITYLESS_RECEIVE_TABLES: &[&str] = &[
+        "deletion_retention_clock",
+        "deletion_retention_policies",
+        "deletion_retention_observations",
         "operations",
         "receive_cursors",
         "snapshots",
@@ -145,6 +154,9 @@ pub(super) fn local_commit_owners(
         return owners(view, space, max);
     }
     const IDENTITYLESS_LOCAL_COMMIT_TABLES: &[&str] = &[
+        "deletion_retention_clock",
+        "deletion_retention_policies",
+        "deletion_retention_observations",
         "operations",
         "receive_cursors",
         "snapshots",

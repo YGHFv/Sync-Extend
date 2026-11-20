@@ -782,6 +782,7 @@ impl Journal {
         receipt(&expected, &after)?;
         observation.verify_content()?;
         tx.commit()?;
+        self.observe_after_current(&header.target.space_id, &header.target_root)?;
         Ok(header.target_root.clone())
     }
 }

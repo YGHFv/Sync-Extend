@@ -194,7 +194,7 @@ impl LocalSpace {
                     self.journal.cleanup_native_publication(&id)?;
                     Ok(())
                 })(),
-                Stage::Cleanup => Ok(()),
+                Stage::Cleanup => self.journal.cleanup_native_publication(&id).map_err(Into::into),
                 Stage::Legacy => unreachable!(),
             }
             };

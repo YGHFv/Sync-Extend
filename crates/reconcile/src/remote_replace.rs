@@ -111,7 +111,8 @@ impl LocalSpace {
                 ));
             }
             if receipt.native_cleanup_complete {
-                return self.replace_result(&id, None);
+                let error = self.journal.cleanup_remote_replace(&id).err().map(|e| e.to_string());
+                return self.replace_result(&id, error);
             }
             return self.recover_remote_replace(&id);
         }
@@ -254,7 +255,8 @@ impl LocalSpace {
         self.replace_approval(&proof)?;
         let current = self.replace_result(id, None)?;
         if current.receipt.native_cleanup_complete {
-            return Ok(current);
+            let error = self.journal.cleanup_remote_replace(id).err().map(|e| e.to_string());
+            return self.replace_result(id, error);
         }
         if current.receipt.local_committed {
             if let Err(error) = self.reserve_internal_worktree(0) {

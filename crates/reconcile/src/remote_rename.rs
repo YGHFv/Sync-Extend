@@ -75,7 +75,12 @@ impl LocalSpace {
                 ));
             }
             if receipt.local_committed {
-                return self.rename_result(&id, None);
+                let root = receipt.snapshot_id.as_ref().ok_or(ReconcileError::Invariant(
+                    "remote Rename committed snapshot missing",
+                ))?;
+                let error = self.journal.admit_committed_deletion_observations(&self.space_id, root)
+                    .err().map(|e| e.to_string());
+                return self.rename_result(&id, error);
             }
             return self.recover_remote_rename(&id);
         }
@@ -149,7 +154,12 @@ impl LocalSpace {
         self.rename_approval(&proof)?;
         let current = self.rename_result(id, None)?;
         if current.receipt.local_committed {
-            return Ok(current);
+            let root = current.receipt.snapshot_id.as_ref().ok_or(ReconcileError::Invariant(
+                "remote Rename committed snapshot missing",
+            ))?;
+            let error = self.journal.admit_committed_deletion_observations(&self.space_id, root)
+                .err().map(|e| e.to_string());
+            return self.rename_result(id, error);
         }
         let outcome = (|| {
             let held = self.journal.reopen_remote_rename_source(id)?;

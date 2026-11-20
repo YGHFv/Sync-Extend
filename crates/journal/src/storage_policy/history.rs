@@ -104,9 +104,28 @@ pub(crate) fn snapshot_locked(
     Ok(())
 }
 
-pub(crate) fn admit_pruning(before: &CapacitySnapshot, json: &str) -> Result<()> {
+pub(crate) fn admit_pruning(
+    before: &CapacitySnapshot,
+    json: &str,
+    retention_clock: Option<&crate::deletion_retention::ClockRecord>,
+) -> Result<()> {
     let prior = before.report.accounted_total();
     let limits = before.report.limits();
+    let clock_growth = if let Some(clock) = retention_clock {
+        let old = before.rows.iter().find(|row| row.table() == "deletion_retention_clock"
+            && row.primary_key() == [clock.space_id.to_string()])
+            .ok_or(JournalError::Invariant("pruning retention clock missing"))?;
+        let columns = crate::deletion_retention::clock_columns(clock)?;
+        let next = columns.iter().try_fold(0u64, |sum, column| {
+            let length = match &column.value {
+                JournalStorageColumnValue::Null => 0,
+                JournalStorageColumnValue::Integer(_) => 8,
+                JournalStorageColumnValue::Text(value) => value.len() as u64,
+            };
+            sum.checked_add(length).ok_or(JournalError::Invariant("pruning clock charge overflow"))
+        })?;
+        next.saturating_sub(old.logical_bytes())
+    } else { 0 };
     // The immutable receipt is inserted while every old snapshot pin still exists.
     if prior
         .rows
@@ -116,6 +135,7 @@ pub(crate) fn admit_pruning(before: &CapacitySnapshot, json: &str) -> Result<()>
             .logical_bytes
             .checked_add(232)
             .and_then(|bytes| bytes.checked_add(json.len() as u64))
+            .and_then(|bytes| bytes.checked_add(clock_growth))
             .is_none_or(|bytes| bytes > limits.max_logical_bytes)
     {
         return Err(JournalError::Invariant(
@@ -130,6 +150,7 @@ pub(crate) fn snapshot_pruned(
     after: &CapacitySnapshot,
     intent: &SnapshotPruning,
     json: &str,
+    retention_clock: Option<&crate::deletion_retention::ClockRecord>,
 ) -> Result<()> {
     let mut remaining: BTreeMap<_, _> = after
         .rows
@@ -142,7 +163,13 @@ pub(crate) fn snapshot_pruned(
         {
             continue;
         }
-        if remaining.remove(&(row.table(), row.primary_key())) != Some(row.columns()) {
+        let clock_columns = retention_clock
+            .filter(|clock| row.table() == "deletion_retention_clock"
+                && row.primary_key() == [clock.space_id.to_string()])
+            .map(crate::deletion_retention::clock_columns)
+            .transpose()?;
+        let expected = clock_columns.as_deref().unwrap_or(row.columns());
+        if remaining.remove(&(row.table(), row.primary_key())) != Some(expected) {
             return Err(JournalError::Invariant(
                 "snapshot pruning changed unrelated values",
             ));

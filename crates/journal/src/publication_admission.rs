@@ -756,6 +756,7 @@ impl Journal {
             .audit_local_commit_capacity(&intent.space_id, bounds)?;
         projection.receipt(&after)?;
         tx.commit()?;
+        self.observe_after_current(&intent.space_id, &root)?;
         Ok(root)
     }
 }

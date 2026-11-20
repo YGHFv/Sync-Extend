@@ -166,7 +166,17 @@ impl Journal {
         intent: &SnapshotPruning,
         max_entries: usize,
     ) -> Result<SnapshotPruning> {
+        self.prune_snapshot_with_minimum_days(intent, max_entries, 0)
+    }
+
+    pub fn prune_snapshot_with_minimum_days(
+        &mut self,
+        intent: &SnapshotPruning,
+        max_entries: usize,
+        minimum_days: u32,
+    ) -> Result<SnapshotPruning> {
         let bounds = self.writer_capacity_limits(max_entries)?;
+        let physical = crate::deletion_retention::physical::PhysicalMetadataGuard::capture(self)?;
         if intent.format_version != FORMAT_VERSION || intent.snapshot_id == intent.baseline_root {
             return Err(JournalError::Invariant("invalid snapshot pruning intent"));
         }
@@ -180,6 +190,7 @@ impl Journal {
                     "snapshot pruning request baseline mismatch",
                 ));
             }
+            physical.verify(self)?;
             tx.commit()?;
             return Ok(old);
         }
@@ -191,6 +202,28 @@ impl Journal {
         if current.root()? != intent.baseline_root {
             return Err(JournalError::Invariant("snapshot pruning baseline changed"));
         }
+        let (policy, _) = crate::deletion_retention::effective_policy(
+            &tx,
+            &intent.space_id,
+            sync_extend_core_model::config::HistoryPolicy {
+                deleted_min_retention_days: minimum_days,
+                ..Default::default()
+            },
+            bounds.max_rows as usize,
+        )?;
+        // Real local clock sampled inside this owned write transaction. The
+        // caller's audit timestamp cannot age a sender-controlled Delete.
+        let now = crate::deletion_retention::local_now_ms().unwrap_or(0);
+        let protections = crate::deletion_retention::protections(
+            &tx, &intent.space_id, &snapshots, policy.deleted_min_retention_days,
+            now, bounds.max_rows as usize,
+        )?;
+        if protections.get(&intent.snapshot_id).is_some_and(|reasons| !reasons.is_empty()) {
+            return Err(JournalError::Invariant("snapshot protected by local deletion retention"));
+        }
+        let retention_clock = self.pruning_retention_clock(
+            &intent.space_id, policy.deleted_min_retention_days, now,
+        )?;
         let target = snapshots
             .iter()
             .find(|s| s.snapshot_id == intent.snapshot_id)
@@ -255,7 +288,10 @@ impl Journal {
             ));
         }
         let json = serde_json::to_string(intent)?;
-        storage_policy::history::admit_pruning(&before, &json)?;
+        storage_policy::history::admit_pruning(&before, &json, retention_clock.as_ref())?;
+        if let Some(clock) = &retention_clock {
+            self.write_retention_clock(&tx, clock)?;
+        }
         tx.execute(
             "INSERT INTO snapshot_prunings VALUES (?1,?2,?3,?4,?5,?6)",
             params![
@@ -272,9 +308,14 @@ impl Journal {
             [intent.snapshot_id.as_str()],
         )?;
         let after = view.audit_history_capacity(&intent.space_id, bounds)?;
-        storage_policy::history::snapshot_pruned(&before, &after, intent, &json)?;
+        storage_policy::history::snapshot_pruned(&before, &after, intent, &json, retention_clock.as_ref())?;
         storage_policy::history::within(&after.report)?;
+        physical.verify(self)?;
         tx.commit()?;
+        physical.verify(self).map_err(|error| JournalError::RetentionMetadataAfterCommit {
+            action: "snapshot pruning", identity: intent.snapshot_id.to_string(),
+            error: Box::new(error),
+        })?;
         Ok(intent.clone())
     }
 }

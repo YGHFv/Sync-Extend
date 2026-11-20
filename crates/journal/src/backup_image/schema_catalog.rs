@@ -118,4 +118,5 @@ const SCHEMA_SCRIPTS: &[&str] = &[
     include_str!("../migration-063.sql"),
     include_str!("../migration-064.sql"),
     include_str!("../migration-065.sql"),
+    include_str!("../migration-066.sql"),
 ];
