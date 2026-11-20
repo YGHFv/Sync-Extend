@@ -39,7 +39,19 @@ pub struct ArchivedReadLeaseHold {
     pub root_bound_local_state: bool,
 }
 
-fn other_owner_tables(database: &rusqlite::Connection) -> Result<Vec<String>> {
+fn other_owner_tables(
+    database: &rusqlite::Connection,
+    space: &SpaceId,
+    max_entries: usize,
+) -> Result<Vec<String>> {
+    // Unlike native receipts these records bind only the original space,
+    // operations, effective snapshots and monotone local clock. Require their
+    // complete bounded schema/hash/revision/anchor audit before treating the
+    // family as portable. The surrounding immutable-image audit also checks
+    // every FK; mapping later proves every non-worktree row remains identical.
+    // In particular, restoration never observes a new deletion time or resets
+    // the clock watermark, and this exemption grants no native/GC authority.
+    crate::deletion_retention::audit(database, space, max_entries)?;
     let mut tables = database.prepare(
         "SELECT name FROM main.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     )?;
@@ -66,7 +78,11 @@ fn other_owner_tables(database: &rusqlite::Connection) -> Result<Vec<String>> {
     ];
     let mut other = Vec::new();
     for name in names {
-        if PORTABLE.contains(&name.as_str()) {
+        if PORTABLE.contains(&name.as_str())
+            || crate::deletion_retention::schema::TABLES
+                .iter()
+                .any(|table| table.name == name)
+        {
             continue;
         }
         let quoted = format!("\"{}\"", name.replace('"', "\"\""));
@@ -129,6 +145,8 @@ fn column<'a>(row: &'a JournalStoredRow, name: &str) -> Result<&'a JournalStorag
 fn read_lease_hold(
     database: &rusqlite::Connection,
     rows: &[JournalStoredRow],
+    space: &SpaceId,
+    max_entries: usize,
 ) -> Result<ArchivedReadLeaseHold> {
     let mut active_leases = 0;
     let mut released_leases = 0;
@@ -187,7 +205,7 @@ fn read_lease_hold(
         pin_rows,
         distinct_pinned_objects: pins.len(),
         inventory_digest: recovery_hold::inventory(rows),
-        other_owner_tables: other_owner_tables(database)?,
+        other_owner_tables: other_owner_tables(database, space, max_entries)?,
         root_bound_local_state,
     })
 }
@@ -209,7 +227,7 @@ impl JournalBackupImage {
                 [],
                 |row| row.get(0),
             )?;
-            if active || !other_owner_tables(database)?.is_empty() {
+            if active || !other_owner_tables(database, space, bounds.max_entries)?.is_empty() {
                 return Err(JournalError::Invariant(
                     "node root mapping refuses unsupported original owner history",
                 ));
@@ -231,7 +249,7 @@ impl JournalBackupImage {
             space,
             bounds,
             |database, rows, _| {
-                let hold = read_lease_hold(database, rows)?;
+                let hold = read_lease_hold(database, rows, space, bounds.max_entries)?;
                 if &hold.inventory_digest != expected {
                     return Err(JournalError::Invariant(
                         "archived read lease hold digest differs",
@@ -266,7 +284,7 @@ impl JournalBackupImage {
             self.bytes().len(),
             space,
             bounds,
-            |database, rows, _| read_lease_hold(database, rows),
+            |database, rows, _| read_lease_hold(database, rows, space, bounds.max_entries),
         )
         .map(|(_, hold)| hold)
     }
