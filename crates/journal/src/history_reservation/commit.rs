@@ -89,10 +89,10 @@ impl Journal {
             &self.connection,
             rusqlite::TransactionBehavior::Immediate,
         )?;
-        let original_phase_chain = if let Some(reservation) = reservation {
-            let prior_reservation_view = self
-                .read_view()
-                .audit_local_commit_capacity(&manifest.space_id, bounds)?;
+        let view = self.read_view();
+        let (original_phase_chain, before) = if let Some(reservation) = reservation {
+            let prior_reservation_view =
+                view.audit_local_commit_capacity(&manifest.space_id, bounds)?;
             let original_phase_chain = consume(
                 &tx,
                 &self.original_local_history_issuer,
@@ -103,9 +103,7 @@ impl Journal {
                 timestamp,
                 observations,
             )?;
-            let consumed_view = self
-                .read_view()
-                .audit_local_commit_capacity(&manifest.space_id, bounds)?;
+            let consumed_view = view.audit_local_commit_capacity(&manifest.space_id, bounds)?;
             let retained = prior_reservation_view
                 .rows
                 .iter()
@@ -126,17 +124,20 @@ impl Journal {
                     "original reservation consume collateral rows",
                 ));
             }
-            Some(original_phase_chain)
+            // This is already the audited pre-commit state in the same SQL
+            // transaction. The collateral check above has made no writes.
+            (Some(original_phase_chain), consumed_view)
         } else {
-            if self.state(super::KEY)?.is_some() {
+            if view.state(super::KEY)?.is_some() {
                 return Err(JournalError::Invariant(
                     "original reserved history defers ordinary commit",
                 ));
             }
-            None
+            (
+                None,
+                view.audit_local_commit_capacity(&manifest.space_id, bounds)?,
+            )
         };
-        let view = self.read_view();
-        let before = view.audit_local_commit_capacity(&manifest.space_id, bounds)?;
         if observations.is_some() && view.state("worktree")?.is_none() {
             return Err(JournalError::Invariant(
                 "observed commit requires initialized worktree",

@@ -56,11 +56,6 @@ impl LocalSpace {
         let volume = owner.volume();
         let outside = OutsidePrivateIntentOwner::open(&intent_parent, volume)?;
         let mut plan = self.plan_local_file_native_history(source, path.clone())?;
-        let footprint = plan.original_native_create_footprint()?;
-        // This aggregate budget includes the bounded outside intent and complete
-        // future terminal records; the five SQLite capacities stay independently
-        // physically reserved by the original metadata VFS.
-        plan.reserve_original_native_internal_budget(footprint.native_peak_bytes)?;
         let attempt_id = plan.original_reservation().attempt().clone();
         let prior_content = plan
             .prior_manifest()

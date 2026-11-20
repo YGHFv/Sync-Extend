@@ -55,6 +55,13 @@ struct Config {
     terminal_receipt_output: Option<PathBuf>,
 }
 
+#[derive(Default)]
+struct PreparedHelperEvidence {
+    process_ids: Vec<u32>,
+    startup_bytes: Vec<Vec<u8>>,
+    process_births: Vec<serde_json::Value>,
+}
+
 pub struct LinuxDaemonOwner {
     pub owner: Arc<LinuxNamespaceCapability>,
     pub budget: Arc<LinuxMetadataBudget>,
@@ -63,9 +70,7 @@ pub struct LinuxDaemonOwner {
     worktree: PathBuf,
     terminal: Mutex<Option<OriginalPairTerminalRelease>>,
     terminal_receipt_output: Option<PathBuf>,
-    prepared_process_ids: (u32, Option<u32>),
-    prepared_startup: (Vec<u8>, Vec<u8>),
-    prepared_process_births: Vec<serde_json::Value>,
+    prepared: PreparedHelperEvidence,
     delayed_helper_program: Option<OutsideHelperProgram>,
 }
 
@@ -158,7 +163,7 @@ pub fn prepare(cli: &Cli) -> Result<Option<LinuxDaemonOwner>> {
     // Other ordinary commands retain their existing preparation/cancel path.
     let delayed = matches!(&cli.command, Command::Publish { .. });
     let mut helpers = if delayed { None } else { Some(OutsideHelperSession::prepare(&owner, &helper)?) };
-    let (prepared_process_ids, prepared_startup, prepared_process_births) =
+    let prepared =
         if let Some(session) = helpers.as_ref() {
             match capture_prepared(&owner, session) {
                 Ok(evidence) => evidence,
@@ -170,7 +175,7 @@ pub fn prepare(cli: &Cli) -> Result<Option<LinuxDaemonOwner>> {
                 }
             }
         } else {
-            ((0, None), (Vec::new(), Vec::new()), Vec::new())
+            PreparedHelperEvidence::default()
         };
     let metadata_limits = config.metadata_limits.into();
     let budget = if initialize {
@@ -229,9 +234,7 @@ pub fn prepare(cli: &Cli) -> Result<Option<LinuxDaemonOwner>> {
         worktree,
         terminal: Mutex::new(None),
         terminal_receipt_output: config.terminal_receipt_output,
-        prepared_process_ids,
-        prepared_startup,
-        prepared_process_births,
+        prepared,
         delayed_helper_program: if delayed { Some(helper) } else { None },
     }))
 }
@@ -240,12 +243,16 @@ pub fn prepare(cli: &Cli) -> Result<Option<LinuxDaemonOwner>> {
 fn capture_prepared(
     owner: &LinuxNamespaceCapability,
     helpers: &OutsideHelperSession,
-) -> std::io::Result<((u32, Option<u32>), (Vec<u8>, Vec<u8>), Vec<serde_json::Value>)> {
+) -> std::io::Result<PreparedHelperEvidence> {
     helpers.verify_prepared_owner(owner)?;
-    let ids = helpers.process_ids();
+    let (guardian, supervisor) = helpers.process_ids();
+    let ids = [
+        guardian,
+        supervisor.ok_or_else(|| std::io::Error::other("prepared supervisor PID absent"))?,
+    ];
     let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
     let mut births = Vec::new();
-    for pid in [Some(ids.0), ids.1].into_iter().flatten() {
+    for pid in ids {
         let raw = fs::read_to_string(format!("/proc/{pid}/stat"))?;
         let fields = raw.rsplit_once(')').ok_or_else(|| std::io::Error::other("prepared helper stat encoding"))?.1;
         let start_ticks: u64 = fields.split_whitespace().nth(19)
@@ -253,11 +260,19 @@ fn capture_prepared(
             .parse().map_err(std::io::Error::other)?;
         births.push(serde_json::json!({"pid": pid, "start_ticks": start_ticks, "boot_id": boot_id.trim()}));
     }
-    let startup = helpers.startup_bytes();
-    let startup = (startup.0.to_vec(), startup.1
-        .ok_or_else(|| std::io::Error::other("prepared supervisor bytes absent"))?.to_vec());
+    let (guardian, supervisor) = helpers.startup_bytes();
+    let startup = vec![
+        guardian.to_vec(),
+        supervisor
+            .ok_or_else(|| std::io::Error::other("prepared supervisor bytes absent"))?
+            .to_vec(),
+    ];
     helpers.verify_prepared_owner(owner)?;
-    Ok((ids, startup, births))
+    Ok(PreparedHelperEvidence {
+        process_ids: ids.to_vec(),
+        startup_bytes: startup,
+        process_births: births,
+    })
 }
 
 impl LinuxDaemonOwner {
@@ -271,15 +286,13 @@ impl LinuxDaemonOwner {
         let program = self.delayed_helper_program.as_ref().ok_or("late helper program absent")?;
         let owner = &self.owner;
         let terminal_slot = &self.terminal;
-        let ids = &mut self.prepared_process_ids;
-        let startup = &mut self.prepared_startup;
-        let births = &mut self.prepared_process_births;
+        let prepared = &mut self.prepared;
         let mut helpers = self.helpers.lock().map_err(|_| "original Linux helper session lock poisoned")?;
         let (result, terminal) = local.publish_original_linux_native_file(
             source, path, owner, &self.budget, &mut helpers, || {
                 let session = OutsideHelperSession::prepare(owner, program)?;
                 match capture_prepared(owner, &session) {
-                    Ok(evidence) => { *ids = evidence.0; *startup = evidence.1; *births = evidence.2; }
+                    Ok(evidence) => *prepared = evidence,
                     Err(error) => {
                         let terminal = session.finish_unarmed()?;
                         let mut slot = terminal_slot.lock().map_err(|_| sync_extend_reconcile::ReconcileError::Invariant("Linux terminal token lock poisoned"))?;
@@ -346,9 +359,7 @@ impl LinuxDaemonOwner {
             terminal,
             terminal_receipt_output,
             helpers,
-            prepared_process_ids,
-            prepared_startup,
-            prepared_process_births,
+            prepared,
             ..
         } = self;
         let metadata = budget.checkpoint_closed();
@@ -372,9 +383,9 @@ impl LinuxDaemonOwner {
                         "native_operation_terminal": "REFUSED",
                         "owner_generation": owner.owner_generation(),
                         "process_ids": ids,
-                        "before_runtime_prepared_process_ids": prepared_process_ids,
-                        "before_runtime_prepared_startup_bytes": prepared_startup,
-                        "before_runtime_prepared_process_births": prepared_process_births,
+                        "before_runtime_prepared_process_ids": prepared.process_ids,
+                        "before_runtime_prepared_startup_bytes": prepared.startup_bytes,
+                        "before_runtime_prepared_process_births": prepared.process_births,
                         "terminal_stdout": [&refused.0, &refused.2],
                         "terminal_stderr": [&refused.1, &refused.3],
                         "original_two_helper_exits_confirmed": true,
@@ -449,9 +460,9 @@ impl LinuxDaemonOwner {
                 "owned_mount_released": true,
                 "owned_loop_released": true,
                 "helper_terminal": helper_terminal,
-                "before_runtime_prepared_process_ids": prepared_process_ids,
-                "before_runtime_prepared_startup_bytes": prepared_startup,
-                "before_runtime_prepared_process_births": prepared_process_births,
+                "before_runtime_prepared_process_ids": prepared.process_ids,
+                "before_runtime_prepared_startup_bytes": prepared.startup_bytes,
+                "before_runtime_prepared_process_births": prepared.process_births,
                 "prepared_is_not_armed_READY": true,
                 "original_guardian_ARM_budget_seconds": 2,
             });

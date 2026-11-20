@@ -25,6 +25,18 @@ pub struct OriginalNativeCreateFootprint {
 }
 
 impl OriginalNativeCreateFootprint {
+    /// The same bounded workload charged by the native history reservation.
+    /// Provides preflight accounting only; it does not reserve storage.
+    #[cfg(target_os = "linux")]
+    pub fn plan_linux(
+        baseline: &Manifest,
+        manifest: &Manifest,
+        path: &PortablePath,
+        replacement: bool,
+    ) -> Result<Self> {
+        Self::plan_native(baseline, manifest, path, if replacement { 2 } else { 3 })
+    }
+
     pub(super) fn plan_native(
         baseline: &Manifest,
         manifest: &Manifest,

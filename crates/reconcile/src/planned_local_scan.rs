@@ -127,6 +127,18 @@ impl LocalSpace {
                 "explicit single CREATE changed another original planner entry",
             ));
         }
+        #[cfg(target_os = "linux")]
+        if acquired_native {
+            // Reject a plan that cannot fit before persisting an active
+            // reservation. SQLite's own capacity is checked separately.
+            let footprint = sync_extend_journal::OriginalNativeCreateFootprint::plan_linux(
+                &prior,
+                &planned,
+                &path,
+                replacement,
+            )?;
+            self.reserve_internal_worktree(footprint.native_peak_bytes)?;
+        }
         let prospective_observations = self.scan_observations(&planned, &projected)?;
         self.journal.preflight_local_history_capacity(
             Some(&prior.root()?),
@@ -170,9 +182,7 @@ impl PlannedLocalCreateHistory<'_> {
     pub fn prior_manifest(&self) -> &Manifest {
         &self.prior
     }
-    pub(crate) fn reserve_original_native_internal_budget(&self, bytes: u64) -> Result<()> {
-        self.local.reserve_internal_worktree(bytes)
-    }
+    #[cfg(target_os = "linux")]
     pub(crate) fn write_original_planned_payload(
         &self,
         output: &mut impl std::io::Write,
@@ -180,6 +190,7 @@ impl PlannedLocalCreateHistory<'_> {
         self.local.cas.write_file(&self.content, output)?;
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     pub(crate) fn write_original_prior_payload(
         &self,
         content: &FileManifest,
