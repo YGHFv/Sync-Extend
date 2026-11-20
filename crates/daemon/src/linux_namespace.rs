@@ -70,7 +70,7 @@ pub struct LinuxDaemonOwner {
     worktree: PathBuf,
     terminal: Mutex<Option<OriginalPairTerminalRelease>>,
     terminal_receipt_output: Option<PathBuf>,
-    prepared: PreparedHelperEvidence,
+    prepared: Mutex<PreparedHelperEvidence>,
     delayed_helper_program: Option<OutsideHelperProgram>,
 }
 
@@ -117,7 +117,32 @@ pub fn prepare(cli: &Cli) -> Result<Option<LinuxDaemonOwner>> {
             return Err("fresh terminal receipt must remain outside the acquired worktree".into());
         }
     }
-    let (data_dir, initialize) = match &cli.command {
+    let webdav_gateway = match &cli.command {
+        Command::WebdavServe { config, .. } => Some(config.clone()),
+        Command::DeploymentRun { config } => {
+            match super::deployment::load(config)?.role {
+                sync_extend_core_model::deployment::DeploymentRole::WebdavClient {
+                    gateway_config, ..
+                } => Some(gateway_config),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let (data_dir, initialize) = if let Some(gateway) = &webdav_gateway {
+        let runtime = super::webdav::load(gateway)?;
+        let exported = runtime.listener.exports.iter().any(|export| {
+            runtime
+                .spaces
+                .get(&export.space_id)
+                .is_some_and(|path| path == &config.metadata_root)
+        });
+        if !exported {
+            return Err("Linux owner metadata root is not a configured DAV export".into());
+        }
+        (&config.metadata_root, false)
+    } else {
+        match &cli.command {
         Command::Init { data_dir, root } => {
             if root != &config.mount_root.join(&config.worktree_directory) {
                 return Err("init root differs from the explicit Linux owner worktree".into());
@@ -136,6 +161,7 @@ pub fn prepare(cli: &Cli) -> Result<Option<LinuxDaemonOwner>> {
         | Command::Snapshots { data_dir }
         | Command::SnapshotAudit { data_dir } => (data_dir, false),
         _ => return Err("this command does not use the explicit Linux local owner".into()),
+        }
     };
     if data_dir != &config.metadata_root {
         return Err("command metadata root differs from the explicit Linux owner".into());
@@ -161,7 +187,7 @@ pub fn prepare(cli: &Cli) -> Result<Option<LinuxDaemonOwner>> {
     // Publish keeps only the accepted pinned helper image during expensive
     // metadata/CAS/full-plan preparation. No child and no ARM has started.
     // Other ordinary commands retain their existing preparation/cancel path.
-    let delayed = matches!(&cli.command, Command::Publish { .. });
+    let delayed = matches!(&cli.command, Command::Publish { .. }) || webdav_gateway.is_some();
     let mut helpers = if delayed { None } else { Some(OutsideHelperSession::prepare(&owner, &helper)?) };
     let prepared =
         if let Some(session) = helpers.as_ref() {
@@ -234,7 +260,7 @@ pub fn prepare(cli: &Cli) -> Result<Option<LinuxDaemonOwner>> {
         worktree,
         terminal: Mutex::new(None),
         terminal_receipt_output: config.terminal_receipt_output,
-        prepared,
+        prepared: Mutex::new(prepared),
         delayed_helper_program: if delayed { Some(helper) } else { None },
     }))
 }
@@ -286,13 +312,15 @@ impl LinuxDaemonOwner {
         let program = self.delayed_helper_program.as_ref().ok_or("late helper program absent")?;
         let owner = &self.owner;
         let terminal_slot = &self.terminal;
-        let prepared = &mut self.prepared;
+        let prepared = &self.prepared;
         let mut helpers = self.helpers.lock().map_err(|_| "original Linux helper session lock poisoned")?;
         let (result, terminal) = local.publish_original_linux_native_file(
             source, path, owner, &self.budget, &mut helpers, || {
                 let session = OutsideHelperSession::prepare(owner, program)?;
                 match capture_prepared(owner, &session) {
-                    Ok(evidence) => *prepared = evidence,
+                    Ok(evidence) => {
+                        *prepared.lock().map_err(|_| sync_extend_reconcile::ReconcileError::Invariant("Linux prepared helper evidence lock poisoned"))? = evidence;
+                    }
                     Err(error) => {
                         let terminal = session.finish_unarmed()?;
                         let mut slot = terminal_slot.lock().map_err(|_| sync_extend_reconcile::ReconcileError::Invariant("Linux terminal token lock poisoned"))?;
@@ -340,6 +368,87 @@ impl LinuxDaemonOwner {
         )
     }
 
+    pub fn owns_metadata_root(&self, data: &Path) -> bool {
+        data == self.metadata_root
+    }
+
+    pub fn commit_webdav_upload(
+        &self,
+        local: &mut LocalSpace,
+        request: sync_extend_reconcile::LinuxNativeWebDavPut,
+        source: &std::fs::File,
+    ) -> sync_extend_reconcile::Result<sync_extend_reconcile::PublishResult> {
+        if self
+            .terminal
+            .lock()
+            .map_err(|_| {
+                sync_extend_reconcile::ReconcileError::Invariant(
+                    "Linux terminal token lock poisoned",
+                )
+            })?
+            .is_some()
+        {
+            return Err(sync_extend_reconcile::ReconcileError::Invariant(
+                "Linux native publisher already used for this daemon owner",
+            ));
+        }
+        let mut helpers = self.helpers.lock().map_err(|_| {
+            sync_extend_reconcile::ReconcileError::Invariant(
+                "Linux helper session lock poisoned",
+            )
+        })?;
+        if helpers.is_some() {
+            return Err(sync_extend_reconcile::ReconcileError::Invariant(
+                "Linux native WebDAV requires delayed original helper preparation",
+            ));
+        }
+        let program = self.delayed_helper_program.as_ref().ok_or(
+            sync_extend_reconcile::ReconcileError::Invariant("late helper program absent"),
+        )?;
+        let (result, terminal) = local.commit_linux_native_webdav_put(
+            request,
+            source,
+            &self.owner,
+            &self.budget,
+            &mut helpers,
+            || {
+                let session = OutsideHelperSession::prepare(&self.owner, program)?;
+                match capture_prepared(&self.owner, &session) {
+                    Ok(evidence) => {
+                        *self.prepared.lock().map_err(|_| {
+                            sync_extend_reconcile::ReconcileError::Invariant(
+                                "Linux prepared helper evidence lock poisoned",
+                            )
+                        })? = evidence;
+                    }
+                    Err(error) => {
+                        let terminal = session.finish_unarmed()?;
+                        let mut slot = self.terminal.lock().map_err(|_| {
+                            sync_extend_reconcile::ReconcileError::Invariant(
+                                "Linux terminal token lock poisoned",
+                            )
+                        })?;
+                        if slot.is_some() {
+                            return Err(sync_extend_reconcile::ReconcileError::Invariant(
+                                "original terminal already retained",
+                            ));
+                        }
+                        *slot = Some(terminal);
+                        return Err(error.into());
+                    }
+                }
+                Ok(session)
+            },
+        )?;
+        drop(helpers);
+        self.retain_terminal(terminal).map_err(|_| {
+            sync_extend_reconcile::ReconcileError::Invariant(
+                "original terminal token could not be retained",
+            )
+        })?;
+        Ok(result)
+    }
+
     pub fn retain_terminal(&self, terminal: OriginalPairTerminalRelease) -> Result<()> {
         let mut retained = self
             .terminal
@@ -370,6 +479,9 @@ impl LinuxDaemonOwner {
         let helpers = helpers
             .into_inner()
             .map_err(|_| "Linux helper session lock poisoned")?;
+        let prepared = prepared
+            .into_inner()
+            .map_err(|_| "Linux prepared helper evidence lock poisoned")?;
         if let Some(helpers) = helpers {
             if terminal.is_some() {
                 return Err("both live helper session and terminal token were retained".into());

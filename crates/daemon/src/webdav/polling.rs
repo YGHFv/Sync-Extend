@@ -27,10 +27,22 @@ impl Polling {
         runtime: &Runtime,
         limits: &LocalLimits,
         interval_secs: u64,
+        #[cfg(target_os = "linux")] linux_owner: Option<&super::super::linux_namespace::LinuxDaemonOwner>,
     ) -> Result<Self, ReconcileError> {
         let mut spaces = BTreeMap::new();
         for (id, path) in &runtime.spaces {
-            let local = LocalSpace::open_with_limits(path, limits.clone())?;
+            let local = {
+                #[cfg(target_os = "linux")]
+                if let Some(owner) = linux_owner.filter(|owner| owner.owns_metadata_root(path)) {
+                    owner.open(path, limits.clone())?
+                } else {
+                    LocalSpace::open_with_limits(path, limits.clone())?
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    LocalSpace::open_with_limits(path, limits.clone())?
+                }
+            };
             if &local.space_id != id {
                 return Err(ReconcileError::Invariant(
                     "WebDAV polling space identity differs from configuration",

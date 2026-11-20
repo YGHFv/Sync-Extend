@@ -164,14 +164,12 @@ pub(crate) fn preflight(
     let mut tables = Vec::new();
     for table in specs {
         let remaining = max_rows as u64 - total_rows;
-        let count: i64 = connection.query_row(
-            &format!(
+        let count: i64 = connection
+            .prepare_cached(&format!(
                 "SELECT count(*) FROM (SELECT 1 FROM main.{} LIMIT ?1)",
                 table.name
-            ),
-            [remaining as i64 + 1],
-            |r| r.get(0),
-        )?;
+            ))?
+            .query_row([remaining as i64 + 1], |r| r.get(0))?;
         let count = u64::try_from(count).map_err(|_| invalid("storage inventory row count"))?;
         total_rows = add(total_rows, count)?;
         if total_rows > max_rows as u64 {

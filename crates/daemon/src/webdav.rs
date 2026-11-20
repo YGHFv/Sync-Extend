@@ -104,6 +104,9 @@ pub fn serve(
     #[cfg(any(target_os = "linux", target_os = "android"))] control: Option<
         crate::local_control::GatewaySlot,
     >,
+    #[cfg(target_os = "linux")] linux_owner: Option<
+        std::sync::Arc<super::linux_namespace::LinuxDaemonOwner>,
+    >,
 ) -> Result<(), Box<dyn std::error::Error>> {
     runtime.listener.validate()?;
     runtime.validate_polling(scan_interval_secs)?;
@@ -130,7 +133,13 @@ pub fn serve(
         .then(|| Gateway::bind(&runtime))
         .transpose()?;
     let mut polling = scan_interval_secs
-        .map(|interval| polling::Polling::open(&runtime, &limits, interval))
+        .map(|interval| polling::Polling::open(
+            &runtime,
+            &limits,
+            interval,
+            #[cfg(target_os = "linux")]
+            linux_owner.as_deref(),
+        ))
         .transpose()?;
     let mut locks = Locks::default();
     let mut requests = 0u64;
@@ -187,6 +196,8 @@ pub fn serve(
             stream,
             peer,
             tls.as_ref(),
+            #[cfg(target_os = "linux")]
+            linux_owner.as_deref(),
         )?;
         requests += 1;
         if requests == runtime.listener.max_requests {
@@ -234,6 +245,7 @@ fn handle_connection(
     stream: std::net::TcpStream,
     peer: SocketAddr,
     tls: Option<&Arc<rustls::ServerConfig>>,
+    #[cfg(target_os = "linux")] linux_owner: Option<&super::linux_namespace::LinuxDaemonOwner>,
 ) -> std::io::Result<()> {
     if !runtime.host_loopback_tls.as_ref().map_or_else(
         || peer.ip().is_loopback(),
@@ -293,6 +305,8 @@ fn handle_connection(
         &request,
         &mut connection,
         polling,
+        #[cfg(target_os = "linux")]
+        linux_owner,
     ) {
         if !connection.response_started {
             let _ = http::response(
@@ -366,6 +380,7 @@ fn dispatch(
     request: &Request,
     stream: &mut Connection,
     polling: Option<&mut polling::Polling>,
+    #[cfg(target_os = "linux")] linux_owner: Option<&super::linux_namespace::LinuxDaemonOwner>,
 ) -> Result<(), u16> {
     let write = !matches!(
         request.method.as_str(),
@@ -375,14 +390,29 @@ fn dispatch(
         .listener
         .authorize(account, &request.target, write)
         .map_err(|_| 403u16)?;
+    let data = runtime.spaces.get(&authorized.space_id).ok_or(403u16)?;
+    let native_write_supported = {
+        #[cfg(windows)]
+        {
+            authorized.allow_native_windows_writes
+        }
+        #[cfg(target_os = "linux")]
+        {
+            linux_owner.is_some_and(|owner| owner.owns_metadata_root(data))
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            false
+        }
+    };
     if matches!(
         request.method.as_str(),
         "PUT" | "DELETE" | "MOVE" | "COPY" | "MKCOL"
-    ) && (!cfg!(windows) || !authorized.allow_native_windows_writes)
+    ) && (!native_write_supported
+        || (cfg!(target_os = "linux") && request.method != "PUT"))
     {
         return Err(501);
     }
-    let data = runtime.spaces.get(&authorized.space_id).ok_or(403u16)?;
     // Read and parse bounded XML metadata before opening LocalSpace.
     // Authentication and path authorization above still run first; this keeps
     // the original connection deadline from expiring during durable baseline work.
@@ -404,7 +434,18 @@ fn dispatch(
     let local = if let Some(polling) = polling {
         polling.local(&authorized.space_id)?
     } else {
-        transient = LocalSpace::open_with_limits(data, limits.clone()).map_err(|_| 503u16)?;
+        transient = {
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = linux_owner.filter(|owner| owner.owns_metadata_root(data)) {
+            owner.open(data, limits.clone()).map_err(|_| 503u16)?
+        } else {
+            LocalSpace::open_with_limits(data, limits.clone()).map_err(|_| 503u16)?
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            LocalSpace::open_with_limits(data, limits.clone()).map_err(|_| 503u16)?
+        }
+        };
         &mut transient
     };
     if local.space_id != authorized.space_id {
@@ -471,17 +512,35 @@ fn dispatch(
             if request.content_length != 0 {
                 return Err(400);
             }
+            let writable = runtime
+                .listener
+                .authorize(account, &request.target, true)
+                .is_ok();
+            let allow = if writable && native_write_supported {
+                #[cfg(windows)]
+                {
+                    "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MOVE, COPY, MKCOL, LOCK, UNLOCK"
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    "OPTIONS, PROPFIND, GET, HEAD, PUT, LOCK, UNLOCK"
+                }
+                #[cfg(not(any(windows, target_os = "linux")))]
+                {
+                    "OPTIONS, PROPFIND, GET, HEAD, LOCK, UNLOCK"
+                }
+            } else if writable {
+                "OPTIONS, PROPFIND, GET, HEAD, LOCK, UNLOCK"
+            } else {
+                "OPTIONS, PROPFIND, GET, HEAD"
+            };
             http::response(
                 stream,
                 200,
                 b"",
                 &[
                     ("DAV", "1, 2".into()),
-                    (
-                        "Allow",
-                        "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MOVE, COPY, LOCK, UNLOCK"
-                            .into(),
-                    ),
+                    ("Allow", allow.into()),
                 ],
                 false,
             )
@@ -595,6 +654,18 @@ fn dispatch(
             local
                 .admit_webdav_upload(request.content_length)
                 .map_err(core_status)?;
+            #[cfg(target_os = "linux")]
+            let native_request = {
+                let expected = baseline.snapshot_id().map_err(core_status)?;
+                Some(
+                    local
+                        .admit_linux_native_webdav_put(
+                            &expected,
+                            authorized.path.as_ref().ok_or(405u16)?,
+                        )
+                        .map_err(core_status)?,
+                )
+            };
             // Start reception after all local capacity and baseline checks.
             // The configured ten-second body phase remains finite even when
             // native admission took longer than the header phase.
@@ -621,13 +692,32 @@ fn dispatch(
                     ReceiveError::Storage => 507u16,
                 })?;
             upload.verify().map_err(|_| 409u16)?;
-            let result = local
-                .commit_webdav_upload(
-                    &baseline,
-                    authorized.path.as_ref().ok_or(405u16)?,
-                    upload.reader(),
-                )
-                .map_err(core_status)?;
+            let result = {
+                #[cfg(target_os = "linux")]
+                {
+                    let owner = linux_owner.ok_or(501u16)?;
+                    let request = native_request.ok_or(409u16)?;
+                    let published = owner
+                        .commit_webdav_upload(local, request, upload.reader())
+                        .map_err(core_status)?;
+                    WebDavCommit {
+                        transaction_id: published.transaction_id,
+                        snapshot_id: published.snapshot_id,
+                        local_committed: published.local_committed,
+                        remote_backup_complete: published.remote_backup_complete,
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    local
+                        .commit_webdav_upload(
+                            &baseline,
+                            authorized.path.as_ref().ok_or(405u16)?,
+                            upload.reader(),
+                        )
+                        .map_err(core_status)?
+                }
+            };
             upload.verify().map_err(|_| 409u16)?;
             committed(stream, if entry.is_some() { 204 } else { 201 }, &result)
         }

@@ -1,12 +1,11 @@
 //! Normal single-file native publication and transaction-specific cleanup.
 //! Immutable history/Final/THAWED receipts survive every cleanup invocation.
 use crate::{LocalSpace, ReconcileError, Result};
-use std::{fs, os::unix::fs::DirBuilderExt, path::Path};
-use sync_extend_core_model::{ContentId, EntryId, PortablePath};
+use std::path::Path;
+use sync_extend_core_model::{EntryId, Manifest, PortablePath};
 use sync_extend_platform_fs::{
     LinuxCleanupAbsenceObservation, LinuxMetadataBudget, LinuxNamespaceCapability,
     LinuxOutsideCleanupBoundary, OriginalPairTerminalRelease, OutsideHelperSession,
-    OutsidePrivateIntentOwner,
 };
 
 impl LocalSpace {
@@ -26,6 +25,35 @@ impl LocalSpace {
         helpers: &mut Option<OutsideHelperSession>,
         prepare_helpers: impl FnOnce() -> Result<OutsideHelperSession>,
     ) -> Result<(crate::PublishResult, OriginalPairTerminalRelease)> {
+        self.validate_original_native_publisher(owner, budget, helpers)?;
+        self.scan_without_recovery()?;
+        let plan = self.plan_local_file_native_history(source, path)?;
+        plan.publish_original_linux_native(owner, budget, helpers, prepare_helpers)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn publish_original_linux_native_upload(
+        &mut self,
+        baseline: &Manifest,
+        source: &std::fs::File,
+        path: PortablePath,
+        owner: &LinuxNamespaceCapability,
+        budget: &LinuxMetadataBudget,
+        helpers: &mut Option<OutsideHelperSession>,
+        prepare_helpers: impl FnOnce() -> Result<OutsideHelperSession>,
+    ) -> Result<(crate::PublishResult, OriginalPairTerminalRelease)> {
+        self.validate_original_native_publisher(owner, budget, helpers)?;
+        self.scan_without_recovery()?;
+        let plan = self.plan_local_native_upload_history(baseline, path, source)?;
+        plan.publish_original_linux_native(owner, budget, helpers, prepare_helpers)
+    }
+
+    fn validate_original_native_publisher(
+        &self,
+        owner: &LinuxNamespaceCapability,
+        budget: &LinuxMetadataBudget,
+        helpers: &Option<OutsideHelperSession>,
+    ) -> Result<()> {
         self.verify_root()?;
         budget.validate_namespace_owner(owner)?;
         let original = self
@@ -40,175 +68,21 @@ impl LocalSpace {
             ));
         }
         if helpers.is_some() {
-            return Err(ReconcileError::Invariant("native full planning requires helpers not yet started"));
-        }
-        self.require_no_mutation()?;
-        if !self.journal.outstanding_publications(&self.space_id)?.is_empty() {
-            return Err(ReconcileError::Invariant("native planning cannot recover a legacy worktree publication before ARM"));
-        }
-        self.scan_without_recovery()?;
-        let worktree = self.worktree.clone();
-        let intent_parent = self.data_dir.join("native-intents");
-        if !intent_parent.try_exists()? {
-            fs::DirBuilder::new().mode(0o700).create(&intent_parent)?;
-            fs::File::open(&self.data_dir)?.sync_all()?;
-        }
-        let volume = owner.volume();
-        let outside = OutsidePrivateIntentOwner::open(&intent_parent, volume)?;
-        let mut plan = self.plan_local_file_native_history(source, path.clone())?;
-        let attempt_id = plan.original_reservation().attempt().clone();
-        let prior_content = plan
-            .prior_manifest()
-            .entries
-            .values()
-            .find(|entry| entry.path == path)
-            .and_then(|entry| entry.content.clone());
-        let content = plan.content().clone();
-        let mut payload = Vec::new();
-        plan.write_original_planned_payload(&mut payload)?;
-        if payload.len() as u64 != content.length || ContentId::hash(&payload) != content.content_id
-        {
             return Err(ReconcileError::Invariant(
-                "native planned payload differs from original CAS",
+                "native full planning requires helpers not yet started",
             ));
         }
-        let prior_payload = if let Some(prior) = &prior_content {
-            let mut bytes = Vec::new();
-            plan.write_original_prior_payload(prior, &mut bytes)?;
-            if bytes.len() as u64 != prior.length || ContentId::hash(&bytes) != prior.content_id {
-                return Err(ReconcileError::Invariant(
-                    "native retained prior payload differs from original CAS",
-                ));
-            }
-            Some(bytes)
-        } else {
-            None
-        };
-        let intent_bytes = plan.intent_evidence_bytes()?;
-        let intent =
-            outside.create_intent(&format!("intent-{attempt_id}"), &intent_bytes, volume)?;
-        plan.observe_original_outside_intent(&intent, volume)?;
-        plan.observe_original_create_request(&intent, volume)?;
-        let relative_parent = worktree.join(
-            path.parent()
-                .map_or(String::new(), |parent| parent.to_string()),
-        );
-        let relative_parent = relative_parent
-            .strip_prefix(owner.mount_path())
-            .map_err(|_| ReconcileError::Invariant("native parent escaped acquired mount"))?;
-        let parent = volume.directory(relative_parent)?;
-        let component = path
-            .as_str()
-            .rsplit('/')
-            .next()
-            .ok_or(ReconcileError::Invariant("native target component absent"))?;
-        let old = if prior_content.is_some() {
-            Some(parent.writer_excluded_original(component)?)
-        } else {
-            None
-        };
-        let freeze = volume.prepare_original_pair_freeze()?;
-        // SQL/CAS/full-plan, retained descriptor and outside intent preparation
-        // finish before the actual PREPARED children begin their unchanged 3s
-        // wait. The caller still runs on the original pre-runtime owner thread.
-        *helpers = Some(prepare_helpers()?);
-        let session = helpers.as_mut().ok_or(ReconcileError::Invariant(
-            "original late prepared helper session absent",
-        ))?;
-        owner.verify_prepared_helpers(session)?;
-        // Both actual ARM READY lines precede the first protected worktree effect.
-        session.arm(attempt_id.as_str())?;
-        let native = owner.admit_native_attempt(session.pair())?;
-        budget.validate_native_attempt(&native)?;
-        native.verify()?;
-        let mut created =
-            parent.create_original_file(&format!("stage-{attempt_id}"), content.length.max(1))?;
-        native.verify()?;
-        plan.observe_original_empty_create(&intent, volume, &created)?;
-        native.verify()?;
-        if !payload.is_empty() {
-            created.observe_preallocated_original_payload(payload.len() as u64)?;
-            native.verify()?;
+        self.require_no_mutation()?;
+        if !self
+            .journal
+            .outstanding_publications(&self.space_id)?
+            .is_empty()
+        {
+            return Err(ReconcileError::Invariant(
+                "native planning cannot recover a legacy worktree publication before ARM",
+            ));
         }
-        created.write_all_bounded(&payload)?;
-        native.verify()?;
-        created.sync_original_and_parents()?;
-        native.verify()?;
-        let transaction = if old.is_some() {
-            Some(parent.create_original_transaction_directory(attempt_id.as_str())?)
-        } else {
-            None
-        };
-        native.verify()?;
-        let retained = match (old, transaction.as_ref(), prior_payload.as_ref()) {
-            (Some(original), Some(transaction), Some(prior_payload)) => Some(
-                original.retain_in_original_transaction(transaction, "original", prior_payload)?,
-            ),
-            (None, None, None) => None,
-            _ => {
-                return Err(ReconcileError::Invariant(
-                    "native replacement original transaction incomplete",
-                ))
-            }
-        };
-        native.verify()?;
-        created.rename_in_same_parent_no_replace(component)?;
-        native.verify()?;
-        plan.observe_original_published_create(&intent, volume, &created)?;
-        native.verify()?;
-        let frozen = freeze.freeze_for_original_pair_diagnostic(session.pair())?;
-        native.verify()?;
-        let (result, history) = plan.commit_after_original_native_observation()?;
-        native.verify()?;
-        let final_observation = crate::observe_original_linux_native_final(
-            &created,
-            &intent,
-            volume,
-            &frozen,
-            session.pair(),
-            &result,
-            history,
-        )?;
-        self.journal.record_original_linux_native_final(
-            &native,
-            budget,
-            &intent,
-            &intent_parent,
-            &worktree,
-            &created,
-            retained.as_ref(),
-            &frozen,
-            session.pair(),
-            final_observation.original_history_receipt(),
-            self.limits.max_storage_entries,
-        )?;
-        native.verify()?;
-        drop(final_observation);
-        drop(native);
-        drop(frozen);
-        let session = helpers.take().ok_or(ReconcileError::Invariant(
-            "original armed session escaped owner",
-        ))?;
-        let terminal = session.finish_committed()?;
-        self.journal.record_original_linux_committed_thaw(
-            owner,
-            &terminal,
-            &attempt_id,
-            self.limits.max_storage_entries,
-        )?;
-        budget.verify()?;
-        Ok((
-            crate::PublishResult {
-                transaction_id: attempt_id,
-                requested_path: path.clone(),
-                published_path: path,
-                conflict_copy: false,
-                snapshot_id: result.snapshot_id,
-                local_committed: true,
-                remote_backup_complete: false,
-            },
-            terminal,
-        ))
+        Ok(())
     }
 
     pub fn cleanup_original_linux_native(

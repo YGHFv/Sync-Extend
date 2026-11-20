@@ -1,5 +1,7 @@
 //! Exact pre-effect local history plan; native ownership must be supplied separately.
-use crate::{LocalSpace, ReconcileError, Result, ScanResult};
+use crate::{scan, LocalSpace, ReconcileError, Result, ScanResult};
+#[cfg(target_os = "linux")]
+use std::fs::File;
 use sync_extend_core_model::{
     ContentId, EntryKind, FileManifest, Manifest, Operation, PortablePath, SnapshotId,
 };
@@ -51,8 +53,14 @@ impl LocalSpace {
             // Preparing the acquired native attempt may not run legacy worktree
             // recovery while no original helper has started. Refuse that work.
             self.require_no_mutation()?;
-            if !self.journal.outstanding_publications(&self.space_id)?.is_empty() {
-                return Err(ReconcileError::Invariant("native planning requires explicit legacy publication recovery first"));
+            if !self
+                .journal
+                .outstanding_publications(&self.space_id)?
+                .is_empty()
+            {
+                return Err(ReconcileError::Invariant(
+                    "native planning requires explicit legacy publication recovery first",
+                ));
             }
         } else {
             self.recover()?;
@@ -89,7 +97,168 @@ impl LocalSpace {
             ));
         }
         let content = self.import_source(source)?;
+        self.plan_local_native_content_history(
+            prior,
+            first,
+            path,
+            allow_replacement,
+            content,
+            acquired_native,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn plan_local_native_upload_history<'a>(
+        &'a mut self,
+        baseline: &Manifest,
+        path: PortablePath,
+        source: &File,
+    ) -> Result<PlannedLocalCreateHistory<'a>> {
+        self.require_no_mutation()?;
+        if self.linux_namespace.is_none()
+            || !self
+                .journal
+                .outstanding_publications(&self.space_id)?
+                .is_empty()
+        {
+            return Err(ReconcileError::Invariant(
+                "Linux upload plan requires its original idle namespace owner",
+            ));
+        }
+        self.verify_root()?;
+        let prior = self.manifest()?.ok_or(ReconcileError::Invariant(
+            "pre-effect original baseline required",
+        ))?;
+        if &prior != baseline {
+            return Err(ReconcileError::Unstable);
+        }
+        let first = self.stable_scan()?;
+        if crate::build_manifest(&prior, &first, &Default::default())? != prior {
+            return Err(ReconcileError::Unstable);
+        }
+        self.validate_native_upload_slot(&prior, &first, &path)?;
+        let content = self.import_original_anonymous_upload(source)?;
+        self.plan_local_native_content_history(prior, first, path, true, content, true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_native_upload_slot(
+        &self,
+        prior: &Manifest,
+        first: &scan::Scan,
+        path: &PortablePath,
+    ) -> Result<()> {
+        let replaced = prior.entries.values().find(|entry| entry.path == *path);
+        let replacement = replaced.is_some();
+        if first.keys().any(|present| {
+            present.collision_key() == path.collision_key() && (!replacement || present != path)
+        }) || (!replacement && self.occupied(path)?)
+            || replaced.is_some_and(|entry| entry.kind != EntryKind::File)
+            || path
+                .as_str()
+                .split('/')
+                .any(|component| component.starts_with('.'))
+        {
+            return Err(ReconcileError::Invariant(
+                "pre-effect baseline or exact visible file slot differs",
+            ));
+        }
+        let parent = self.parent_for(path)?;
+        if std::fs::symlink_metadata(&parent)?.file_type().is_symlink() {
+            return Err(ReconcileError::Invariant(
+                "pre-effect original parent required",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn import_original_anonymous_upload(&self, source: &File) -> Result<FileManifest> {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::unix::fs::MetadataExt;
+
+        let before = source.metadata()?;
+        if !before.is_file() {
+            return Err(ReconcileError::Invariant(
+                "Linux DAV upload requires an anonymous regular file",
+            ));
+        }
+        if before.nlink() != 0 {
+            return Err(ReconcileError::Invariant(
+                "Linux DAV upload descriptor is not anonymous",
+            ));
+        }
+        if before.len() > self.limits.max_file_bytes || before.len() > self.limits.max_staging_bytes
+        {
+            return Err(ReconcileError::ResourceLimit("DAV upload bytes"));
+        }
+        let identity = (before.dev(), before.ino(), before.len());
+        let times = (
+            before.mtime(),
+            before.mtime_nsec(),
+            before.ctime(),
+            before.ctime_nsec(),
+        );
+        let mut reader = source.try_clone()?;
+        reader.seek(SeekFrom::Start(0))?;
+        let content = self.cas.import_bounded(
+            reader.take(before.len().saturating_add(1)),
+            before.len(),
+            self.limits.max_scan_chunks,
+        )?;
+        let after = source.metadata()?;
+        if content.length != before.len()
+            || (after.dev(), after.ino(), after.len()) != identity
+            || (
+                after.mtime(),
+                after.mtime_nsec(),
+                after.ctime(),
+                after.ctime_nsec(),
+            ) != times
+        {
+            return Err(ReconcileError::Unstable);
+        }
+        Ok(content)
+    }
+
+    fn plan_local_native_content_history<'a>(
+        &'a mut self,
+        prior: Manifest,
+        first: scan::Scan,
+        path: PortablePath,
+        allow_replacement: bool,
+        content: FileManifest,
+        acquired_native: bool,
+    ) -> Result<PlannedLocalCreateHistory<'a>> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = acquired_native;
+        self.verify_root()?;
+        let existing = crate::build_manifest(&prior, &first, &Default::default())?;
         self.check_publication_limits(&content)?;
+        let replaced = prior.entries.values().find(|entry| entry.path == path);
+        let replacement = allow_replacement && replaced.is_some();
+        if existing != prior
+            || first.keys().any(|present| {
+                present.collision_key() == path.collision_key()
+                    && (!replacement || present != &path)
+            })
+            || (!replacement && self.occupied(&path)?)
+            || replaced.is_some_and(|entry| entry.kind != EntryKind::File)
+            || path
+                .as_str()
+                .split('/')
+                .any(|component| component.starts_with('.'))
+        {
+            return Err(ReconcileError::Invariant(
+                "pre-effect baseline or exact absent path differs",
+            ));
+        }
+        let parent = self.parent_for(&path)?;
+        if std::fs::symlink_metadata(&parent)?.file_type().is_symlink() {
+            return Err(ReconcileError::Invariant(
+                "pre-effect original parent required",
+            ));
+        }
         if let Some(original) = replaced.and_then(|entry| entry.content.as_ref()) {
             if !replacement || original == &content {
                 return Err(ReconcileError::Invariant(
@@ -178,7 +347,7 @@ impl LocalSpace {
     }
 }
 
-impl PlannedLocalCreateHistory<'_> {
+impl<'a> PlannedLocalCreateHistory<'a> {
     pub fn prior_manifest(&self) -> &Manifest {
         &self.prior
     }
@@ -399,26 +568,40 @@ impl PlannedLocalCreateHistory<'_> {
     /// scans and full original builder remain mandatory before Journal effects.
     pub fn commit_after_original_native_observation(
         self,
-    ) -> Result<(ScanResult, OriginalReservedHistoryCommitReceipt)> {
-        self.local.verify_root()?;
-        self.local.require_no_mutation()?;
-        if self.local.manifest()?.as_ref() != Some(&self.prior) {
+    ) -> Result<(
+        ScanResult,
+        OriginalReservedHistoryCommitReceipt,
+        &'a mut LocalSpace,
+    )> {
+        let PlannedLocalCreateHistory {
+            local,
+            prior,
+            planned,
+            operations,
+            path,
+            content,
+            timestamp,
+            reservation,
+        } = self;
+        local.verify_root()?;
+        local.require_no_mutation()?;
+        if local.manifest()?.as_ref() != Some(&prior) {
             return Err(ReconcileError::Invariant(
                 "planned original baseline changed",
             ));
         }
-        let scanned = self.local.stable_scan()?;
-        let observed = scanned.get(&self.path).ok_or(ReconcileError::Unstable)?;
+        let scanned = local.stable_scan()?;
+        let observed = scanned.get(&path).ok_or(ReconcileError::Unstable)?;
         if observed.kind != EntryKind::File
-            || observed.content.as_ref() != Some(&self.content)
+            || observed.content.as_ref() != Some(&content)
             || !observed.single_link
         {
             return Err(ReconcileError::Unstable);
         }
-        let built = crate::build_manifest(&self.prior, &scanned, &Default::default())?;
-        if built.entries.len() != self.planned.entries.len()
+        let built = crate::build_manifest(&prior, &scanned, &Default::default())?;
+        if built.entries.len() != planned.entries.len()
             || built.entries.values().any(|entry| {
-                !self.planned.entries.values().any(|planned| {
+                !planned.entries.values().any(|planned| {
                     planned.path == entry.path
                         && planned.kind == entry.kind
                         && planned.content == entry.content
@@ -429,50 +612,45 @@ impl PlannedLocalCreateHistory<'_> {
                 "original planner actual tree differs",
             ));
         }
-        let mut expected = self.planned.clone();
+        let mut expected = planned.clone();
         // Replay the exact shared planner operation builder against the same
         // prior version vector. IDs and timestamp remain the pre-effect choices.
-        expected.version_vector = self.prior.version_vector.clone();
-        let operations = self.local.original_local_history_operations(
-            &self.prior,
-            &mut expected,
-            self.timestamp,
-        )?;
-        if expected != self.planned || operations != self.operations {
+        expected.version_vector = prior.version_vector.clone();
+        let replayed_operations =
+            local.original_local_history_operations(&prior, &mut expected, timestamp)?;
+        if expected != planned || replayed_operations != operations {
             return Err(ReconcileError::Invariant(
                 "pre-effect original full operation list differs",
             ));
         }
-        for entry in self.planned.entries.values() {
+        for entry in planned.entries.values() {
             if let Some(content) = &entry.content {
-                self.local.cas.verify(content)?;
+                local.cas.verify(content)?;
             }
         }
-        let observations = self.local.scan_observations(&self.planned, &scanned)?;
+        let observations = local.scan_observations(&planned, &scanned)?;
         crate::fault::checkpoint("before_planned_local_history_commit");
-        let receipt = self.local.journal.commit_original_reserved_history(
-            self.reservation,
-            Some(&self.prior.root()?),
-            &self.planned,
-            &self.operations,
-            self.timestamp,
+        let receipt = local.journal.commit_original_reserved_history(
+            reservation,
+            Some(&prior.root()?),
+            &planned,
+            &operations,
+            timestamp,
             &observations,
-            self.local.limits.max_storage_entries,
+            local.limits.max_storage_entries,
         )?;
         crate::fault::checkpoint("after_planned_local_history_commit");
         let result = ScanResult {
-            space_id: self.planned.space_id.clone(),
+            space_id: planned.space_id.clone(),
             snapshot_id: receipt.snapshot().clone(),
-            entries: self.planned.entries.len(),
-            operations: self.operations.len(),
-            files: self
-                .planned
+            entries: planned.entries.len(),
+            operations: operations.len(),
+            files: planned
                 .entries
                 .values()
                 .filter(|entry| entry.kind == EntryKind::File)
                 .count(),
-            logical_bytes: self
-                .planned
+            logical_bytes: planned
                 .entries
                 .values()
                 .filter_map(|entry| entry.content.as_ref())
@@ -480,6 +658,195 @@ impl PlannedLocalCreateHistory<'_> {
                 .sum(),
             network_enabled: false,
         };
-        Ok((result, receipt))
+        Ok((result, receipt, local))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn publish_original_linux_native(
+        mut self,
+        owner: &sync_extend_platform_fs::LinuxNamespaceCapability,
+        budget: &sync_extend_platform_fs::LinuxMetadataBudget,
+        helpers: &mut Option<sync_extend_platform_fs::OutsideHelperSession>,
+        prepare_helpers: impl FnOnce() -> Result<sync_extend_platform_fs::OutsideHelperSession>,
+    ) -> Result<(
+        crate::PublishResult,
+        sync_extend_platform_fs::OriginalPairTerminalRelease,
+    )> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let path = self.path.clone();
+        let worktree = self.local.worktree.clone();
+        let intent_parent = self.local.data_dir.join("native-intents");
+        if !intent_parent.try_exists()? {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&intent_parent)?;
+            std::fs::File::open(&self.local.data_dir)?.sync_all()?;
+        }
+        let volume = owner.volume();
+        let outside =
+            sync_extend_platform_fs::OutsidePrivateIntentOwner::open(&intent_parent, volume)?;
+        let attempt_id = self.original_reservation().attempt().clone();
+        let prior_content = self
+            .prior_manifest()
+            .entries
+            .values()
+            .find(|entry| entry.path == path)
+            .and_then(|entry| entry.content.clone());
+        let content = self.content().clone();
+        let mut payload = Vec::new();
+        self.write_original_planned_payload(&mut payload)?;
+        if payload.len() as u64 != content.length || ContentId::hash(&payload) != content.content_id
+        {
+            return Err(ReconcileError::Invariant(
+                "native planned payload differs from original CAS",
+            ));
+        }
+        let prior_payload = if let Some(prior) = &prior_content {
+            let mut bytes = Vec::new();
+            self.write_original_prior_payload(prior, &mut bytes)?;
+            if bytes.len() as u64 != prior.length || ContentId::hash(&bytes) != prior.content_id {
+                return Err(ReconcileError::Invariant(
+                    "native retained prior payload differs from original CAS",
+                ));
+            }
+            Some(bytes)
+        } else {
+            None
+        };
+        let intent_bytes = self.intent_evidence_bytes()?;
+        let intent =
+            outside.create_intent(&format!("intent-{attempt_id}"), &intent_bytes, volume)?;
+        self.observe_original_outside_intent(&intent, volume)?;
+        self.observe_original_create_request(&intent, volume)?;
+        let relative_parent = worktree.join(
+            path.parent()
+                .map_or(String::new(), |parent| parent.to_string()),
+        );
+        let relative_parent = relative_parent
+            .strip_prefix(owner.mount_path())
+            .map_err(|_| ReconcileError::Invariant("native parent escaped acquired mount"))?;
+        let parent = volume.directory(relative_parent)?;
+        let component = path
+            .as_str()
+            .rsplit('/')
+            .next()
+            .ok_or(ReconcileError::Invariant("native target component absent"))?;
+        let old = if prior_content.is_some() {
+            Some(parent.writer_excluded_original(component)?)
+        } else {
+            None
+        };
+        let freeze = volume.prepare_original_pair_freeze()?;
+        *helpers = Some(prepare_helpers()?);
+        let session = helpers.as_mut().ok_or(ReconcileError::Invariant(
+            "original late prepared helper session absent",
+        ))?;
+        owner.verify_prepared_helpers(session)?;
+        session.arm(attempt_id.as_str())?;
+        let native = owner.admit_native_attempt(session.pair())?;
+        budget.validate_native_attempt(&native)?;
+        native.verify()?;
+        let mut created =
+            parent.create_original_file(&format!("stage-{attempt_id}"), content.length.max(1))?;
+        native.verify()?;
+        self.observe_original_empty_create(&intent, volume, &created)?;
+        native.verify()?;
+        if !payload.is_empty() {
+            created.observe_preallocated_original_payload(payload.len() as u64)?;
+            native.verify()?;
+        }
+        created.write_all_bounded(&payload)?;
+        native.verify()?;
+        created.sync_original_and_parents()?;
+        native.verify()?;
+        let transaction = if old.is_some() {
+            Some(parent.create_original_transaction_directory(attempt_id.as_str())?)
+        } else {
+            None
+        };
+        native.verify()?;
+        let retained = match (old, transaction.as_ref(), prior_payload.as_ref()) {
+            (Some(original), Some(transaction), Some(prior_payload)) => Some(
+                original.retain_in_original_transaction(transaction, "original", prior_payload)?,
+            ),
+            (None, None, None) => None,
+            _ => {
+                return Err(ReconcileError::Invariant(
+                    "native replacement original transaction incomplete",
+                ))
+            }
+        };
+        native.verify()?;
+        created.rename_in_same_parent_no_replace(component)?;
+        native.verify()?;
+        self.observe_original_published_create(&intent, volume, &created)?;
+        native.verify()?;
+        let frozen = freeze.freeze_for_original_pair_diagnostic(session.pair())?;
+        native.verify()?;
+        let expected_manifest = self.planned.clone();
+        let (result, history, local) = self.commit_after_original_native_observation()?;
+        native.verify()?;
+        let final_observation = crate::observe_original_linux_native_final(
+            &created,
+            &intent,
+            volume,
+            &frozen,
+            session.pair(),
+            &result,
+            history,
+        )?;
+        local.journal.record_original_linux_native_final(
+            &native,
+            budget,
+            &intent,
+            &intent_parent,
+            &worktree,
+            &created,
+            retained.as_ref(),
+            &frozen,
+            session.pair(),
+            final_observation.original_history_receipt(),
+            local.limits.max_storage_entries,
+        )?;
+        native.verify()?;
+        drop(final_observation);
+        drop(native);
+        drop(frozen);
+        let session = helpers.take().ok_or(ReconcileError::Invariant(
+            "original armed session escaped owner",
+        ))?;
+        let terminal = session.finish_committed()?;
+        local.journal.record_original_linux_committed_thaw(
+            owner,
+            &terminal,
+            &attempt_id,
+            local.limits.max_storage_entries,
+        )?;
+        budget.verify()?;
+        let reopened_manifest = local
+            .manifest()?
+            .ok_or(ReconcileError::Invariant("committed DAV manifest absent"))?;
+        let reopened_scan = local.stable_scan()?;
+        let reopened_tree =
+            crate::build_manifest(&reopened_manifest, &reopened_scan, &Default::default())?;
+        if result.snapshot_id != expected_manifest.root()?
+            || reopened_manifest != expected_manifest
+            || reopened_tree != expected_manifest
+        {
+            return Err(ReconcileError::Unstable);
+        }
+        Ok((
+            crate::PublishResult {
+                transaction_id: attempt_id,
+                requested_path: path.clone(),
+                published_path: path,
+                conflict_copy: false,
+                snapshot_id: result.snapshot_id,
+                local_committed: true,
+                remote_backup_complete: false,
+            },
+            terminal,
+        ))
     }
 }

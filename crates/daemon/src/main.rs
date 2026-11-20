@@ -1358,7 +1358,7 @@ fn run_cli(
         Err(error) => {
             eprintln!("syncd: deployment validation failed: {error}");
             #[cfg(target_os = "linux")]
-            if let Some(owner) = linux_owner {
+            if let Some(owner) = linux_owner.take() {
                 if let Err(terminal) = owner.finish() {
                     eprintln!("syncd: Linux validation terminal refused: {terminal}");
                 }
@@ -1391,6 +1391,8 @@ fn run_cli(
         }
         return outcome;
     }
+    #[cfg(target_os = "linux")]
+    let linux_owner = linux_owner.map(std::sync::Arc::new);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build();
@@ -1398,7 +1400,7 @@ fn run_cli(
         Ok(runtime) => match runtime.block_on(Box::pin(execute(
             cli,
             #[cfg(target_os = "linux")]
-            linux_owner.as_ref(),
+            linux_owner.clone(),
         ))) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
@@ -1413,6 +1415,13 @@ fn run_cli(
     };
     #[cfg(target_os = "linux")]
     if let Some(owner) = linux_owner {
+        let owner = match std::sync::Arc::try_unwrap(owner) {
+            Ok(owner) => owner,
+            Err(_) => {
+                eprintln!("syncd: Linux listener retained an owner after shutdown");
+                return ExitCode::FAILURE;
+            }
+        };
         if let Err(error) = owner.finish() {
             eprintln!("syncd: Linux original owner terminal refused: {error}");
             return ExitCode::FAILURE;
@@ -1451,7 +1460,7 @@ fn read_local_limits(path: Option<&std::path::Path>) -> Result<sync_extend_core_
 
 async fn execute(
     cli: Cli,
-    #[cfg(target_os = "linux")] linux_owner: Option<&linux_namespace::LinuxDaemonOwner>,
+    #[cfg(target_os = "linux")] linux_owner: Option<std::sync::Arc<linux_namespace::LinuxDaemonOwner>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let limits = read_local_limits(cli.limits.as_deref())?;
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1476,7 +1485,7 @@ async fn execute(
     };
     let open = |data: &std::path::Path| {
         #[cfg(target_os = "linux")]
-        if let Some(owner) = linux_owner {
+        if let Some(owner) = linux_owner.as_ref() {
             return owner.open(data, limits.clone());
         }
         LocalSpace::open(data)?.with_limits(limits.clone())
@@ -1811,6 +1820,8 @@ async fn execute(
             let gateway = local_control
                 .as_ref()
                 .map(local_control::LocalControl::gateway_slot);
+            #[cfg(target_os = "linux")]
+            let worker_owner = linux_owner.clone();
             let mut worker = tokio::task::spawn_blocking(move || {
                 webdav::serve(
                     runtime,
@@ -1819,6 +1830,8 @@ async fn execute(
                     worker_shutdown,
                     #[cfg(any(target_os = "linux", target_os = "android"))]
                     gateway,
+                    #[cfg(target_os = "linux")]
+                    worker_owner,
                 )
                 .map_err(|error| error.to_string())
             });
@@ -2729,7 +2742,7 @@ async fn execute(
         }
         Command::Init { data_dir, root } => {
             #[cfg(target_os = "linux")]
-            if let Some(owner) = linux_owner {
+            if let Some(owner) = linux_owner.as_ref() {
                 let local = owner.initialize(&data_dir, &root, limits.clone())?;
                 print(&local.status()?)?;
                 return Ok(());
@@ -2752,8 +2765,7 @@ async fn execute(
             data_dir,
             transaction,
         } => {
-            let owner =
-                linux_owner.ok_or("explicit acquired Linux owner configuration is required")?;
+            let owner = linux_owner.as_ref().ok_or("explicit acquired Linux owner configuration is required")?;
             print(
                 &open(&data_dir)?
                     .cleanup_original_linux_native(&owner.owner, &transaction.parse()?)?,

@@ -38,6 +38,25 @@ impl WebDavBaseline {
     }
 }
 
+/// Request-derived Linux single-file PUT, bound to the caller's sealed request
+/// descriptor and the original complete DAV snapshot.
+#[cfg(target_os = "linux")]
+pub struct LinuxNativeWebDavPut {
+    baseline: WebDavBaseline,
+    path: PortablePath,
+    snapshot: SnapshotId,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxNativeWebDavPut {
+    pub fn snapshot_id(&self) -> &SnapshotId {
+        &self.snapshot
+    }
+    pub fn path(&self) -> &PortablePath {
+        &self.path
+    }
+}
+
 impl LocalSpace {
     fn require_webdav_idle(&self) -> Result<()> {
         self.verify_root()?;
@@ -247,6 +266,73 @@ impl LocalSpace {
             return Err(ReconcileError::Unstable);
         }
         self.commit_webdav_content(baseline, path, content)
+    }
+
+    /// Seal one authorized single-file PUT against an explicitly expected
+    /// complete DAV baseline before accepting its body bytes.
+    #[cfg(target_os = "linux")]
+    pub fn admit_linux_native_webdav_put(
+        &mut self,
+        expected: &SnapshotId,
+        path: &PortablePath,
+    ) -> Result<LinuxNativeWebDavPut> {
+        if self.capture_webdav_baseline()?.snapshot_id()? != *expected {
+            return Err(ReconcileError::Unstable);
+        }
+        let baseline = self.capture_webdav_baseline()?;
+        if baseline.snapshot_id()? != *expected {
+            return Err(ReconcileError::Unstable);
+        }
+        let content = baseline
+            .manifest
+            .entries
+            .values()
+            .find(|entry| &entry.path == path);
+        if content.is_some_and(|entry| entry.kind != sync_extend_core_model::EntryKind::File)
+            || path
+                .as_str()
+                .split('/')
+                .any(|component| component.starts_with('.'))
+        {
+            return Err(ReconcileError::Invariant(
+                "Linux DAV PUT requires one visible file slot",
+            ));
+        }
+        Ok(LinuxNativeWebDavPut {
+            snapshot: baseline.snapshot_id()?,
+            baseline,
+            path: path.clone(),
+        })
+    }
+
+    /// Consume one sealed request and import only its original anonymous file
+    /// descriptor into the existing Linux original native publication plan.
+    #[cfg(target_os = "linux")]
+    pub fn commit_linux_native_webdav_put(
+        &mut self,
+        request: LinuxNativeWebDavPut,
+        source: &File,
+        owner: &sync_extend_platform_fs::LinuxNamespaceCapability,
+        budget: &sync_extend_platform_fs::LinuxMetadataBudget,
+        helpers: &mut Option<sync_extend_platform_fs::OutsideHelperSession>,
+        prepare_helpers: impl FnOnce() -> Result<sync_extend_platform_fs::OutsideHelperSession>,
+    ) -> Result<(
+        crate::PublishResult,
+        sync_extend_platform_fs::OriginalPairTerminalRelease,
+    )> {
+        self.check_webdav_baseline(&request.baseline)?;
+        if request.baseline.snapshot_id()? != request.snapshot {
+            return Err(ReconcileError::Unstable);
+        }
+        self.publish_original_linux_native_upload(
+            &request.baseline.manifest,
+            source,
+            request.path,
+            owner,
+            budget,
+            helpers,
+            prepare_helpers,
+        )
     }
 
     pub fn copy_webdav_file(

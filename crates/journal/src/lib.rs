@@ -636,7 +636,20 @@ impl Journal {
     ) -> Result<Self> {
         // Retain bounded bytecode and committed descriptive read proofs only
         // after the original identity and Linux VFS opening checks.
-        connection.set_prepared_statement_cache_capacity(256);
+        // The held-metadata path repeats the complete 134-table inventory
+        // before and after every original native phase. Retain its bounded
+        // SQL programs, prepared during the pre-ARM plan, without retaining
+        // their rows or any authority across writes. Every audit still runs
+        // against the current transaction and original metadata VFS.
+        #[cfg(target_os = "linux")]
+        let statement_capacity = if linux_metadata_vfs.is_some() {
+            1024
+        } else {
+            256
+        };
+        #[cfg(not(target_os = "linux"))]
+        let statement_capacity = 256;
+        connection.set_prepared_statement_cache_capacity(statement_capacity);
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;

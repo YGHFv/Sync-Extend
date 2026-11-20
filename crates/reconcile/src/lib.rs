@@ -108,6 +108,8 @@ pub use storage_retirement_inspection::StorageRetirementObjectObservation;
 mod webdav;
 #[cfg(windows)]
 mod webdav_local_execution;
+#[cfg(target_os = "linux")]
+pub use webdav::LinuxNativeWebDavPut;
 pub use webdav::{WebDavBaseline, WebDavCommit, WebDavRead};
 #[cfg(windows)]
 pub use webdav_local_execution::{WebDavBudgetLimits, WebDavLocalExecution};
