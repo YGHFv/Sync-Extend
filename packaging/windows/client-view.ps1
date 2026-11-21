@@ -50,6 +50,66 @@ function Add-SyncExtendViewRow($View, [string]$Tab, [object[]]$Values) {
     [void]$View.Rows[$Tab].Add($Values)
 }
 
+function New-SyncExtendConnectionView($Observation) {
+    Assert-SyncExtendViewObject $Observation
+    $age = Get-SyncExtendViewInteger $Observation.age_ms
+    $staleAfter = Get-SyncExtendViewInteger $Observation.stale_after_ms
+    Assert-SyncExtendViewFlag $Observation.current
+    $sample = $Observation.actual
+    Assert-SyncExtendViewObject $sample
+    foreach ($key in @('observation_format_version', 'udp_sent_bytes', 'udp_received_bytes',
+            'udp_sent_datagrams', 'udp_received_datagrams', 'rtt_us', 'path_lost_packets', 'path_lost_bytes')) {
+        $null = Get-SyncExtendViewInteger $sample[$key]
+    }
+    foreach ($key in @('active', 'initiated')) { Assert-SyncExtendViewFlag $sample[$key] }
+    Assert-SyncExtendViewId $sample.peer_device
+    Assert-SyncExtendViewId $sample.space_id 32
+    Assert-SyncExtendViewId $sample.session_binding
+    if ($sample.observation_format_version -ne 1 -or
+        $sample.sample_scope -cne 'latest_authenticated_connection' -or
+        $sample.meter_unit -cne 'inner_quic_udp_payload_bytes' -or
+        $sample.route_attribution -cne 'unknown' -or
+        $null -ne $sample.outer_wire_bytes -or $null -ne $sample.billing_bytes -or
+        $staleAfter -ne 30000 -or $Observation.current -cne ($age -le $staleAfter) -or
+        $sample.lifecycle -cnotin @('active', 'finished', 'failed', 'dropped', 'stale') -or
+        $sample.active -cne ($sample.lifecycle -ceq 'active') -or
+        ($sample.active -and !$Observation.current) -or
+        ($sample.lifecycle -ceq 'stale' -and $Observation.current) -or
+        $sample.local_socket_scope -cnotin @('endpoint_bind', 'connection_local_ip')) {
+        throw 'The authenticated connection sample cannot be verified.'
+    }
+    foreach ($key in @('local_socket', 'remote_socket')) {
+        if ($null -eq $sample[$key] -and $key -ceq 'local_socket') { continue }
+        Assert-SyncExtendViewText $sample[$key] 128
+        $endpoint = [Net.IPEndPoint]::Parse($sample[$key])
+        if ($endpoint.Port -eq 0) { throw 'The observed UDP endpoint cannot be verified.' }
+    }
+    $state = switch ($sample.lifecycle) {
+        'active' { '采样时会话活动；当前可达性未测试' }
+        'finished' { '传输已结束；样本已失活' }
+        'failed' { '传输失败；样本已失活' }
+        'dropped' { '会话已释放；结束结果未知' }
+        'stale' { '样本过旧；当前连接状态未知' }
+    }
+    return @(
+        ,@('连接样本范围', '最近一次已鉴权会话；不代表所有连接')
+        ,@('样本状态', $state)
+        ,@('采样距今 / 过旧门槛', "$age ms / $staleAfter ms")
+        ,@('对端设备', $sample.peer_device)
+        ,@('空间', $sample.space_id)
+        ,@('会话绑定标识', $sample.session_binding)
+        ,@('连接方向', $(if ($sample.initiated) { '本机发起' } else { '本机接入' }))
+        ,@('本机 UDP 端点', $(if ($sample.local_socket) { "$($sample.local_socket) ($($sample.local_socket_scope))" } else { '未观察到' }))
+        ,@('对端 UDP 端点', $sample.remote_socket)
+        ,@('内层 UDP 发送载荷', (Format-SyncExtendViewBytes $sample.udp_sent_bytes))
+        ,@('内层 UDP 接收载荷', (Format-SyncExtendViewBytes $sample.udp_received_bytes))
+        ,@('发送 / 接收 UDP 报文', "$($sample.udp_sent_datagrams) / $($sample.udp_received_datagrams)")
+        ,@('QUIC RTT（微秒）', "$($sample.rtt_us) us")
+        ,@('当前 QUIC 路径丢包', "$($sample.path_lost_packets) 报文 / $($sample.path_lost_bytes) B")
+        ,@('计量范围', 'QUINN 内层 UDP 载荷，含协议开销和重传；不是外层 wire 或费用')
+    )
+}
+
 function New-SyncExtendClientView($Dashboard) {
     Assert-SyncExtendViewObject $Dashboard
     $null = Get-SyncExtendViewInteger $Dashboard.dashboard_format_version
@@ -216,9 +276,15 @@ function New-SyncExtendClientView($Dashboard) {
     } else {
         Add-SyncExtendViewRow $view 'Storage' @('存储节点', '当前角色没有可用的存储样本')
     }
-    Add-SyncExtendViewRow $view 'Network' @('连接观测', $(if ($null -eq $Dashboard.connection) { '当前没有连接样本' } else { '连接样本格式尚未接入' }))
+    if ($null -ne $Dashboard.connection) {
+        foreach ($row in @(New-SyncExtendConnectionView $Dashboard.connection)) {
+            Add-SyncExtendViewRow $view 'Network' $row
+        }
+    } else {
+        Add-SyncExtendViewRow $view 'Network' @('连接观测', '当前没有经过鉴权的连接样本')
+    }
     Add-SyncExtendViewRow $view 'Network' @('实际路径', '未知；不能据此确认 LAN / P2P / 中继')
-    Add-SyncExtendViewRow $view 'Network' @('实际流量 / 中继费用', '尚未计量；逻辑交付与请求预留分别展示')
+    Add-SyncExtendViewRow $view 'Network' @('外层 wire / 中继费用', '尚未计量；逻辑交付与请求预留分别展示')
     Add-SyncExtendViewRow $view 'Pull budget' @('显式拉取预算', '未指定预算文件；可通过“查看拉取预算”只读检查已初始化的账本')
 
     if ($null -ne $Dashboard.webdav) {

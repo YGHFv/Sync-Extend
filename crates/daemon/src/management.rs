@@ -53,6 +53,7 @@ pub fn resources_deferred() {
 pub struct ManagementGuard {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    _connections: Option<sync_extend_transport::ConnectionObservationRegistration>,
 }
 
 impl Drop for ManagementGuard {
@@ -113,6 +114,11 @@ pub fn start(path: &Path, role: &'static str) -> Result<ManagementGuard> {
     let listener = TcpListener::bind(config.address)?;
     listener.set_nonblocking(true)?;
     dashboard::configure(&config)?;
+    let connections = config
+        .control
+        .as_ref()
+        .filter(|policy| policy.dashboard)
+        .and_then(|_| sync_extend_transport::register_connection_observations());
     READY.store(false, Ordering::Release);
     CONTROL_STOP.store(false, Ordering::Release);
     let stop = Arc::new(AtomicBool::new(false));
@@ -143,6 +149,7 @@ pub fn start(path: &Path, role: &'static str) -> Result<ManagementGuard> {
     Ok(ManagementGuard {
         stop,
         thread: Some(thread),
+        _connections: connections,
     })
 }
 

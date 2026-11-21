@@ -37,12 +37,46 @@ td,th{text-align:left;padding:8px;border-bottom:1px solid #304057;overflow-wrap:
 const byId=id=>document.getElementById(id);
 const text=(id,value)=>{byId(id).textContent=value;};
 function table(id,heads,rows){const target=byId(id);target.replaceChildren();const t=document.createElement("table");const header=t.insertRow();for(const head of heads){const cell=document.createElement("th");cell.textContent=head;header.append(cell);}for(const row of rows){const tr=t.insertRow();for(const value of row){const cell=tr.insertCell();cell.textContent=String(value);}}target.append(t);}
+function connectionText(observation){
+if(!observation)return "当前没有经过鉴权的连接样本。实际路径、外层 wire 和中继费用保持未知。";
+const channel=observation.actual;const count=value=>Number.isSafeInteger(value)&&value>=0;
+const id=(value,length)=>typeof value==="string"&&value.length===length&&/^[0-9a-f]+$/.test(value);
+const socket=value=>{if(typeof value!=="string"||value.length>128)return false;
+const match=/^(\[[0-9a-fA-F:.]+\]|(?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})$/.exec(value);
+if(!match||Number(match[2])<1||Number(match[2])>65535)return false;
+try{const parsed=new URL("http://"+value+"/");return Boolean(parsed.hostname)&&
+(match[1].startsWith("[")||match[1].split(".").every(part=>Number(part)<=255));}catch(error){return false;}};
+if(!channel||!count(observation.age_ms)||observation.stale_after_ms!==30000||
+typeof observation.current!=="boolean"||observation.current!==(observation.age_ms<=observation.stale_after_ms)||
+channel.observation_format_version!==1||channel.sample_scope!=="latest_authenticated_connection"||
+channel.meter_unit!=="inner_quic_udp_payload_bytes"||channel.route_attribution!=="unknown"||
+channel.outer_wire_bytes!==null||channel.billing_bytes!==null||!id(channel.peer_device,64)||
+!id(channel.space_id,32)||!id(channel.session_binding,64)||typeof channel.initiated!=="boolean"||
+typeof channel.active!=="boolean"||channel.active!==(channel.lifecycle==="active")||
+(channel.active&&!observation.current)||(channel.lifecycle==="stale"&&observation.current)||
+!["active","finished","failed","dropped","stale"].includes(channel.lifecycle)||
+!["endpoint_bind","connection_local_ip"].includes(channel.local_socket_scope)||
+(channel.local_socket!==null&&!socket(channel.local_socket))||!socket(channel.remote_socket)||
+["udp_sent_bytes","udp_received_bytes","udp_sent_datagrams","udp_received_datagrams","rtt_us","path_lost_packets","path_lost_bytes"].some(key=>!count(channel[key]))){
+throw Error("连接样本无法验证。");}
+const states={active:"采样时会话活动；当前可达性未测试",finished:"传输已结束；样本已失活",
+failed:"传输失败；样本已失活",dropped:"会话已释放；结束结果未知",stale:"样本过旧；当前连接状态未知"};
+return "最近一次已鉴权会话："+states[channel.lifecycle]+"。对端设备 "+channel.peer_device+
+"；空间 "+channel.space_id+"；会话绑定 "+channel.session_binding+"；"+
+(channel.initiated?"本机发起":"本机接入")+"；本机 UDP 端点 "+(channel.local_socket??"未观察到")+
+"（"+channel.local_socket_scope+"）；对端 UDP 端点 "+channel.remote_socket+
+"；内层 UDP 发送/接收载荷 "+channel.udp_sent_bytes+"/"+channel.udp_received_bytes+" B，报文 "+
+channel.udp_sent_datagrams+"/"+channel.udp_received_datagrams+"；QUIC RTT "+channel.rtt_us+
+" us；当前 QUIC 路径丢包 "+channel.path_lost_packets+" 报文 / "+channel.path_lost_bytes+
+" B；采样距今 "+observation.age_ms+" ms。内层载荷含协议开销和重传；不代表所有连接。" +
+"实际 LAN/P2P/中继路径、外层 wire 和中继费用保持未知，逻辑交付与请求预留分别计量。";
+}
 let requestEpoch=0;let activeController=null;let ownerGeneration=null;
 function forget(){ownerGeneration=null;byId("stop").disabled=true;byId("storage-section").hidden=true;byId("storage").replaceChildren();requestEpoch++;activeController?.abort();activeController=null;byId("refresh").disabled=false;byId("token").value="";byId("content").hidden=true;for(const id of ["space","queue","network","dav","chunks","conflicts","history","paths"]){byId(id).replaceChildren();}text("message","凭据与展示已清除。");}
 byId("forget").addEventListener("click",forget);
 byId("refresh").addEventListener("click",async()=>{
 const token=byId("token").value;if(!/^[0-9a-f]{64}$/.test(token)){text("message","请输入有效的本机管理凭据。");return;}
-byId("refresh").disabled=true;text("message","正在读取本机状态…");
+byId("refresh").disabled=true;byId("content").hidden=true;text("network","");text("message","正在读取本机状态…");
 const epoch=++requestEpoch;const controller=new AbortController();activeController=controller;const timeout=setTimeout(()=>controller.abort(),5000);
 try{
 const response=await fetch("/v1/dashboard",{method:"GET",headers:{Authorization:"Bearer "+token},credentials:"omit",cache:"no-store",mode:"same-origin",redirect:"error",signal:controller.signal});
@@ -53,9 +87,9 @@ if(epoch!==requestEpoch)return;
 const value=JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(joined));
 if(value.dashboard_format_version!==1||value.remote_backup_complete!==false){throw Error("无法识别本机状态。");}
 ownerGeneration=/^[0-9a-f]{32}$/.test(value.owner_generation??"")?value.owner_generation:null;byId("stop").disabled=!ownerGeneration||value.stop_allowed!==true;
-const channel=value.connection?.actual;const gateway=value.webdav;const storage=value.storage?.actual;byId("content").hidden=false;byId("storage-section").hidden=!storage;
+const gateway=value.webdav;const storage=value.storage?.actual;byId("content").hidden=false;byId("storage-section").hidden=!storage;
 text("storage",storage?"空间 "+storage.space_id+"；设备 "+storage.device_id+"；角色 "+storage.role+"；受保护内容 "+storage.protected_bytes+" 字节；实际块文件 "+storage.physical_cas_bytes+"/"+storage.stored_byte_limit+" 字节；逻辑交付累计 "+storage.charged_logical_delivery_bytes+"/"+storage.traffic_byte_limit+" 字节；检查 "+storage.checked_chunks+"/"+storage.protected_chunks+" 个块，不可读取 "+storage.unavailable_chunks.length+" 个；"+(storage.expired?"存储策略已到期。":"存储策略尚未到期。")+" 备份完整性尚未认证。":"");
-text("network",channel?"对端 "+channel.peer_device+"；连接 "+channel.remote_socket+"；UDP发送 "+channel.udp_sent_bytes+" 字节、接收 "+channel.udp_received_bytes+" 字节；采样距今 "+value.connection.age_ms+" 毫秒。实际选路与中继费用尚未确认。":"当前没有连接观测。");
+text("network",connectionText(value.connection));
 text("dav",gateway?"连接地址 http://"+gateway.address+"；认证已启用；授权导出 "+gateway.exports.map(x=>x.url+(x.writable?"（读写）":"（只读）")).join("、")+"。凭据通过本机配置管理。":"当前没有网关观测。");
 if(!value.observation){text("message","当前角色没有空间观测；连接和网关状态见下方。");for(const id of ["space","queue","chunks","conflicts","history","paths"]){byId(id).replaceChildren();}return;}
 const local=value.observation.local;
@@ -68,14 +102,14 @@ table("conflicts",["事务","状态","文件已物化"],local.conflict_admission
 table("history",["快照","状态","当前"],local.snapshots.map(x=>[x.snapshot_id,x.state,x.current?"是":""]));
 table("paths",["相对路径","类型","逻辑字节"],local.entries.map(x=>[x.path,x.kind,x.logical_bytes??"—"]));
 if(local.entries_truncated||local.snapshots_truncated||local.conflict_admissions_truncated){text("message",byId("message").textContent+" 列表已按展示上限截取。");}
-}catch(error){if(epoch!==requestEpoch)return;ownerGeneration=null;byId("stop").disabled=true;byId("content").hidden=true;text("message",error.name==="AbortError"?"读取超时，请稍后重试。":error.message==="管理请求被拒绝。"?"管理请求被拒绝。":"无法读取本机状态，请检查服务和凭据。");}
+}catch(error){if(epoch!==requestEpoch)return;ownerGeneration=null;byId("stop").disabled=true;byId("content").hidden=true;text("network","");text("message",error.name==="AbortError"?"读取超时，请稍后重试。":error.message==="管理请求被拒绝。"?"管理请求被拒绝。":"无法读取本机状态，请检查服务和凭据。");}
 finally{clearTimeout(timeout);if(epoch===requestEpoch){activeController=null;byId("refresh").disabled=false;}}
 });
 byId("stop").addEventListener("click",async()=>{
 const token=byId("token").value;const generation=ownerGeneration;
 if(!/^[0-9a-f]{64}$/.test(token)||!generation){text("message","请先读取当前本机状态。");return;}
 activeController?.abort();const epoch=++requestEpoch;const controller=new AbortController();
-activeController=controller;byId("stop").disabled=true;byId("refresh").disabled=true;
+activeController=controller;byId("stop").disabled=true;byId("refresh").disabled=true;text("network","");
 text("message","正在请求停止本机服务…");
 const requestId=Array.from(crypto.getRandomValues(new Uint8Array(16)),x=>x.toString(16).padStart(2,"0")).join("");
 const timeout=setTimeout(()=>controller.abort(),5000);
@@ -92,7 +126,7 @@ const joined=new Uint8Array(size);let offset=0;for(const part of parts){joined.s
 const value=JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(joined));
 if(value.owner_generation!==generation||value.stop_requested!==true||value.resources_ready!==false||
 value.process_exit_verified!==false){throw Error("响应无法验证。");}
-ownerGeneration=null;byId("content").hidden=true;
+ownerGeneration=null;byId("content").hidden=true;text("network","");
 text("message","停止请求已接受，服务正在退出。");
 }catch(error){if(epoch!==requestEpoch)return;ownerGeneration=null;
 text("message",error.message==="停止请求被拒绝。"?"停止请求被拒绝，请重新读取状态。":

@@ -33,14 +33,18 @@ const UI: &str = include_str!("dashboard.html");
 /// Local kernel-owner collection is independent of HTTP dashboard permission.
 /// Registration never starts a listener or opens a second resource owner.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) struct LocalDashboardRegistration;
+pub(crate) struct LocalDashboardRegistration {
+    _connections: Option<sync_extend_transport::ConnectionObservationRegistration>,
+}
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn register_local_dashboard() -> LocalDashboardRegistration {
     if LOCAL_REGISTRATIONS.fetch_add(1, Ordering::AcqRel) == 0 {
         clear_local();
     }
-    LocalDashboardRegistration
+    LocalDashboardRegistration {
+        _connections: sync_extend_transport::register_connection_observations(),
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -100,13 +104,14 @@ pub(crate) fn local_dashboard() -> (Option<serde_json::Value>, &'static str) {
     let local = sample(&LOCAL_OBSERVATION, "local");
     let storage = sample(&LOCAL_STORAGE, "actual");
     let gateway = LOCAL_GATEWAY.lock().ok().and_then(|slot| slot.clone());
-    if local.is_none() && storage.is_none() && gateway.is_none() {
+    let connection = sync_extend_transport::latest_connection_observation();
+    if local.is_none() && storage.is_none() && gateway.is_none() && connection.is_none() {
         return (None, "no_observation");
     }
     let value = serde_json::json!({
         "dashboard_format_version": 1,
         "observation": local, "storage": storage, "webdav": gateway,
-        "connection": null, "route": null, "traffic": null,
+        "connection": connection, "route": null, "traffic": null,
         "remote_backup_complete": false,
     });
     match serde_json::to_vec(&value) {
@@ -494,12 +499,16 @@ pub fn serve(
                     "actual": value,
                 })
             });
+        let ready = READY.load(Ordering::Acquire) && !super::control_stop_requested();
+        let connection = ready
+            .then(sync_extend_transport::latest_connection_observation)
+            .flatten();
         let value = serde_json::json!({
             "dashboard_format_version": 1,
             "owner_generation": generation,
-            "resources_ready": READY.load(Ordering::Acquire),
+            "resources_ready": ready,
             "observation": observation, "storage": storage,
-            "connection": null, "route": null, "traffic": null, "webdav": gateway,
+            "connection": connection, "route": null, "traffic": null, "webdav": gateway,
             "stop_allowed": config.control.as_ref().is_some_and(|policy| policy.stop),
             "remote_backup_complete": false,
         });
@@ -514,7 +523,7 @@ pub fn serve(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
          Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
          Referrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; \
-         script-src 'sha256-Qkl3NuWWYg01xbhOtXsYmWJ9oHh3x6VGjxVlD3BED8k='; style-src 'unsafe-inline'; \
+         script-src 'sha256-ydeld3R0FVp5E583iFCeW5Hw7uYfZaA4gY34Csxysx0='; style-src 'unsafe-inline'; \
          connect-src 'self'; img-src 'none'; frame-ancestors 'none'; base-uri 'none'; \
          form-action 'none'\r\n\r\n",
         body.len()

@@ -12,7 +12,7 @@ const fields = {};
   "service-state", "service-detail", "gateway-state", "gateway-detail", "exports", "refresh",
   "verify-stop", "ask-stop", "stop-confirmation", "stop", "cancel-stop", "probe-result",
   "workspace-state", "workspace-detail", "workspace-summary",
-  "storage-state", "storage-detail", "storage-summary", "network-detail",
+  "storage-state", "storage-detail", "storage-summary", "network-state", "network-detail", "network-summary",
 ].forEach((id) => { fields[id] = document.getElementById(id); });
 
 const canUseBridge = Boolean(window.ksu && typeof window.ksu.exec === "function");
@@ -54,12 +54,18 @@ function readJson(operation, selectedExport) {
     window[callback] = (code, output) => {
       finish();
       if (code !== 0 || typeof output !== "string" ||
-          output.length > (operation === "gateway" ? 65536 : 4096)) {
+          output.length > (operation === "gateway" ? 65536 : 16384)) {
         reject(new Error("Module operation refused"));
         return;
       }
       try {
-        resolve(JSON.parse(output));
+        const value = JSON.parse(output);
+        // The CLI pretty-prints native control JSON. Its display whitespace
+        // does not enlarge the existing 4096-byte native protocol allowance.
+        if (operation !== "gateway" && new TextEncoder().encode(JSON.stringify(value)).length > 4096) {
+          throw new Error("Native control response exceeds its bound");
+        }
+        resolve(value);
       } catch (error) {
         reject(error);
       }
@@ -95,12 +101,12 @@ function hideConfirmation() {
 
 function clearRuntime(detail = "当前没有可验证的运行摘要。") {
   liveGateway = null;
-  for (const category of ["workspace", "storage"]) {
+  for (const category of ["workspace", "storage", "network"]) {
     fields[`${category}-summary`].textContent = "";
     fields[`${category}-summary`].hidden = true;
     setStatus(category, "暂无观察", detail);
   }
-  fields["network-detail"].textContent = "当前没有连接观测；实际路径、实际流量和中继费用保持未知。";
+  fields["network-detail"].textContent = "当前没有已鉴权的连接样本；实际路径、外层 wire 和中继费用保持未知。";
 }
 
 function clearExportTests(detail = "连接待测试") {
@@ -169,6 +175,57 @@ function showSummary(category, rows) {
   target.hidden = false;
 }
 
+function validSocket(value) {
+  if (typeof value !== "string" || value.length > 128) return false;
+  const match = /^(\[[0-9a-fA-F:.]+\]|(?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})$/.exec(value);
+  if (!match || Number(match[2]) < 1 || Number(match[2]) > 65535) return false;
+  try {
+    const address = new URL(`http://${value}/`);
+    if (!match[1].startsWith("[") && match[1].split(".").some((part) => Number(part) > 255)) return false;
+    return Boolean(address.hostname) && !address.username && !address.password;
+  } catch (error) { return false; }
+}
+
+function showConnection(observation) {
+  if (!observation) return;
+  requireCounts(observation, ["age_ms", "stale_after_ms"]);
+  requireFlags(observation, ["current"]);
+  const sample = observation.actual;
+  requireCounts(sample, ["observation_format_version", "udp_sent_bytes", "udp_received_bytes",
+    "udp_sent_datagrams", "udp_received_datagrams", "rtt_us", "path_lost_packets", "path_lost_bytes"]);
+  requireFlags(sample, ["active", "initiated"]);
+  if (sample.observation_format_version !== 1 || !identifier(sample.peer_device, 64) ||
+      !identifier(sample.space_id, 32) || !identifier(sample.session_binding, 64) ||
+      sample.sample_scope !== "latest_authenticated_connection" || sample.meter_unit !== "inner_quic_udp_payload_bytes" ||
+      sample.route_attribution !== "unknown" || sample.outer_wire_bytes !== null || sample.billing_bytes !== null ||
+      observation.stale_after_ms !== 30000 || observation.current !== (observation.age_ms <= observation.stale_after_ms) ||
+      !["active", "finished", "failed", "dropped", "stale"].includes(sample.lifecycle) ||
+      sample.active !== (sample.lifecycle === "active") || (sample.active && !observation.current) ||
+      (sample.lifecycle === "stale" && observation.current) ||
+      !["endpoint_bind", "connection_local_ip"].includes(sample.local_socket_scope) ||
+      (sample.local_socket !== null && !validSocket(sample.local_socket)) || !validSocket(sample.remote_socket)) {
+    throw new Error("Invalid authenticated connection sample");
+  }
+  const states = {
+    active: "采样时活动", finished: "传输已结束", failed: "传输失败",
+    dropped: "会话已释放", stale: "样本过旧",
+  };
+  showSummary("network", [
+    ["样本范围", "最近一次已鉴权会话"], ["采样距今 / 过旧门槛", `${observation.age_ms} / ${observation.stale_after_ms} ms`],
+    ["对端设备", sample.peer_device], ["空间", sample.space_id], ["会话绑定标识", sample.session_binding],
+    ["连接方向", sample.initiated ? "本机发起" : "本机接入"],
+    ["本机 UDP 端点", `${sample.local_socket ?? "未观察到"} (${sample.local_socket_scope})`],
+    ["对端 UDP 端点", sample.remote_socket],
+    ["内层 UDP 发送 / 接收载荷", `${sample.udp_sent_bytes} / ${sample.udp_received_bytes} B`],
+    ["UDP 发送 / 接收报文", `${sample.udp_sent_datagrams} / ${sample.udp_received_datagrams}`],
+    ["QUIC RTT", `${sample.rtt_us} us`],
+    ["当前 QUIC 路径丢包", `${sample.path_lost_packets} 报文 / ${sample.path_lost_bytes} B`],
+  ]);
+  setStatus("network", states[sample.lifecycle],
+    "QUINN 内层 UDP 载荷包含协议开销与重传；样本不代表所有连接，当前可达性未测试。" +
+    "实际 LAN/P2P/中继路径、外层 wire 和中继费用保持未知。逻辑交付与请求预留预算分别计量。");
+}
+
 function showDashboard(owner) {
   clearRuntime();
   const value = owner.dashboard;
@@ -184,7 +241,7 @@ function showDashboard(owner) {
   }
   if (!ownerReady || owner.dashboard_state !== "available" ||
       value.dashboard_format_version !== 1 || value.remote_backup_complete !== false ||
-      JSON.stringify(value).length > 3072) {
+      new TextEncoder().encode(JSON.stringify(value)).length > 3072) {
     throw new Error("Invalid owner dashboard");
   }
   if (value.observation) {
@@ -267,8 +324,7 @@ function showDashboard(owner) {
         gateway.address.length > 128) throw new Error("Invalid live gateway summary");
     liveGateway = gateway;
   }
-  fields["network-detail"].textContent = "当前没有可验证的连接或实际路径观测。实际流量和中继费用尚未计量；" +
-    "逻辑交付累计见存储摘要。独立请求预留预算尚未接入此 Android 运行路径，不能据此免费放行或重置额度。";
+  showConnection(value.connection);
   showGatewayAvailability();
 }
 

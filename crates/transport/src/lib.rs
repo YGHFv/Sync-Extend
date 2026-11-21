@@ -1,5 +1,10 @@
 mod conflict_resolution;
 mod connection;
+mod observation;
+pub use observation::{
+    latest_connection_observation, register_connection_observations, AuthenticatedConnectionSample,
+    ConnectionObservation, ConnectionObservationRegistration,
+};
 mod forwarded_page;
 mod storage_delivery;
 mod storage_snapshot;

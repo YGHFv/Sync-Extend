@@ -98,6 +98,8 @@ pub struct Connection {
     receive: RecvStream,
     channel_binding: ContentId,
     peer: PeerIdentity,
+    initiated: bool,
+    observation: Option<crate::observation::ObservedConnection>,
 }
 
 impl Connection {
@@ -151,6 +153,8 @@ impl Connection {
             receive,
             channel_binding: ContentId::hash(&exporter),
             peer: peer.clone(),
+            initiated: initiator,
+            observation: None,
         };
         let hello = SignedHello::sign(identity, result.channel_binding.clone())?;
         if initiator {
@@ -166,7 +170,32 @@ impl Connection {
                 .verify(peer, &result.channel_binding)?;
             result.send_json(&hello).await?;
         }
+        // Before this point even a valid TLS peer has not completed the signed
+        // application identity exchange and must never produce a sample.
+        result.observation = crate::observation::ObservedConnection::authenticated();
+        result.observe();
         Ok(result)
+    }
+
+    fn observe(&self) {
+        if let Some(observation) = &self.observation {
+            observation.record(
+                &self._endpoint,
+                &self.connection,
+                &self.peer,
+                &self.channel_binding,
+                self.initiated,
+            );
+        }
+    }
+
+    fn observe_result(&self, success: bool) {
+        if !success {
+            if let Some(observation) = &self.observation {
+                observation.failed();
+            }
+        }
+        self.observe();
     }
 
     pub fn peer_identity(&self) -> &PeerIdentity {
@@ -179,6 +208,19 @@ impl Connection {
     /// Wait for peer transport acknowledgement before closing the connection.
     /// Application receipts still require their own durable-state validation.
     pub async fn finish(&mut self) -> Result<()> {
+        let result = self.finish_inner().await;
+        if let Some(observation) = &self.observation {
+            if result.is_ok() {
+                observation.finished();
+            } else {
+                observation.failed();
+            }
+        }
+        self.observe();
+        result
+    }
+
+    async fn finish_inner(&mut self) -> Result<()> {
         self.send.finish().map_err(protocol)?;
         let stopped = tokio::time::timeout(IO_TIMEOUT, self.send.stopped())
             .await
@@ -197,37 +239,44 @@ impl Connection {
                 "trailing data after session finish",
             ));
         }
-        let _ = self.connection.stable_id();
         Ok(())
     }
 
     pub async fn send_json<T: Serialize>(&mut self, value: &T) -> Result<()> {
-        self.write_frame(
-            CONTROL_FRAME,
-            &serde_json::to_vec(value)?,
-            MAX_CONTROL_BYTES,
-        )
-        .await
+        let bytes = match serde_json::to_vec(value) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.observe_result(false);
+                return Err(error.into());
+            }
+        };
+        self.write_frame(CONTROL_FRAME, &bytes, MAX_CONTROL_BYTES)
+            .await
     }
 
     pub async fn receive_json<T: DeserializeOwned>(&mut self) -> Result<T> {
-        Ok(serde_json::from_slice(
-            &self.read_frame(CONTROL_FRAME, MAX_CONTROL_BYTES).await?,
-        )?)
+        let result = self
+            .read_frame(CONTROL_FRAME, MAX_CONTROL_BYTES)
+            .await
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into));
+        self.observe_result(result.is_ok());
+        result
     }
 
     /// A peer may perform a bounded native Final before its next control frame.
     /// Length checks still precede allocation; ordinary frames retain 30s I/O.
     pub async fn receive_json_after_application<T: DeserializeOwned>(&mut self) -> Result<T> {
-        Ok(serde_json::from_slice(
-            &self
-                .read_frame_with_timeout(CONTROL_FRAME, MAX_CONTROL_BYTES, Duration::from_secs(300))
-                .await?,
-        )?)
+        let result = self
+            .read_frame_with_timeout(CONTROL_FRAME, MAX_CONTROL_BYTES, Duration::from_secs(300))
+            .await
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into));
+        self.observe_result(result.is_ok());
+        result
     }
 
     pub async fn send_block(&mut self, expected: &ContentId, bytes: &[u8]) -> Result<()> {
         if bytes.is_empty() || ContentId::hash(bytes) != *expected {
+            self.observe_result(false);
             return Err(TransportError::Protocol("invalid outgoing block"));
         }
         self.write_frame(BLOCK_FRAME, bytes, MAX_BLOCK_BYTES).await
@@ -239,12 +288,14 @@ impl Connection {
         expected_length: u32,
     ) -> Result<Vec<u8>> {
         if expected_length == 0 || expected_length as usize > MAX_BLOCK_BYTES {
+            self.observe_result(false);
             return Err(TransportError::Limit("expected block length"));
         }
         let bytes = self
             .read_frame(BLOCK_FRAME, expected_length as usize)
             .await?;
         if bytes.len() != expected_length as usize || ContentId::hash(&bytes) != *expected {
+            self.observe_result(false);
             return Err(TransportError::Protocol(
                 "received block integrity mismatch",
             ));
@@ -254,16 +305,19 @@ impl Connection {
 
     async fn write_frame(&mut self, kind: u8, bytes: &[u8], maximum: usize) -> Result<()> {
         if bytes.is_empty() || bytes.len() > maximum {
+            self.observe_result(false);
             return Err(TransportError::Limit("outgoing frame length"));
         }
         let mut header = [kind, 0, 0, 0, 0];
         header[1..].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
-        tokio::time::timeout(IO_TIMEOUT, async {
+        let result = tokio::time::timeout(IO_TIMEOUT, async {
             self.send.write_all(&header).await.map_err(protocol)?;
             self.send.write_all(bytes).await.map_err(protocol)
         })
         .await
-        .map_err(|_| TransportError::Protocol("send timeout"))?
+        .unwrap_or_else(|_| Err(TransportError::Protocol("send timeout")));
+        self.observe_result(result.is_ok());
+        result
     }
 
     async fn read_frame(&mut self, kind: u8, maximum: usize) -> Result<Vec<u8>> {
@@ -277,7 +331,7 @@ impl Connection {
         maximum: usize,
         wait: Duration,
     ) -> Result<Vec<u8>> {
-        tokio::time::timeout(wait, async {
+        let result = tokio::time::timeout(wait, async {
             let mut header = [0u8; 5];
             self.receive
                 .read_exact(&mut header)
@@ -302,6 +356,17 @@ impl Connection {
             Ok(bytes)
         })
         .await
-        .map_err(|_| TransportError::Protocol("receive timeout"))?
+        .unwrap_or_else(|_| Err(TransportError::Protocol("receive timeout")));
+        self.observe_result(result.is_ok());
+        result
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let Some(observation) = &self.observation {
+            observation.dropped();
+        }
+        self.observe();
     }
 }
