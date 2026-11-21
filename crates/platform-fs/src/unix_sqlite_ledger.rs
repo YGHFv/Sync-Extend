@@ -1,4 +1,4 @@
-//! Private fixed-budget SQLite access through retained local Unix descriptors.
+//! Two closed private SQLite ledger kinds use retained local Unix descriptors.
 //! SQLite never opens a pathname. A process-wide file lock serializes writers;
 //! WAL/FULL remains responsible for durable commit and crash recovery.
 use crate::UnixFileKey;
@@ -21,7 +21,34 @@ use std::{
 
 mod callbacks;
 
-const FILE_NAME: &str = "storage-pull-attempt-budget.sqlite";
+#[derive(Clone, Copy)]
+enum LedgerKind {
+    StoragePullAttempt,
+    StorageTraffic,
+}
+
+impl LedgerKind {
+    fn basename(self) -> &'static str {
+        match self {
+            Self::StoragePullAttempt => "storage-pull-attempt-budget.sqlite",
+            Self::StorageTraffic => "storage-traffic.sqlite",
+        }
+    }
+
+    fn maximum_file_bytes(self) -> u64 {
+        match self {
+            Self::StoragePullAttempt => 100_000 * 4096 + 1024 * 1024,
+            Self::StorageTraffic => 1_000_000 * 4096 + 1024 * 1024,
+        }
+    }
+
+    fn registration(self) -> &'static str {
+        match self {
+            Self::StoragePullAttempt => "budget",
+            Self::StorageTraffic => "storage-traffic",
+        }
+    }
+}
 const MAX_PATH: usize = 4096;
 const LOCK_WAIT: Duration = Duration::from_secs(5);
 static NEXT_VFS: AtomicU64 = AtomicU64::new(1);
@@ -73,6 +100,7 @@ struct HeldFile {
 }
 
 struct State {
+    kind: LedgerKind,
     directories: Vec<HeldDirectory>,
     files: [Option<HeldFile>; 3],
     main_path: PathBuf,
@@ -197,7 +225,7 @@ impl State {
                 ));
             }
         }
-        let shm = component(format!("{FILE_NAME}-shm").as_bytes())?;
+        let shm = component(format!("{}-shm", self.kind.basename()).as_bytes())?;
         if self.observe(&shm)?.is_some() {
             return Err(refused(
                 "Unix ledger SHM has no retained descriptor authority",
@@ -244,16 +272,53 @@ impl UnixSqliteLedgerConnection {
 }
 
 impl UnixSqliteLedger {
+    /// Budget issuance keeps its existing fixed basename and separate journal schema.
     pub fn open(path: &Path, max_bytes: u64, fresh: bool, read_only: bool) -> io::Result<Self> {
+        Self::open_kind(
+            LedgerKind::StoragePullAttempt,
+            path,
+            max_bytes,
+            fresh,
+            read_only,
+        )
+    }
+
+    /// Ordinary logical traffic has only its own trusted fixed basename.
+    /// Callers cannot supply arbitrary SQLite filenames or budget authority.
+    pub fn open_storage_traffic(
+        path: &Path,
+        max_bytes: u64,
+        fresh: bool,
+        read_only: bool,
+    ) -> io::Result<Self> {
+        Self::open_kind(
+            LedgerKind::StorageTraffic,
+            path,
+            max_bytes,
+            fresh,
+            read_only,
+        )
+    }
+
+    fn open_kind(
+        kind: LedgerKind,
+        path: &Path,
+        max_bytes: u64,
+        fresh: bool,
+        read_only: bool,
+    ) -> io::Result<Self> {
+        let file_name = kind.basename();
         let raw = path.as_os_str().as_bytes();
         if !path.is_absolute()
             || raw.len() > MAX_PATH
             || max_bytes == 0
-            || max_bytes > i64::MAX as u64
+            || max_bytes > kind.maximum_file_bytes()
             || fresh && read_only
-            || path.file_name().map(OsStrExt::as_bytes) != Some(FILE_NAME.as_bytes())
+            || path.file_name().map(OsStrExt::as_bytes) != Some(file_name.as_bytes())
         {
-            return Err(refused("fixed absolute Unix budget ledger path required"));
+            return Err(refused(
+                "fixed absolute private Unix ledger path and bound required",
+            ));
         }
         let parent = path
             .parent()
@@ -309,13 +374,13 @@ impl UnixSqliteLedger {
         if !matches!(filesystem.f_type as u64, 0xef53 | 0xf2f52010) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "Unix budget ledger requires local ext4 or F2FS",
+                "Unix private ledger requires local ext4 or F2FS",
             ));
         }
         let names = [
-            component(FILE_NAME.as_bytes())?,
-            component(format!("{FILE_NAME}-wal").as_bytes())?,
-            component(format!("{FILE_NAME}-journal").as_bytes())?,
+            component(file_name.as_bytes())?,
+            component(format!("{file_name}-wal").as_bytes())?,
+            component(format!("{file_name}-journal").as_bytes())?,
         ];
         let path_name = |suffix: &[u8]| {
             let mut bytes = raw.to_vec();
@@ -328,6 +393,7 @@ impl UnixSqliteLedger {
             path_name(b"-journal")?,
         ];
         let mut state = State {
+            kind,
             directories,
             files: [None, None, None],
             main_path: path.to_path_buf(),
@@ -339,7 +405,7 @@ impl UnixSqliteLedger {
             process: std::process::id(),
             poisoned: AtomicBool::new(false),
         };
-        let shm = component(format!("{FILE_NAME}-shm").as_bytes())?;
+        let shm = component(format!("{file_name}-shm").as_bytes())?;
         if state.observe(&shm)?.is_some() {
             return Err(refused("Unix ledger SHM is not supported"));
         }
@@ -373,7 +439,7 @@ impl UnixSqliteLedger {
                 if class == 0 {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
-                        "initialized Unix budget ledger missing",
+                        "initialized private Unix ledger missing",
                     ));
                 }
                 continue;
@@ -463,8 +529,12 @@ impl UnixSqliteLedger {
                 }
             })
             .map_err(|_| refused("Unix ledger VFS generation exhausted"))?;
-        let name = CString::new(format!("sync-budget-{}-{sequence}", std::process::id()))
-            .map_err(|_| refused("Unix ledger VFS name"))?;
+        let name = CString::new(format!(
+            "sync-{}-{}-{sequence}",
+            kind.registration(),
+            std::process::id()
+        ))
+        .map_err(|_| refused("Unix ledger VFS name"))?;
         let mut registration = callbacks::registration();
         registration.zName = name.as_ptr();
         registration.pAppData = Arc::as_ptr(&state).cast_mut().cast();

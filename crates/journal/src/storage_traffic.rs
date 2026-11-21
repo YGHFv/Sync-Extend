@@ -1,8 +1,12 @@
 //! Storage-role traffic is an independent bounded durable ledger, with no worktree mutation.
+mod guard;
+
 use crate::{JournalError, Result};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+use rusqlite::Connection;
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -10,15 +14,25 @@ use sync_extend_core_model::{storage_node::StorageNodeConfig, ContentId, DeviceI
 use sync_extend_transport::{ForwardedPageEnvelope, ForwardedSnapshotEnvelope};
 
 type TrafficPermit = (String, String, String, u64, u64);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+type LedgerConnection = sync_extend_platform_fs::UnixSqliteLedgerConnection;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+type LedgerConnection = Connection;
 
 pub struct StorageTrafficLedger {
-    connection: Connection,
+    connection: LedgerConnection,
     gate: Arc<Mutex<Option<TrafficPermit>>>,
     page_gate: Arc<Mutex<Option<(String, String, u64)>>>,
     path: PathBuf,
     file: File,
+    max_file_bytes: u64,
+    query_budget: guard::QueryBudget,
     #[cfg(windows)]
-    _parents: Vec<sync_extend_platform_fs::LockedDirectory>,
+    parents: Vec<(PathBuf, sync_extend_platform_fs::LockedDirectory)>,
+    #[cfg(windows)]
+    readonly_files: Vec<(PathBuf, sync_extend_platform_fs::GuardedReadFile)>,
+    #[cfg(windows)]
+    absent_sidecars: Vec<PathBuf>,
 }
 
 fn sql_nonnegative(value: i64, index: usize) -> rusqlite::Result<u64> {
@@ -32,79 +46,49 @@ impl StorageTrafficLedger {
         device: &DeviceId,
         create: bool,
     ) -> Result<Self> {
+        Self::open_inner(path, config, device, create, false)
+    }
+
+    /// Linux and Android observe a closed main through retained O_NOATIME descriptors.
+    /// Active writers, WAL recovery and SHM are refused without advancing state.
+    /// Other platforms return unsupported before any ledger I/O.
+    pub fn read_charged_bytes(
+        path: &Path,
+        config: &StorageNodeConfig,
+        device: &DeviceId,
+    ) -> Result<u64> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            Self::open_inner(path, config, device, false, true)?.charged_bytes(config, device)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = (path, config, device);
+            Err(JournalError::Invariant(
+                "storage traffic zero-effect status requires retained Unix no-atime descriptors",
+            ))
+        }
+    }
+
+    fn open_inner(
+        path: &Path,
+        config: &StorageNodeConfig,
+        device: &DeviceId,
+        create: bool,
+        read_only: bool,
+    ) -> Result<Self> {
         config.validate()?;
-        if !path.is_absolute() || (!create && !path.is_file()) || (create && path.try_exists()?) {
-            return Err(JournalError::Invariant(
-                "fresh storage traffic ledger or explicit reopen required",
-            ));
-        }
-        for ancestor in path.ancestors() {
-            match std::fs::symlink_metadata(ancestor) {
-                Ok(metadata) => {
-                    #[cfg(windows)]
-                    let reparse = {
-                        use std::os::windows::fs::MetadataExt;
-                        metadata.file_attributes() & 0x400 != 0
-                    };
-                    #[cfg(not(windows))]
-                    let reparse = false;
-                    if metadata.file_type().is_symlink() || reparse {
-                        return Err(JournalError::Invariant(
-                            "storage traffic path is not owned real storage",
-                        ));
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        #[cfg(windows)]
-        let parents = {
-            let parent = path
-                .parent()
-                .ok_or(JournalError::Invariant("storage ledger parent absent"))?;
-            let mut result = Vec::new();
-            for ancestor in parent.ancestors().collect::<Vec<_>>().into_iter().rev() {
-                let directory = sync_extend_platform_fs::LockedDirectory::open(ancestor)?;
-                if !directory.matches_path(ancestor)? {
-                    return Err(JournalError::Invariant("storage ledger ancestor changed"));
-                }
-                result.push(directory);
-            }
-            result
-                .last()
-                .ok_or(JournalError::Invariant("storage ledger root absent"))?
-                .require_local_ntfs(parent)?;
-            result
-        };
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
-        if create {
-            options.create_new(true);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            options.share_mode(3).custom_flags(0x00200000);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(path)?;
-        Self::verify_file(&file, path)?;
-        let connection = Connection::open(path)?;
-        Self::verify_file(&file, path)?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
+        guard::require_path(path, config, create, read_only)?;
+        let native = guard::open_native(path, config, create, read_only)?;
+        let mut connection = native.connection;
+        let query_budget = guard::configure_limits(&mut connection, config, read_only)?;
         let gate = Arc::new(Mutex::new(None::<(String, String, String, u64, u64)>));
         let function = gate.clone();
         connection.create_scalar_function(
             "sync_storage_traffic_issue",
             5,
-            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_INNOCUOUS,
             move |context| {
                 let mut held = function.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
                 let actual = (
@@ -127,7 +111,8 @@ impl StorageTrafficLedger {
         connection.create_scalar_function(
             "sync_storage_page_issue",
             3,
-            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_INNOCUOUS,
             move |context| {
                 let mut held = function.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
                 let actual = (
@@ -163,85 +148,31 @@ impl StorageTrafficLedger {
             gate,
             page_gate,
             path: path.to_path_buf(),
-            file,
+            file: native.file,
+            max_file_bytes: guard::max_file_bytes(config)?,
+            query_budget,
             #[cfg(windows)]
-            _parents: parents,
+            parents: native.parents,
+            #[cfg(windows)]
+            readonly_files: native.readonly_files,
+            #[cfg(windows)]
+            absent_sidecars: native.absent_sidecars,
         };
         result.audit(config, device)?;
         Ok(result)
     }
 
     fn audit(&self, config: &StorageNodeConfig, device: &DeviceId) -> Result<(u64, usize)> {
-        Self::verify_file(&self.file, &self.path)?;
-        let expected = Connection::open_in_memory()?;
-        expected.execute_batch(include_str!("storage-traffic-schema.sql"))?;
-        fn schema(
-            connection: &Connection,
-            max_objects: usize,
-        ) -> Result<Vec<(String, String, String, Option<String>)>> {
-            let limit = i64::try_from(max_objects)
-                .map_err(|_| JournalError::Invariant("storage traffic schema limit overflow"))?;
-            let mut query = connection.prepare(
-                "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name LIMIT ?1",
-            )?;
-            let rows = query
-                .query_map([limit], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                })?
-                .collect::<rusqlite::Result<_>>()?;
-            Ok(rows)
-        }
-        let expected_schema = schema(&expected, 65)?;
-        if expected_schema.is_empty()
-            || expected_schema.len() > 64
-            || schema(&self.connection, expected_schema.len() + 1)? != expected_schema
-            || self
-                .connection
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?
-                != 1
-        {
-            return Err(JournalError::Invariant(
-                "storage traffic exact schema changed",
-            ));
-        }
-        let owner: (String, String, String, u64, u64) = self.connection.query_row(
-            "SELECT space,device,policy,max_bytes,expires FROM owner",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    sql_nonnegative(row.get::<_, i64>(3)?, 3)?,
-                    sql_nonnegative(row.get::<_, i64>(4)?, 4)?,
-                ))
-            },
-        )?;
-        if owner
-            != (
-                config.space_id.to_string(),
-                device.to_string(),
-                config.fingerprint()?.to_string(),
-                config.max_traffic_bytes,
-                config.expires_at_ms,
-            )
-            || self
-                .connection
-                .query_row("SELECT COUNT(*) FROM owner", [], |row| row.get::<_, i64>(0))?
-                != 1
-        {
-            return Err(JournalError::Invariant(
-                "storage traffic policy/owner changed",
-            ));
-        }
+        let expected_count = self.begin_query(config, device)?;
         let mut total = 0u64;
-        let pages = self.pages(config, device)?;
-        let snapshots = self.snapshots(config, device)?;
+        let pages = self.pages_inner(config, device)?;
+        let snapshots = self.snapshots_inner(config, device)?;
         let mut snapshot_requests = std::collections::BTreeMap::<
             ContentId,
             std::collections::BTreeMap<ContentId, u32>,
         >::new();
         for envelope in &snapshots {
+            self.require_work_remaining()?;
             let request = envelope
                 .storage_id()
                 .map_err(|_| JournalError::Invariant("storage snapshot traffic owner identity"))?;
@@ -255,6 +186,7 @@ impl StorageTrafficLedger {
                 .filter_map(|entry| entry.content.as_ref())
                 .flat_map(|file| &file.chunks)
             {
+                self.require_work_remaining()?;
                 if chunks
                     .insert(chunk.content_id.clone(), chunk.length)
                     .is_some_and(|prior| prior != chunk.length)
@@ -266,20 +198,16 @@ impl StorageTrafficLedger {
             }
         }
         let mut count = pages.len() + snapshots.len();
-        let metadata_bytes: u64 = self.connection.query_row(
-            "SELECT COALESCE(SUM(length(CAST(envelope AS BLOB))),0) FROM
-             (SELECT envelope FROM pages UNION ALL SELECT envelope FROM snapshots)",
-            [],
-            |row| sql_nonnegative(row.get::<_, i64>(0)?, 0),
+        let mut statement = self.connection.prepare(
+            "SELECT
+             CASE WHEN length(CAST(request AS BLOB))<=64 THEN request ELSE '' END,
+             CASE WHEN length(CAST(content AS BLOB))<=64 THEN content ELSE '' END,
+             CASE WHEN length(CAST(direction AS BLOB))<=16 THEN direction ELSE '' END,
+             bytes,at_ms FROM traffic ORDER BY request,content,direction",
         )?;
-        if count > config.max_metadata_entries
-            || metadata_bytes > config.max_metadata_entries as u64 * 1024
-        {
-            return Err(JournalError::Invariant("storage aggregate metadata bounds"));
-        }
-        let mut statement = self.connection.prepare("SELECT request,content,direction,bytes,at_ms FROM traffic ORDER BY at_ms,request,content,direction")?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
+            self.require_work_remaining()?;
             let request: String = row.get(0)?;
             let content: String = row.get(1)?;
             let direction: String = row.get(2)?;
@@ -317,13 +245,24 @@ impl StorageTrafficLedger {
                 return Err(JournalError::Invariant("storage traffic bounds exceeded"));
             }
         }
+        if count != expected_count {
+            return Err(JournalError::Invariant(
+                "storage traffic audited row count differs",
+            ));
+        }
+        self.verify_native()?;
+        self.require_work_remaining()?;
         Ok((total, count))
     }
 
-    fn verify_file(file: &File, path: &Path) -> Result<()> {
+    fn verify_file(file: &File, path: &Path, max_bytes: u64) -> Result<()> {
         let slot = std::fs::symlink_metadata(path)?;
         let held = file.metadata()?;
-        if !slot.is_file() || !held.is_file() || slot.file_type().is_symlink() {
+        if !slot.is_file()
+            || !held.is_file()
+            || slot.file_type().is_symlink()
+            || held.len() > max_bytes
+        {
             return Err(JournalError::Invariant("storage ledger slot differs"));
         }
         #[cfg(windows)]
@@ -339,6 +278,7 @@ impl StorageTrafficLedger {
                 || slot.ino() != held.ino()
                 || held.nlink() != 1
                 || held.mode() & 0o077 != 0
+                || slot.len() != held.len()
             {
                 return Err(JournalError::Invariant(
                     "storage ledger inode/privacy differs",
@@ -565,14 +505,26 @@ impl StorageTrafficLedger {
         config: &StorageNodeConfig,
         device: &DeviceId,
     ) -> Result<Vec<ForwardedPageEnvelope>> {
+        self.begin_query(config, device)?;
+        self.pages_inner(config, device)
+    }
+
+    fn pages_inner(
+        &self,
+        config: &StorageNodeConfig,
+        device: &DeviceId,
+    ) -> Result<Vec<ForwardedPageEnvelope>> {
         let mut statement = self.connection.prepare(
-            "SELECT storage_id,CASE WHEN length(CAST(envelope AS BLOB))<=2097152
-             THEN envelope ELSE '' END,envelope_hash,retained_at_ms FROM pages ORDER BY storage_id",
+            "SELECT CASE WHEN length(CAST(storage_id AS BLOB))<=64 THEN storage_id ELSE '' END,
+             CASE WHEN length(CAST(envelope AS BLOB))<=2097152 THEN envelope ELSE '' END,
+             CASE WHEN length(CAST(envelope_hash AS BLOB))<=64 THEN envelope_hash ELSE '' END,
+             retained_at_ms FROM pages ORDER BY storage_id",
         )?;
         let mut rows = statement.query([])?;
         let mut result = Vec::new();
         let mut bytes = 0u64;
         while let Some(row) = rows.next()? {
+            self.require_work_remaining()?;
             let id: String = row.get(0)?;
             let json: String = row.get(1)?;
             let digest: String = row.get(2)?;
@@ -602,8 +554,10 @@ impl StorageTrafficLedger {
                     "storage durable page identity changed",
                 ));
             }
+            self.require_work_remaining()?;
             result.push(envelope);
         }
+        self.verify_native()?;
         Ok(result)
     }
 
@@ -728,15 +682,27 @@ impl StorageTrafficLedger {
         config: &StorageNodeConfig,
         device: &DeviceId,
     ) -> Result<Vec<ForwardedSnapshotEnvelope>> {
+        self.begin_query(config, device)?;
+        self.snapshots_inner(config, device)
+    }
+
+    fn snapshots_inner(
+        &self,
+        config: &StorageNodeConfig,
+        device: &DeviceId,
+    ) -> Result<Vec<ForwardedSnapshotEnvelope>> {
         let mut statement = self.connection.prepare(
-            "SELECT storage_id,CASE WHEN length(CAST(envelope AS BLOB))<=8519680
-             THEN envelope ELSE '' END,envelope_hash,retained_at_ms
+            "SELECT CASE WHEN length(CAST(storage_id AS BLOB))<=64 THEN storage_id ELSE '' END,
+             CASE WHEN length(CAST(envelope AS BLOB))<=8519680 THEN envelope ELSE '' END,
+             CASE WHEN length(CAST(envelope_hash AS BLOB))<=64 THEN envelope_hash ELSE '' END,
+             retained_at_ms
              FROM snapshots ORDER BY storage_id",
         )?;
         let mut rows = statement.query([])?;
         let mut result = Vec::new();
         let mut bytes = 0u64;
         while let Some(row) = rows.next()? {
+            self.require_work_remaining()?;
             let id: String = row.get(0)?;
             let json: String = row.get(1)?;
             let digest: String = row.get(2)?;
@@ -766,8 +732,10 @@ impl StorageTrafficLedger {
                     "storage snapshot durable identity changed",
                 ));
             }
+            self.require_work_remaining()?;
             result.push(envelope);
         }
+        self.verify_native()?;
         Ok(result)
     }
 }
