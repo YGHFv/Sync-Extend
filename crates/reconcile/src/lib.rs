@@ -136,6 +136,11 @@ pub use tree_final_observation::{TreeFinalObservation, TreeFinalObservationRepor
 pub use tree_native_owner::{TreeNativeRestoreResult, TreeOwnerCreation, TreeOwnerReadiness};
 pub use tree_restore_capture::TreeRestoreCapture;
 pub use tree_restore_pipeline::TreeRestoreBudgets;
+mod restore_preview;
+pub use restore_preview::{
+    project_restore_preview, RestorePreview, RestorePreviewCounts, RestorePreviewDifference,
+    RestorePreviewEntry, RestorePreviewLimits, RestorePreviewRequest, RestorePreviewSelection,
+};
 
 use serde::Serialize;
 use std::{

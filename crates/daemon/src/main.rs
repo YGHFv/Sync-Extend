@@ -26,6 +26,7 @@ mod webdav_http;
 mod webdav_locks;
 mod webdav_upload;
 mod webdav_xml;
+mod restore_preview_cli;
 
 #[derive(Parser)]
 #[command(
@@ -370,6 +371,19 @@ enum Command {
     TreeTransactions {
         #[arg(long)]
         data_dir: PathBuf,
+    },
+    /// Preview full or one-file retained history read-only with explicit bounds.
+    RestorePreview {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long)]
+        baseline: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        budgets: PathBuf,
     },
     /// Prepare one bounded historical whole-tree restore, retaining input pins.
     TreePrepare {
@@ -1306,6 +1320,11 @@ fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
     let parsed = Cli::parse();
     #[cfg(target_os = "linux")]
+    if let Err(error) = restore_preview_cli::precheck(&parsed) {
+        eprintln!("syncd: {error}");
+        return ExitCode::FAILURE;
+    }
+    #[cfg(target_os = "linux")]
     let linux_owner = match linux_namespace::prepare(&parsed) {
         Ok(owner) => owner,
         Err(error) => {
@@ -1324,6 +1343,10 @@ fn main() -> ExitCode {
             .stack_size(16 * 1024 * 1024)
             .spawn(move || {
                 let parsed = Cli::parse();
+                if let Err(error) = restore_preview_cli::precheck(&parsed) {
+                    eprintln!("syncd: {error}");
+                    return ExitCode::FAILURE;
+                }
                 run_cli(
                     parsed,
                     #[cfg(target_os = "linux")]
@@ -1899,6 +1922,21 @@ async fn execute(
         }
         Command::TreeTransactions { data_dir } => {
             print(&open(&data_dir)?.tree_restore_transactions()?)?;
+        }
+        Command::RestorePreview {
+            data_dir,
+            snapshot,
+            baseline,
+            path,
+            budgets,
+        } => {
+            restore_preview_cli::run(
+                &data_dir,
+                &snapshot,
+                baseline.as_deref(),
+                path.as_deref(),
+                &budgets,
+            )?;
         }
         Command::TreePrepare {
             data_dir,

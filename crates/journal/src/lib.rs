@@ -2797,6 +2797,13 @@ mod read_lease;
 pub use read_lease::{read_lease_expiry, ReadLease, ReadLeaseIntent, ReadLeaseState};
 mod snapshot_retention;
 pub use snapshot_retention::RetainedSnapshot;
+mod readonly_restore_preview;
+pub use readonly_restore_preview::{
+    validate_preview_manifest, ReadOnlyRestorePreviewSource, ReadOnlySnapshotPreviewLimits,
+    ReadOnlySnapshotPreviewSource,
+};
+#[cfg(target_os = "linux")]
+pub use readonly_restore_preview::ReadOnlyRestorePreviewJournal;
 mod snapshot_pruning;
 pub use snapshot_pruning::{SnapshotAudit, SnapshotPruning};
 mod gc_mark;
