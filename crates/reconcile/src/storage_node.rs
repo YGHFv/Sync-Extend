@@ -7,6 +7,7 @@ use std::{
     fs::{self, File, OpenOptions},
     path::PathBuf,
 };
+#[cfg(not(target_os = "linux"))]
 use sync_extend_cas::Cas;
 use sync_extend_core_model::{
     reference_owner::{ReferenceOwnerKind, ReferenceOwnerScope},
@@ -24,7 +25,10 @@ pub struct StorageNode {
     pub(super) config: StorageNodeConfig,
     pub(super) device: DeviceId,
     pub(super) journal: Journal,
+    #[cfg(not(target_os = "linux"))]
     pub(super) cas: Cas,
+    #[cfg(target_os = "linux")]
+    pub(super) cas: crate::storage_linux_cas::StorageCas,
     pub(super) traffic: sync_extend_journal::StorageTrafficLedger,
     data_identity: crate::filesystem::PathIdentity,
     file_identities: Vec<(PathBuf, crate::filesystem::PathIdentity)>,
@@ -451,6 +455,36 @@ impl StorageNode {
             .map_err(Into::into)
     }
 
+    /// Hold the real shared original Journal/CAS session and outer owner Arc.
+    /// Dropping the node cannot make finish/Arc::try_unwrap succeed while it lives.
+    #[cfg(target_os = "linux")]
+    pub fn linux_storage_cas_session(&self) -> Result<crate::LinuxStorageCasSessionGuard> {
+        self.verify_storage()?;
+        self.cas.hold_inside_session().map_err(Into::into)
+    }
+
+    /// Actual original file FD/lease/hash loan; ordinary/v1 nodes cannot use it.
+    #[cfg(target_os = "linux")]
+    pub fn linux_storage_cas_read_guard(
+        &self,
+        reference: &ChunkRef,
+    ) -> Result<crate::LinuxStorageCasReadGuard> {
+        self.verify_storage()?;
+        self.cas.hold_inside_read(reference).map_err(Into::into)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn linux_storage_cas_inventory(
+        &self,
+    ) -> Result<sync_extend_platform_fs::LinuxStorageCasInventory> {
+        self.verify_storage()?;
+        self.cas
+            .inside_inventory()?
+            .ok_or(ReconcileError::Invariant(
+                "actual v2 inside-image CAS required for FD inventory",
+            ))
+    }
+
     fn open_inner(
         config: StorageNodeConfig,
         create: bool,
@@ -564,8 +598,8 @@ impl StorageNode {
                 .sync_all()?;
         }
         #[cfg(target_os = "linux")]
-        let mut journal = if let Some(budget) = original_linux_metadata {
-            Journal::open_with_linux_metadata_budget(budget, config.max_metadata_entries)?
+        let mut journal = if let Some(owner) = &linux_storage_owner {
+            owner.open_journal()?
         } else {
             Journal::open_with_storage_limit(
                 &config.data_dir.join("journal.sqlite"),
@@ -590,14 +624,20 @@ impl StorageNode {
             ));
         }
         #[cfg(target_os = "linux")]
-        let cas = if let Some(budget) = original_linux_metadata {
-            crate::managed_cas_with_linux_metadata(
-                &config.data_dir,
-                budget,
-                config.max_metadata_entries,
-            )?
+        let cas = if let Some(owner) = &linux_storage_owner {
+            if owner.has_inside_cas() {
+                crate::storage_linux_cas::StorageCas::inside(std::sync::Arc::clone(owner))?
+            } else {
+                crate::storage_linux_cas::StorageCas::Ordinary(
+                    crate::managed_cas_with_linux_metadata(
+                        &config.data_dir,
+                        owner.budget(),
+                        config.max_metadata_entries,
+                    )?,
+                )
+            }
         } else {
-            managed_cas(&config.data_dir)?
+            crate::storage_linux_cas::StorageCas::Ordinary(managed_cas(&config.data_dir)?)
         };
         #[cfg(not(target_os = "linux"))]
         let cas = managed_cas(&config.data_dir)?;
@@ -1961,8 +2001,11 @@ impl StorageNode {
 
     pub(super) fn verify_storage(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
-        if let Some(owner) = &self.linux_storage_owner {
-            owner.verify_journal(&self.journal, &self.device)?;
+        {
+            if let Some(owner) = &self.linux_storage_owner {
+                owner.verify_journal(&self.journal, &self.device)?;
+            }
+            self.cas.verify_inside_owner()?;
         }
         self.data_identity.verify(&self.config.data_dir)?;
         for (path, identity) in &self.file_identities {
@@ -2038,6 +2081,19 @@ impl StorageNode {
     }
 
     fn physical_bytes(&self) -> Result<u64> {
+        #[cfg(target_os = "linux")]
+        if let Some(inventory) = self.cas.inside_inventory()? {
+            let total = inventory
+                .payload_bytes
+                .checked_add(inventory.temporary_bytes)
+                .ok_or(ReconcileError::ResourceLimit("inside CAS byte inventory"))?;
+            if total > self.config.max_stored_bytes {
+                return Err(ReconcileError::ResourceLimit(
+                    "inside CAS physical quota exceeded",
+                ));
+            }
+            return Ok(total);
+        }
         let mut total = 0u64;
         let mut count = 0usize;
         let root = self.config.data_dir.join("cas");

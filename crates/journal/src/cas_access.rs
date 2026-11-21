@@ -35,8 +35,10 @@ fn try_lock(file: &File, shared: bool, busy: &'static str) -> Result<()> {
 
 /// Cooperative process-lifetime CAS coordination, not a content pin or delete right.
 pub struct CasAccessGuard {
-    file: File,
+    file: Option<File>,
     path: PathBuf,
+    #[cfg(target_os = "linux")]
+    original_linux: Option<sync_extend_platform_fs::LinuxStorageCasCoordinationGuard>,
     #[cfg(windows)]
     _directories: Vec<sync_extend_platform_fs::LockedDirectory>,
 }
@@ -81,8 +83,10 @@ impl CasAccessGuard {
         let file = options.open(&path)?;
         try_lock(&file, true, "CAS exclusive access is running")?;
         let guard = Self {
-            file,
+            file: Some(file),
             path,
+            #[cfg(target_os = "linux")]
+            original_linux: None,
             #[cfg(windows)]
             _directories: directories,
         };
@@ -91,17 +95,44 @@ impl CasAccessGuard {
     }
 
     pub(crate) fn try_exclusive(&mut self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(original) = &mut self.original_linux {
+            original.try_exclusive().map_err(|error| {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    JournalError::Invariant("original Linux CAS readers are running")
+                } else {
+                    error.into()
+                }
+            })?;
+            return self.verify();
+        }
         // A failed upgrade grants nothing; callers roll back their DB transaction.
+        let file = self.file.as_ref().ok_or(JournalError::Invariant(
+            "ordinary CAS coordination descriptor absent",
+        ))?;
         #[cfg(target_os = "android")]
-        fs2::FileExt::unlock(&self.file)?;
+        fs2::FileExt::unlock(file)?;
         #[cfg(not(target_os = "android"))]
-        self.file.unlock()?;
-        try_lock(&self.file, false, "CAS readers are running")?;
+        file.unlock()?;
+        try_lock(file, false, "CAS readers are running")?;
         self.verify()
     }
 
     pub(crate) fn verify(&self) -> Result<()> {
-        let held = self.file.metadata()?;
+        #[cfg(target_os = "linux")]
+        if let Some(original) = &self.original_linux {
+            if self.file.is_some() {
+                return Err(JournalError::Invariant(
+                    "original Linux CAS guard cannot contain an escaping ordinary descriptor",
+                ));
+            }
+            original.verify()?;
+            return Ok(());
+        }
+        let file = self.file.as_ref().ok_or(JournalError::Invariant(
+            "ordinary CAS coordination descriptor absent",
+        ))?;
+        let held = file.metadata()?;
         let named = fs::symlink_metadata(&self.path)?;
         if !held.is_file()
             || !named.is_file()
@@ -115,11 +146,11 @@ impl CasAccessGuard {
         #[cfg(windows)]
         {
             use sync_extend_platform_fs::verify_regular_file;
-            verify_regular_file(&self.file)?;
+            verify_regular_file(file)?;
             // Observe only the named slot. File::open's default READ sharing
             // conflicts with the retained original RW coordination handles.
             // This metadata-only nonfollowing check grants no writer authority.
-            if !sync_extend_platform_fs::regular_file_matches_path(&self.file, &self.path)? {
+            if !sync_extend_platform_fs::regular_file_matches_path(file, &self.path)? {
                 return Err(JournalError::Invariant("CAS coordination identity changed"));
             }
         }
@@ -130,6 +161,59 @@ impl CasAccessGuard {
                 return Err(JournalError::Invariant("CAS coordination identity changed"));
             }
         }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn shared_original_linux(
+        database: &Path,
+        original: &sync_extend_platform_fs::LinuxStorageCasCoordinationLoan,
+    ) -> Result<Self> {
+        let parent = database.parent().ok_or(JournalError::Invariant(
+            "original Linux CAS Journal parent absent",
+        ))?;
+        let guard = original.acquire_shared()?;
+        let result = Self {
+            file: None,
+            // Audit label only; actual opens/checks/upgrade use the typed loan.
+            path: parent.join("cas-access.lock"),
+            original_linux: Some(guard),
+        };
+        result.verify()?;
+        original.verify()?;
+        Ok(result)
+    }
+
+    /// Verify actual typed original possession. Ordinary and v1 guards cannot
+    /// acquire an original storage capability from matching paths or keys.
+    #[cfg(target_os = "linux")]
+    pub fn verify_linux_storage_original(&self) -> Result<()> {
+        if self.original_linux.is_none() {
+            return Err(JournalError::Invariant(
+                "actual original Linux CAS guard required for verification",
+            ));
+        }
+        self.verify()
+    }
+
+    /// Actual typed guard release; a failed verification grants no close receipt.
+    #[cfg(target_os = "linux")]
+    pub fn close_linux_storage_original(self) -> Result<()> {
+        self.verify_linux_storage_original()?;
+        let Self {
+            file,
+            original_linux,
+            ..
+        } = self;
+        let original = original_linux.ok_or(JournalError::Invariant(
+            "actual original Linux CAS guard required for explicit close",
+        ))?;
+        if file.is_some() {
+            return Err(JournalError::Invariant(
+                "original Linux CAS guard cannot close a mixed ordinary descriptor",
+            ));
+        }
+        original.close()?;
         Ok(())
     }
 }
@@ -158,6 +242,14 @@ impl Journal {
     }
 
     pub(crate) fn acquire_cas_coordination(&self) -> Result<CasAccessGuard> {
+        #[cfg(target_os = "linux")]
+        if let Some(original) = &self.original_linux_cas_coordination {
+            self.linux_storage_cas_coordination_key()?
+                .ok_or(JournalError::Invariant(
+                    "original Linux CAS coordination binding lost",
+                ))?;
+            return CasAccessGuard::shared_original_linux(&self.database_path, original);
+        }
         #[cfg(windows)]
         if self.original_restored_image.is_some() {
             let original =
@@ -198,7 +290,7 @@ impl CasAccessGuard {
         let file = original.open_for_shared_coordination(&path)?;
         try_lock(&file, true, "original CAS exclusive access running")?;
         let guard = Self {
-            file,
+            file: Some(file),
             path,
             _directories: directories,
         };

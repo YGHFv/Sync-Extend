@@ -466,6 +466,8 @@ mod held_volume;
 #[cfg(target_os = "linux")]
 mod linux_metadata;
 #[cfg(target_os = "linux")]
+mod storage_cas;
+#[cfg(target_os = "linux")]
 pub use held_volume::{
     HeldPrivateDirectory, HeldPrivateOriginal, HeldPrivateVolume, LinuxCleanupAbsenceObservation,
     LinuxNamespaceCapability, LinuxNativeAttempt, LinuxOutsideCleanupBoundary,
@@ -478,4 +480,11 @@ pub use held_volume::{
 pub use linux_metadata::{
     LinuxMetadataBudget, LinuxMetadataFileReceipt, LinuxMetadataLimits, LinuxMetadataReceipt,
     LinuxMetadataVfs,
+};
+#[cfg(target_os = "linux")]
+pub use storage_cas::{
+    LinuxStorageCas, LinuxStorageCasCoordination, LinuxStorageCasCoordinationGuard,
+    LinuxStorageCasCoordinationLoan, LinuxStorageCasDirectoryGuard, LinuxStorageCasExpectedLayout,
+    LinuxStorageCasFileGuard, LinuxStorageCasFileObservation, LinuxStorageCasInventory,
+    LinuxStorageCasLimits, LinuxStorageCasObservation, LinuxStorageCasStaged,
 };

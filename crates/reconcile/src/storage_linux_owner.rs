@@ -1,4 +1,5 @@
-//! Explicit Linux storage-only Journal owner. No worktree or native CAS action.
+//! Explicit Linux storage-only owner; v2 opts into a fresh inside-image CAS.
+//! No worktree, retired native inspection, marker, disposal or resume authority.
 use crate::{ReconcileError, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,7 @@ use std::{
     io::Read,
     os::unix::fs::{FileExt as UnixFileExt, MetadataExt, OpenOptionsExt},
     path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 use sync_extend_core_model::{storage_node::StorageNodeConfig, ContentId, DeviceId};
 use sync_extend_journal::{
@@ -15,7 +17,8 @@ use sync_extend_journal::{
 };
 use sync_extend_platform_fs::{
     LinuxMetadataBudget, LinuxMetadataLimits, LinuxMetadataReceipt, LinuxNamespaceCapability,
-    UnixFileKey,
+    LinuxStorageCas, LinuxStorageCasCoordination, LinuxStorageCasExpectedLayout,
+    LinuxStorageCasLimits, UnixFileKey,
 };
 
 const MAX_CONFIG_BYTES: usize = 65_536;
@@ -64,6 +67,74 @@ pub struct LinuxStorageOwnerConfig {
     pub mount_root: PathBuf,
     pub expected_device: Option<DeviceId>,
     pub metadata_limits: LinuxStorageMetadataLimits,
+    #[serde(default)]
+    pub inside_image_cas: Option<LinuxStorageInsideCasConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinuxStorageCasRealm {
+    NewInsideImage,
+}
+
+/// A versioned opt-in, with no caller-selected CAS or mount-relative path.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinuxStorageInsideCasConfig {
+    pub format_version: u32,
+    pub realm: LinuxStorageCasRealm,
+    pub expected_layout: Option<LinuxStorageInsideCasExpectation>,
+}
+
+/// Serialized rejection/audit inputs only; reopening still reacquires the real
+/// original image lease, namespace/mount and nonfollowing directory/file FDs.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinuxStorageInsideCasExpectation {
+    pub format_version: u32,
+    pub layout_version: u32,
+    pub realm: LinuxStorageCasRealm,
+    pub storage_policy: ContentId,
+    pub owner_config_fingerprint: ContentId,
+    pub realm_fingerprint: ContentId,
+    pub persistent_metadata_owner_generation: [u8; 16],
+    pub outside_data_root: LinuxStorageObjectIdentity,
+    pub cas_access_lock: LinuxStorageObjectIdentity,
+    pub backing_image: LinuxStorageObjectIdentity,
+    pub image_filesystem_id: [u8; 8],
+    pub mounted_root_inode: u64,
+    pub cas_inode: u64,
+    pub objects_inode: u64,
+    pub temporary_inode: u64,
+    pub realm_inode: u64,
+    pub owner_uid: u32,
+}
+
+impl LinuxStorageInsideCasExpectation {
+    fn platform(&self) -> LinuxStorageCasExpectedLayout {
+        LinuxStorageCasExpectedLayout {
+            format_version: self.layout_version,
+            backing_image: UnixFileKey {
+                device: self.backing_image.device,
+                inode: self.backing_image.inode,
+            },
+            image_filesystem_id: self.image_filesystem_id,
+            mounted_root_inode: self.mounted_root_inode,
+            cas_inode: self.cas_inode,
+            objects_inode: self.objects_inode,
+            temporary_inode: self.temporary_inode,
+            realm_inode: self.realm_inode,
+            realm_fingerprint: binding_bytes(&self.realm_fingerprint),
+            owner_uid: self.owner_uid,
+        }
+    }
+
+    fn coordination_key(&self) -> UnixFileKey {
+        UnixFileKey {
+            device: self.cas_access_lock.device,
+            inode: self.cas_access_lock.inode,
+        }
+    }
 }
 
 fn absolute(path: &Path) -> Result<()> {
@@ -89,7 +160,7 @@ fn absolute(path: &Path) -> Result<()> {
 impl LinuxStorageOwnerConfig {
     pub fn validate(&self, initialize: bool) -> Result<()> {
         self.storage.validate()?;
-        if self.format_version != 1
+        if !matches!(self.format_version, 1 | 2)
             || self.owner_role != LinuxStorageOwnerRole::StorageOnly
             || initialize != self.expected_device.is_none()
             || self.storage.max_metadata_entries < 3
@@ -97,6 +168,49 @@ impl LinuxStorageOwnerConfig {
             return Err(ReconcileError::Invariant(
                 "explicit storage-only role and init/reopen identity required",
             ));
+        }
+        match (&self.inside_image_cas, self.format_version) {
+            (None, 1) => {}
+            (Some(cas), 2)
+                if cas.format_version == 1
+                    && cas.realm == LinuxStorageCasRealm::NewInsideImage
+                    && initialize == cas.expected_layout.is_none() =>
+            {
+                self.inside_cas_limits()?.physical_liability_bytes()?;
+                if let Some(expected) = &cas.expected_layout {
+                    let inodes = [
+                        expected.mounted_root_inode,
+                        expected.cas_inode,
+                        expected.objects_inode,
+                        expected.temporary_inode,
+                        expected.realm_inode,
+                    ];
+                    if expected.format_version != 1
+                        || expected.layout_version != 1
+                        || expected.realm != LinuxStorageCasRealm::NewInsideImage
+                        || expected.storage_policy != self.storage.fingerprint()?
+                        || expected.owner_config_fingerprint != self.owner_config_fingerprint()?
+                        || expected.persistent_metadata_owner_generation == [0; 16]
+                        || expected.owner_uid != 0
+                        || expected.image_filesystem_id == [0; 8]
+                        || inodes.contains(&0)
+                        || inodes.into_iter().collect::<BTreeSet<_>>().len() != 5
+                        || expected.outside_data_root.inode == 0
+                        || expected.cas_access_lock.inode == 0
+                        || expected.backing_image.inode == 0
+                        || expected.cas_access_lock.device != expected.outside_data_root.device
+                    {
+                        return Err(ReconcileError::Invariant(
+                            "exact versioned inside CAS rejection expectation required",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(ReconcileError::Invariant(
+                    "v1 stays metadata-only; v2 requires explicit new inside-image CAS",
+                ))
+            }
         }
         for path in [
             &self.backing_image,
@@ -144,9 +258,54 @@ impl LinuxStorageOwnerConfig {
         let _ = limits.storage_only_physical_liabilities()?;
         Ok(())
     }
+
+    fn inside_cas_limits(&self) -> Result<LinuxStorageCasLimits> {
+        let limits = LinuxStorageCasLimits {
+            max_payload_bytes: self.storage.max_stored_bytes,
+            max_entries: self.storage.max_metadata_entries,
+        };
+        limits.validate()?;
+        Ok(limits)
+    }
+
+    /// v1 retains its exact original policy bytes. The new v2 domain explicitly
+    /// binds the inside-image opt-in and all stable owner policy/path/limits.
+    /// expected_device and expected_layout remain independent reopening checks:
+    /// the initial device is created only by the later real StorageNode Journal.
+    pub fn owner_config_fingerprint(&self) -> Result<ContentId> {
+        if self.format_version == 1 && self.inside_image_cas.is_none() {
+            return Ok(self.storage.fingerprint()?);
+        }
+        let cas = self
+            .inside_image_cas
+            .as_ref()
+            .ok_or(ReconcileError::Invariant(
+                "v2 owner configuration requires its explicit inside CAS opt-in",
+            ))?;
+        if self.format_version != 2
+            || cas.format_version != 1
+            || cas.realm != LinuxStorageCasRealm::NewInsideImage
+        {
+            return Err(ReconcileError::Invariant(
+                "exact v2 inside CAS config domain required",
+            ));
+        }
+        Ok(ContentId::hash(&serde_json::to_vec(&(
+            "sync-extend-linux-storage-only-owner-inside-cas-v2",
+            self.format_version,
+            self.owner_role,
+            cas.format_version,
+            cas.realm,
+            &self.storage,
+            &self.backing_image,
+            &self.mount_root,
+            self.metadata_limits,
+        ))?))
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LinuxStorageObjectIdentity {
     pub device: u64,
     pub inode: u64,
@@ -159,6 +318,46 @@ impl From<UnixFileKey> for LinuxStorageObjectIdentity {
             inode: value.inode,
         }
     }
+}
+
+fn binding_bytes(fingerprint: &ContentId) -> [u8; 64] {
+    let mut result = [0u8; 64];
+    result.copy_from_slice(fingerprint.as_str().as_bytes());
+    result
+}
+
+fn realm_fingerprint(
+    config: &LinuxStorageOwnerConfig,
+    persistent_generation: [u8; 16],
+    outside_root: LinuxStorageObjectIdentity,
+    coordination: UnixFileKey,
+    layout: LinuxStorageCasExpectedLayout,
+) -> Result<ContentId> {
+    if persistent_generation == [0; 16] {
+        return Err(ReconcileError::Invariant(
+            "actual persistent metadata owner generation required",
+        ));
+    }
+    // ext4 f_fsid is the actual stable UUID-derived filesystem identity. Inner
+    // st_dev, runtime mount ID, namespace and fresh owner generation are excluded.
+    Ok(ContentId::hash(&serde_json::to_vec(&(
+        "sync-extend-linux-storage-inside-cas-durable-realm-v1",
+        config.owner_config_fingerprint()?,
+        persistent_generation,
+        outside_root,
+        LinuxStorageObjectIdentity::from(coordination),
+        LinuxStorageObjectIdentity::from(layout.backing_image),
+        layout.format_version,
+        layout.image_filesystem_id,
+        [
+            layout.mounted_root_inode,
+            layout.cas_inode,
+            layout.objects_inode,
+            layout.temporary_inode,
+            layout.realm_inode,
+        ],
+        layout.owner_uid,
+    ))?))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -246,6 +445,47 @@ pub struct LinuxStorageOwnerObservation {
     pub pending_resume_authority: bool,
     pub helpers_started: bool,
     pub worktree: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inside_cas: Option<LinuxStorageInsideCasObservation>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LinuxStorageInsideCasObservation {
+    pub format_version: u32,
+    pub scope: &'static str,
+    pub expected_layout: LinuxStorageInsideCasExpectation,
+    pub current_owner_generation: [u8; 16],
+    pub namespace: LinuxStorageObjectIdentity,
+    pub runtime_mount_id: u64,
+    pub mounted_root: LinuxStorageObjectIdentity,
+    pub cas: LinuxStorageObjectIdentity,
+    pub objects: LinuxStorageObjectIdentity,
+    pub temporary: LinuxStorageObjectIdentity,
+    pub realm: LinuxStorageObjectIdentity,
+    pub max_payload_bytes: u64,
+    pub max_entries: usize,
+    pub complete_image_physical_liability_bytes: u64,
+    pub fixed_image_relative_layout: [&'static str; 4],
+    pub outside_cas_adopted: bool,
+    pub cooperative_lock_native_writer_authority: bool,
+    pub native_inspection_authority: bool,
+    pub native_admission_authority: bool,
+    pub marker_creation_authority: bool,
+    pub payload_move_authority: bool,
+    pub deletion_authority: bool,
+    pub terminal_authority: bool,
+    pub release_authority: bool,
+    pub cleanup_authority: bool,
+    pub pending_resume_authority: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LinuxStorageInsideCasClosed {
+    pub original_layout: LinuxStorageInsideCasObservation,
+    pub original_realm_file_and_lease_closed: bool,
+    pub original_inside_directory_fds_closed: bool,
+    pub original_cooperative_sentinel_fds_closed: bool,
+    pub retired_native_cleanup_authority: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -259,18 +499,23 @@ pub struct LinuxStorageOwnerClosed {
     pub original_loop_released: bool,
     pub helpers_started: bool,
     pub pending_resume_authority: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inside_cas: Option<LinuxStorageInsideCasClosed>,
 }
 
 /// Acquired live objects only. Its serialized observations cannot construct it.
 pub struct LinuxStorageOwner {
     config: LinuxStorageOwnerConfig,
-    owner: LinuxNamespaceCapability,
+    owner: Arc<LinuxNamespaceCapability>,
     budget: LinuxMetadataBudget,
+    inside_cas: Option<LinuxStorageCas>,
+    cas_coordination: Option<LinuxStorageCasCoordination>,
     root: File,
     root_identity: LinuxStorageObjectIdentity,
     process_start_ticks: u64,
     initialize: bool,
     bootstrap_budget: Option<StorageJournalBootstrapBudget>,
+    cas_failure: Mutex<Option<String>>,
 }
 
 fn identity(metadata: &Metadata) -> LinuxStorageObjectIdentity {
@@ -372,8 +617,8 @@ fn root_names(path: &Path) -> Result<BTreeSet<std::ffi::OsString>> {
         .collect::<std::io::Result<_>>()?)
 }
 
-fn required_names() -> BTreeSet<std::ffi::OsString> {
-    [
+fn required_names(config: &LinuxStorageOwnerConfig) -> BTreeSet<std::ffi::OsString> {
+    let mut names: BTreeSet<_> = [
         "storage.lock",
         "device.secret",
         "journal.sqlite",
@@ -382,25 +627,36 @@ fn required_names() -> BTreeSet<std::ffi::OsString> {
         "journal.sqlite-journal",
         "journal.sqlite.metadata-owner",
         "storage-traffic.sqlite",
-        "cas",
     ]
     .into_iter()
     .map(std::ffi::OsString::from)
-    .collect()
+    .collect();
+    names.insert(std::ffi::OsString::from(if config.format_version == 2 {
+        "cas-access.lock"
+    } else {
+        "cas"
+    }));
+    names
 }
 
-fn allowed_names() -> BTreeSet<std::ffi::OsString> {
-    required_names()
+fn allowed_names(config: &LinuxStorageOwnerConfig) -> BTreeSet<std::ffi::OsString> {
+    let mut names: BTreeSet<_> = required_names(config)
         .into_iter()
         .chain(
             ["storage-traffic.sqlite-wal", "storage-traffic.sqlite-shm"]
                 .into_iter()
                 .map(std::ffi::OsString::from),
         )
-        .collect()
+        .collect();
+    if config.format_version == 2 {
+        // An optional outside CAS is inert. Even a matching name, payload or
+        // inode never supplies an image CAS key, byte, reference or permission.
+        names.insert(std::ffi::OsString::from("cas"));
+    }
+    names
 }
 
-fn layout(config: &LinuxStorageOwnerConfig, initialize: bool) -> Result<()> {
+fn layout(config: &LinuxStorageOwnerConfig, initialize: bool, root: &File) -> Result<()> {
     let names = root_names(&config.storage.data_dir)?;
     if initialize {
         if !names.is_empty() {
@@ -410,8 +666,8 @@ fn layout(config: &LinuxStorageOwnerConfig, initialize: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let required = required_names();
-    let allowed = allowed_names();
+    let required = required_names(config);
+    let allowed = allowed_names(config);
     if !required.is_subset(&names) || !names.is_subset(&allowed) {
         return Err(ReconcileError::Invariant(
             "complete original storage-only layout required; unknown slots refused",
@@ -430,15 +686,25 @@ fn layout(config: &LinuxStorageOwnerConfig, initialize: bool) -> Result<()> {
             }
         }
     }
-    // CAS is still ordinary managed storage in N06a. This check grants no
-    // namespace mutation/inspection/quarantine/delete authority to its objects.
-    for relative in ["cas", "cas/objects", "cas/tmp"] {
-        let path = config.storage.data_dir.join(relative);
-        crate::check_ancestors(&path)?;
-        let metadata = fs::symlink_metadata(path)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(ReconcileError::Invariant("original storage CAS layout"));
+    if config.format_version == 1 {
+        // The original v1 outside CAS checks and non-native behavior stay intact.
+        for relative in ["cas", "cas/objects", "cas/tmp"] {
+            let path = config.storage.data_dir.join(relative);
+            crate::check_ancestors(&path)?;
+            let metadata = fs::symlink_metadata(path)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(ReconcileError::Invariant("original storage CAS layout"));
+            }
         }
+    } else {
+        let expected = config
+            .inside_image_cas
+            .as_ref()
+            .and_then(|cas| cas.expected_layout.as_ref())
+            .ok_or(ReconcileError::Invariant(
+                "inside CAS reopen expectation absent",
+            ))?;
+        LinuxStorageCasCoordination::preflight_existing(root, expected.coordination_key())?;
     }
     Ok(())
 }
@@ -567,7 +833,21 @@ impl LinuxStorageOwner {
         // The five mandatory leases and acquired namespace supply ownership.
         root.try_lock_exclusive()?;
         let root_identity = identity(&root.metadata()?);
-        layout(&config, initialize)?;
+        layout(&config, initialize, &root)?;
+        if config.format_version == 2 {
+            if initialize {
+                LinuxStorageCasCoordination::preflight_new(&root)?;
+            } else if config
+                .inside_image_cas
+                .as_ref()
+                .and_then(|cas| cas.expected_layout.as_ref())
+                .is_none_or(|expected| expected.outside_data_root != root_identity)
+            {
+                return Err(ReconcileError::Invariant(
+                    "inside CAS original outside data root expectation differs; no CREATE",
+                ));
+            }
+        }
         let bootstrap_budget = if initialize {
             let budget = Journal::storage_bootstrap_physical_budget(
                 &config.storage.space_id,
@@ -605,6 +885,17 @@ impl LinuxStorageOwner {
             device: image_metadata.dev(),
             inode: image_metadata.ino(),
         };
+        if config.format_version == 2
+            && config
+                .inside_image_cas
+                .as_ref()
+                .and_then(|cas| cas.expected_layout.as_ref())
+                .is_some_and(|expected| expected.platform().backing_image != image_identity)
+        {
+            return Err(ReconcileError::Invariant(
+                "inside CAS original image expectation differs before acquisition",
+            ));
+        }
         if !initialize {
             preflight_identity(&config)?;
         }
@@ -616,36 +907,147 @@ impl LinuxStorageOwner {
             initialize,
         )?;
         let process_start_ticks = process_start_ticks()?;
-        let owner = LinuxNamespaceCapability::acquire_storage_only_private_ext4_image(
-            &config.backing_image,
-            &config.mount_root,
-            image_identity,
-        )?;
-        let prepared = if initialize {
-            LinuxMetadataBudget::prepare_new_storage_only(
-                &owner,
-                &config.storage.data_dir,
-                &root,
-                config.metadata_limits.into(),
-            )
-        } else {
-            LinuxMetadataBudget::reopen_storage_only(
-                &owner,
-                &config.storage.data_dir,
-                &root,
-                config.metadata_limits.into(),
-            )
-        };
-        let budget = match prepared {
-            Ok(budget) => budget,
+        let owner = Arc::new(
+            LinuxNamespaceCapability::acquire_storage_only_private_ext4_image(
+                &config.backing_image,
+                &config.mount_root,
+                image_identity,
+            )?,
+        );
+        let prepared = (|| {
+            // Validate every inside scaffold, expectation and complete image
+            // geometry before the first outside sentinel/metadata/CAS CREATE.
+            let existing_cas = if config.format_version == 2 {
+                let limits = config.inside_cas_limits()?;
+                if initialize {
+                    LinuxStorageCas::preflight_new(&owner, limits)?;
+                    None
+                } else {
+                    let expected = config
+                        .inside_image_cas
+                        .as_ref()
+                        .and_then(|cas| cas.expected_layout.as_ref())
+                        .ok_or(ReconcileError::Invariant("inside CAS expectation absent"))?;
+                    Some(LinuxStorageCas::reopen_existing(
+                        Arc::clone(&owner),
+                        limits,
+                        expected.platform(),
+                    )?)
+                }
+            } else {
+                None
+            };
+            let coordination = if config.format_version == 2 {
+                Some(if initialize {
+                    LinuxStorageCasCoordination::create_new(Arc::clone(&owner), &root)?
+                } else {
+                    let expected = config
+                        .inside_image_cas
+                        .as_ref()
+                        .and_then(|cas| cas.expected_layout.as_ref())
+                        .ok_or(ReconcileError::Invariant(
+                            "inside CAS coordination expectation absent",
+                        ))?;
+                    LinuxStorageCasCoordination::reopen_existing(
+                        Arc::clone(&owner),
+                        &root,
+                        expected.coordination_key(),
+                    )?
+                })
+            } else {
+                None
+            };
+            let budget = if initialize {
+                LinuxMetadataBudget::prepare_new_storage_only(
+                    &owner,
+                    &config.storage.data_dir,
+                    &root,
+                    config.metadata_limits.into(),
+                )?
+            } else {
+                LinuxMetadataBudget::reopen_storage_only(
+                    &owner,
+                    &config.storage.data_dir,
+                    &root,
+                    config.metadata_limits.into(),
+                )?
+            };
+            let inside_cas = if config.format_version == 2 && initialize {
+                let original_coordination = coordination
+                    .as_ref()
+                    .ok_or(ReconcileError::Invariant(
+                        "inside CAS original coordination absent before realm CREATE",
+                    ))?
+                    .key()?;
+                Some(LinuxStorageCas::create_new(
+                    Arc::clone(&owner),
+                    config.inside_cas_limits()?,
+                    |layout| {
+                        realm_fingerprint(
+                            &config,
+                            budget.persistent_owner_generation(),
+                            root_identity,
+                            original_coordination,
+                            layout,
+                        )
+                        .map(|fingerprint| binding_bytes(&fingerprint))
+                        .map_err(|error| std::io::Error::other(error.to_string()))
+                    },
+                )?)
+            } else {
+                existing_cas
+            };
+            if let Some(cas) = &inside_cas {
+                let original_coordination = coordination
+                    .as_ref()
+                    .ok_or(ReconcileError::Invariant(
+                        "inside CAS original coordination absent after metadata reopen",
+                    ))?
+                    .key()?;
+                let fingerprint = realm_fingerprint(
+                    &config,
+                    budget.persistent_owner_generation(),
+                    root_identity,
+                    original_coordination,
+                    cas.observation()?.expected_layout,
+                )?;
+                cas.verify_realm_binding(binding_bytes(&fingerprint))?;
+                if config
+                    .inside_image_cas
+                    .as_ref()
+                    .and_then(|cas| cas.expected_layout.as_ref())
+                    .is_some_and(|expected| {
+                        expected.persistent_metadata_owner_generation
+                            != budget.persistent_owner_generation()
+                            || expected.realm_fingerprint != fingerprint
+                    })
+                {
+                    return Err(ReconcileError::Invariant(
+                        "actual persistent metadata generation/config/realm binding differs",
+                    ));
+                }
+            }
+            Ok::<_, ReconcileError>((budget, inside_cas, coordination))
+        })();
+        let (budget, inside_cas, cas_coordination) = match prepared {
+            Ok(prepared) => prepared,
             Err(error) => {
-                if let Err(release) = owner.release_unarmed_mount() {
+                // Local original FDs have closed; no persistent prefix is
+                // erased or adopted. Normal kernel unmount still must succeed.
+                let release = Arc::try_unwrap(owner)
+                    .map_err(|_| {
+                        std::io::Error::other(
+                            "original storage namespace still has live dependents",
+                        )
+                    })
+                    .and_then(LinuxNamespaceCapability::release_unarmed_mount);
+                if let Err(release) = release {
                     return Err(std::io::Error::other(format!(
                         "{error}; storage metadata preparation owner release refused: {release}"
                     ))
                     .into());
                 }
-                return Err(error.into());
+                return Err(error);
             }
         };
         let result = Self {
@@ -653,14 +1055,21 @@ impl LinuxStorageOwner {
             config,
             owner,
             budget,
+            inside_cas,
+            cas_coordination,
             root,
             process_start_ticks,
             initialize,
             bootstrap_budget,
+            cas_failure: Mutex::new(None),
         };
         if let Err(error) = result.verify() {
-            let closed = result.finish();
-            closed?;
+            if let Err(closed) = result.finish() {
+                return Err(std::io::Error::other(format!(
+                    "{error}; original storage preparation close also refused: {closed}"
+                ))
+                .into());
+            }
             return Err(error);
         }
         Ok(result)
@@ -668,6 +1077,41 @@ impl LinuxStorageOwner {
 
     pub(crate) fn budget(&self) -> &LinuxMetadataBudget {
         &self.budget
+    }
+
+    pub(crate) fn has_inside_cas(&self) -> bool {
+        self.config.format_version == 2 && self.inside_cas.is_some()
+    }
+
+    pub(crate) fn inside_cas(&self) -> Result<&LinuxStorageCas> {
+        self.verify()?;
+        self.inside_cas.as_ref().ok_or(ReconcileError::Invariant(
+            "explicit v2 original inside-image CAS required",
+        ))
+    }
+
+    pub(crate) fn open_journal(&self) -> Result<Journal> {
+        self.verify()?;
+        if let Some(original) = &self.cas_coordination {
+            Ok(Journal::open_with_linux_storage_cas_coordination(
+                &self.budget,
+                self.config.storage.max_metadata_entries,
+                original.loan()?,
+            )?)
+        } else {
+            Ok(Journal::open_with_linux_metadata_budget(
+                &self.budget,
+                self.config.storage.max_metadata_entries,
+            )?)
+        }
+    }
+
+    pub(crate) fn poison_inside_cas(&self, error: impl std::fmt::Display) {
+        // A real failed read/verify/close prevents future operations and success
+        // receipts; this flag cannot supply a kernel close or native authority.
+        if let Ok(mut failure) = self.cas_failure.lock() {
+            failure.get_or_insert_with(|| error.to_string());
+        }
     }
 
     pub(crate) fn verify_config(&self, config: &StorageNodeConfig, initialize: bool) -> Result<()> {
@@ -681,6 +1125,19 @@ impl LinuxStorageOwner {
     }
 
     pub fn verify(&self) -> Result<()> {
+        if let Some(failure) = self
+            .cas_failure
+            .lock()
+            .map_err(|_| {
+                ReconcileError::Invariant("inside CAS actual failure diagnostics mutex is poisoned")
+            })?
+            .as_ref()
+        {
+            return Err(std::io::Error::other(format!(
+                "inside CAS prior actual integrity/lease/close failure: {failure}"
+            ))
+            .into());
+        }
         self.owner.verify()?;
         self.budget.validate_namespace_owner(&self.owner)?;
         private(&self.root.metadata()?, true)?;
@@ -689,10 +1146,35 @@ impl LinuxStorageOwner {
             || self.root_identity != identity(&named)
             || self.root_identity != identity(&self.root.metadata()?)
             || process_start_ticks()? != self.process_start_ticks
-            || !root_names(&self.config.storage.data_dir)?.is_subset(&allowed_names())
+            || !root_names(&self.config.storage.data_dir)?.is_subset(&allowed_names(&self.config))
         {
             return Err(ReconcileError::Unstable);
         }
+        match (
+            &self.inside_cas,
+            &self.cas_coordination,
+            self.config.format_version,
+        ) {
+            (None, None, 1) => {}
+            (Some(cas), Some(coordination), 2) => {
+                coordination.verify()?;
+                let fingerprint = realm_fingerprint(
+                    &self.config,
+                    self.budget.persistent_owner_generation(),
+                    self.root_identity,
+                    coordination.key()?,
+                    cas.observation()?.expected_layout,
+                )?;
+                cas.verify_realm_binding(binding_bytes(&fingerprint))?;
+                coordination.verify()?;
+            }
+            _ => {
+                return Err(ReconcileError::Invariant(
+                    "original owner version and acquired inside CAS/coordination differ",
+                ))
+            }
+        }
+        self.owner.verify()?;
         Ok(())
     }
 
@@ -707,6 +1189,18 @@ impl LinuxStorageOwner {
         {
             return Err(ReconcileError::Invariant(
                 "storage Journal lacks its original full-FD owner or identity",
+            ));
+        }
+        let coordination = journal.linux_storage_cas_coordination_key()?;
+        if let Some(original) = &self.cas_coordination {
+            if coordination != Some(original.key()?) {
+                return Err(ReconcileError::Invariant(
+                    "v2 storage Journal lacks its actual original CAS coordination loan",
+                ));
+            }
+        } else if coordination.is_some() {
+            return Err(ReconcileError::Invariant(
+                "v1 storage Journal cannot acquire an inside CAS binding from matching IDs",
             ));
         }
         let max = self.config.storage.max_metadata_entries;
@@ -744,11 +1238,15 @@ impl LinuxStorageOwner {
         self.verify()?;
         let volume = self.owner.volume().observation();
         Ok(LinuxStorageOwnerObservation {
-            format_version: 1,
-            scope: "linux-storage-only-full-journal-fd-v1",
+            format_version: self.config.format_version,
+            scope: if self.has_inside_cas() {
+                "linux-storage-only-full-journal-fd-inside-cas-v2"
+            } else {
+                "linux-storage-only-full-journal-fd-v1"
+            },
             process_id: std::process::id(),
             process_start_ticks: self.process_start_ticks,
-            policy_fingerprint: self.config.storage.fingerprint()?,
+            policy_fingerprint: self.config.owner_config_fingerprint()?,
             backing_image: self.owner.backing_image_key().into(),
             namespace: self.owner.namespace_key().into(),
             mounted_root: volume.root_key.into(),
@@ -765,12 +1263,181 @@ impl LinuxStorageOwner {
             pending_resume_authority: false,
             helpers_started: false,
             worktree: None,
+            inside_cas: self.inside_cas_observation()?,
         })
+    }
+
+    fn inside_cas_observation(&self) -> Result<Option<LinuxStorageInsideCasObservation>> {
+        let Some(cas) = &self.inside_cas else {
+            return Ok(None);
+        };
+        let original = cas.observation()?;
+        let coordination = self
+            .cas_coordination
+            .as_ref()
+            .ok_or(ReconcileError::Invariant(
+                "original inside CAS observation lacks coordination",
+            ))?
+            .key()?;
+        let fingerprint = realm_fingerprint(
+            &self.config,
+            self.budget.persistent_owner_generation(),
+            self.root_identity,
+            coordination,
+            original.expected_layout,
+        )?;
+        cas.verify_realm_binding(binding_bytes(&fingerprint))?;
+        let layout = original.expected_layout;
+        Ok(Some(LinuxStorageInsideCasObservation {
+            format_version: 1,
+            scope: "linux-storage-fixed-inside-image-cas-fd-v1",
+            expected_layout: LinuxStorageInsideCasExpectation {
+                format_version: 1,
+                layout_version: layout.format_version,
+                realm: LinuxStorageCasRealm::NewInsideImage,
+                storage_policy: self.config.storage.fingerprint()?,
+                owner_config_fingerprint: self.config.owner_config_fingerprint()?,
+                realm_fingerprint: fingerprint,
+                persistent_metadata_owner_generation: self.budget.persistent_owner_generation(),
+                outside_data_root: self.root_identity,
+                cas_access_lock: coordination.into(),
+                backing_image: layout.backing_image.into(),
+                image_filesystem_id: layout.image_filesystem_id,
+                mounted_root_inode: layout.mounted_root_inode,
+                cas_inode: layout.cas_inode,
+                objects_inode: layout.objects_inode,
+                temporary_inode: layout.temporary_inode,
+                realm_inode: layout.realm_inode,
+                owner_uid: layout.owner_uid,
+            },
+            current_owner_generation: original.owner_generation,
+            namespace: original.namespace.into(),
+            runtime_mount_id: original.runtime_mount_id,
+            mounted_root: original.mounted_root.into(),
+            cas: original.cas.into(),
+            objects: original.objects.into(),
+            temporary: original.temporary.into(),
+            realm: original.realm.into(),
+            max_payload_bytes: original.limits.max_payload_bytes,
+            max_entries: original.limits.max_entries,
+            complete_image_physical_liability_bytes: original.physical_liability_bytes,
+            fixed_image_relative_layout: ["cas", "cas/objects", "cas/tmp", "cas/realm-v1"],
+            outside_cas_adopted: false,
+            cooperative_lock_native_writer_authority: false,
+            native_inspection_authority: false,
+            native_admission_authority: false,
+            marker_creation_authority: false,
+            payload_move_authority: false,
+            deletion_authority: false,
+            terminal_authority: false,
+            release_authority: false,
+            cleanup_authority: false,
+            pending_resume_authority: false,
+        }))
+    }
+
+    /// v2 rejection checks run while every base original still lives. They are
+    /// not a close receipt: finish must subsequently perform each actual close,
+    /// metadata checkpoint and normal kernel namespace/mount/loop release.
+    pub fn verify_finish_constraints(&self) -> Result<()> {
+        self.verify()?;
+        if !self.has_inside_cas() {
+            return Err(ReconcileError::Invariant(
+                "inside CAS finish constraints require the explicit v2 owner",
+            ));
+        }
+        // Budget owns namespace identity projections and real metadata FDs,
+        // not another Arc<LinuxNamespaceCapability>. Each acquired base layout
+        // and base cooperative coordinator has exactly one namespace Arc.
+        let base_namespace_owners = 1
+            + usize::from(self.inside_cas.is_some())
+            + usize::from(self.cas_coordination.is_some());
+        if Arc::strong_count(&self.owner) != base_namespace_owners {
+            return Err(ReconcileError::Invariant(
+                "actual original Journal/CAS/coordination guards or loans remain active",
+            ));
+        }
+        if self.budget.receipt()?.storage_active_sqlite_files != Some(0) {
+            return Err(ReconcileError::Invariant(
+                "actual full-FD SQLite files remain active before any owner FD close",
+            ));
+        }
+        self.inside_cas
+            .as_ref()
+            .ok_or(ReconcileError::Invariant(
+                "actual inside CAS base originals absent",
+            ))?
+            .verify_closed_constraints()?;
+        self.cas_coordination
+            .as_ref()
+            .ok_or(ReconcileError::Invariant(
+                "actual inside CAS base sentinel absent",
+            ))?
+            .verify()?;
+        self.owner.verify()?;
+        Ok(())
     }
 
     /// Call after dropping every StorageNode and its CAS/Journal callbacks.
     /// Never delete persistent files or unfamiliar residue during closure.
     pub fn finish(self) -> Result<LinuxStorageOwnerClosed> {
+        if self.has_inside_cas() {
+            self.verify_finish_constraints()?;
+            let original_layout =
+                self.inside_cas_observation()?
+                    .ok_or(ReconcileError::Invariant(
+                        "actual v2 original inside layout absent at close",
+                    ))?;
+            let Self {
+                owner,
+                budget,
+                process_start_ticks,
+                root,
+                inside_cas,
+                cas_coordination,
+                ..
+            } = self;
+            // Outer owner Arc loans must already be gone. Each success below
+            // comes only from the actual kernel/FD operation, never a flag.
+            inside_cas
+                .ok_or(ReconcileError::Invariant(
+                    "original inside CAS close absent",
+                ))?
+                .close()?;
+            cas_coordination
+                .ok_or(ReconcileError::Invariant(
+                    "original CAS sentinel close absent",
+                ))?
+                .close()?;
+            let persistent = budget.persistent_owner_generation();
+            let receipt = budget.checkpoint_closed()?;
+            drop(budget);
+            LinuxStorageCasCoordination::close_outside_root(root)?;
+            let owner = Arc::try_unwrap(owner).map_err(|_| {
+                ReconcileError::Invariant(
+                    "original namespace still has active CAS/Journal/guard dependents",
+                )
+            })?;
+            owner.release_unarmed_mount()?;
+            return Ok(LinuxStorageOwnerClosed {
+                format_version: 2,
+                process_id: std::process::id(),
+                process_start_ticks,
+                metadata: metadata_observation(receipt, persistent),
+                all_sqlite_connections_closed: true,
+                original_mount_released: true,
+                original_loop_released: true,
+                helpers_started: false,
+                pending_resume_authority: false,
+                inside_cas: Some(LinuxStorageInsideCasClosed {
+                    original_layout,
+                    original_realm_file_and_lease_closed: true,
+                    original_inside_directory_fds_closed: true,
+                    original_cooperative_sentinel_fds_closed: true,
+                    retired_native_cleanup_authority: false,
+                }),
+            });
+        }
         let Self {
             owner,
             budget,
@@ -781,7 +1448,9 @@ impl LinuxStorageOwner {
         let persistent = budget.persistent_owner_generation();
         let checkpoint = budget.checkpoint_closed();
         drop(budget);
-        let release = owner.release_unarmed_mount();
+        let release = Arc::try_unwrap(owner)
+            .map_err(|_| std::io::Error::other("original v1 namespace still has live dependents"))
+            .and_then(LinuxNamespaceCapability::release_unarmed_mount);
         drop(root);
         let receipt = match (checkpoint, release) {
             (Ok(receipt), Ok(())) => receipt,
@@ -805,6 +1474,7 @@ impl LinuxStorageOwner {
             original_loop_released: true,
             helpers_started: false,
             pending_resume_authority: false,
+            inside_cas: None,
         })
     }
 }

@@ -250,6 +250,9 @@ pub struct Journal {
     webdav_native_read_charges: webdav_native::DavReadChargeCache,
     #[cfg(target_os = "linux")]
     linux_metadata_vfs: Option<sync_extend_platform_fs::LinuxMetadataVfs>,
+    #[cfg(target_os = "linux")]
+    original_linux_cas_coordination:
+        Option<sync_extend_platform_fs::LinuxStorageCasCoordinationLoan>,
     original_local_history_issuer: std::sync::Arc<()>,
     #[cfg(windows)]
     original_restored_image: Option<sync_extend_platform_fs::ReleasedOriginalFileIdentity>,
@@ -644,6 +647,95 @@ impl Journal {
             connection,
             Some(vfs),
         )
+    }
+
+    /// Explicit storage v2 only: the actual original outside sentinel/root
+    /// loan accompanies this full-FD VFS. No observation or arbitrary pathname
+    /// can install it, and later CAS coordination never falls back to CREATE.
+    #[cfg(target_os = "linux")]
+    pub fn open_with_linux_storage_cas_coordination(
+        budget: &sync_extend_platform_fs::LinuxMetadataBudget,
+        max_storage_entries: usize,
+        original: sync_extend_platform_fs::LinuxStorageCasCoordinationLoan,
+    ) -> Result<Self> {
+        if !budget.is_storage_only() {
+            return Err(JournalError::Invariant(
+                "original Linux CAS coordination requires storage-only metadata",
+            ));
+        }
+        budget.verify()?;
+        original.verify()?;
+        let receipt = budget.receipt()?;
+        if receipt.parent != original.parent_key()?
+            || receipt.owner_generation != original.owner_generation()?
+        {
+            return Err(JournalError::Invariant(
+                "original Linux CAS sentinel/root and actual metadata owner differ",
+            ));
+        }
+        let mut journal = Self::open_with_linux_metadata_budget(budget, max_storage_entries)?;
+        journal.original_linux_cas_coordination = Some(original);
+        journal
+            .linux_storage_cas_coordination_key()?
+            .ok_or(JournalError::Invariant(
+                "original Linux CAS coordination binding absent",
+            ))?;
+        Ok(journal)
+    }
+
+    /// Audit the acquired original binding. This copyable key supplies no
+    /// constructor, guard, durable reference, or native permission.
+    #[cfg(target_os = "linux")]
+    pub fn linux_storage_cas_coordination_key(
+        &self,
+    ) -> Result<Option<sync_extend_platform_fs::UnixFileKey>> {
+        let Some(original) = &self.original_linux_cas_coordination else {
+            return Ok(None);
+        };
+        original.verify()?;
+        let receipt = self
+            .linux_metadata_receipt()?
+            .ok_or(JournalError::Invariant(
+                "original Linux CAS coordination lacks its full-FD Journal",
+            ))?;
+        if receipt.parent != original.parent_key()?
+            || receipt.owner_generation != original.owner_generation()?
+        {
+            return Err(JournalError::Invariant(
+                "actual Linux Journal and original CAS coordination owner changed",
+            ));
+        }
+        Ok(Some(original.original_key()?))
+    }
+
+    /// Actual SQLite close and original loan FD closes for a v2 CAS callback
+    /// connection. A busy/failed close remains an error and grants no receipt.
+    #[cfg(target_os = "linux")]
+    pub fn close_linux_storage_cas_coordination(self) -> Result<()> {
+        self.linux_storage_cas_coordination_key()?
+            .ok_or(JournalError::Invariant(
+                "original Linux CAS Journal binding required at close",
+            ))?;
+        let Self {
+            connection,
+            linux_metadata_vfs,
+            original_linux_cas_coordination,
+            ..
+        } = self;
+        connection
+            .close()
+            .map_err(|(_connection, error)| JournalError::from(error))?;
+        let vfs = linux_metadata_vfs.ok_or(JournalError::Invariant(
+            "original Linux CAS callback VFS absent at close",
+        ))?;
+        vfs.verify()?;
+        drop(vfs);
+        original_linux_cas_coordination
+            .ok_or(JournalError::Invariant(
+                "original Linux CAS callback loan absent at close",
+            ))?
+            .close()?;
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -1347,6 +1439,8 @@ impl Journal {
             webdav_native_read_charges: webdav_native::DavReadChargeCache::default(),
             #[cfg(target_os = "linux")]
             linux_metadata_vfs,
+            #[cfg(target_os = "linux")]
+            original_linux_cas_coordination: None,
             original_local_history_issuer: std::sync::Arc::new(()),
             #[cfg(windows)]
             original_restored_image: None,
@@ -3015,12 +3109,12 @@ pub use read_lease::{read_lease_expiry, ReadLease, ReadLeaseIntent, ReadLeaseSta
 mod snapshot_retention;
 pub use snapshot_retention::RetainedSnapshot;
 mod readonly_restore_preview;
+#[cfg(target_os = "linux")]
+pub use readonly_restore_preview::ReadOnlyRestorePreviewJournal;
 pub use readonly_restore_preview::{
     validate_preview_manifest, ReadOnlyRestorePreviewSource, ReadOnlySnapshotPreviewLimits,
     ReadOnlySnapshotPreviewSource,
 };
-#[cfg(target_os = "linux")]
-pub use readonly_restore_preview::ReadOnlyRestorePreviewJournal;
 mod snapshot_pruning;
 pub use snapshot_pruning::{SnapshotAudit, SnapshotPruning};
 mod gc_mark;
@@ -3420,9 +3514,7 @@ mod original_handoff;
 #[cfg(windows)]
 mod original_write_transition;
 #[cfg(windows)]
-pub use original_write_transition::{
-    OriginalJournalTransitionFailure, OriginalJournalWriteTransition,
-};
+pub use original_write_transition::{OriginalJournalTransitionFailure, OriginalJournalWriteTransition};
 
 pub use backup_image::{
     DetachedOriginalNodeHistory, OriginalHistoryContentReference,

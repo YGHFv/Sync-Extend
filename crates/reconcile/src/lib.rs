@@ -90,13 +90,19 @@ mod snapshot_pruning;
 mod snapshot_retention;
 mod storage;
 #[cfg(target_os = "linux")]
+mod storage_linux_cas;
+#[cfg(target_os = "linux")]
 mod storage_linux_owner;
 mod storage_node;
 #[cfg(target_os = "linux")]
+pub use storage_linux_cas::{LinuxStorageCasReadGuard, LinuxStorageCasSessionGuard};
+#[cfg(target_os = "linux")]
 pub use storage_linux_owner::{
-    read_linux_storage_owner_config, LinuxStorageMetadataLimits, LinuxStorageOwner,
-    LinuxStorageOwnerClosed, LinuxStorageOwnerConfig, LinuxStorageOwnerObservation,
-    LinuxStorageOwnerRole,
+    read_linux_storage_owner_config, LinuxStorageCasRealm, LinuxStorageInsideCasClosed,
+    LinuxStorageInsideCasConfig, LinuxStorageInsideCasExpectation,
+    LinuxStorageInsideCasObservation, LinuxStorageMetadataLimits, LinuxStorageObjectIdentity,
+    LinuxStorageOwner, LinuxStorageOwnerClosed, LinuxStorageOwnerConfig,
+    LinuxStorageOwnerObservation, LinuxStorageOwnerRole,
 };
 mod storage_retirement;
 mod storage_retirement_disposal;
@@ -146,14 +152,14 @@ pub use tree_restore_capture::TreeRestoreCapture;
 pub use tree_restore_pipeline::TreeRestoreBudgets;
 mod restore_preview;
 mod restore_selection_preview;
+pub use restore_preview::{
+    project_restore_preview, RestorePreview, RestorePreviewCounts, RestorePreviewDifference,
+    RestorePreviewEntry, RestorePreviewLimits, RestorePreviewRequest, RestorePreviewSelection,
+};
 pub use restore_selection_preview::{
     project_restore_selection_preview, RestoreProposedOperation, RestoreSelectionDifference,
     RestoreSelectionPreview, RestoreSelectionPreviewCounts, RestoreSelectionPreviewEntry,
     RestoreSelectionPreviewRequest, RestoreSelectionPreviewSource, RestoreSelectionSourceKind,
-};
-pub use restore_preview::{
-    project_restore_preview, RestorePreview, RestorePreviewCounts, RestorePreviewDifference,
-    RestorePreviewEntry, RestorePreviewLimits, RestorePreviewRequest, RestorePreviewSelection,
 };
 
 use serde::Serialize;
