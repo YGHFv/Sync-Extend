@@ -13,6 +13,11 @@ pub(crate) struct PathIdentity {
 }
 
 impl PathIdentity {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn original_descriptor(&self) -> &File {
+        self.handle.as_file()
+    }
+
     pub(crate) fn capture(path: &Path) -> Result<Self> {
         check_ancestors(path)?;
         let handle = Handle::from_path(path)?;

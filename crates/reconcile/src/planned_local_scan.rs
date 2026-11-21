@@ -667,11 +667,11 @@ impl<'a> PlannedLocalCreateHistory<'a> {
         owner: &sync_extend_platform_fs::LinuxNamespaceCapability,
         budget: &sync_extend_platform_fs::LinuxMetadataBudget,
         helpers: &mut Option<sync_extend_platform_fs::OutsideHelperSession>,
-        prepare_helpers: impl FnOnce() -> Result<sync_extend_platform_fs::OutsideHelperSession>,
-    ) -> Result<(
-        crate::PublishResult,
-        sync_extend_platform_fs::OriginalPairTerminalRelease,
-    )> {
+        terminal_slot: &mut Option<sync_extend_platform_fs::OriginalPairTerminalRelease>,
+        prepare_helpers: impl FnOnce(
+            &mut Option<sync_extend_platform_fs::OutsideHelperSession>,
+        ) -> Result<()>,
+    ) -> Result<crate::PublishResult> {
         use std::os::unix::fs::DirBuilderExt;
 
         let path = self.path.clone();
@@ -738,13 +738,16 @@ impl<'a> PlannedLocalCreateHistory<'a> {
             None
         };
         let freeze = volume.prepare_original_pair_freeze()?;
-        *helpers = Some(prepare_helpers()?);
+        if terminal_slot.is_some() {
+            return Err(ReconcileError::Invariant("original terminal slot occupied"));
+        }
+        prepare_helpers(helpers)?;
         let session = helpers.as_mut().ok_or(ReconcileError::Invariant(
             "original late prepared helper session absent",
         ))?;
         owner.verify_prepared_helpers(session)?;
         session.arm(attempt_id.as_str())?;
-        let native = owner.admit_native_attempt(session.pair())?;
+        let native = owner.admit_native_attempt(session)?;
         budget.validate_native_attempt(&native)?;
         native.verify()?;
         let mut created =
@@ -810,19 +813,24 @@ impl<'a> PlannedLocalCreateHistory<'a> {
             local.limits.max_storage_entries,
         )?;
         native.verify()?;
+        crate::fault::checkpoint("after_original_linux_final");
         drop(final_observation);
         drop(native);
         drop(frozen);
         let session = helpers.take().ok_or(ReconcileError::Invariant(
             "original armed session escaped owner",
         ))?;
-        let terminal = session.finish_committed()?;
+        *terminal_slot = Some(session.finish_committed()?);
+        let terminal = terminal_slot.as_ref().ok_or(ReconcileError::Invariant(
+            "original terminal escaped retention",
+        ))?;
         local.journal.record_original_linux_committed_thaw(
             owner,
-            &terminal,
+            terminal,
             &attempt_id,
             local.limits.max_storage_entries,
         )?;
+        crate::fault::checkpoint("after_original_linux_thawed");
         budget.verify()?;
         let reopened_manifest = local
             .manifest()?
@@ -836,17 +844,14 @@ impl<'a> PlannedLocalCreateHistory<'a> {
         {
             return Err(ReconcileError::Unstable);
         }
-        Ok((
-            crate::PublishResult {
-                transaction_id: attempt_id,
-                requested_path: path.clone(),
-                published_path: path,
-                conflict_copy: false,
-                snapshot_id: result.snapshot_id,
-                local_committed: true,
-                remote_backup_complete: false,
-            },
-            terminal,
-        ))
+        Ok(crate::PublishResult {
+            transaction_id: attempt_id,
+            requested_path: path.clone(),
+            published_path: path,
+            conflict_copy: false,
+            snapshot_id: result.snapshot_id,
+            local_committed: true,
+            remote_backup_complete: false,
+        })
     }
 }

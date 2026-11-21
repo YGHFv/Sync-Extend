@@ -39,6 +39,20 @@ impl OutsidePrivateIntentOwner {
         Ok(Self { parent, parent_key })
     }
 
+    /// Read-only closure check; unfamiliar intents are retained and refuse a successor.
+    pub fn verify_empty(&self, volume: &HeldPrivateVolume) -> io::Result<()> {
+        volume.verify()?;
+        private(&self.parent.file, true)?;
+        if key(&self.parent.file)? != self.parent_key
+            || std::fs::read_dir(format!("/proc/self/fd/{}", self.parent.file.as_raw_fd()))?
+                .next()
+                .is_some()
+        {
+            return Err(unsupported("outside intent inventory is not exactly empty"));
+        }
+        volume.verify()
+    }
+
     /// The caller binds these exact bounded bytes to its full original plan
     /// before target effects. Existing intent occupants are never adopted.
     pub fn create_intent(

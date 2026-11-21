@@ -35,6 +35,14 @@ pub use unix_noreplace::{
 };
 
 #[cfg(target_os = "linux")]
+mod publication_epoch;
+#[cfg(target_os = "linux")]
+pub use publication_epoch::{
+    LinuxPendingSuccessor, LinuxPublicationEpoch, LinuxPublicationWorktreeIdentity,
+    LinuxPublicationWorktreeLock,
+};
+
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod linux_write_lease;
 

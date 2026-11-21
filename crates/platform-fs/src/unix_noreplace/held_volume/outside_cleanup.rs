@@ -221,7 +221,9 @@ impl<'a> LinuxOutsideCleanupBoundary<'a> {
             || self.exact_bytes != expected_bytes
             || self.component.to_bytes() != b"original"
         {
-            return Err(super::super::unsupported("held original retained content scope differs"));
+            return Err(super::super::unsupported(
+                "held original retained content scope differs",
+            ));
         }
         self.verify()
     }
@@ -372,6 +374,10 @@ impl<'a> LinuxCleanupAbsenceObservation<'a> {
         value.verify()?;
         Ok(value)
     }
+    pub(crate) fn retained_parent_descriptor(&self) -> i32 {
+        self.parent.as_raw_fd()
+    }
+
     pub fn original_parent_key(&self) -> UnixFileKey {
         self.parent_key
     }

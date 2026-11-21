@@ -13,21 +13,25 @@ pub(super) const MAX_SPACES: usize = 64;
 
 pub(super) struct Polling {
     spaces: BTreeMap<SpaceId, Space>,
-    interval: Duration,
+    interval: Option<Duration>,
 }
 
 struct Space {
     local: LocalSpace,
     ready: bool,
     next_scan: Instant,
+    #[cfg(target_os = "linux")]
+    linux_owned: bool,
 }
 
 impl Polling {
     pub(super) fn open(
         runtime: &Runtime,
         limits: &LocalLimits,
-        interval_secs: u64,
-        #[cfg(target_os = "linux")] linux_owner: Option<&super::super::linux_namespace::LinuxDaemonOwner>,
+        interval_secs: Option<u64>,
+        #[cfg(target_os = "linux")] linux_owner: Option<
+            &super::super::linux_namespace::LinuxDaemonOwner,
+        >,
     ) -> Result<Self, ReconcileError> {
         let mut spaces = BTreeMap::new();
         for (id, path) in &runtime.spaces {
@@ -52,18 +56,29 @@ impl Polling {
                 id.clone(),
                 Space {
                     local,
-                    ready: false,
+                    ready: interval_secs.is_none(),
                     next_scan: Instant::now(),
+                    #[cfg(target_os = "linux")]
+                    linux_owned: linux_owner.is_some_and(|owner| owner.owns_metadata_root(path)),
                 },
             );
         }
         Ok(Self {
             spaces,
-            interval: Duration::from_secs(interval_secs),
+            interval: interval_secs.map(Duration::from_secs),
         })
     }
 
-    pub(super) fn scan_due(&mut self, shutdown: &AtomicBool) {
+    pub(super) fn scan_due(
+        &mut self,
+        shutdown: &AtomicBool,
+        #[cfg(target_os = "linux")] linux_owner: Option<
+            &super::super::linux_namespace::LinuxDaemonOwner,
+        >,
+    ) {
+        let Some(interval) = self.interval else {
+            return;
+        };
         if shutdown.load(Ordering::Acquire) {
             return;
         }
@@ -75,6 +90,12 @@ impl Polling {
             return;
         };
         if space.next_scan > Instant::now() {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if space.linux_owned && linux_owner.is_none_or(|owner| !owner.publication_ready_for_scan())
+        {
+            space.next_scan = Instant::now() + interval;
             return;
         }
         // Take one due space at a time and skip missed ticks, so even a slow
@@ -92,7 +113,7 @@ impl Polling {
                 false
             }
         };
-        space.next_scan = Instant::now() + self.interval;
+        space.next_scan = Instant::now() + interval;
         super::super::shutdown::set_resources_ready(self.spaces.values().all(|space| space.ready));
     }
 

@@ -19,7 +19,7 @@ fn native_key(key: Key) -> UnixFileKey {
 }
 
 impl Journal {
-    fn append_original_linux_state(
+    pub(super) fn append_original_linux_state(
         &mut self,
         name: &str,
         json: &str,
@@ -443,10 +443,10 @@ impl Journal {
 
     pub fn complete_original_linux_cleanup(
         &mut self,
-        permit: OriginalLinuxCleanupPermit,
+        mut permit: OriginalLinuxCleanupPermit,
         absent: &[&LinuxCleanupAbsenceObservation<'_>],
         max: usize,
-    ) -> Result<()> {
+    ) -> Result<OriginalLinuxCleanupCompletion> {
         permit.verify_issuer(self)?;
         let prepared = permit
             .prepared_json
@@ -473,43 +473,45 @@ impl Journal {
             }
         }
         let stored: Stored = parse(&permit.final_record.reservation_json)?;
-        if permit.cleaned_json.is_some() {
-            return self.observe_after_current(&stored.planned.space_id, &stored.planned.root()?);
+        if permit.cleaned_json.is_none() {
+            let progress = Progress {
+                version: 1,
+                attempt: permit.final_record.attempt.clone(),
+                final_digest: ContentId::hash(permit.final_json.as_bytes()),
+                thawed_digest: ContentId::hash(permit.thawed_json.as_bytes()),
+                cleanup_owner_generation: permit.cleanup_owner_generation,
+                persistent_metadata_generation: permit.final_record.persistent_metadata_generation,
+                backing_image: permit.final_record.backing_image,
+                predecessor: Some(ContentId::hash(prepared.as_bytes())),
+                observed_absent_slots: expected,
+            };
+            let json = serde_json::to_string(&progress)?;
+            validate_progress(
+                &json,
+                &permit.final_json,
+                &permit.thawed_json,
+                &permit.final_record,
+                Some(prepared),
+            )?;
+            self.append_original_linux_state(
+                &key(CLEANED, &permit.final_record.attempt),
+                &json,
+                &stored.planned.space_id,
+                max,
+            )?;
+            permit.cleaned_json = Some(json);
         }
-        let progress = Progress {
-            version: 1,
-            attempt: permit.final_record.attempt.clone(),
-            final_digest: ContentId::hash(permit.final_json.as_bytes()),
-            thawed_digest: ContentId::hash(permit.thawed_json.as_bytes()),
-            cleanup_owner_generation: permit.cleanup_owner_generation,
-            persistent_metadata_generation: permit.final_record.persistent_metadata_generation,
-            backing_image: permit.final_record.backing_image,
-            predecessor: Some(ContentId::hash(prepared.as_bytes())),
-            observed_absent_slots: expected,
-        };
-        let json = serde_json::to_string(&progress)?;
-        validate_progress(
-            &json,
-            &permit.final_json,
-            &permit.thawed_json,
-            &permit.final_record,
-            Some(prepared),
-        )?;
-        self.append_original_linux_state(
-            &key(CLEANED, &permit.final_record.attempt),
-            &json,
-            &stored.planned.space_id,
-            max,
-        )?;
         for observed in absent {
             observed.verify()?;
         }
-        self.observe_after_current(&stored.planned.space_id, &stored.planned.root()?)
+        self.observe_after_current(&stored.planned.space_id, &stored.planned.root()?)?;
+        permit.verify_issuer(self)?;
+        Ok(OriginalLinuxCleanupCompletion { permit })
     }
 }
 
 impl OriginalLinuxCleanupPermit {
-    fn verify_issuer(&self, journal: &Journal) -> Result<()> {
+    pub(super) fn verify_issuer(&self, journal: &Journal) -> Result<()> {
         if !std::sync::Arc::ptr_eq(&self.issuer, &journal.original_local_history_issuer)
             || state(&journal.connection, &key(FINAL, &self.final_record.attempt))?.as_deref()
                 != Some(self.final_json.as_str())

@@ -132,15 +132,22 @@ pub fn serve(
         .enabled
         .then(|| Gateway::bind(&runtime))
         .transpose()?;
-    let mut polling = scan_interval_secs
-        .map(|interval| polling::Polling::open(
+    // A Linux publisher retains one LocalSpace and one Journal issuer even
+    // without periodic scanning. The synchronous loop is its bounded actor.
+    let shared_locals = scan_interval_secs.is_some();
+    #[cfg(target_os = "linux")]
+    let shared_locals = shared_locals || linux_owner.is_some();
+    let mut polling = if shared_locals {
+        Some(polling::Polling::open(
             &runtime,
             &limits,
-            interval,
+            scan_interval_secs,
             #[cfg(target_os = "linux")]
             linux_owner.as_deref(),
-        ))
-        .transpose()?;
+        )?)
+    } else {
+        None
+    };
     let mut locks = Locks::default();
     let mut requests = 0u64;
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -157,7 +164,7 @@ pub fn serve(
             )
         })
     });
-    super::shutdown::started(polling.is_none())?;
+    super::shutdown::started(scan_interval_secs.is_none())?;
     if let Some(active) = &gateway {
         super::management::observe_gateway(Some(&runtime.listener), runtime.scheme());
         println!(
@@ -170,7 +177,11 @@ pub fn serve(
     }
     while !shutdown.load(Ordering::Acquire) {
         if let Some(polling) = &mut polling {
-            polling.scan_due(&shutdown);
+            polling.scan_due(
+                &shutdown,
+                #[cfg(target_os = "linux")]
+                linux_owner.as_deref(),
+            );
             if shutdown.load(Ordering::Acquire) {
                 break;
             }
@@ -201,7 +212,7 @@ pub fn serve(
         )?;
         requests += 1;
         if requests == runtime.listener.max_requests {
-            if polling.is_none() {
+            if scan_interval_secs.is_none() {
                 break;
             }
             // Preserve the explicit request bound without stopping local sync.
@@ -408,8 +419,7 @@ fn dispatch(
     if matches!(
         request.method.as_str(),
         "PUT" | "DELETE" | "MOVE" | "COPY" | "MKCOL"
-    ) && (!native_write_supported
-        || (cfg!(target_os = "linux") && request.method != "PUT"))
+    ) && (!native_write_supported || (cfg!(target_os = "linux") && request.method != "PUT"))
     {
         return Err(501);
     }
@@ -435,16 +445,16 @@ fn dispatch(
         polling.local(&authorized.space_id)?
     } else {
         transient = {
-        #[cfg(target_os = "linux")]
-        if let Some(owner) = linux_owner.filter(|owner| owner.owns_metadata_root(data)) {
-            owner.open(data, limits.clone()).map_err(|_| 503u16)?
-        } else {
-            LocalSpace::open_with_limits(data, limits.clone()).map_err(|_| 503u16)?
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            LocalSpace::open_with_limits(data, limits.clone()).map_err(|_| 503u16)?
-        }
+            #[cfg(target_os = "linux")]
+            if let Some(owner) = linux_owner.filter(|owner| owner.owns_metadata_root(data)) {
+                owner.open(data, limits.clone()).map_err(|_| 503u16)?
+            } else {
+                LocalSpace::open_with_limits(data, limits.clone()).map_err(|_| 503u16)?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                LocalSpace::open_with_limits(data, limits.clone()).map_err(|_| 503u16)?
+            }
         };
         &mut transient
     };
@@ -538,10 +548,7 @@ fn dispatch(
                 stream,
                 200,
                 b"",
-                &[
-                    ("DAV", "1, 2".into()),
-                    ("Allow", allow.into()),
-                ],
+                &[("DAV", "1, 2".into()), ("Allow", allow.into())],
                 false,
             )
             .map_err(|_| 500u16)
@@ -656,6 +663,10 @@ fn dispatch(
                 .map_err(core_status)?;
             #[cfg(target_os = "linux")]
             let native_request = {
+                linux_owner
+                    .ok_or(501u16)?
+                    .require_publication_ready()
+                    .map_err(core_status)?;
                 let expected = baseline.snapshot_id().map_err(core_status)?;
                 Some(
                     local
@@ -697,9 +708,16 @@ fn dispatch(
                 {
                     let owner = linux_owner.ok_or(501u16)?;
                     let request = native_request.ok_or(409u16)?;
-                    let published = owner
-                        .commit_webdav_upload(local, request, upload.reader())
-                        .map_err(core_status)?;
+                    let published =
+                        match owner.commit_webdav_upload(local, request, upload.reader()) {
+                            Ok(published) => published,
+                            Err(failure) => {
+                                if let Some(committed) = failure.committed {
+                                    return committed_but_blocked(stream, &committed);
+                                }
+                                return Err(core_status(*failure.error));
+                            }
+                        };
                     WebDavCommit {
                         transaction_id: published.transaction_id,
                         snapshot_id: published.snapshot_id,
@@ -718,6 +736,11 @@ fn dispatch(
                         .map_err(core_status)?
                 }
             };
+            #[cfg(target_os = "linux")]
+            if upload.verify().is_err() {
+                return committed_but_blocked(stream, &result);
+            }
+            #[cfg(not(target_os = "linux"))]
             upload.verify().map_err(|_| 409u16)?;
             committed(stream, if entry.is_some() { 204 } else { 201 }, &result)
         }
@@ -882,6 +905,27 @@ fn committed(stream: &mut Connection, status: u16, result: &WebDavCommit) -> Res
             ("X-SyncExtend-Snapshot", result.snapshot_id.to_string()),
             ("X-SyncExtend-Local-Committed", "true".into()),
             ("X-SyncExtend-Remote-Backup-Complete", "false".into()),
+        ],
+        false,
+    )
+    .map_err(|_| 500u16)
+}
+
+#[cfg(target_os = "linux")]
+fn committed_but_blocked(stream: &mut Connection, result: &WebDavCommit) -> Result<(), u16> {
+    if !result.local_committed || result.remote_backup_complete {
+        return Err(500);
+    }
+    http::response(
+        stream,
+        503,
+        b"File committed locally; publication cleanup is blocked. Recheck the file before retrying.",
+        &[
+            ("X-SyncExtend-Transaction", result.transaction_id.to_string()),
+            ("X-SyncExtend-Snapshot", result.snapshot_id.to_string()),
+            ("X-SyncExtend-Local-Committed", "true".into()),
+            ("X-SyncExtend-Remote-Backup-Complete", "false".into()),
+            ("X-SyncExtend-Publication-Ready", "false".into()),
         ],
         false,
     )

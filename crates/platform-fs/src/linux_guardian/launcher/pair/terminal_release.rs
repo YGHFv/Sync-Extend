@@ -12,6 +12,7 @@ use std::{
 };
 
 pub struct OriginalPairTerminalRelease {
+    pub(crate) epoch: std::sync::Arc<crate::publication_epoch::PublicationEpochState>,
     owner_pid: u32,
     mount: UnixFileKey,
     mount_id: u64,
@@ -30,7 +31,7 @@ enum Completion {
 
 impl OriginalPairTerminalRelease {
     pub(crate) fn verify_owner(&self, owner: &LinuxNamespaceCapability) -> io::Result<()> {
-        owner.verify()?;
+        owner.verify_publication_state(&self.epoch)?;
         let observed = owner.volume().observation();
         if self.owner_pid != std::process::id()
             || self.mount != observed.root_key
@@ -87,6 +88,7 @@ impl OriginalPairTerminalRelease {
 }
 
 pub struct OutsideHelperSession {
+    pub(crate) epoch: std::sync::Arc<crate::publication_epoch::PublicationEpochState>,
     pair: OutsidePreparationPair,
     guardian_control: File,
     supervisor_control: File,
@@ -153,6 +155,7 @@ fn committed_thaw(bytes: &[u8]) -> io::Result<()> {
 impl OutsideHelperSession {
     pub fn prepare(
         owner: &LinuxNamespaceCapability,
+        epoch: &crate::LinuxPublicationEpoch,
         program: &super::super::OutsideHelperProgram,
     ) -> io::Result<Self> {
         owner.verify()?;
@@ -166,7 +169,7 @@ impl OutsideHelperSession {
         let process = unsafe { File::from_raw_fd(descriptor) };
         let (guardian_read, guardian_control) = pipe()?;
         let (supervisor_read, supervisor_control) = pipe()?;
-        owner.claim_helper_preparation()?;
+        let epoch = owner.claim_helper_preparation(epoch)?;
         let mut pair = program.start_preparation_pair(
             owner.mount_descriptor(),
             &process,
@@ -190,6 +193,7 @@ impl OutsideHelperSession {
             return Err(io::Error::other(format!("original prepared scope refused: {error}; cancellation_confirmation={observation:?}; exact_terminal_streams={bytes:?}")));
         }
         Ok(Self {
+            epoch,
             pair,
             guardian_control,
             supervisor_control,
@@ -205,7 +209,7 @@ impl OutsideHelperSession {
     /// Both actual PREPARED lines and both live original pidfds are required.
     /// ARM and its unchanged two-second guardian deadline occur only at Final.
     pub fn verify_prepared_owner(&self, owner: &LinuxNamespaceCapability) -> io::Result<()> {
-        owner.verify()?;
+        owner.verify_publication_state(&self.epoch)?;
         self.pair.verify_original_pair()?;
         self.pair.guardian.prepared_process()?;
         self.pair
@@ -323,6 +327,7 @@ impl OutsideHelperSession {
             ));
         }
         Ok(OriginalPairTerminalRelease {
+            epoch: std::sync::Arc::clone(&self.epoch),
             owner_pid,
             mount,
             mount_id,
@@ -415,6 +420,7 @@ impl OutsideHelperSession {
             ));
         }
         Ok(OriginalPairTerminalRelease {
+            epoch: std::sync::Arc::clone(&self.epoch),
             owner_pid,
             mount,
             mount_id,

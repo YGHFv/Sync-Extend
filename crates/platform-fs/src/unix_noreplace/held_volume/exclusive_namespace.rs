@@ -76,9 +76,7 @@ pub struct LinuxNamespaceCapability {
     loop_rdev: u64,
     generation: [u8; 16],
     owner_pid: u32,
-    helper_preparation_started: AtomicBool,
-    attempt_issued: AtomicBool,
-    attempt_scope: std::sync::Mutex<Option<(String, u64)>>,
+    pub(crate) publication: std::sync::Mutex<crate::publication_epoch::PublicationCursor>,
     released: AtomicBool,
 }
 
@@ -239,9 +237,9 @@ impl LinuxNamespaceCapability {
             loop_number,
             generation,
             owner_pid: std::process::id(),
-            helper_preparation_started: AtomicBool::new(false),
-            attempt_issued: AtomicBool::new(false),
-            attempt_scope: std::sync::Mutex::new(None),
+            publication: std::sync::Mutex::new(
+                crate::publication_epoch::PublicationCursor::initial(generation),
+            ),
             released: AtomicBool::new(false),
         };
         capability.verify()?;
@@ -345,20 +343,11 @@ impl LinuxNamespaceCapability {
         &self.volume.path
     }
 
-    /// Register one original helper launch before any child is created. This
-    /// state comes only from this acquired owner, never from caller observations.
-    pub(crate) fn claim_helper_preparation(&self) -> io::Result<()> {
-        self.verify()?;
-        if self.helper_preparation_started.swap(true, Ordering::AcqRel) {
-            return Err(refusal("original owner helper preparation already started"));
-        }
-        Ok(())
-    }
-
     /// Both live prepared helpers must belong to this acquired owner before ARM.
     /// SQL/CAS/full-plan preparation grants no protected native effect.
     pub fn verify_prepared_helpers(&self, session: &crate::OutsideHelperSession) -> io::Result<()> {
-        if self.attempt_issued.load(Ordering::Acquire) {
+        self.verify_publication_state(&session.epoch)?;
+        if session.epoch.attempt_issued.load(Ordering::Acquire) {
             return Err(refusal(
                 "original namespace Final attempt was already consumed",
             ));
@@ -370,20 +359,23 @@ impl LinuxNamespaceCapability {
     /// The native capability is single-attempt and expires after 2 seconds.
     pub fn admit_native_attempt<'a>(
         &'a self,
-        pair: &'a OutsidePreparationPair,
+        session: &'a crate::OutsideHelperSession,
     ) -> io::Result<LinuxNativeAttempt<'a>> {
-        self.verify()?;
+        self.verify_publication_state(&session.epoch)?;
+        let pair = session.pair();
         pair.verify_original_mount(&self.volume.root.file)?;
-        if self.attempt_issued.swap(true, Ordering::AcqRel) {
+        if session.epoch.attempt_issued.swap(true, Ordering::AcqRel) {
             return Err(refusal("original namespace attempt was already consumed"));
         }
         let scope = pair.original_attempt_scope()?;
-        *self
+        *session
+            .epoch
             .attempt_scope
             .lock()
             .map_err(|_| refusal("original attempt scope poisoned"))? = Some(scope.clone());
         let attempt = LinuxNativeAttempt {
             owner: self,
+            epoch: std::sync::Arc::clone(&session.epoch),
             pair,
             deadline: pair.original_guardian_arm_deadline()?,
             scope,
@@ -396,12 +388,21 @@ impl LinuxNamespaceCapability {
     /// image, journal, worktree object, directory or unfamiliar residue.
     pub fn release_unarmed_mount(self) -> io::Result<()> {
         self.verify()?;
-        if self.helper_preparation_started.load(Ordering::Acquire)
-            || self.attempt_issued.load(Ordering::Acquire) {
+        let cursor = self
+            .publication
+            .lock()
+            .map_err(|_| refusal("publication cursor poisoned"))?;
+        if cursor
+            .current
+            .helper_preparation_started
+            .load(Ordering::Acquire)
+            || cursor.current.attempt_issued.load(Ordering::Acquire)
+        {
             return Err(refusal(
                 "started helpers require their retained original terminal release",
             ));
         }
+        drop(cursor);
         self.release_owned_mount()
     }
 
@@ -421,11 +422,13 @@ impl LinuxNamespaceCapability {
         &self,
         terminal: &crate::OriginalPairTerminalRelease,
     ) -> io::Result<()> {
-        let scope = self
+        self.verify_publication_state(&terminal.epoch)?;
+        let scope = terminal
+            .epoch
             .attempt_scope
             .lock()
             .map_err(|_| refusal("original attempt scope poisoned"))?;
-        if scope.is_some() != self.attempt_issued.load(Ordering::Acquire) {
+        if scope.is_some() != terminal.epoch.attempt_issued.load(Ordering::Acquire) {
             return Err(refusal("original attempt issuance state differs"));
         }
         terminal.verify_attempt_state(scope.as_ref())
@@ -455,6 +458,7 @@ impl LinuxNamespaceCapability {
 
 pub struct LinuxNativeAttempt<'a> {
     owner: &'a LinuxNamespaceCapability,
+    epoch: std::sync::Arc<crate::publication_epoch::PublicationEpochState>,
     pair: &'a OutsidePreparationPair,
     deadline: Instant,
     scope: (String, u64),
@@ -464,10 +468,10 @@ impl LinuxNativeAttempt<'_> {
         if Instant::now() >= self.deadline {
             return Err(refusal("native namespace attempt deadline expired"));
         }
-        self.owner.verify()?;
+        self.owner.verify_publication_state(&self.epoch)?;
         if self.pair.original_attempt_scope()? != self.scope
             || self
-                .owner
+                .epoch
                 .attempt_scope
                 .lock()
                 .map_err(|_| refusal("original attempt scope poisoned"))?
@@ -484,7 +488,9 @@ impl LinuxNativeAttempt<'_> {
             return Err(refusal("original native attempt mount changed"));
         }
         if Instant::now() >= self.deadline {
-            return Err(refusal("native namespace attempt deadline expired during original verification"));
+            return Err(refusal(
+                "native namespace attempt deadline expired during original verification",
+            ));
         }
         Ok(())
     }

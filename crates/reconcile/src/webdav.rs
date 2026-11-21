@@ -312,14 +312,11 @@ impl LocalSpace {
         &mut self,
         request: LinuxNativeWebDavPut,
         source: &File,
-        owner: &sync_extend_platform_fs::LinuxNamespaceCapability,
-        budget: &sync_extend_platform_fs::LinuxMetadataBudget,
-        helpers: &mut Option<sync_extend_platform_fs::OutsideHelperSession>,
-        prepare_helpers: impl FnOnce() -> Result<sync_extend_platform_fs::OutsideHelperSession>,
-    ) -> Result<(
-        crate::PublishResult,
-        sync_extend_platform_fs::OriginalPairTerminalRelease,
-    )> {
+        publication: crate::LinuxNativePublication<'_>,
+        prepare_helpers: impl FnOnce(
+            &mut Option<sync_extend_platform_fs::OutsideHelperSession>,
+        ) -> Result<()>,
+    ) -> Result<crate::PublishResult> {
         self.check_webdav_baseline(&request.baseline)?;
         if request.baseline.snapshot_id()? != request.snapshot {
             return Err(ReconcileError::Unstable);
@@ -328,9 +325,7 @@ impl LocalSpace {
             &request.baseline.manifest,
             source,
             request.path,
-            owner,
-            budget,
-            helpers,
+            publication,
             prepare_helpers,
         )
     }

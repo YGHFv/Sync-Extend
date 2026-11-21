@@ -3412,6 +3412,10 @@ pub use history_reservation::{
     OriginalLocalHistoryReservation, OriginalNativeCreateFootprint, OriginalNativePhaseChain,
     OriginalReservedHistoryCommitReceipt,
 };
+#[cfg(target_os = "linux")]
+pub use history_reservation::{
+    OriginalLinuxCleanupCompletion, OriginalLinuxPublisherBinding, OriginalLinuxSuccessorReceipt,
+};
 pub use history_reservation::{OriginalLinuxCleanupPermit, OriginalLinuxNativeFinalDiagnostic};
 mod recovered_attempt_diagnostics;
 mod recovered_retention;

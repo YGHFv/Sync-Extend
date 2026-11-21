@@ -10,7 +10,7 @@ use std::{
 };
 use sync_extend_core_model::{limits::LocalLimits, ContentId};
 use sync_extend_platform_fs::{
-    LinuxMetadataBudget, LinuxMetadataLimits, LinuxNamespaceCapability,
+    LinuxMetadataBudget, LinuxMetadataLimits, LinuxNamespaceCapability, LinuxPublicationEpoch,
     OriginalPairTerminalRelease, OutsideHelperProgram, OutsideHelperSession, PinnedProgram,
 };
 use sync_extend_reconcile::LocalSpace;
@@ -62,6 +62,21 @@ struct PreparedHelperEvidence {
     process_births: Vec<serde_json::Value>,
 }
 
+#[derive(Clone, Copy)]
+enum PublisherPhase {
+    Ready,
+    Publishing,
+    Blocked,
+}
+
+struct PublisherActor {
+    initial_epoch: Option<LinuxPublicationEpoch>,
+    publisher: Option<sync_extend_reconcile::LinuxNativePublisher>,
+    phase: PublisherPhase,
+    completed_epochs: u64,
+    last_terminal_diagnostic: Option<serde_json::Value>,
+}
+
 pub struct LinuxDaemonOwner {
     pub owner: Arc<LinuxNamespaceCapability>,
     pub budget: Arc<LinuxMetadataBudget>,
@@ -69,9 +84,24 @@ pub struct LinuxDaemonOwner {
     metadata_root: PathBuf,
     worktree: PathBuf,
     terminal: Mutex<Option<OriginalPairTerminalRelease>>,
+    publisher_actor: Mutex<PublisherActor>,
     terminal_receipt_output: Option<PathBuf>,
     prepared: Mutex<PreparedHelperEvidence>,
     delayed_helper_program: Option<OutsideHelperProgram>,
+}
+
+pub struct LinuxWebDavCommitFailure {
+    pub error: Box<sync_extend_reconcile::ReconcileError>,
+    pub committed: Option<sync_extend_reconcile::WebDavCommit>,
+}
+
+impl From<sync_extend_reconcile::ReconcileError> for LinuxWebDavCommitFailure {
+    fn from(error: sync_extend_reconcile::ReconcileError) -> Self {
+        Self {
+            error: Box::new(error),
+            committed: None,
+        }
+    }
 }
 
 fn absolute(path: &Path) -> Result<()> {
@@ -119,14 +149,13 @@ pub fn prepare(cli: &Cli) -> Result<Option<LinuxDaemonOwner>> {
     }
     let webdav_gateway = match &cli.command {
         Command::WebdavServe { config, .. } => Some(config.clone()),
-        Command::DeploymentRun { config } => {
-            match super::deployment::load(config)?.role {
-                sync_extend_core_model::deployment::DeploymentRole::WebdavClient {
-                    gateway_config, ..
-                } => Some(gateway_config),
-                _ => None,
-            }
-        }
+        Command::DeploymentRun { config } => match super::deployment::load(config)?.role {
+            sync_extend_core_model::deployment::DeploymentRole::WebdavClient {
+                gateway_config,
+                ..
+            } => Some(gateway_config),
+            _ => None,
+        },
         _ => None,
     };
     let (data_dir, initialize) = if let Some(gateway) = &webdav_gateway {
@@ -143,24 +172,24 @@ pub fn prepare(cli: &Cli) -> Result<Option<LinuxDaemonOwner>> {
         (&config.metadata_root, false)
     } else {
         match &cli.command {
-        Command::Init { data_dir, root } => {
-            if root != &config.mount_root.join(&config.worktree_directory) {
-                return Err("init root differs from the explicit Linux owner worktree".into());
+            Command::Init { data_dir, root } => {
+                if root != &config.mount_root.join(&config.worktree_directory) {
+                    return Err("init root differs from the explicit Linux owner worktree".into());
+                }
+                (data_dir, true)
             }
-            (data_dir, true)
-        }
-        Command::Scan { data_dir }
-        | Command::Status { data_dir }
-        | Command::Run { data_dir, .. }
-        | Command::Publish { data_dir, .. }
-        | Command::LinuxNativeFinals { data_dir }
-        | Command::CleanupLinuxNative { data_dir, .. }
-        | Command::Manifest { data_dir }
-        | Command::Ops { data_dir }
-        | Command::Verify { data_dir }
-        | Command::Snapshots { data_dir }
-        | Command::SnapshotAudit { data_dir } => (data_dir, false),
-        _ => return Err("this command does not use the explicit Linux local owner".into()),
+            Command::Scan { data_dir }
+            | Command::Status { data_dir }
+            | Command::Run { data_dir, .. }
+            | Command::Publish { data_dir, .. }
+            | Command::LinuxNativeFinals { data_dir }
+            | Command::CleanupLinuxNative { data_dir, .. }
+            | Command::Manifest { data_dir }
+            | Command::Ops { data_dir }
+            | Command::Verify { data_dir }
+            | Command::Snapshots { data_dir }
+            | Command::SnapshotAudit { data_dir } => (data_dir, false),
+            _ => return Err("this command does not use the explicit Linux local owner".into()),
         }
     };
     if data_dir != &config.metadata_root {
@@ -188,21 +217,33 @@ pub fn prepare(cli: &Cli) -> Result<Option<LinuxDaemonOwner>> {
     // metadata/CAS/full-plan preparation. No child and no ARM has started.
     // Other ordinary commands retain their existing preparation/cancel path.
     let delayed = matches!(&cli.command, Command::Publish { .. }) || webdav_gateway.is_some();
-    let mut helpers = if delayed { None } else { Some(OutsideHelperSession::prepare(&owner, &helper)?) };
-    let prepared =
-        if let Some(session) = helpers.as_ref() {
-            match capture_prepared(&owner, session) {
-                Ok(evidence) => evidence,
-                Err(error) => {
-                    let terminal = helpers.take().ok_or("original prepared session escaped")?.finish_unarmed()?;
-                    Arc::try_unwrap(owner).map_err(|_| "refused helper birth owner remains borrowed")?
-                        .release_mount_after_helpers(terminal)?;
-                    return Err(error.into());
-                }
+    let initial_epoch = owner.initial_publication_epoch()?;
+    let mut helpers = if delayed {
+        None
+    } else {
+        Some(OutsideHelperSession::prepare(
+            &owner,
+            &initial_epoch,
+            &helper,
+        )?)
+    };
+    let prepared = if let Some(session) = helpers.as_ref() {
+        match capture_prepared(&owner, session) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                let terminal = helpers
+                    .take()
+                    .ok_or("original prepared session escaped")?
+                    .finish_unarmed()?;
+                Arc::try_unwrap(owner)
+                    .map_err(|_| "refused helper birth owner remains borrowed")?
+                    .release_mount_after_helpers(terminal)?;
+                return Err(error.into());
             }
-        } else {
-            PreparedHelperEvidence::default()
-        };
+        }
+    } else {
+        PreparedHelperEvidence::default()
+    };
     let metadata_limits = config.metadata_limits.into();
     let budget = if initialize {
         LinuxMetadataBudget::prepare_new(
@@ -222,10 +263,17 @@ pub fn prepare(cli: &Cli) -> Result<Option<LinuxDaemonOwner>> {
     let budget = match budget {
         Ok(budget) => Arc::new(budget),
         Err(error) => {
-            let terminal = helpers.take().map(OutsideHelperSession::finish_unarmed).transpose()?;
-            let owner = Arc::try_unwrap(owner).map_err(|_| "refused Linux owner remains borrowed")?;
-            if let Some(terminal) = terminal { owner.release_mount_after_helpers(terminal)?; }
-            else { owner.release_unarmed_mount()?; }
+            let terminal = helpers
+                .take()
+                .map(OutsideHelperSession::finish_unarmed)
+                .transpose()?;
+            let owner =
+                Arc::try_unwrap(owner).map_err(|_| "refused Linux owner remains borrowed")?;
+            if let Some(terminal) = terminal {
+                owner.release_mount_after_helpers(terminal)?;
+            } else {
+                owner.release_unarmed_mount()?;
+            }
             return Err(error.into());
         }
     };
@@ -242,12 +290,19 @@ pub fn prepare(cli: &Cli) -> Result<Option<LinuxDaemonOwner>> {
         Ok(())
     })();
     if let Err(error) = worktree_prepared {
-        let terminal = helpers.take().map(OutsideHelperSession::finish_unarmed).transpose()?;
+        let terminal = helpers
+            .take()
+            .map(OutsideHelperSession::finish_unarmed)
+            .transpose()?;
         let closed = budget.checkpoint_closed();
         drop(budget);
-        let owner = Arc::try_unwrap(owner).map_err(|_| "refused Linux worktree owner remains borrowed")?;
-        let release = if let Some(terminal) = terminal { owner.release_mount_after_helpers(terminal) }
-            else { owner.release_unarmed_mount() };
+        let owner =
+            Arc::try_unwrap(owner).map_err(|_| "refused Linux worktree owner remains borrowed")?;
+        let release = if let Some(terminal) = terminal {
+            owner.release_mount_after_helpers(terminal)
+        } else {
+            owner.release_unarmed_mount()
+        };
         closed?;
         release?;
         return Err(error);
@@ -259,6 +314,13 @@ pub fn prepare(cli: &Cli) -> Result<Option<LinuxDaemonOwner>> {
         metadata_root: config.metadata_root,
         worktree,
         terminal: Mutex::new(None),
+        publisher_actor: Mutex::new(PublisherActor {
+            initial_epoch: Some(initial_epoch),
+            publisher: None,
+            phase: PublisherPhase::Ready,
+            completed_epochs: 0,
+            last_terminal_diagnostic: None,
+        }),
         terminal_receipt_output: config.terminal_receipt_output,
         prepared: Mutex::new(prepared),
         delayed_helper_program: if delayed { Some(helper) } else { None },
@@ -280,11 +342,19 @@ fn capture_prepared(
     let mut births = Vec::new();
     for pid in ids {
         let raw = fs::read_to_string(format!("/proc/{pid}/stat"))?;
-        let fields = raw.rsplit_once(')').ok_or_else(|| std::io::Error::other("prepared helper stat encoding"))?.1;
-        let start_ticks: u64 = fields.split_whitespace().nth(19)
+        let fields = raw
+            .rsplit_once(')')
+            .ok_or_else(|| std::io::Error::other("prepared helper stat encoding"))?
+            .1;
+        let start_ticks: u64 = fields
+            .split_whitespace()
+            .nth(19)
             .ok_or_else(|| std::io::Error::other("prepared helper start time absent"))?
-            .parse().map_err(std::io::Error::other)?;
-        births.push(serde_json::json!({"pid": pid, "start_ticks": start_ticks, "boot_id": boot_id.trim()}));
+            .parse()
+            .map_err(std::io::Error::other)?;
+        births.push(
+            serde_json::json!({"pid": pid, "start_ticks": start_ticks, "boot_id": boot_id.trim()}),
+        );
     }
     let (guardian, supervisor) = helpers.startup_bytes();
     let startup = vec![
@@ -305,36 +375,82 @@ impl LinuxDaemonOwner {
     /// This ordinary Publish path finishes without constructing a Tokio runtime.
     /// The live LocalSpace plan remains borrowed until the same attempt commits.
     pub fn publish_before_runtime(
-        &mut self, data: &Path, source: &Path,
-        path: sync_extend_core_model::PortablePath, limits: LocalLimits,
+        &mut self,
+        data: &Path,
+        source: &Path,
+        path: sync_extend_core_model::PortablePath,
+        limits: LocalLimits,
     ) -> Result<sync_extend_reconcile::PublishResult> {
         let mut local = self.open(data, limits)?;
-        let program = self.delayed_helper_program.as_ref().ok_or("late helper program absent")?;
+        let program = self
+            .delayed_helper_program
+            .as_ref()
+            .ok_or("late helper program absent")?;
         let owner = &self.owner;
-        let terminal_slot = &self.terminal;
         let prepared = &self.prepared;
-        let mut helpers = self.helpers.lock().map_err(|_| "original Linux helper session lock poisoned")?;
-        let (result, terminal) = local.publish_original_linux_native_file(
-            source, path, owner, &self.budget, &mut helpers, || {
-                let session = OutsideHelperSession::prepare(owner, program)?;
-                match capture_prepared(owner, &session) {
-                    Ok(evidence) => {
-                        *prepared.lock().map_err(|_| sync_extend_reconcile::ReconcileError::Invariant("Linux prepared helper evidence lock poisoned"))? = evidence;
-                    }
-                    Err(error) => {
-                        let terminal = session.finish_unarmed()?;
-                        let mut slot = terminal_slot.lock().map_err(|_| sync_extend_reconcile::ReconcileError::Invariant("Linux terminal token lock poisoned"))?;
-                        if slot.is_some() { return Err(sync_extend_reconcile::ReconcileError::Invariant("original terminal already retained")); }
-                        *slot = Some(terminal);
-                        return Err(error.into());
-                    }
-                }
-                Ok(session)
+        let mut actor = self
+            .publisher_actor
+            .lock()
+            .map_err(|_| "publisher actor poisoned")?;
+        let PublisherActor {
+            initial_epoch,
+            publisher,
+            phase,
+            ..
+        } = &mut *actor;
+        if publisher.is_none() {
+            *publisher = Some(local.bind_initial_linux_native_publisher(
+                owner,
+                &self.budget,
+                initial_epoch,
+            )?);
+        }
+        let publisher = publisher.as_ref().ok_or("publisher initial epoch absent")?;
+        *phase = PublisherPhase::Publishing;
+        let mut helpers = self
+            .helpers
+            .lock()
+            .map_err(|_| "original Linux helper session lock poisoned")?;
+        let mut terminal = self
+            .terminal
+            .lock()
+            .map_err(|_| "Linux terminal token lock poisoned")?;
+        let result = local.publish_original_linux_native_file(
+            source,
+            path,
+            sync_extend_reconcile::LinuxNativePublication::borrow_original(
+                owner,
+                &self.budget,
+                publisher,
+                &mut helpers,
+                &mut terminal,
+            ),
+            |slot| {
+                *slot = Some(OutsideHelperSession::prepare(
+                    owner,
+                    publisher.platform_epoch()?,
+                    program,
+                )?);
+                let evidence = capture_prepared(
+                    owner,
+                    slot.as_ref()
+                        .ok_or(sync_extend_reconcile::ReconcileError::Invariant(
+                            "original prepared helper escaped",
+                        ))?,
+                )?;
+                *prepared.lock().map_err(|_| {
+                    sync_extend_reconcile::ReconcileError::Invariant(
+                        "Linux prepared helper evidence lock poisoned",
+                    )
+                })? = evidence;
+                Ok(())
             },
-        )?;
+        );
+        *phase = PublisherPhase::Blocked;
+        let result = result?;
+        drop(terminal);
         drop(helpers);
         drop(local);
-        self.retain_terminal(terminal)?;
         Ok(result)
     }
     pub fn initialize(&self, data: &Path, root: &Path, limits: LocalLimits) -> Result<LocalSpace> {
@@ -377,87 +493,146 @@ impl LinuxDaemonOwner {
         local: &mut LocalSpace,
         request: sync_extend_reconcile::LinuxNativeWebDavPut,
         source: &std::fs::File,
-    ) -> sync_extend_reconcile::Result<sync_extend_reconcile::PublishResult> {
-        if self
+    ) -> std::result::Result<sync_extend_reconcile::PublishResult, LinuxWebDavCommitFailure> {
+        use sync_extend_reconcile::ReconcileError::Invariant;
+        let mut actor = self
+            .publisher_actor
+            .try_lock()
+            .map_err(|_| Invariant("Linux publication actor busy or poisoned"))?;
+        if !matches!(actor.phase, PublisherPhase::Ready) {
+            return Err(Invariant("Linux publication actor remains blocked").into());
+        }
+        let PublisherActor {
+            initial_epoch,
+            publisher,
+            phase,
+            completed_epochs,
+            last_terminal_diagnostic,
+        } = &mut *actor;
+        if publisher.is_none() {
+            *publisher = Some(local.bind_initial_linux_native_publisher(
+                &self.owner,
+                &self.budget,
+                initial_epoch,
+            )?);
+        }
+        let publisher = publisher
+            .as_mut()
+            .ok_or(Invariant("Linux live publisher absent"))?;
+        let mut helpers = self
+            .helpers
+            .lock()
+            .map_err(|_| Invariant("Linux helper session lock poisoned"))?;
+        let mut terminal = self
             .terminal
             .lock()
-            .map_err(|_| {
-                sync_extend_reconcile::ReconcileError::Invariant(
-                    "Linux terminal token lock poisoned",
-                )
-            })?
-            .is_some()
-        {
-            return Err(sync_extend_reconcile::ReconcileError::Invariant(
-                "Linux native publisher already used for this daemon owner",
-            ));
+            .map_err(|_| Invariant("Linux terminal token lock poisoned"))?;
+        if helpers.is_some() || terminal.is_some() {
+            return Err(Invariant("Linux previous helper or terminal still retained").into());
         }
-        let mut helpers = self.helpers.lock().map_err(|_| {
-            sync_extend_reconcile::ReconcileError::Invariant(
-                "Linux helper session lock poisoned",
-            )
-        })?;
-        if helpers.is_some() {
-            return Err(sync_extend_reconcile::ReconcileError::Invariant(
-                "Linux native WebDAV requires delayed original helper preparation",
-            ));
-        }
-        let program = self.delayed_helper_program.as_ref().ok_or(
-            sync_extend_reconcile::ReconcileError::Invariant("late helper program absent"),
-        )?;
-        let (result, terminal) = local.commit_linux_native_webdav_put(
-            request,
-            source,
-            &self.owner,
-            &self.budget,
-            &mut helpers,
-            || {
-                let session = OutsideHelperSession::prepare(&self.owner, program)?;
-                match capture_prepared(&self.owner, &session) {
-                    Ok(evidence) => {
+        let program = self
+            .delayed_helper_program
+            .as_ref()
+            .ok_or(Invariant("late helper program absent"))?;
+        *phase = PublisherPhase::Publishing;
+        let outcome: std::result::Result<_, LinuxWebDavCommitFailure> = (|| {
+            let result =
+                local.commit_linux_native_webdav_put(
+                    request,
+                    source,
+                    sync_extend_reconcile::LinuxNativePublication::borrow_original(
+                        &self.owner,
+                        &self.budget,
+                        publisher,
+                        &mut helpers,
+                        &mut terminal,
+                    ),
+                    |slot| {
+                        *slot = Some(OutsideHelperSession::prepare(
+                            &self.owner,
+                            publisher.platform_epoch()?,
+                            program,
+                        )?);
+                        let evidence = capture_prepared(
+                            &self.owner,
+                            slot.as_ref()
+                                .ok_or(Invariant("original prepared helper escaped"))?,
+                        )?;
                         *self.prepared.lock().map_err(|_| {
-                            sync_extend_reconcile::ReconcileError::Invariant(
-                                "Linux prepared helper evidence lock poisoned",
-                            )
+                            Invariant("Linux prepared helper evidence lock poisoned")
                         })? = evidence;
-                    }
-                    Err(error) => {
-                        let terminal = session.finish_unarmed()?;
-                        let mut slot = self.terminal.lock().map_err(|_| {
-                            sync_extend_reconcile::ReconcileError::Invariant(
-                                "Linux terminal token lock poisoned",
-                            )
-                        })?;
-                        if slot.is_some() {
-                            return Err(sync_extend_reconcile::ReconcileError::Invariant(
-                                "original terminal already retained",
-                            ));
-                        }
-                        *slot = Some(terminal);
-                        return Err(error.into());
-                    }
+                        Ok(())
+                    },
+                )?;
+            *last_terminal_diagnostic = terminal.as_ref().map(terminal_diagnostic);
+            let next = match local.complete_linux_native_publication_epoch(
+                &self.owner,
+                &self.budget,
+                publisher,
+                &mut terminal,
+                &result.transaction_id,
+            ) {
+                Ok(next) => next,
+                Err(error) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "linux_publication_blocked": true,
+                            "transaction_id": result.transaction_id,
+                            "snapshot_id": result.snapshot_id,
+                            "local_committed": true,
+                            "remote_backup_complete": false,
+                            "publication_ready": false,
+                        })
+                    );
+                    return Err(LinuxWebDavCommitFailure {
+                        error: Box::new(error),
+                        committed: Some(sync_extend_reconcile::WebDavCommit {
+                            transaction_id: result.transaction_id,
+                            snapshot_id: result.snapshot_id,
+                            local_committed: result.local_committed,
+                            remote_backup_complete: result.remote_backup_complete,
+                        }),
+                    });
                 }
-                Ok(session)
-            },
-        )?;
-        drop(helpers);
-        self.retain_terminal(terminal).map_err(|_| {
-            sync_extend_reconcile::ReconcileError::Invariant(
-                "original terminal token could not be retained",
-            )
-        })?;
-        Ok(result)
+            };
+            if let Some(diagnostic) = last_terminal_diagnostic.as_mut() {
+                diagnostic["consumed_by_successor"] = serde_json::json!(true);
+            }
+            *completed_epochs = next;
+            println!(
+                "{}",
+                serde_json::json!({"linux_publication_successor": next,
+                "transaction_id": result.transaction_id, "owner_pid": std::process::id(),
+                "owner_generation": self.owner.owner_generation(),
+                "namespace": {"device": self.owner.namespace_key().device, "inode": self.owner.namespace_key().inode},
+                "mount": self.owner.volume().observation().runtime_mount_id,
+                "image": {"device": self.owner.backing_image_key().device, "inode": self.owner.backing_image_key().inode}})
+            );
+            Ok(result)
+        })();
+        *phase = if outcome.is_ok() {
+            PublisherPhase::Ready
+        } else {
+            PublisherPhase::Blocked
+        };
+        outcome
     }
 
-    pub fn retain_terminal(&self, terminal: OriginalPairTerminalRelease) -> Result<()> {
-        let mut retained = self
-            .terminal
-            .lock()
-            .map_err(|_| "Linux terminal token lock poisoned")?;
-        if retained.is_some() {
-            return Err("the original Linux helper terminal token was already retained".into());
+    /// The synchronous gateway is one actor; polling never scans an armed,
+    /// cleaning, or failed epoch, and it never opens another Journal issuer.
+    pub fn publication_ready_for_scan(&self) -> bool {
+        self.publisher_actor
+            .try_lock()
+            .is_ok_and(|actor| matches!(actor.phase, PublisherPhase::Ready))
+    }
+
+    pub fn require_publication_ready(&self) -> sync_extend_reconcile::Result<()> {
+        if !self.publication_ready_for_scan() {
+            return Err(sync_extend_reconcile::ReconcileError::Invariant(
+                "Linux publication actor busy or blocked",
+            ));
         }
-        *retained = Some(terminal);
         Ok(())
     }
 
@@ -469,8 +644,16 @@ impl LinuxDaemonOwner {
             terminal_receipt_output,
             helpers,
             prepared,
+            publisher_actor,
             ..
         } = self;
+        let actor = publisher_actor
+            .into_inner()
+            .map_err(|_| "Linux publisher actor poisoned")?;
+        let completed_epochs = actor.completed_epochs;
+        let last_terminal_diagnostic = actor.last_terminal_diagnostic;
+        drop(actor.publisher);
+        drop(actor.initial_epoch);
         let metadata = budget.checkpoint_closed();
         let persistent_generation = budget.persistent_owner_generation();
         let mut terminal = terminal
@@ -521,18 +704,10 @@ impl LinuxDaemonOwner {
             terminal = Some(helpers.finish_unarmed()?);
         }
         let metadata = metadata?;
-        let helper_terminal = terminal.as_ref().map(|value| {
-            let startup = value.startup_bytes();
-            let finished = value.terminal_bytes();
-            serde_json::json!({
-                "process_ids": value.process_ids(),
-                "startup_bytes": [startup.0, startup.1],
-                "terminal_stdout": [finished.0.0, finished.1.0],
-                "terminal_stderr": [finished.0.1, finished.1.1],
-                "original_two_helper_terminal_token": true,
-                "committed_thaw_observed": value.committed_thaw_observed(),
-            })
-        });
+        let helper_terminal = terminal
+            .as_ref()
+            .map(terminal_diagnostic)
+            .or(last_terminal_diagnostic);
         let files: Vec<_> = metadata
             .files
             .iter()
@@ -548,6 +723,8 @@ impl LinuxDaemonOwner {
                 })
             })
             .collect();
+        let owner_pid = std::process::id();
+        let mount_id = owner.volume().observation().runtime_mount_id;
         let generation = owner.owner_generation();
         let namespace = owner.namespace_key();
         let image = owner.backing_image_key();
@@ -562,6 +739,8 @@ impl LinuxDaemonOwner {
         if let Some(path) = terminal_receipt_output {
             let value = serde_json::json!({
                 "format_version": 1, "owner_generation": generation,
+                "owner_pid": owner_pid, "runtime_mount_id": mount_id,
+                "completed_publication_epochs": completed_epochs,
                 "persistent_metadata_generation": persistent_generation,
                 "namespace": {"device": namespace.device, "inode": namespace.inode},
                 "backing_image": {"device": image.device, "inode": image.inode},
@@ -589,4 +768,16 @@ impl LinuxDaemonOwner {
         }
         Ok(())
     }
+}
+
+// Diagnostics are retained for the stop receipt only, never read as authority.
+fn terminal_diagnostic(value: &OriginalPairTerminalRelease) -> serde_json::Value {
+    let startup = value.startup_bytes();
+    let finished = value.terminal_bytes();
+    serde_json::json!({
+        "process_ids": value.process_ids(), "startup_bytes": [startup.0, startup.1],
+        "terminal_stdout": [finished.0.0, finished.1.0], "terminal_stderr": [finished.0.1, finished.1.1],
+        "original_two_helper_terminal_token": true, "committed_thaw_observed": value.committed_thaw_observed(),
+        "consumed_by_successor": false,
+    })
 }

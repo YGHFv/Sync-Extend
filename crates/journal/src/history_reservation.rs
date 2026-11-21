@@ -722,6 +722,10 @@ pub use phases::OriginalNativePhaseObservationReceipt;
 
 mod linux_terminal;
 mod phase_evidence;
+#[cfg(target_os = "linux")]
+pub use linux_terminal::{
+    OriginalLinuxCleanupCompletion, OriginalLinuxPublisherBinding, OriginalLinuxSuccessorReceipt,
+};
 pub use linux_terminal::{OriginalLinuxCleanupPermit, OriginalLinuxNativeFinalDiagnostic};
 #[allow(unused_imports)]
 pub(crate) use phase_evidence::{

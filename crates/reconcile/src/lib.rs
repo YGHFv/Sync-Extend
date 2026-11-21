@@ -1928,6 +1928,8 @@ pub use planned_local_scan::PlannedLocalCreateHistory;
 #[cfg(target_os = "linux")]
 mod linux_native;
 #[cfg(target_os = "linux")]
+pub use linux_native::{LinuxNativePublication, LinuxNativePublisher};
+#[cfg(target_os = "linux")]
 mod native_final_observation;
 #[cfg(target_os = "linux")]
 pub use native_final_observation::{

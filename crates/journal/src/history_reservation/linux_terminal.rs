@@ -93,6 +93,28 @@ pub struct OriginalLinuxNativeFinalDiagnostic {
     pub immutable_history_and_native_receipts_retained: bool,
 }
 
+/// A live Journal binding; deserialized history never constructs this value.
+#[cfg(target_os = "linux")]
+pub struct OriginalLinuxPublisherBinding {
+    issuer: std::sync::Arc<()>,
+}
+
+/// Issued only after durable cleanup and all native absence postchecks.
+#[cfg(target_os = "linux")]
+pub struct OriginalLinuxCleanupCompletion {
+    permit: OriginalLinuxCleanupPermit,
+}
+
+/// Live receipt for one append-only predecessor transition.
+#[cfg(target_os = "linux")]
+pub struct OriginalLinuxSuccessorReceipt {
+    issuer: std::sync::Arc<()>,
+    row_key: String,
+    exact_json: String,
+    owner_generation: [u8; 16],
+    next_sequence: u64,
+}
+
 pub struct OriginalLinuxCleanupPermit {
     final_record: Final,
     final_json: String,
@@ -583,3 +605,6 @@ pub(super) fn cleaned_rows(rows: &[crate::JournalStoredRow], attempt: &EntryId) 
 
 #[cfg(target_os = "linux")]
 mod live;
+
+#[cfg(target_os = "linux")]
+mod successor;
