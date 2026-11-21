@@ -25,7 +25,7 @@ pub enum RestoreOccupiedTargetPolicy {
     ReplaceFiles,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RestoreSelection {
     Full,
@@ -39,6 +39,37 @@ pub enum RestoreSelection {
     Paths {
         paths: Vec<PortablePath>,
     },
+}
+
+// An empty struct variant checks every field in the tagged map. Serde's unit
+// variant does not enforce deny_unknown_fields for the public Full variant.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum RestoreSelectionWire {
+    Full {},
+    File {
+        path: PortablePath,
+    },
+    Directory {
+        path: PortablePath,
+    },
+    Paths {
+        paths: Vec<PortablePath>,
+    },
+}
+
+impl<'de> Deserialize<'de> for RestoreSelection {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match RestoreSelectionWire::deserialize(deserializer)? {
+            RestoreSelectionWire::Full {} => Self::Full,
+            RestoreSelectionWire::File { path } => Self::File { path },
+            RestoreSelectionWire::Directory { path } => Self::Directory { path },
+            RestoreSelectionWire::Paths { paths } => Self::Paths { paths },
+        })
+    }
 }
 
 impl RestoreSelection {
