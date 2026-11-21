@@ -13,7 +13,7 @@
     <header class="header">
       <span class="context">KernelSU 模块</span>
       <h1>SyncExtend</h1>
-      <p>查看守护进程和本机 WebDAV。</p>
+      <p>查看本机工作区、存储保护和 WebDAV 连接状态。</p>
     </header>
 
     <section class="panel" aria-labelledby="service-title">
@@ -34,6 +34,31 @@
           <button id="cancel-stop" type="button">取消</button>
         </div>
       </div>
+    </section>
+
+    <section class="panel" aria-labelledby="workspace-title">
+      <div class="panel-title">
+        <h2 id="workspace-title">工作区与历史</h2>
+        <span id="workspace-state" class="pill" data-tone="neutral">等待服务</span>
+      </div>
+      <p id="workspace-detail" class="detail">从持有资源的后台服务读取有界摘要。</p>
+      <dl id="workspace-summary" class="summary" hidden></dl>
+    </section>
+
+    <section class="panel" aria-labelledby="storage-title">
+      <div class="panel-title">
+        <h2 id="storage-title">存储与暂存</h2>
+        <span id="storage-state" class="pill" data-tone="neutral">等待服务</span>
+      </div>
+      <p id="storage-detail" class="detail">容量、受保护内容和逻辑交付额度分别展示。</p>
+      <dl id="storage-summary" class="summary" hidden></dl>
+    </section>
+
+    <section class="panel" aria-labelledby="network-title">
+      <div class="panel-title">
+        <h2 id="network-title">连接、路径与预算</h2>
+      </div>
+      <p id="network-detail" class="detail">实际路径和中继费用尚未确认。</p>
     </section>
 
     <section class="panel" aria-labelledby="gateway-title">

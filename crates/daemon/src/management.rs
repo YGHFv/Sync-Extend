@@ -20,6 +20,10 @@ use sync_extend_core_model::{
 mod client;
 pub use client::{dashboard as control_dashboard, status as control_status, stop as control_stop};
 mod dashboard;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) use dashboard::{
+    local_dashboard, register_local_dashboard, LocalDashboardRegistration, MAX_LOCAL_DASHBOARD,
+};
 pub use dashboard::{observe_gateway, observe_local_space, observe_storage};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;

@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position = 0)]
-    [ValidateSet('install', 'start', 'status', 'stop', 'upgrade', 'rollback', 'uninstall', 'webdav-enable', 'webdav-disable')][string]$Action,
+    [ValidateSet('install', 'start', 'resume', 'status', 'stop', 'upgrade', 'rollback', 'uninstall', 'webdav-enable', 'webdav-disable')][string]$Action,
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'SyncExtend\install'),
     [string]$Package = (Join-Path $PSScriptRoot 'package.json'),
     [string]$Deployment = (Join-Path $env:LOCALAPPDATA 'SyncExtend\client\deployment.json'),
@@ -281,6 +281,20 @@ try {
             $selected = Install-Package $Package
             $previous = if ($record.selected.version_id -ceq $selected.version_id) { $record.previous } else { $record.selected }
             Start-Installed $selected $Deployment $previous
+        }
+        'resume' {
+            if (!$record -or $record.state -cne 'stopped' -or
+                ![string]::Equals((Resolve-SyncExtendPath $Deployment -File), $record.deployment,
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Resume requires this profile and its successfully stopped installed version.'
+            }
+            $process = if ($record.process) { Get-OwnedProcess $record.process }
+            if ($process) { $process.Dispose(); throw 'The recorded deployment process is still active.' }
+            $null = Resolve-SyncExtendPath $record.management -File
+            Confirm-Configuration $record
+            # Retain the selected installed image and previous version. Resuming
+            # from an older launcher must not silently install or roll back it.
+            Start-Installed $record.selected $record.deployment $record.previous
         }
         'status' {
             if (!$record) { throw 'Start an installed version first.' }

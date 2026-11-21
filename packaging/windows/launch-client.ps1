@@ -7,6 +7,8 @@ param(
     [ValidateRange(1024, 65535)][int]$ManagementPort = 17423,
     [switch]$EnableReadOnlyWebdav,
     [ValidateRange(1024, 65535)][int]$WebdavPort = 17842,
+    [string]$StorageConfig,
+    [string]$AttemptPolicy,
     [switch]$Snapshot
 )
 $ErrorActionPreference = 'Stop'
@@ -43,4 +45,4 @@ if (!(Test-Path -LiteralPath (Join-Path $InstallRoot 'state.json') -PathType Lea
     }
 }
 & (Join-Path $PSScriptRoot 'client.ps1') -Deployment $deploymentPath -Binary $binaryPath -InstallRoot $InstallRoot `
-    -WebdavPort $WebdavPort -Managed -Snapshot:$Snapshot
+    -WebdavPort $WebdavPort -StorageConfig $StorageConfig -AttemptPolicy $AttemptPolicy -Managed -Snapshot:$Snapshot

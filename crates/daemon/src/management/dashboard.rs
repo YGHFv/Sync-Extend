@@ -1,5 +1,7 @@
 //! Optional local dashboard, using cached observations from the real resource owner.
 use super::{Result, READY};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::sync::atomic::AtomicUsize;
 use std::{
     io::Write,
     net::TcpStream,
@@ -16,7 +18,103 @@ static OBSERVATION: Mutex<Option<(Instant, Vec<u8>)>> = Mutex::new(None);
 static STORAGE: Mutex<Option<(Instant, serde_json::Value)>> = Mutex::new(None);
 static GATEWAY: Mutex<Option<serde_json::Value>> = Mutex::new(None);
 static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+static LOCAL_REGISTRATIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+static LOCAL_OBSERVATION: Mutex<Option<(Instant, serde_json::Value)>> = Mutex::new(None);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+static LOCAL_STORAGE: Mutex<Option<(Instant, serde_json::Value)>> = Mutex::new(None);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+static LOCAL_GATEWAY: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) const MAX_LOCAL_DASHBOARD: usize = 3072;
 const UI: &str = include_str!("dashboard.html");
+
+/// Local kernel-owner collection is independent of HTTP dashboard permission.
+/// Registration never starts a listener or opens a second resource owner.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) struct LocalDashboardRegistration;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn register_local_dashboard() -> LocalDashboardRegistration {
+    if LOCAL_REGISTRATIONS.fetch_add(1, Ordering::AcqRel) == 0 {
+        clear_local();
+    }
+    LocalDashboardRegistration
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl Drop for LocalDashboardRegistration {
+    fn drop(&mut self) {
+        if LOCAL_REGISTRATIONS.fetch_sub(1, Ordering::AcqRel) == 1 {
+            clear_local();
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn collecting_local() -> bool {
+    LOCAL_REGISTRATIONS.load(Ordering::Acquire) != 0
+}
+
+fn collecting() -> bool {
+    let collecting = ENABLED.load(Ordering::Acquire);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let collecting = collecting || collecting_local();
+    collecting
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn clear_local() {
+    if let Ok(mut slot) = LOCAL_OBSERVATION.lock() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = LOCAL_STORAGE.lock() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = LOCAL_GATEWAY.lock() {
+        *slot = None;
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn sample(
+    slot: &Mutex<Option<(Instant, serde_json::Value)>>,
+    name: &str,
+) -> Option<serde_json::Value> {
+    slot.lock().ok()?.as_ref().map(|(at, value)| {
+        let mut sample = serde_json::Map::new();
+        sample.insert(
+            "age_ms".to_owned(),
+            serde_json::json!(at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+        );
+        sample.insert(name.to_owned(), value.clone());
+        serde_json::Value::Object(sample)
+    })
+}
+
+/// Only copies the bounded summaries cached by the retained resource owner.
+/// No inventory, credential, ledger or CAS reads occur in the control thread.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn local_dashboard() -> (Option<serde_json::Value>, &'static str) {
+    let local = sample(&LOCAL_OBSERVATION, "local");
+    let storage = sample(&LOCAL_STORAGE, "actual");
+    let gateway = LOCAL_GATEWAY.lock().ok().and_then(|slot| slot.clone());
+    if local.is_none() && storage.is_none() && gateway.is_none() {
+        return (None, "no_observation");
+    }
+    let value = serde_json::json!({
+        "dashboard_format_version": 1,
+        "observation": local, "storage": storage, "webdav": gateway,
+        "connection": null, "route": null, "traffic": null,
+        "remote_backup_complete": false,
+    });
+    match serde_json::to_vec(&value) {
+        Ok(bytes) if bytes.len() <= MAX_LOCAL_DASHBOARD => (Some(value), "available"),
+        Ok(_) => (None, "over_limit"),
+        Err(_) => (None, "unavailable"),
+    }
+}
 
 pub fn configure(config: &ManagementConfig) -> Result<()> {
     ENABLED.store(
@@ -42,6 +140,21 @@ pub fn observe_gateway(
     listener: Option<&sync_extend_core_model::webdav::WebDavListener>,
     scheme: &str,
 ) {
+    if !collecting() {
+        return;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if collecting_local() {
+        if let Ok(mut slot) = LOCAL_GATEWAY.lock() {
+            *slot = listener.map(|listener| {
+                serde_json::json!({
+                    "address": listener.address, "scheme": scheme,
+                    "listening": true, "authenticated": true,
+                    "export_count": listener.exports.len(),
+                })
+            });
+        }
+    }
     if !ENABLED.load(Ordering::Acquire) {
         return;
     }
@@ -78,12 +191,43 @@ pub fn observe_gateway(
     }
 }
 pub fn observe_storage(node: &sync_extend_reconcile::StorageNode) {
-    if !ENABLED.load(Ordering::Acquire) {
+    if !collecting() {
         return;
     }
-    let value = node
-        .management_dashboard()
-        .ok()
+    let observation = node.management_dashboard().ok();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if collecting_local() {
+        if let Ok(mut slot) = LOCAL_STORAGE.lock() {
+            *slot = observation.as_ref().map(|value| {
+                (
+                    Instant::now(),
+                    serde_json::json!({
+                        "space_id": value.space_id, "device_id": value.device_id,
+                        "role": value.role,
+                        "protected_chunks": value.protected_chunks,
+                        "protected_bytes": value.protected_bytes,
+                        "physical_cas_bytes": value.physical_cas_bytes,
+                        "stored_byte_limit": value.stored_byte_limit,
+                        "request_byte_limit": value.request_byte_limit,
+                        "charged_logical_delivery_bytes": value.charged_logical_delivery_bytes,
+                        "traffic_byte_limit": value.traffic_byte_limit,
+                        "expired": value.expired,
+                        "checked_chunks": value.checked_chunks,
+                        "checked_bytes": value.checked_bytes,
+                        "unavailable_chunks_count": value.unavailable_chunks.len(),
+                        "all_protected_chunks_checked": value.all_protected_chunks_checked,
+                        "total_snapshot_reports": value.total_snapshot_reports,
+                        "snapshot_reports_truncated": value.snapshot_reports_truncated,
+                        "journal_snapshot_consistent": value.journal_snapshot_consistent,
+                        "cross_database_snapshot_consistent": value.cross_database_snapshot_consistent,
+                        "content_complete_certified": false, "backup_complete": false,
+                    }),
+                )
+            });
+        }
+    }
+    let value = observation
+        .filter(|_| ENABLED.load(Ordering::Acquire))
         .and_then(|value| serde_json::to_vec(&value).ok())
         .filter(|bytes| bytes.len() <= MAX_OWNER_BODY)
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
@@ -106,12 +250,42 @@ pub fn clear() {
 
 /// Runs only in the resource owner's existing blocking worker.
 pub fn observe_local_space(local: &LocalSpace) {
-    if !ENABLED.load(Ordering::Acquire) {
+    if !collecting() {
         return;
     }
-    let value = local
-        .management_dashboard()
-        .ok()
+    let observation = local.management_dashboard().ok();
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if collecting_local() {
+        if let Ok(mut slot) = LOCAL_OBSERVATION.lock() {
+            *slot = observation.as_ref().map(|value| {
+                (
+                    Instant::now(),
+                    serde_json::json!({
+                        "space_id": value.space_id, "device_id": value.device_id,
+                        "total_entries": value.total_entries,
+                        "total_snapshots": value.total_snapshots,
+                        "outstanding_mutations": value.outstanding_mutations,
+                        "outstanding_publications": value.outstanding_publications,
+                        "entries_truncated": value.entries_truncated,
+                        "snapshots_truncated": value.snapshots_truncated,
+                        "conflict_admissions_count": value.conflict_admissions.len(),
+                        "conflict_admissions_truncated": value.conflict_admissions_truncated,
+                        "chunks": {
+                            "checked_chunks": value.chunks.checked_chunks,
+                            "checked_bytes": value.chunks.checked_bytes,
+                            "total_current_chunks": value.chunks.total_current_chunks,
+                            "unavailable_chunks_count": value.chunks.unavailable_chunks.len(),
+                            "all_current_chunks_checked": value.chunks.all_current_chunks_checked,
+                        },
+                        "read_leases": value.read_leases,
+                        "remote_backup_complete": false,
+                    }),
+                )
+            });
+        }
+    }
+    let value = observation
+        .filter(|_| ENABLED.load(Ordering::Acquire))
         .and_then(|value| serde_json::to_vec(&value).ok())
         .filter(|bytes| bytes.len() <= MAX_OWNER_BODY);
     if let Ok(mut slot) = OBSERVATION.lock() {

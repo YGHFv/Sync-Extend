@@ -106,6 +106,10 @@ button:disabled { opacity: 0.54; }
 .export-summary { font-weight: 620; }
 .export-access { color: var(--muted); font-size: 0.875rem; }
 .export-probe { margin-top: 8px; }
+.export-result { display: block; color: var(--muted); font-size: 0.875rem; margin-top: 6px; }
+.summary { display: grid; grid-template-columns: minmax(100px, 1fr) minmax(0, 2fr); gap: 8px 12px; margin: 14px 0 0; }
+.summary dt { color: var(--muted); }
+.summary dd { margin: 0; overflow-wrap: anywhere; user-select: text; }
 code { display: block; margin-top: 4px; white-space: normal; overflow-wrap: anywhere; user-select: all; }
 footer { padding: 15px 6px 0; font-size: 0.8125rem; }
 

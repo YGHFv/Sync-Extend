@@ -11,6 +11,8 @@ const fields = {};
 [
   "service-state", "service-detail", "gateway-state", "gateway-detail", "exports", "refresh",
   "verify-stop", "ask-stop", "stop-confirmation", "stop", "cancel-stop", "probe-result",
+  "workspace-state", "workspace-detail", "workspace-summary",
+  "storage-state", "storage-detail", "storage-summary", "network-detail",
 ].forEach((id) => { fields[id] = document.getElementById(id); });
 
 const canUseBridge = Boolean(window.ksu && typeof window.ksu.exec === "function");
@@ -19,6 +21,11 @@ let busy = false;
 let activeOwner = false;
 let ownerReady = false;
 let probeButtons = [];
+let exportResults = new Map();
+let gatewayConfigured = false;
+let gatewayDisabled = false;
+let currentOwnerPid = null;
+let liveGateway = null;
 const validExportName = (name) => typeof name === "string" && name.length >= 1 &&
   name.length <= 64 && !/[^A-Za-z0-9_-]/.test(name);
 
@@ -46,7 +53,8 @@ function readJson(operation, selectedExport) {
     }, 8000);
     window[callback] = (code, output) => {
       finish();
-      if (code !== 0 || typeof output !== "string" || output.length > 65536) {
+      if (code !== 0 || typeof output !== "string" ||
+          output.length > (operation === "gateway" ? 65536 : 4096)) {
         reject(new Error("Module operation refused"));
         return;
       }
@@ -85,6 +93,35 @@ function hideConfirmation() {
   fields["stop-confirmation"].hidden = true;
 }
 
+function clearRuntime(detail = "当前没有可验证的运行摘要。") {
+  liveGateway = null;
+  for (const category of ["workspace", "storage"]) {
+    fields[`${category}-summary`].textContent = "";
+    fields[`${category}-summary`].hidden = true;
+    setStatus(category, "暂无观察", detail);
+  }
+  fields["network-detail"].textContent = "当前没有连接观测；实际路径、实际流量和中继费用保持未知。";
+}
+
+function clearExportTests(detail = "连接待测试") {
+  for (const result of exportResults.values()) result.textContent = detail;
+  fields["probe-result"].hidden = true;
+}
+
+function showGatewayAvailability() {
+  if (!gatewayConfigured) {
+    setStatus("gateway", gatewayDisabled ? "配置已关闭" : "未启用",
+      gatewayDisabled ? "WebDAV 已关闭；当前页面不会测试已关闭的导出。" : "当前模块配置未启用 WebDAV。");
+  } else if (!ownerReady) {
+    setStatus("gateway", "配置已开 · 服务未就绪",
+      activeOwner ? "后台资源尚未就绪，导出暂不能测试。" : "服务停止或状态未确认；导出配置继续保留，运行可访问性未确认。");
+  } else if (!liveGateway) {
+    setStatus("gateway", "配置已开 · 监听待确认", "后台资源已就绪；尚无活动监听摘要，可测试选中的导出。");
+  } else {
+    setStatus("gateway", "监听已登记 · 待测试", "后台登记了活动监听。每个导出的账号认证和可访问性仍需连接测试。");
+  }
+}
+
 function showOwner(value) {
   if (!value || value.format_version !== 1 || value.kernel_owner_authenticated !== true ||
       typeof value.stop_requested !== "boolean" || typeof value.ready !== "boolean" ||
@@ -93,6 +130,12 @@ function showOwner(value) {
   }
   activeOwner = !value.stop_requested;
   ownerReady = activeOwner && value.ready;
+  currentOwnerPid = value.owner_pid;
+  if (!ownerReady) {
+    clearRuntime(value.stop_requested ? "服务正在停止，旧运行摘要已清除。" : "资源尚未就绪，旧运行摘要已清除。");
+    clearExportTests("服务未就绪");
+    showGatewayAvailability();
+  }
   if (value.stop_requested) {
     setStatus("service", "正在停止", "停止请求已接受。进程退出后可确认停止。");
   } else if (value.ready) {
@@ -100,6 +143,133 @@ function showOwner(value) {
   } else {
     setStatus("service", "等待资源", "已连接后台进程，当前资源尚未就绪。");
   }
+}
+
+const count = (value) => Number.isSafeInteger(value) && value >= 0;
+const identifier = (value, length) => typeof value === "string" && value.length === length &&
+  !/[^0-9a-f]/.test(value);
+function requireCounts(value, names) {
+  if (!value || typeof value !== "object" || names.some((name) => !count(value[name]))) {
+    throw new Error("Invalid bounded summary count");
+  }
+}
+function requireFlags(value, names) {
+  if (names.some((name) => typeof value[name] !== "boolean")) throw new Error("Invalid bounded summary flag");
+}
+function showSummary(category, rows) {
+  const target = fields[`${category}-summary`];
+  target.textContent = "";
+  for (const [name, value] of rows) {
+    const label = document.createElement("dt");
+    const detail = document.createElement("dd");
+    label.textContent = name;
+    detail.textContent = String(value);
+    target.append(label, detail);
+  }
+  target.hidden = false;
+}
+
+function showDashboard(owner) {
+  clearRuntime();
+  const value = owner.dashboard;
+  if (!value) {
+    const detail = owner.dashboard_state === "over_limit" ?
+      "运行摘要超过协议上限；当前状态保持未知。" :
+      owner.dashboard_state === "no_observation" ?
+        "当前角色尚未提供工作区或存储样本。" :
+        "当前后台版本尚未提供可用摘要；可刷新服务状态。";
+    clearRuntime(detail);
+    showGatewayAvailability();
+    return;
+  }
+  if (!ownerReady || owner.dashboard_state !== "available" ||
+      value.dashboard_format_version !== 1 || value.remote_backup_complete !== false ||
+      JSON.stringify(value).length > 3072) {
+    throw new Error("Invalid owner dashboard");
+  }
+  if (value.observation) {
+    const observation = value.observation;
+    requireCounts(observation, ["age_ms"]);
+    const local = observation.local;
+    requireCounts(local, ["total_entries", "total_snapshots", "outstanding_mutations",
+      "outstanding_publications", "conflict_admissions_count"]);
+    requireFlags(local, ["entries_truncated", "snapshots_truncated", "conflict_admissions_truncated"]);
+    if (!identifier(local.space_id, 32) || !identifier(local.device_id, 64) ||
+        local.remote_backup_complete !== false || local.conflict_admissions_count > 128) {
+      throw new Error("Invalid workspace summary");
+    }
+    const chunks = local.chunks;
+    requireCounts(chunks, ["checked_chunks", "checked_bytes", "total_current_chunks", "unavailable_chunks_count"]);
+    requireFlags(chunks, ["all_current_chunks_checked"]);
+    if (chunks.checked_chunks > 64 || chunks.checked_bytes > 16 * 1024 * 1024 ||
+        chunks.checked_chunks > chunks.total_current_chunks || chunks.unavailable_chunks_count > chunks.checked_chunks ||
+        chunks.all_current_chunks_checked !== (chunks.checked_chunks === chunks.total_current_chunks)) {
+      throw new Error("Invalid chunk coverage");
+    }
+    const leases = local.read_leases;
+    requireCounts(leases, ["total", "active", "expired_pending_recovery"]);
+    requireFlags(leases, ["explicit_recovery_required"]);
+    if (leases.active > leases.total || leases.expired_pending_recovery > leases.active ||
+        leases.explicit_recovery_required !== (leases.expired_pending_recovery > 0)) {
+      throw new Error("Invalid lease summary");
+    }
+    showSummary("workspace", [
+      ["空间", local.space_id], ["设备", local.device_id], ["采样距今", `${observation.age_ms} ms`],
+      ["路径 / 历史快照", `${local.total_entries} / ${local.total_snapshots}`],
+      ["待处理文件 / 发布", `${local.outstanding_mutations} / ${local.outstanding_publications}`],
+      ["冲突样本", `${local.conflict_admissions_count}${local.conflict_admissions_truncated ? "（已截取）" : ""}`],
+      ["当前块检查", `${chunks.checked_chunks} / ${chunks.total_current_chunks}；不可读取 ${chunks.unavailable_chunks_count}`],
+      ["读租约：总数 / 活跃 / 到期", `${leases.total} / ${leases.active} / ${leases.expired_pending_recovery}`],
+    ]);
+    setStatus("workspace", "已有样本",
+      `${chunks.all_current_chunks_checked ? "已检查当前块。" : "块检查仅为部分抽样。"} ` +
+      `${leases.explicit_recovery_required ? "到期租约仍受保护，需要显式回收。" : "没有到期待回收租约。"} ` +
+      `${local.entries_truncated || local.snapshots_truncated ? "后台列表已有截取。 " : ""}本页展示摘要；远端备份尚未确认。`);
+  }
+  if (value.storage) {
+    const observation = value.storage;
+    requireCounts(observation, ["age_ms"]);
+    const storage = observation.actual;
+    requireCounts(storage, ["protected_chunks", "protected_bytes", "physical_cas_bytes",
+      "stored_byte_limit", "request_byte_limit", "charged_logical_delivery_bytes", "traffic_byte_limit",
+      "checked_chunks", "checked_bytes", "unavailable_chunks_count", "total_snapshot_reports"]);
+    requireFlags(storage, ["expired", "all_protected_chunks_checked", "snapshot_reports_truncated",
+      "journal_snapshot_consistent", "cross_database_snapshot_consistent"]);
+    if (!identifier(storage.space_id, 32) || !identifier(storage.device_id, 64) ||
+        !["full", "staging"].includes(storage.role) || storage.backup_complete !== false ||
+        storage.content_complete_certified !== false || storage.checked_chunks > 64 ||
+        storage.checked_bytes > 16 * 1024 * 1024 || storage.checked_chunks > storage.protected_chunks ||
+        storage.unavailable_chunks_count > storage.checked_chunks ||
+        storage.all_protected_chunks_checked !== (storage.checked_chunks === storage.protected_chunks)) {
+      throw new Error("Invalid storage summary");
+    }
+    showSummary("storage", [
+      ["角色", storage.role === "staging" ? "暂存" : "完整存储角色（完整性未认证）"],
+      ["采样距今", `${observation.age_ms} ms`],
+      ["受保护内容", `${storage.protected_bytes} B`],
+      ["实际块文件 / 容量", `${storage.physical_cas_bytes} / ${storage.stored_byte_limit} B`],
+      ["单次请求上限", `${storage.request_byte_limit} B`],
+      ["逻辑交付累计 / 额度", `${storage.charged_logical_delivery_bytes} / ${storage.traffic_byte_limit} B`],
+      ["受保护块检查", `${storage.checked_chunks} / ${storage.protected_chunks}；不可读取 ${storage.unavailable_chunks_count}`],
+      ["快照报告总数", storage.total_snapshot_reports],
+    ]);
+    setStatus("storage", storage.expired ? "策略已到期" : "已有样本",
+      `${storage.expired ? "新接收会拒绝；受保护内容不会自动清理。 " : ""}` +
+      "逻辑交付按请求、内容和方向去重；不等于重试字节或中继计费。" +
+      `${storage.cross_database_snapshot_consistent ? "" : "独立数据库分别采样，跨库一致性未确认。"}`,
+      storage.expired ? "warn" : "neutral");
+  }
+  if (value.webdav) {
+    const gateway = value.webdav;
+    requireCounts(gateway, ["export_count"]);
+    if (gateway.listening !== true || gateway.authenticated !== true ||
+        !["http", "https"].includes(gateway.scheme) || typeof gateway.address !== "string" ||
+        gateway.address.length > 128) throw new Error("Invalid live gateway summary");
+    liveGateway = gateway;
+  }
+  fields["network-detail"].textContent = "当前没有可验证的连接或实际路径观测。实际流量和中继费用尚未计量；" +
+    "逻辑交付累计见存储摘要。独立请求预留预算尚未接入此 Android 运行路径，不能据此免费放行或重置额度。";
+  showGatewayAvailability();
 }
 
 function exportRow(item) {
@@ -120,6 +290,7 @@ function exportRow(item) {
   const access = document.createElement("span");
   const url = document.createElement("code");
   const probe = document.createElement("button");
+  const result = document.createElement("span");
   heading.className = "export-summary";
   access.className = "export-access";
   name.textContent = item.name;
@@ -131,8 +302,11 @@ function exportRow(item) {
   probe.setAttribute("aria-label", `测试 ${item.name} 的连接`);
   probe.addEventListener("click", () => testExport(item.name, address.href));
   probe.disabled = true;
+  result.className = "export-result";
+  result.textContent = ownerReady ? "连接待测试" : "服务未就绪";
+  exportResults.set(item.name, result);
   heading.append(name, access);
-  row.append(heading, url, probe);
+  row.append(heading, url, probe, result);
   return { row, probe };
 }
 
@@ -141,7 +315,9 @@ function showGateway(value) {
     throw new Error("Invalid gateway response");
   }
   if (!value.webdav || value.webdav.enabled === false) {
-    setStatus("gateway", "未启用", "当前模块配置未启用 WebDAV。");
+    gatewayConfigured = false;
+    gatewayDisabled = value.webdav?.enabled === false;
+    showGatewayAvailability();
     return;
   }
   if (value.webdav.enabled !== true || !Array.isArray(value.webdav.exports) ||
@@ -149,12 +325,14 @@ function showGateway(value) {
     throw new Error("Invalid gateway export list");
   }
   const rows = value.webdav.exports.map(exportRow);
+  gatewayConfigured = true;
+  gatewayDisabled = false;
   for (const { row, probe } of rows) {
     fields.exports.appendChild(row);
     probeButtons.push(probe);
   }
   fields.exports.hidden = false;
-  setStatus("gateway", "配置已开启", "在本机 WebDAV 应用中填入导出地址和已授予的账号。", "ready");
+  showGatewayAvailability();
 }
 
 async function refresh() {
@@ -163,12 +341,24 @@ async function refresh() {
   setBusy(true);
   activeOwner = false;
   ownerReady = false;
+  currentOwnerPid = null;
+  gatewayConfigured = false;
+  gatewayDisabled = false;
+  exportResults = new Map();
   probeButtons = [];
   fields.exports.textContent = "";
   fields.exports.hidden = true;
   fields["probe-result"].hidden = true;
+  clearRuntime("正在读取当前后台属主的摘要。");
   try {
-    await readJson("status").then(showOwner).catch(() => {
+    await readJson("status").then((value) => {
+      showOwner(value);
+      if (ownerReady) {
+        try { showDashboard(value); }
+        catch (error) { clearRuntime("运行摘要无法验证；当前观察保持未知。"); }
+      }
+    }).catch(() => {
+      clearRuntime("没有收到经过验证的当前后台属主状态。");
       setStatus("service", "无法读取", "未收到服务状态。若已停止，可使用“确认已停止”。", "warn");
     });
     await readJson("gateway").then(showGateway).catch(() => {
@@ -186,16 +376,30 @@ async function testExport(name, expectedUrl) {
   const result = fields["probe-result"];
   result.hidden = false;
   result.textContent = `正在测试 ${name}…`;
+  const expectedOwnerPid = currentOwnerPid;
   try {
     const value = await readJson("probe", name);
+    if (value.owner_pid !== expectedOwnerPid) {
+      activeOwner = false;
+      ownerReady = false;
+      clearRuntime("后台属主已变化；请刷新当前服务状态。");
+      clearExportTests("属主变化，需重新测试");
+      throw new Error("Live owner changed");
+    }
     showOwner(value);
     if (!ownerReady || value.webdav?.export !== name || value.webdav.export_accessible !== true ||
         value.webdav.remote_backup_complete !== false || new URL(value.webdav.url).href !== expectedUrl) {
       throw new Error("Export did not match the live gateway");
     }
     result.textContent = `${name} 可访问，已验证本机认证；远端备份需在对端确认。`;
+    result.hidden = false;
+    exportResults.get(name).textContent = "本机认证连接测试通过";
+    setStatus("gateway", "选中导出测试通过", `${name} 可访问。其他导出需分别测试；远端备份尚未确认。`, "ready");
   } catch (error) {
     result.textContent = `${name} 无法通过连接测试。请刷新状态，并检查导出和账号配置。`;
+    result.hidden = false;
+    exportResults.get(name).textContent = "连接测试未通过";
+    setStatus("gateway", "连接测试未通过", "当前导出可访问性未确认。请刷新属主状态并检查配置和账号。", "warn");
   } finally {
     setBusy(false);
   }
@@ -221,6 +425,9 @@ fields.stop.addEventListener("click", async () => {
   } catch (error) {
     activeOwner = false;
     ownerReady = false;
+    clearRuntime("停止请求未确认；旧运行摘要已清除。");
+    clearExportTests("状态未确认");
+    showGatewayAvailability();
     setStatus("service", "未确认停止", "无法确认停止请求，请刷新状态。", "warn");
   } finally {
     setBusy(false);
@@ -237,6 +444,10 @@ fields["verify-stop"].addEventListener("click", async () => {
     }
     activeOwner = false;
     ownerReady = false;
+    currentOwnerPid = null;
+    clearRuntime("当前后台服务已停止，旧运行摘要已清除。");
+    clearExportTests("服务已停止");
+    showGatewayAvailability();
     fields["probe-result"].hidden = true;
     setStatus("service", "已停止", "当前没有持有模块控制权的后台服务。", "ready");
   } catch (error) {
@@ -252,4 +463,5 @@ if (canUseBridge) {
   setBusy(false);
   setStatus("service", "未连接模块", "请在 KernelSU 管理器中打开此页面。", "warn");
   setStatus("gateway", "未连接模块", "网关配置由 KernelSU 模块提供。");
+  clearRuntime("请在 KernelSU 管理器中连接当前模块后读取。");
 }

@@ -44,7 +44,7 @@ New-Item -ItemType Directory -Path $output | Out-Null
 $source = Join-Path $PSScriptRoot $Platform
 if ($Platform -eq 'windows') {
     foreach ($name in @('run.ps1', 'register-service.ps1', 'windows-common.ps1', 'configure-client.ps1',
-            'client.ps1', 'manage-user.ps1', 'launch-client.ps1', 'Start-SyncExtend.cmd', 'map-webdav.ps1')) {
+            'client.ps1', 'client-view.ps1', 'manage-user.ps1', 'launch-client.ps1', 'Start-SyncExtend.cmd', 'map-webdav.ps1')) {
         Copy-Item -LiteralPath (Join-Path $source $name) -Destination $output
     }
     $image = Join-Path $output $binaryName
