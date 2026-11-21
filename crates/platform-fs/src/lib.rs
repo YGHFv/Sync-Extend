@@ -4,8 +4,8 @@
 mod unix_noreplace;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use unix_noreplace::{
-    acquire_sidecar_owner, create_anonymous_upload, probe_no_replace, NoReplaceProbeReport,
-    UnixFileKey,
+    NoReplaceProbeReport, UnixFileKey, acquire_sidecar_owner, create_anonymous_upload,
+    probe_no_replace,
 };
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -19,8 +19,8 @@ pub use unix_sqlite_ledger::{UnixSqliteLedger, UnixSqliteLedgerConnection};
 mod local_control;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use local_control::{
-    request_local_control, LocalControlConnection, LocalControlListener, LocalControlOperation,
-    LocalControlResponse,
+    LocalControlConnection, LocalControlListener, LocalControlOperation, LocalControlResponse,
+    request_local_control,
 };
 
 #[cfg(target_os = "linux")]
@@ -51,17 +51,21 @@ mod linux_write_lease;
 mod windows;
 #[cfg(windows)]
 pub use windows::{
-    regular_file_link_count, regular_file_matches_path, sqlite_main_file_identity,
-    verify_regular_file, FreshExclusiveSqliteFile, GuardedReadFile, LockedDirectory,
-    LockedDirectoryMutation, LockedFile, OriginalDirectoryCreation, OriginalFileCreation,
-    OwnedFileCreation, PublishedOriginalFile, ReacquiredNodeFile, ReacquiredNodeLock,
+    FreshExclusiveSqliteFile, GuardedReadFile, LockedDirectory, LockedDirectoryMutation,
+    LockedFile, OriginalDirectoryCreation, OriginalFileCreation, OwnedFileCreation,
+    PublishedOriginalFile, ReacquiredNodeFile, ReacquiredNodeLock,
     ReleasedOriginalCoordinationFile, ReleasedOriginalFileIdentity, ReleasedOriginalReadFile,
-    RetainedWriterDirectory, SealedOriginalFile,
+    RetainedWriterDirectory, SealedOriginalFile, regular_file_link_count,
+    regular_file_matches_path, sqlite_main_file_identity, verify_regular_file,
 };
 
 #[allow(unsafe_code)]
 mod managed_process;
-pub use managed_process::{read_available, ManagedChild};
+pub use managed_process::{ManagedChild, read_available};
+
+#[allow(unsafe_code)]
+mod managed_rpc;
+pub use managed_rpc::{ManagedRpcBinding, ManagedRpcOwner};
 
 #[allow(unsafe_code)]
 mod pinned_program;
@@ -74,7 +78,7 @@ pub use sidecar_config::SidecarConfig;
 #[allow(unsafe_code)]
 mod held_disk_space;
 #[cfg(windows)]
-pub use held_disk_space::{held_disk_space, HeldDiskSpace};
+pub use held_disk_space::{HeldDiskSpace, held_disk_space};
 mod writer_owner;
 pub use writer_owner::WriterOwner;
 
@@ -83,7 +87,7 @@ pub use writer_owner::WriterOwner;
 mod windows_service;
 #[cfg(windows)]
 pub use windows_service::{
-    report_service_ready, run_windows_service, service_stop_requested, ServiceReporter,
+    ServiceReporter, report_service_ready, run_windows_service, service_stop_requested,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,7 +144,7 @@ pub use windows::{
 mod linux_guardian;
 #[cfg(target_os = "linux")]
 pub use linux_guardian::{
-    take_inherited_descriptor, OriginalPairTerminalRelease, OutsideGuardian, OutsideHelperChild,
-    OutsideHelperExitObservation, OutsideHelperProgram, OutsideHelperSession,
-    OutsidePreparationGate, OutsidePreparationPair, OutsideSupervisor, ThawObservation,
+    OriginalPairTerminalRelease, OutsideGuardian, OutsideHelperChild, OutsideHelperExitObservation,
+    OutsideHelperProgram, OutsideHelperSession, OutsidePreparationGate, OutsidePreparationPair,
+    OutsideSupervisor, ThawObservation, take_inherited_descriptor,
 };

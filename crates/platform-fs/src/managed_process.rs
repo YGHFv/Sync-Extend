@@ -27,8 +27,8 @@ impl ManagedChild {
                 System::{
                     JobObjects::{
                         AssignProcessToJobObject, CreateJobObjectW,
+                        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
                         JobObjectExtendedLimitInformation, SetInformationJobObject,
-                        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
                     },
                     Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED},
                 },
@@ -108,6 +108,12 @@ impl ManagedChild {
 
     pub fn child(&mut self) -> &mut Child {
         &mut self.child
+    }
+
+    /// Retain the identity of this exact child and its already pinned image.
+    /// This is a read-only RPC witness, never child or network authority.
+    pub fn rpc_owner(&self, program: &crate::PinnedProgram) -> io::Result<crate::ManagedRpcOwner> {
+        crate::ManagedRpcOwner::new(&self.child, program)
     }
 }
 

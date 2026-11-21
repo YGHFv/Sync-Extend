@@ -124,6 +124,7 @@ pub fn prepare(cli: Cli) -> Result<(Cli, Option<super::management::ManagementGua
             config: gateway_config,
             scan_interval_secs,
         },
+        DeploymentRole::EasyTier { config, seconds } => Command::EasytierRun { config, seconds },
     };
     Ok((
         Cli {

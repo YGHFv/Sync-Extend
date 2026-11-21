@@ -1,11 +1,11 @@
 //! Optional local dashboard, using cached observations from the real resource owner.
-use super::{Result, READY};
+use super::{READY, Result};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::sync::atomic::AtomicUsize;
 use std::{
     io::Write,
     net::TcpStream,
-    sync::{atomic::Ordering, Mutex},
+    sync::{Mutex, atomic::Ordering},
     time::Instant,
 };
 use sync_extend_core_model::management::ManagementConfig;
@@ -105,13 +105,19 @@ pub(crate) fn local_dashboard() -> (Option<serde_json::Value>, &'static str) {
     let storage = sample(&LOCAL_STORAGE, "actual");
     let gateway = LOCAL_GATEWAY.lock().ok().and_then(|slot| slot.clone());
     let connection = sync_extend_transport::latest_connection_observation();
-    if local.is_none() && storage.is_none() && gateway.is_none() && connection.is_none() {
+    let easytier = super::super::easytier::latest_observation();
+    if local.is_none()
+        && storage.is_none()
+        && gateway.is_none()
+        && connection.is_none()
+        && easytier.is_none()
+    {
         return (None, "no_observation");
     }
     let value = serde_json::json!({
         "dashboard_format_version": 1,
         "observation": local, "storage": storage, "webdav": gateway,
-        "connection": connection, "route": null, "traffic": null,
+        "connection": connection, "easytier": easytier, "route": null, "traffic": null,
         "remote_backup_complete": false,
     });
     match serde_json::to_vec(&value) {
@@ -503,12 +509,15 @@ pub fn serve(
         let connection = ready
             .then(sync_extend_transport::latest_connection_observation)
             .flatten();
+        let easytier = (!super::control_stop_requested())
+            .then(super::super::easytier::latest_observation)
+            .flatten();
         let value = serde_json::json!({
             "dashboard_format_version": 1,
             "owner_generation": generation,
             "resources_ready": ready,
             "observation": observation, "storage": storage,
-            "connection": connection, "route": null, "traffic": null, "webdav": gateway,
+            "connection": connection, "easytier": easytier, "route": null, "traffic": null, "webdav": gateway,
             "stop_allowed": config.control.as_ref().is_some_and(|policy| policy.stop),
             "remote_backup_complete": false,
         });
@@ -523,7 +532,7 @@ pub fn serve(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
          Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
          Referrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; \
-         script-src 'sha256-ydeld3R0FVp5E583iFCeW5Hw7uYfZaA4gY34Csxysx0='; style-src 'unsafe-inline'; \
+         script-src 'sha256-hrPpTtuPU9QimkU+9eu0t1p7iUnjELGC2F9AxGlp1QQ='; style-src 'unsafe-inline'; \
          connect-src 'self'; img-src 'none'; frame-ancestors 'none'; base-uri 'none'; \
          form-action 'none'\r\n\r\n",
         body.len()

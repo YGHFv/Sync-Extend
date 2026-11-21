@@ -1,5 +1,5 @@
 //! Pinned sidecar configuration and observations; overlay IDs are not device identities.
-use crate::{ContentId, EntryId, ModelError, Result, EASYTIER_VERSION};
+use crate::{ContentId, EASYTIER_VERSION, EntryId, ModelError, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -26,6 +26,8 @@ pub struct EasyTierConfig {
     pub peers: Vec<String>,
     pub listeners: Vec<String>,
     pub allow_tun: bool,
+    #[serde(default = "default_bind_device")]
+    pub bind_device: bool,
     pub allow_public_relay: bool,
     pub command_timeout_secs: u64,
     pub restart_delay_secs: u64,
@@ -86,8 +88,12 @@ impl EasyTierConfig {
         );
         let mut out = format!(
             "instance_name = \"SyncExtend-{}\"\ninstance_id = \"{uuid}\"\nipv4 = \"{}/{}\"\ndhcp = false\nlisteners = {}\n\n[network_identity]\nnetwork_name = \"{}\"\nnetwork_secret = \"{}\"\n",
-            self.instance_id, self.ipv4, self.prefix_len, serde_json::to_string(&self.listeners)?,
-            self.network_name, self.network_secret
+            self.instance_id,
+            self.ipv4,
+            self.prefix_len,
+            serde_json::to_string(&self.listeners)?,
+            self.network_name,
+            self.network_secret
         );
         for peer in &self.peers {
             out.push_str(&format!(
@@ -96,14 +102,18 @@ impl EasyTierConfig {
             ));
         }
         out.push_str(&format!(
-            "\n[flags]\nno_tun = {}\nenable_encryption = true\nrelay_network_whitelist = \"\"\np2p_only = {}\n",
-            !self.allow_tun, !self.allow_public_relay
+            "\n[flags]\nno_tun = {}\nbind_device = {}\nenable_encryption = true\nrelay_network_whitelist = \"\"\np2p_only = {}\n",
+            !self.allow_tun, self.bind_device, !self.allow_public_relay
         ));
         if out.len() > 65536 {
             return Err(ModelError::InvalidConfig("EasyTier generated config limit"));
         }
         Ok(out)
     }
+}
+
+fn default_bind_device() -> bool {
+    true
 }
 
 fn random_hex(value: &str) -> bool {

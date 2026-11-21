@@ -13,6 +13,7 @@ const fields = {};
   "verify-stop", "ask-stop", "stop-confirmation", "stop", "cancel-stop", "probe-result",
   "workspace-state", "workspace-detail", "workspace-summary",
   "storage-state", "storage-detail", "storage-summary", "network-state", "network-detail", "network-summary",
+  "easytier-state", "easytier-detail", "easytier-summary",
 ].forEach((id) => { fields[id] = document.getElementById(id); });
 
 const canUseBridge = Boolean(window.ksu && typeof window.ksu.exec === "function");
@@ -101,12 +102,13 @@ function hideConfirmation() {
 
 function clearRuntime(detail = "当前没有可验证的运行摘要。") {
   liveGateway = null;
-  for (const category of ["workspace", "storage", "network"]) {
+  for (const category of ["workspace", "storage", "network", "easytier"]) {
     fields[`${category}-summary`].textContent = "";
     fields[`${category}-summary`].hidden = true;
     setStatus(category, "暂无观察", detail);
   }
   fields["network-detail"].textContent = "当前没有已鉴权的连接样本；实际路径、外层 wire 和中继费用保持未知。";
+  fields["easytier-detail"].textContent = "当前没有本机受管子进程与 RPC 属主绑定的样本。";
 }
 
 function clearExportTests(detail = "连接待测试") {
@@ -226,6 +228,70 @@ function showConnection(observation) {
     "实际 LAN/P2P/中继路径、外层 wire 和中继费用保持未知。逻辑交付与请求预留预算分别计量。");
 }
 
+function showEasyTier(observation) {
+  if (!observation) return;
+  requireCounts(observation, ["age_ms", "stale_after_ms"]);
+  requireFlags(observation, ["current"]);
+  const sample = observation.actual;
+  requireCounts(sample, ["observation_format_version", "child_pid", "peer_count"]);
+  requireFlags(sample, ["owner_bound", "peers_truncated", "authenticated_sync_device"]);
+  const loopback = validSocket(sample.rpc_portal) &&
+    (sample.rpc_portal.startsWith("[::1]:") || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}:/.test(sample.rpc_portal));
+  const reasons = ["rpc_not_observed", "configuration_pin_unavailable", "rpc_ownership_unavailable",
+    "rpc_query_unavailable", "rpc_ownership_changed", "rpc_listener_changed", "configuration_pin_changed",
+    "rpc_window_expired", "observation_clock_unavailable", "invalid_peer_output",
+    "sampler_unavailable", "process_owner_unavailable", "sample_stale"];
+  if (sample.observation_format_version !== 1 || sample.sample_scope !== "managed_easytier_peers" ||
+      sample.pinned_version !== "2.6.4" || !identifier(sample.generation, 32) ||
+      !identifier(sample.process_start, 16) || !["core_pin", "cli_pin", "config_pin"].every((key) => identifier(sample[key], 64)) ||
+      sample.child_pid < 1 || sample.child_pid > 4294967295 || sample.peer_count > 4096 || !loopback ||
+      sample.authenticated_sync_device !== false || sample.route_attribution !== "unassociated_with_sync_connection" ||
+      sample.outer_wire_bytes !== null || sample.billing_bytes !== null ||
+      observation.stale_after_ms !== 10000 || observation.current !== (observation.age_ms <= observation.stale_after_ms) ||
+      !["available", "unavailable", "stale"].includes(sample.lifecycle) || sample.owner_bound !== (sample.lifecycle === "available") ||
+      (sample.owner_bound && (!observation.current || sample.process_start === "0000000000000000")) ||
+      (sample.lifecycle === "stale" && (observation.current || sample.unavailable_reason !== "sample_stale")) ||
+      (sample.owner_bound ? sample.unavailable_reason !== null : !reasons.includes(sample.unavailable_reason)) ||
+      !Array.isArray(sample.peers) || sample.peers.length !== Math.min(4, sample.peer_count) ||
+      sample.peers_truncated !== (sample.peer_count > 4) || (!sample.owner_bound && sample.peer_count !== 0)) {
+    throw new Error("Invalid managed EasyTier sample");
+  }
+  const rows = [
+    ["样本范围", "本机受管启动代的 overlay peer；未关联到同步连接"],
+    ["采样距今 / 门槛", `${observation.age_ms} / ${observation.stale_after_ms} ms`],
+    ["受管启动代 / PID", `${sample.generation} / ${sample.child_pid}`],
+    ["RPC 端点 / 固定版本", `${sample.rpc_portal} / ${sample.pinned_version}`],
+    ["peer 显示", `${sample.peers.length} / ${sample.peer_count}${sample.peers_truncated ? "（已截取）" : ""}`],
+  ];
+  const ids = new Set();
+  for (const peer of sample.peers) {
+    requireCounts(peer, ["overlay_peer_id"]);
+    if (peer.overlay_peer_id > 4294967295 || ids.has(peer.overlay_peer_id) ||
+        (peer.ipv4 !== null && (typeof peer.ipv4 !== "string" || !/^(?:\d{1,3}\.){3}\d{1,3}$/.test(peer.ipv4) ||
+          peer.ipv4.split(".").some((part) => Number(part) > 255)))) {
+      throw new Error("Invalid EasyTier overlay peer");
+    }
+    ids.add(peer.overlay_peer_id);
+    const names = { local: "本机 overlay", p2p: "overlay P2P", unknown: "overlay 路径未知" };
+    let path = typeof peer.path === "string" && Object.hasOwn(names, peer.path) ? names[peer.path] : null;
+    if (!path) {
+      const relay = peer.path?.relay;
+      if (typeof peer.path !== "object" || peer.path === null || Object.keys(peer.path).length !== 1 ||
+          typeof relay !== "object" || relay === null || Object.keys(relay).length !== 1 ||
+          !Number.isSafeInteger(relay.hops) || relay.hops < 2 || relay.hops > 64) {
+        throw new Error("Invalid EasyTier overlay path");
+      }
+      path = `overlay 中继（${relay.hops} 跳）`;
+    }
+    rows.push([`overlay peer ${peer.overlay_peer_id}`, `${peer.ipv4 ?? "未观察到 IPv4"}；${path}`]);
+  }
+  showSummary("easytier", rows);
+  const states = { available: "采样时属主已验证", unavailable: "不可用；旧 peer 已清除", stale: "样本过旧；旧 peer 已清除" };
+  setStatus("easytier", states[sample.lifecycle],
+    (sample.unavailable_reason ? "子进程、RPC 或采样无法验证，当前路径保持未知。" : "当前链路可达性未测试。") +
+    "overlay ID 不是 SyncExtend 设备身份，未关联到同步连接；不授予 P2P 费用豁免。外层 wire 和费用未知。");
+}
+
 function showDashboard(owner) {
   clearRuntime();
   const value = owner.dashboard;
@@ -325,6 +391,7 @@ function showDashboard(owner) {
     liveGateway = gateway;
   }
   showConnection(value.connection);
+  showEasyTier(value.easytier);
   showGatewayAvailability();
 }
 

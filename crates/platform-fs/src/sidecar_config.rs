@@ -39,13 +39,13 @@ impl SidecarConfig {
                 ptr,
             };
             use windows_sys::Win32::{
-                Foundation::{LocalFree, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE},
+                Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree},
                 Security::{
                     Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
                     PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
                 },
                 Storage::FileSystem::{
-                    CreateFileW, CREATE_NEW, DELETE, FILE_FLAG_DELETE_ON_CLOSE,
+                    CREATE_NEW, CreateFileW, DELETE, FILE_FLAG_DELETE_ON_CLOSE,
                     FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
                 },
             };
@@ -149,5 +149,40 @@ impl SidecarConfig {
             return Err(io::Error::other("sidecar config handle differs"));
         }
         Ok(&self.path)
+    }
+
+    /// Read the retained original configuration without reopening its pathname.
+    pub fn verify_content(&self, expected: &[u8]) -> io::Result<()> {
+        if expected.len() > 65536 || self.file.metadata()?.len() != expected.len() as u64 {
+            return Err(io::Error::other("sidecar configuration content differs"));
+        }
+        let mut bytes = vec![0u8; expected.len()];
+        let mut offset = 0;
+        while offset < bytes.len() {
+            #[cfg(windows)]
+            let count = {
+                use std::os::windows::fs::FileExt;
+                self.file.seek_read(&mut bytes[offset..], offset as u64)?
+            };
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let count = {
+                use std::os::unix::fs::FileExt;
+                self.file.read_at(&mut bytes[offset..], offset as u64)?
+            };
+            #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+            let count = return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "private sidecar config unavailable",
+            ));
+            if count == 0 {
+                return Err(io::Error::other("sidecar configuration shortened"));
+            }
+            offset += count;
+        }
+        if bytes != expected {
+            return Err(io::Error::other("sidecar configuration content differs"));
+        }
+        self.path()?;
+        Ok(())
     }
 }

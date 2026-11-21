@@ -110,6 +110,98 @@ function New-SyncExtendConnectionView($Observation) {
     )
 }
 
+function New-SyncExtendEasyTierView($Observation) {
+    Assert-SyncExtendViewObject $Observation
+    $age = Get-SyncExtendViewInteger $Observation.age_ms
+    $staleAfter = Get-SyncExtendViewInteger $Observation.stale_after_ms
+    Assert-SyncExtendViewFlag $Observation.current
+    $sample = $Observation.actual
+    Assert-SyncExtendViewObject $sample
+    foreach ($key in @('observation_format_version', 'child_pid', 'peer_count')) {
+        $null = Get-SyncExtendViewInteger $sample[$key]
+    }
+    foreach ($key in @('owner_bound', 'peers_truncated', 'authenticated_sync_device')) {
+        Assert-SyncExtendViewFlag $sample[$key]
+    }
+    Assert-SyncExtendViewId $sample.generation 32
+    Assert-SyncExtendViewId $sample.process_start 16
+    foreach ($key in @('core_pin', 'cli_pin', 'config_pin')) { Assert-SyncExtendViewId $sample[$key] }
+    Assert-SyncExtendViewList $sample.peers 4
+    Assert-SyncExtendViewText $sample.rpc_portal 128
+    $endpoint = [Net.IPEndPoint]::Parse($sample.rpc_portal)
+    if ($sample.observation_format_version -ne 1 -or
+        $sample.sample_scope -cne 'managed_easytier_peers' -or
+        $sample.pinned_version -cne '2.6.4' -or $sample.child_pid -eq 0 -or
+        $sample.child_pid -gt [uint32]::MaxValue -or $sample.peer_count -gt 4096 -or
+        ![Net.IPAddress]::IsLoopback($endpoint.Address) -or $endpoint.Port -eq 0 -or
+        $sample.authenticated_sync_device -cne $false -or
+        $sample.route_attribution -cne 'unassociated_with_sync_connection' -or
+        $null -ne $sample.outer_wire_bytes -or $null -ne $sample.billing_bytes -or
+        $staleAfter -ne 10000 -or $Observation.current -cne ($age -le $staleAfter) -or
+        $sample.lifecycle -cnotin @('available', 'unavailable', 'stale') -or
+        $sample.owner_bound -cne ($sample.lifecycle -ceq 'available') -or
+        ($sample.owner_bound -and (!$Observation.current -or $sample.process_start -ceq '0000000000000000')) -or
+        ($sample.lifecycle -ceq 'stale' -and $Observation.current) -or
+        ($sample.owner_bound -and $null -ne $sample.unavailable_reason) -or
+        $sample.peers.Count -ne [Math]::Min(4, $sample.peer_count) -or
+        $sample.peers_truncated -cne ($sample.peer_count -gt 4) -or
+        (!$sample.owner_bound -and ($sample.peer_count -ne 0 -or $sample.peers.Count -ne 0))) {
+        throw 'The managed EasyTier sample cannot be verified.'
+    }
+    if (!$sample.owner_bound -and $sample.unavailable_reason -cnotin @('rpc_not_observed',
+            'configuration_pin_unavailable', 'rpc_ownership_unavailable', 'rpc_query_unavailable',
+            'rpc_ownership_changed', 'rpc_listener_changed', 'configuration_pin_changed',
+            'rpc_window_expired', 'observation_clock_unavailable', 'invalid_peer_output',
+            'sampler_unavailable', 'process_owner_unavailable', 'sample_stale')) {
+        throw 'The managed EasyTier unavailable state cannot be verified.'
+    }
+    if ($sample.lifecycle -ceq 'stale' -and $sample.unavailable_reason -cne 'sample_stale') {
+        throw 'The managed EasyTier freshness cannot be verified.'
+    }
+    $rows = [Collections.Generic.List[object]]::new()
+    [void]$rows.Add(@('EasyTier 样本范围', '本机受管启动代的 overlay peer；未关联到同步连接'))
+    [void]$rows.Add(@('EasyTier 状态', $(switch ($sample.lifecycle) {
+        'available' { '采样时已验证当前子进程与 RPC 属主；当前链路可达性未测试' }
+        'unavailable' { '子进程、RPC 或采样无法验证；旧 peer 已清除' }
+        'stale' { '样本过旧；旧 peer 已清除' }
+    })))
+    [void]$rows.Add(@('EasyTier 采样距今 / 门槛', "$age ms / $staleAfter ms"))
+    [void]$rows.Add(@('EasyTier 受管启动代 / PID', "$($sample.generation) / $($sample.child_pid)"))
+    [void]$rows.Add(@('EasyTier RPC 端点', $sample.rpc_portal))
+    [void]$rows.Add(@('EasyTier 固定版本', $sample.pinned_version))
+    [void]$rows.Add(@('EasyTier peer 显示', "$($sample.peers.Count) / $($sample.peer_count)$(if ($sample.peers_truncated) { '（已截取）' })"))
+    $ids = [Collections.Generic.HashSet[long]]::new()
+    foreach ($peer in $sample.peers) {
+        Assert-SyncExtendViewObject $peer
+        $peerId = Get-SyncExtendViewInteger $peer.overlay_peer_id
+        if ($peerId -gt [uint32]::MaxValue -or !$ids.Add($peerId)) { throw 'Invalid EasyTier overlay ID.' }
+        $address = '未观察到 IPv4'
+        if ($null -ne $peer.ipv4) {
+            Assert-SyncExtendViewText $peer.ipv4 15
+            $ip = [Net.IPAddress]::Parse($peer.ipv4)
+            if ($ip.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) { throw 'Invalid EasyTier overlay IPv4.' }
+            $address = $peer.ipv4
+        }
+        $path = switch -CaseSensitive ($peer.path) {
+            'local' { '本机 overlay' }
+            'p2p' { 'overlay P2P' }
+            'unknown' { 'overlay 路径未知' }
+            default {
+                Assert-SyncExtendViewObject $peer.path
+                Assert-SyncExtendViewObject $peer.path.relay
+                $hops = Get-SyncExtendViewInteger $peer.path.relay.hops
+                if ($peer.path.Count -ne 1 -or $peer.path.relay.Count -ne 1 -or $hops -lt 2 -or $hops -gt 64) {
+                    throw 'Invalid EasyTier overlay path.'
+                }
+                "overlay 中继（$hops 跳）"
+            }
+        }
+        [void]$rows.Add(@("EasyTier overlay peer $peerId", "$address；$path"))
+    }
+    [void]$rows.Add(@('EasyTier 身份与计量', 'overlay ID 不是 SyncExtend 设备身份；不授予 P2P 费用豁免；外层 wire 和费用未知'))
+    return $rows.ToArray()
+}
+
 function New-SyncExtendClientView($Dashboard) {
     Assert-SyncExtendViewObject $Dashboard
     $null = Get-SyncExtendViewInteger $Dashboard.dashboard_format_version
@@ -283,7 +375,14 @@ function New-SyncExtendClientView($Dashboard) {
     } else {
         Add-SyncExtendViewRow $view 'Network' @('连接观测', '当前没有经过鉴权的连接样本')
     }
-    Add-SyncExtendViewRow $view 'Network' @('实际路径', '未知；不能据此确认 LAN / P2P / 中继')
+    if ($null -ne $Dashboard.easytier) {
+        foreach ($row in @(New-SyncExtendEasyTierView $Dashboard.easytier)) {
+            Add-SyncExtendViewRow $view 'Network' $row
+        }
+    } else {
+        Add-SyncExtendViewRow $view 'Network' @('EasyTier 受管观测', '当前没有本机子进程与 RPC 属主绑定的样本')
+    }
+    Add-SyncExtendViewRow $view 'Network' @('同步连接实际路径', '未知；尚未把 overlay peer 关联到已鉴权的同步连接')
     Add-SyncExtendViewRow $view 'Network' @('外层 wire / 中继费用', '尚未计量；逻辑交付与请求预留分别展示')
     Add-SyncExtendViewRow $view 'Pull budget' @('显式拉取预算', '未指定预算文件；可通过“查看拉取预算”只读检查已初始化的账本')
 

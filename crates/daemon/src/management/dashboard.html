@@ -23,7 +23,7 @@ td,th{text-align:left;padding:8px;border-bottom:1px solid #304057;overflow-wrap:
 <div class="grid">
 <section><h2>空间</h2><div id="space"></div></section>
 <section><h2>待处理工作</h2><div id="queue"></div></section>
-<section><h2>连接、路径与流量</h2><div id="network"></div></section>
+<section><h2>连接、路径与流量</h2><div id="network"></div><h3>EasyTier 受管路径</h3><div id="easytier"></div></section>
 <section><h2>本机 WebDAV</h2><div id="dav"></div></section>
 </div>
 <section id="storage-section" hidden><h2>存储节点</h2><div id="storage"></div></section>
@@ -71,12 +71,59 @@ channel.udp_sent_datagrams+"/"+channel.udp_received_datagrams+"；QUIC RTT "+cha
 " B；采样距今 "+observation.age_ms+" ms。内层载荷含协议开销和重传；不代表所有连接。" +
 "实际 LAN/P2P/中继路径、外层 wire 和中继费用保持未知，逻辑交付与请求预留分别计量。";
 }
+function easyTierText(observation){
+if(!observation)return "当前没有本机受管子进程与 RPC 属主绑定的样本。";
+const sample=observation.actual;const count=value=>Number.isSafeInteger(value)&&value>=0;
+const id=(value,length)=>typeof value==="string"&&value.length===length&&/^[0-9a-f]+$/.test(value);
+const reasons=["rpc_not_observed","configuration_pin_unavailable","rpc_ownership_unavailable",
+"rpc_query_unavailable","rpc_ownership_changed","rpc_listener_changed","configuration_pin_changed",
+"rpc_window_expired","observation_clock_unavailable","invalid_peer_output","sampler_unavailable",
+"process_owner_unavailable","sample_stale"];
+const rpc=sample?.rpc_portal;const match=typeof rpc==="string"&&/^(\[::1\]|127\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})$/.exec(rpc);
+if(!sample||!count(observation.age_ms)||observation.stale_after_ms!==10000||
+typeof observation.current!=="boolean"||observation.current!==(observation.age_ms<=observation.stale_after_ms)||
+sample.observation_format_version!==1||sample.sample_scope!=="managed_easytier_peers"||
+sample.pinned_version!=="2.6.4"||!id(sample.generation,32)||!id(sample.process_start,16)||
+!["core_pin","cli_pin","config_pin"].every(key=>id(sample[key],64))||!count(sample.child_pid)||
+sample.child_pid<1||sample.child_pid>4294967295||!count(sample.peer_count)||sample.peer_count>4096||
+!match||Number(match[2])<1||Number(match[2])>65535||
+(!match[1].startsWith("[")&&match[1].split(".").some(part=>Number(part)>255))||
+sample.authenticated_sync_device!==false||sample.route_attribution!=="unassociated_with_sync_connection"||
+sample.outer_wire_bytes!==null||sample.billing_bytes!==null||typeof sample.owner_bound!=="boolean"||
+typeof sample.peers_truncated!=="boolean"||!["available","unavailable","stale"].includes(sample.lifecycle)||
+sample.owner_bound!==(sample.lifecycle==="available")||(sample.owner_bound&&(!observation.current||sample.process_start==="0000000000000000"))||
+(sample.lifecycle==="stale"&&(observation.current||sample.unavailable_reason!=="sample_stale"))||
+(sample.owner_bound?sample.unavailable_reason!==null:!reasons.includes(sample.unavailable_reason))||
+!Array.isArray(sample.peers)||sample.peers.length!==Math.min(4,sample.peer_count)||
+sample.peers_truncated!==(sample.peer_count>4)||(!sample.owner_bound&&sample.peer_count!==0)){
+throw Error("EasyTier 属主样本无法验证。");}
+const names={local:"本机 overlay",p2p:"overlay P2P",unknown:"overlay 路径未知"};
+const ids=new Set();const rows=[];
+for(const peer of sample.peers){
+if(!peer||!count(peer.overlay_peer_id)||peer.overlay_peer_id>4294967295||ids.has(peer.overlay_peer_id)||
+(peer.ipv4!==null&&(typeof peer.ipv4!=="string"||!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(peer.ipv4)||
+peer.ipv4.split(".").some(part=>Number(part)>255))))throw Error("EasyTier peer 无法验证。");
+ids.add(peer.overlay_peer_id);
+let path=typeof peer.path==="string"&&Object.hasOwn(names,peer.path)?names[peer.path]:null;
+if(!path){const relay=peer.path?.relay;
+if(typeof peer.path!=="object"||peer.path===null||Object.keys(peer.path).length!==1||
+typeof relay!=="object"||relay===null||Object.keys(relay).length!==1||!count(relay.hops)||relay.hops<2||relay.hops>64)
+throw Error("EasyTier 路径无法验证。");path="overlay 中继（"+relay.hops+" 跳）";}
+rows.push("overlay peer "+peer.overlay_peer_id+"："+(peer.ipv4??"未观察到 IPv4")+"，"+path);
+}
+const state=sample.lifecycle==="available"?"采样时已验证当前子进程与 RPC 属主；当前链路可达性未测试":
+sample.lifecycle==="stale"?"样本过旧；旧 peer 已清除":"子进程、RPC 或采样无法验证；旧 peer 已清除";
+return state+"。受管启动代 "+sample.generation+"；PID "+sample.child_pid+"；RPC "+sample.rpc_portal+
+"；固定版本 "+sample.pinned_version+"；peer 显示 "+sample.peers.length+"/"+sample.peer_count+
+(sample.peers_truncated?"（已截取）":"")+"；采样距今 "+observation.age_ms+" ms。"+rows.join("；")+
+"。overlay ID 不是 SyncExtend 设备身份，未关联到已鉴权的同步连接；不授予 P2P 费用豁免。外层 wire 和费用未知。";
+}
 let requestEpoch=0;let activeController=null;let ownerGeneration=null;
-function forget(){ownerGeneration=null;byId("stop").disabled=true;byId("storage-section").hidden=true;byId("storage").replaceChildren();requestEpoch++;activeController?.abort();activeController=null;byId("refresh").disabled=false;byId("token").value="";byId("content").hidden=true;for(const id of ["space","queue","network","dav","chunks","conflicts","history","paths"]){byId(id).replaceChildren();}text("message","凭据与展示已清除。");}
+function forget(){ownerGeneration=null;byId("stop").disabled=true;byId("storage-section").hidden=true;byId("storage").replaceChildren();requestEpoch++;activeController?.abort();activeController=null;byId("refresh").disabled=false;byId("token").value="";byId("content").hidden=true;for(const id of ["space","queue","network","easytier","dav","chunks","conflicts","history","paths"]){byId(id).replaceChildren();}text("message","凭据与展示已清除。");}
 byId("forget").addEventListener("click",forget);
 byId("refresh").addEventListener("click",async()=>{
 const token=byId("token").value;if(!/^[0-9a-f]{64}$/.test(token)){text("message","请输入有效的本机管理凭据。");return;}
-byId("refresh").disabled=true;byId("content").hidden=true;text("network","");text("message","正在读取本机状态…");
+byId("refresh").disabled=true;byId("content").hidden=true;text("network","");text("easytier","");text("message","正在读取本机状态…");
 const epoch=++requestEpoch;const controller=new AbortController();activeController=controller;const timeout=setTimeout(()=>controller.abort(),5000);
 try{
 const response=await fetch("/v1/dashboard",{method:"GET",headers:{Authorization:"Bearer "+token},credentials:"omit",cache:"no-store",mode:"same-origin",redirect:"error",signal:controller.signal});
@@ -90,6 +137,7 @@ ownerGeneration=/^[0-9a-f]{32}$/.test(value.owner_generation??"")?value.owner_ge
 const gateway=value.webdav;const storage=value.storage?.actual;byId("content").hidden=false;byId("storage-section").hidden=!storage;
 text("storage",storage?"空间 "+storage.space_id+"；设备 "+storage.device_id+"；角色 "+storage.role+"；受保护内容 "+storage.protected_bytes+" 字节；实际块文件 "+storage.physical_cas_bytes+"/"+storage.stored_byte_limit+" 字节；逻辑交付累计 "+storage.charged_logical_delivery_bytes+"/"+storage.traffic_byte_limit+" 字节；检查 "+storage.checked_chunks+"/"+storage.protected_chunks+" 个块，不可读取 "+storage.unavailable_chunks.length+" 个；"+(storage.expired?"存储策略已到期。":"存储策略尚未到期。")+" 备份完整性尚未认证。":"");
 text("network",connectionText(value.connection));
+text("easytier",easyTierText(value.easytier));
 text("dav",gateway?"连接地址 http://"+gateway.address+"；认证已启用；授权导出 "+gateway.exports.map(x=>x.url+(x.writable?"（读写）":"（只读）")).join("、")+"。凭据通过本机配置管理。":"当前没有网关观测。");
 if(!value.observation){text("message","当前角色没有空间观测；连接和网关状态见下方。");for(const id of ["space","queue","chunks","conflicts","history","paths"]){byId(id).replaceChildren();}return;}
 const local=value.observation.local;
@@ -102,14 +150,14 @@ table("conflicts",["事务","状态","文件已物化"],local.conflict_admission
 table("history",["快照","状态","当前"],local.snapshots.map(x=>[x.snapshot_id,x.state,x.current?"是":""]));
 table("paths",["相对路径","类型","逻辑字节"],local.entries.map(x=>[x.path,x.kind,x.logical_bytes??"—"]));
 if(local.entries_truncated||local.snapshots_truncated||local.conflict_admissions_truncated){text("message",byId("message").textContent+" 列表已按展示上限截取。");}
-}catch(error){if(epoch!==requestEpoch)return;ownerGeneration=null;byId("stop").disabled=true;byId("content").hidden=true;text("network","");text("message",error.name==="AbortError"?"读取超时，请稍后重试。":error.message==="管理请求被拒绝。"?"管理请求被拒绝。":"无法读取本机状态，请检查服务和凭据。");}
+}catch(error){if(epoch!==requestEpoch)return;ownerGeneration=null;byId("stop").disabled=true;byId("content").hidden=true;text("network","");text("easytier","");text("message",error.name==="AbortError"?"读取超时，请稍后重试。":error.message==="管理请求被拒绝。"?"管理请求被拒绝。":"无法读取本机状态，请检查服务和凭据。");}
 finally{clearTimeout(timeout);if(epoch===requestEpoch){activeController=null;byId("refresh").disabled=false;}}
 });
 byId("stop").addEventListener("click",async()=>{
 const token=byId("token").value;const generation=ownerGeneration;
 if(!/^[0-9a-f]{64}$/.test(token)||!generation){text("message","请先读取当前本机状态。");return;}
 activeController?.abort();const epoch=++requestEpoch;const controller=new AbortController();
-activeController=controller;byId("stop").disabled=true;byId("refresh").disabled=true;text("network","");
+activeController=controller;byId("stop").disabled=true;byId("refresh").disabled=true;text("network","");text("easytier","");
 text("message","正在请求停止本机服务…");
 const requestId=Array.from(crypto.getRandomValues(new Uint8Array(16)),x=>x.toString(16).padStart(2,"0")).join("");
 const timeout=setTimeout(()=>controller.abort(),5000);
@@ -126,7 +174,7 @@ const joined=new Uint8Array(size);let offset=0;for(const part of parts){joined.s
 const value=JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(joined));
 if(value.owner_generation!==generation||value.stop_requested!==true||value.resources_ready!==false||
 value.process_exit_verified!==false){throw Error("响应无法验证。");}
-ownerGeneration=null;byId("content").hidden=true;text("network","");
+ownerGeneration=null;byId("content").hidden=true;text("network","");text("easytier","");
 text("message","停止请求已接受，服务正在退出。");
 }catch(error){if(epoch!==requestEpoch)return;ownerGeneration=null;
 text("message",error.message==="停止请求被拒绝。"?"停止请求被拒绝，请重新读取状态。":

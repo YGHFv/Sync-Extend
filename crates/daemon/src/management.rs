@@ -4,17 +4,17 @@ use std::{
     net::{TcpListener, TcpStream},
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 use sync_extend_core_model::{
-    management::{
-        authenticated_control_request, ControlOperation, ControlSession, ManagementConfig,
-    },
     EntryId,
+    management::{
+        ControlOperation, ControlSession, ManagementConfig, authenticated_control_request,
+    },
 };
 
 mod client;
@@ -22,7 +22,7 @@ pub use client::{dashboard as control_dashboard, status as control_status, stop 
 mod dashboard;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) use dashboard::{
-    local_dashboard, register_local_dashboard, LocalDashboardRegistration, MAX_LOCAL_DASHBOARD,
+    LocalDashboardRegistration, MAX_LOCAL_DASHBOARD, local_dashboard, register_local_dashboard,
 };
 pub use dashboard::{observe_gateway, observe_local_space, observe_storage};
 
@@ -33,6 +33,7 @@ static CONTROL_STOP: AtomicBool = AtomicBool::new(false);
 fn request_stop() {
     CONTROL_STOP.store(true, Ordering::Release);
     READY.store(false, Ordering::Release);
+    super::easytier::clear_observations();
 }
 
 pub fn control_stop_requested() -> bool {
@@ -308,7 +309,11 @@ fn serve(
             b"{\"error\":\"authenticated health request required\"}".to_vec(),
         )
     };
-    write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n", body.len())?;
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+        body.len()
+    )?;
     stream.write_all(&body)?;
     Ok(())
 }
@@ -320,8 +325,12 @@ pub fn check(path: &Path) -> Result<()> {
     let mut stream = TcpStream::connect_timeout(&config.address, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    write!(stream, "GET /v1/health HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-           config.address, std::str::from_utf8(&secret)?)?;
+    write!(
+        stream,
+        "GET /v1/health HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        config.address,
+        std::str::from_utf8(&secret)?
+    )?;
     let mut bytes = Vec::new();
     let deadline = Instant::now() + timeout;
     loop {

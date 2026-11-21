@@ -1,5 +1,5 @@
 //! Explicit per-process deployment roles; existing identities must be provisioned first.
-use crate::{DeviceId, ModelError, Result, FORMAT_VERSION};
+use crate::{DeviceId, FORMAT_VERSION, ModelError, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
@@ -46,6 +46,10 @@ pub enum DeploymentRole {
         gateway_config: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scan_interval_secs: Option<u64>,
+    },
+    EasyTier {
+        config: PathBuf,
+        seconds: u64,
     },
 }
 
@@ -115,6 +119,9 @@ impl DeploymentConfig {
                 path(gateway_config)
                     && scan_interval_secs.is_none_or(|interval| (1..=86_400).contains(&interval))
             }
+            DeploymentRole::EasyTier { config, seconds } => {
+                path(config) && (1..=86_400).contains(seconds)
+            }
         };
         if !valid {
             return Err(ModelError::InvalidConfig(
@@ -131,6 +138,7 @@ impl DeploymentConfig {
             DeploymentRole::MetadataServer { .. } => "metadata_server",
             DeploymentRole::Storage { .. } => "storage",
             DeploymentRole::WebdavClient { .. } => "webdav_client",
+            DeploymentRole::EasyTier { .. } => "easy_tier",
         }
     }
 }

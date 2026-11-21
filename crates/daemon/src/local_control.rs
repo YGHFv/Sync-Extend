@@ -3,8 +3,8 @@ use super::webdav::GatewayProbe;
 use std::{
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::Duration,
@@ -76,6 +76,7 @@ impl LocalControl {
                             Ok(operation) => {
                                 if operation == LocalControlOperation::Stop {
                                     STOP_REQUESTED.store(true, Ordering::Release);
+                                    super::easytier::clear_observations();
                                 }
                                 let mut response = serde_json::json!({
                                     "format_version":1,
