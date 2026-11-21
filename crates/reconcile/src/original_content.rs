@@ -1,13 +1,15 @@
 //! Signed page restart and original content owners; no metadata or native worker.
 use crate::{fault::checkpoint, LocalSpace, ReconcileError, Result};
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
     reference_owner::{ReferenceOwnerKind, ReferenceOwnerScope},
     Change, ChunkRef, ContentId, DeviceId, EntryId, OperationId, SpaceId, FORMAT_VERSION,
 };
 use sync_extend_transport::{
     PeerIdentity, SignedOriginalContentRequest, SignedOriginalOperationPage,
-    VerifiedOriginalContentOffer,
+    VerifiedOriginalContentOffer, MAX_BLOCK_BYTES, MAX_ORIGINAL_CONTENT_BYTES,
+    MAX_ORIGINAL_CONTENT_CHUNKS,
 };
 
 #[derive(Serialize)]
@@ -34,6 +36,92 @@ pub struct OriginalContentImport {
 }
 
 impl LocalSpace {
+    /// Plan every authenticated offered chunk without probing or reading CAS.
+    /// Cached chunks still need admission before their payload is verified.
+    pub(crate) fn original_content_chunk_plan(
+        &self,
+        offer: &VerifiedOriginalContentOffer,
+    ) -> Result<Vec<ChunkRef>> {
+        let mut chunks = BTreeMap::new();
+        for file in offer.files() {
+            file.validate()
+                .map_err(|_| ReconcileError::Invariant("original offered file geometry"))?;
+            for chunk in &file.chunks {
+                if chunks
+                    .insert(chunk.content_id.clone(), chunk.clone())
+                    .is_some_and(|previous: ChunkRef| previous.length != chunk.length)
+                {
+                    return Err(ReconcileError::Invariant(
+                        "original offered hash has conflicting length",
+                    ));
+                }
+                if chunks.len() > MAX_ORIGINAL_CONTENT_CHUNKS {
+                    return Err(ReconcileError::ResourceLimit(
+                        "original complete offered chunk plan",
+                    ));
+                }
+            }
+        }
+        let chunks = chunks.into_values().collect::<Vec<_>>();
+        self.original_content_frame_liability(&chunks)?;
+        if !chunks.is_empty() {
+            offer
+                .request(chunks.clone())
+                .map_err(|_| ReconcileError::Invariant("original complete typed offered plan"))?;
+        }
+        Ok(chunks)
+    }
+
+    /// Exact payload and len+5 liability for one complete bounded chunk plan.
+    /// This checks only typed geometry; no file availability is inspected.
+    pub(crate) fn original_content_frame_liability(
+        &self,
+        chunks: &[ChunkRef],
+    ) -> Result<(u64, u64)> {
+        if chunks.len() > MAX_ORIGINAL_CONTENT_CHUNKS {
+            return Err(ReconcileError::ResourceLimit(
+                "original complete chunk frame count",
+            ));
+        }
+        let payload_limit = self
+            .limits
+            .max_staging_bytes
+            .min(MAX_ORIGINAL_CONTENT_BYTES);
+        let frame_limit = payload_limit
+            .checked_add(5 * MAX_ORIGINAL_CONTENT_CHUNKS as u64)
+            .ok_or(ReconcileError::ResourceLimit(
+                "original complete frame liability bound",
+            ))?;
+        let mut seen = BTreeSet::new();
+        let mut payload = 0u64;
+        let mut frames = 0u64;
+        for chunk in chunks {
+            if chunk.length == 0
+                || chunk.length as usize > MAX_BLOCK_BYTES
+                || !seen.insert(&chunk.content_id)
+            {
+                return Err(ReconcileError::Invariant(
+                    "original exact unique chunk frame geometry",
+                ));
+            }
+            payload = payload
+                .checked_add(u64::from(chunk.length))
+                .filter(|bytes| *bytes <= payload_limit)
+                .ok_or(ReconcileError::ResourceLimit(
+                    "original complete payload liability",
+                ))?;
+            frames = frames
+                .checked_add(u64::from(chunk.length).checked_add(5).ok_or(
+                    ReconcileError::ResourceLimit("original exact block frame liability"),
+                )?)
+                .filter(|bytes| *bytes <= frame_limit)
+                .ok_or(ReconcileError::ResourceLimit(
+                    "original complete frame liability",
+                ))?;
+        }
+        Ok((payload, frames))
+    }
+
     fn original_content_offer(
         &self,
         source: &PeerIdentity,

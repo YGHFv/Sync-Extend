@@ -1,5 +1,6 @@
 use crate::{LocalSpace, ReconcileError, Result};
 use sync_extend_core_model::{ContentId, PortablePath, PROTOCOL_VERSION};
+use sync_extend_transport::ProducerKind;
 use sync_extend_transport::{Connection, FileOffer, FileRequest, FileResponse, SignedFileOffer};
 
 impl LocalSpace {
@@ -12,7 +13,9 @@ impl LocalSpace {
             return Err(ReconcileError::Invariant("connection space mismatch"));
         }
         let request: FileRequest = connection
-            .receive_json()
+            .receive_json_with_permit(
+                connection.reserve_incoming_json(ProducerKind::DirectFileControl)?,
+            )
             .await
             .map_err(|_| ReconcileError::Invariant("peer offer request failed"))?;
         let FileRequest::Offer {
@@ -30,6 +33,7 @@ impl LocalSpace {
                 "peer request protocol or space mismatch",
             ));
         }
+        let offer_permit = connection.reserve_outgoing_json(ProducerKind::DirectFileControl)?;
         self.scan()?;
         let manifest = self
             .manifest()?
@@ -71,9 +75,12 @@ impl LocalSpace {
         // This prototype does not promise an expiring detached read lease.
         let session = self.cas.acquire_session()?;
         connection
-            .send_json(&FileResponse::Offer {
-                offer: Box::new(signed),
-            })
+            .send_json_with_permit(
+                offer_permit,
+                &FileResponse::Offer {
+                    offer: Box::new(signed),
+                },
+            )
             .await
             .map_err(|_| ReconcileError::Invariant("sending file offer failed"))?;
         let unique: std::collections::BTreeMap<_, _> = content
@@ -88,7 +95,9 @@ impl LocalSpace {
         let mut requested = std::collections::BTreeSet::new();
         for _ in 0..max_requests {
             match connection
-                .receive_json::<FileRequest>()
+                .receive_json_with_permit::<FileRequest>(
+                    connection.reserve_incoming_json(ProducerKind::DirectFileControl)?,
+                )
                 .await
                 .map_err(|_| ReconcileError::Invariant("peer content request failed"))?
             {
@@ -105,16 +114,26 @@ impl LocalSpace {
                         ));
                     }
                     self.verify_root()?;
+                    let control_permit =
+                        connection.reserve_outgoing_json(ProducerKind::DirectFileControl)?;
+                    let block_permit = connection.reserve_outgoing_block(
+                        ProducerKind::DirectFileBlock,
+                        &chunk.content_id,
+                        chunk.length,
+                    )?;
                     let bytes = self.cas.read(&chunk)?;
                     connection
-                        .send_json(&FileResponse::Chunk {
-                            request_id: request_id.clone(),
-                            chunk: chunk.clone(),
-                        })
+                        .send_json_with_permit(
+                            control_permit,
+                            &FileResponse::Chunk {
+                                request_id: request_id.clone(),
+                                chunk: chunk.clone(),
+                            },
+                        )
                         .await
                         .map_err(|_| ReconcileError::Invariant("peer chunk response failed"))?;
                     connection
-                        .send_block(&chunk.content_id, &bytes)
+                        .send_block_with_permit(block_permit, &chunk.content_id, &bytes)
                         .await
                         .map_err(|_| ReconcileError::Invariant("peer block transfer failed"))?;
                 }
@@ -122,7 +141,10 @@ impl LocalSpace {
                     request_id: received,
                 } if received == request_id => {
                     connection
-                        .send_json(&FileResponse::Finished { request_id })
+                        .send_json_with_permit(
+                            connection.reserve_outgoing_json(ProducerKind::DirectFileControl)?,
+                            &FileResponse::Finished { request_id },
+                        )
                         .await
                         .map_err(|_| ReconcileError::Invariant("peer finish response failed"))?;
                     drop(session);
@@ -145,15 +167,20 @@ impl LocalSpace {
     ) -> Result<FileOffer> {
         self.verify_root()?;
         connection
-            .send_json(&FileRequest::Offer {
-                protocol_version: PROTOCOL_VERSION,
-                space_id: self.space_id.clone(),
-                path,
-            })
+            .send_json_with_permit(
+                connection.reserve_outgoing_json(ProducerKind::DirectFileControl)?,
+                &FileRequest::Offer {
+                    protocol_version: PROTOCOL_VERSION,
+                    space_id: self.space_id.clone(),
+                    path,
+                },
+            )
             .await
             .map_err(|_| ReconcileError::Invariant("peer offer request failed"))?;
         let FileResponse::Offer { offer } = connection
-            .receive_json()
+            .receive_json_with_permit(
+                connection.reserve_incoming_json(ProducerKind::DirectFileControl)?,
+            )
             .await
             .map_err(|_| ReconcileError::Invariant("peer offer response failed"))?
         else {
@@ -171,15 +198,25 @@ impl LocalSpace {
         request_id: &ContentId,
         chunk: &sync_extend_core_model::ChunkRef,
     ) -> Result<Vec<u8>> {
+        let block_permit = connection.reserve_incoming_block(
+            ProducerKind::DirectFileBlock,
+            &chunk.content_id,
+            chunk.length,
+        )?;
         connection
-            .send_json(&FileRequest::Chunk {
-                request_id: request_id.clone(),
-                chunk: chunk.clone(),
-            })
+            .send_json_with_permit(
+                connection.reserve_outgoing_json(ProducerKind::DirectFileControl)?,
+                &FileRequest::Chunk {
+                    request_id: request_id.clone(),
+                    chunk: chunk.clone(),
+                },
+            )
             .await
             .map_err(|_| ReconcileError::Invariant("peer chunk request failed"))?;
         match connection
-            .receive_json::<FileResponse>()
+            .receive_json_with_permit::<FileResponse>(
+                connection.reserve_incoming_json(ProducerKind::DirectFileControl)?,
+            )
             .await
             .map_err(|_| ReconcileError::Invariant("peer chunk header failed"))?
         {
@@ -194,7 +231,7 @@ impl LocalSpace {
             }
         }
         connection
-            .receive_block(&chunk.content_id, chunk.length)
+            .receive_block_with_permit(block_permit, &chunk.content_id, chunk.length)
             .await
             .map_err(|_| ReconcileError::Invariant("peer chunk integrity failed"))
     }

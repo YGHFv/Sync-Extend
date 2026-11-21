@@ -4,6 +4,7 @@ use serde::Serialize;
 use sync_extend_core_model::{
     causal::CausalReduction, operation_batch::OperationBatch, ContentId, DeviceId, PROTOCOL_VERSION,
 };
+use sync_extend_transport::ProducerKind;
 use sync_extend_transport::{
     Connection, OperationBatchRequest, OperationReceiveReceipt, SignedOperationBatch,
     SignedOperationReceiveReceipt,
@@ -37,7 +38,9 @@ impl LocalSpace {
         self.verify_root()?;
         let identity = self.transport_identity()?;
         let request = connection
-            .receive_json::<OperationBatchRequest>()
+            .receive_json_with_permit::<OperationBatchRequest>(
+                connection.reserve_incoming_json(ProducerKind::OperationMetadataControl)?,
+            )
             .await
             .map_err(|_| ReconcileError::Invariant("operation batch request failed"))?;
         request
@@ -48,6 +51,8 @@ impl LocalSpace {
                 "operation connection space mismatch",
             ));
         }
+        let batch_permit =
+            connection.reserve_outgoing_json(ProducerKind::OperationMetadataControl)?;
         let batch = self.journal.own_operation_batch(
             &self.space_id,
             &self.device_id,
@@ -58,12 +63,14 @@ impl LocalSpace {
         let signed = SignedOperationBatch::sign(&identity, batch)
             .map_err(|_| ReconcileError::Invariant("operation batch signing failed"))?;
         connection
-            .send_json(&signed)
+            .send_json_with_permit(batch_permit, &signed)
             .await
             .map_err(|_| ReconcileError::Invariant("operation batch response failed"))?;
         connection
             // The receiver durably admits the bounded page before acknowledging it.
-            .receive_json_after_application::<SignedOperationReceiveReceipt>()
+            .receive_json_after_application_with_permit::<SignedOperationReceiveReceipt>(
+                connection.reserve_incoming_json(ProducerKind::OperationMetadataControl)?,
+            )
             .await
             .map_err(|_| ReconcileError::Invariant("operation receipt missing"))?
             .verify(
@@ -93,6 +100,8 @@ impl LocalSpace {
             ));
         }
         let peer = connection.peer_identity().clone();
+        let request_permit =
+            connection.reserve_outgoing_json(ProducerKind::OperationMetadataControl)?;
         let request = OperationBatchRequest {
             protocol_version: PROTOCOL_VERSION,
             space_id: self.space_id.clone(),
@@ -100,11 +109,13 @@ impl LocalSpace {
             after_sequence,
         };
         connection
-            .send_json(&request)
+            .send_json_with_permit(request_permit, &request)
             .await
             .map_err(|_| ReconcileError::Invariant("operation batch pull request failed"))?;
         let signed = connection
-            .receive_json::<SignedOperationBatch>()
+            .receive_json_with_permit::<SignedOperationBatch>(
+                connection.reserve_incoming_json(ProducerKind::OperationMetadataControl)?,
+            )
             .await
             .map_err(|_| ReconcileError::Invariant("operation batch pull response failed"))?;
         signed
@@ -117,6 +128,8 @@ impl LocalSpace {
         }
         let result = self.receive_operation_batch(&peer.device_id, &signed.batch)?;
         let identity = self.transport_identity()?;
+        let receipt_permit =
+            connection.reserve_outgoing_json(ProducerKind::OperationMetadataControl)?;
         let receipt = SignedOperationReceiveReceipt::sign(
             &identity,
             OperationReceiveReceipt {
@@ -134,7 +147,7 @@ impl LocalSpace {
         )
         .map_err(|_| ReconcileError::Invariant("operation receive receipt signing failed"))?;
         connection
-            .send_json(&receipt)
+            .send_json_with_permit(receipt_permit, &receipt)
             .await
             .map_err(|_| ReconcileError::Invariant("operation receive receipt sending failed"))?;
         Ok(result)

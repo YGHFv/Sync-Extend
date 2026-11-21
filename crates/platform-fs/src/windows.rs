@@ -190,6 +190,19 @@ impl LockedDirectory {
         local_ntfs(&self.file, path)
     }
 
+    /// Before child CREATE, require this actual retained directory to have the
+    /// sole current-user, protected full-access OI/CI ACE.
+    pub fn require_current_user_private(&self) -> io::Result<()> {
+        current_user_file::verify_current_user_private_directory(&self.file)
+    }
+
+    /// Audit a current-user inherited SQLite sidecar against this proven parent.
+    /// The caller separately binds the child HANDLE to its exact fixed slot.
+    pub fn verify_current_user_private_child_file(&self, file: &File) -> io::Result<()> {
+        self.require_current_user_private()?;
+        current_user_file::verify_current_user_private_inherited_file(file)
+    }
+
     pub fn require_case_insensitive(&self) -> io::Result<()> {
         require_case_insensitive(&self.file)
     }

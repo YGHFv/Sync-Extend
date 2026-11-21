@@ -2,6 +2,7 @@
 use crate::{LocalSpace, PeerOperationPull, ReconcileError, Result};
 use serde::Serialize;
 use sync_extend_core_model::DeviceId;
+use sync_extend_transport::ProducerKind;
 use sync_extend_transport::{Connection, MetadataCycleHello, MAX_METADATA_CYCLE_ROUNDS};
 
 #[derive(Debug, Serialize)]
@@ -62,15 +63,18 @@ impl LocalSpace {
     ) -> Result<PeerMetadataCycle> {
         self.verify_root()?;
         let identity = self.transport_identity()?;
+        let hello_permit = connection.reserve_outgoing_json(ProducerKind::MetadataCycleControl)?;
         let hello =
             MetadataCycleHello::new(identity.peer_identity(), connection.peer_identity(), rounds)
                 .map_err(|_| ReconcileError::Invariant("metadata cycle configuration"))?;
         connection
-            .send_json(&hello)
+            .send_json_with_permit(hello_permit, &hello)
             .await
             .map_err(|_| ReconcileError::Invariant("metadata cycle hello send"))?;
         let accepted = connection
-            .receive_json::<MetadataCycleHello>()
+            .receive_json_with_permit::<MetadataCycleHello>(
+                connection.reserve_incoming_json(ProducerKind::MetadataCycleControl)?,
+            )
             .await
             .map_err(|_| ReconcileError::Invariant("metadata cycle hello receive"))?;
         if accepted != hello {
@@ -92,7 +96,9 @@ impl LocalSpace {
         }
         let identity = self.transport_identity()?;
         let hello = connection
-            .receive_json::<MetadataCycleHello>()
+            .receive_json_with_permit::<MetadataCycleHello>(
+                connection.reserve_incoming_json(ProducerKind::MetadataCycleControl)?,
+            )
             .await
             .map_err(|_| ReconcileError::Invariant("metadata cycle hello receive"))?;
         hello
@@ -103,7 +109,10 @@ impl LocalSpace {
             )
             .map_err(|_| ReconcileError::Invariant("metadata cycle hello scope"))?;
         connection
-            .send_json(&hello)
+            .send_json_with_permit(
+                connection.reserve_outgoing_json(ProducerKind::MetadataCycleControl)?,
+                &hello,
+            )
             .await
             .map_err(|_| ReconcileError::Invariant("metadata cycle hello send"))?;
         self.metadata_cycle_inner(connection, hello.rounds, false)

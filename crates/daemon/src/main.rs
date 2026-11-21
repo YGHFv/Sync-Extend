@@ -19,6 +19,7 @@ mod recovery;
 mod shutdown;
 mod storage;
 mod storage_retirement_cli;
+mod transport_budget;
 mod webdav;
 mod webdav_conditions;
 mod webdav_credentials;
@@ -38,6 +39,12 @@ struct Cli {
     /// Apply a local limits JSON file to this invocation (not a retention/GC policy).
     #[arg(long, global = true)]
     limits: Option<PathBuf>,
+    /// Select an independently owner-signed finite Sync QUIC frame-attempt policy.
+    #[arg(long, global = true)]
+    transport_attempt_policy: Option<PathBuf>,
+    /// Existing private control directory; ordinary command data-dir is the explicit default.
+    #[arg(long, global = true)]
+    transport_attempt_budget_dir: Option<PathBuf>,
     /// Enable same-owner local lifecycle control using an existing private directory.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[arg(long, global = true)]
@@ -52,6 +59,43 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Sign one explicit unsigned frame-attempt policy with the existing paired owner.
+    TransportAttemptPolicySign {
+        #[arg(
+            long,
+            required_unless_present = "storage_config",
+            conflicts_with = "storage_config"
+        )]
+        data_dir: Option<PathBuf>,
+        #[arg(long)]
+        storage_config: Option<PathBuf>,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Initialize one fresh fixed application-frame ledger; never resets existing state.
+    TransportAttemptBudgetInit {
+        #[arg(
+            long,
+            required_unless_present = "storage_config",
+            conflicts_with = "storage_config"
+        )]
+        data_dir: Option<PathBuf>,
+        #[arg(long)]
+        storage_config: Option<PathBuf>,
+    },
+    /// Audit the exact existing application-frame ledger without updating its clock.
+    TransportAttemptBudgetStatus {
+        #[arg(
+            long,
+            required_unless_present = "storage_config",
+            conflicts_with = "storage_config"
+        )]
+        data_dir: Option<PathBuf>,
+        #[arg(long)]
+        storage_config: Option<PathBuf>,
+    },
     /// Query or stop the running same-owner daemon through kernel-authenticated control.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     LocalControl {
@@ -103,6 +147,27 @@ enum Command {
     ManagementDashboard {
         #[arg(long)]
         config: PathBuf,
+    },
+    /// Preview portable selected history through the authenticated live owner.
+    ManagementRestorePreview {
+        #[arg(
+            long,
+            required_unless_present = "deployment",
+            conflicts_with = "deployment"
+        )]
+        config: Option<PathBuf>,
+        #[arg(long, required_unless_present = "config", conflicts_with = "config")]
+        deployment: Option<PathBuf>,
+        #[arg(long, required_unless_present = "context", conflicts_with = "context")]
+        request_hex: Option<String>,
+        #[arg(
+            long,
+            required_unless_present = "request_hex",
+            conflicts_with = "request_hex"
+        )]
+        context: bool,
+        #[arg(long, requires = "context")]
+        space_id: Option<sync_extend_core_model::SpaceId>,
     },
     /// Ask the exact authenticated foreground deployment owner to stop.
     ManagementStop {
@@ -380,7 +445,7 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
-    /// Preview full or one-file retained history read-only with explicit bounds.
+    /// Preview retained history read-only with explicit selection and bounds.
     RestorePreview {
         #[arg(long)]
         data_dir: PathBuf,
@@ -390,6 +455,18 @@ enum Command {
         baseline: Option<String>,
         #[arg(long)]
         path: Option<String>,
+        #[arg(long, conflicts_with_all = ["path", "select_path"])]
+        directory: Option<String>,
+        #[arg(long, conflicts_with_all = ["path", "directory"])]
+        select_path: Vec<String>,
+        #[arg(long)]
+        destination_prefix: Option<String>,
+        #[arg(long, value_parser = ["preserve", "replace-selected-scope"])]
+        current_extra_policy: Option<String>,
+        #[arg(long, value_parser = ["report-conflicts", "replace-files"])]
+        occupied_target_policy: Option<String>,
+        #[arg(long)]
+        selection_v2: bool,
         #[arg(long)]
         budgets: PathBuf,
     },
@@ -1325,11 +1402,13 @@ fn print(value: &impl serde::Serialize) -> Result<(), Box<dyn std::error::Error>
 }
 
 fn main() -> ExitCode {
-    #[cfg(target_os = "linux")]
     let parsed = Cli::parse();
-    #[cfg(target_os = "linux")]
     if let Err(error) = restore_preview_cli::precheck(&parsed) {
         eprintln!("syncd: {error}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(error) = transport_budget::preflight(&parsed) {
+        eprintln!("syncd: application budget startup refused: {error}");
         return ExitCode::FAILURE;
     }
     #[cfg(target_os = "linux")]
@@ -1369,11 +1448,6 @@ fn main() -> ExitCode {
             .name("syncd-main".into())
             .stack_size(16 * 1024 * 1024)
             .spawn(move || {
-                let parsed = Cli::parse();
-                if let Err(error) = restore_preview_cli::precheck(&parsed) {
-                    eprintln!("syncd: {error}");
-                    return ExitCode::FAILURE;
-                }
                 run_cli(
                     parsed,
                     #[cfg(target_os = "linux")]
@@ -1400,9 +1474,13 @@ fn run_cli(
         let name = name.clone();
         let config = config.clone();
         let limits = parsed.limits.clone();
+        let transport_attempt_policy = parsed.transport_attempt_policy.clone();
+        let transport_attempt_budget_dir = parsed.transport_attempt_budget_dir.clone();
         return match sync_extend_platform_fs::run_windows_service(&name, move |_reporter| {
             let (cli, _management) = deployment::prepare(Cli {
                 limits,
+                transport_attempt_policy,
+                transport_attempt_budget_dir,
                 command: Command::DeploymentRun { config },
             })
             .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -1548,6 +1626,7 @@ async fn execute(
         std::sync::Arc<linux_namespace::LinuxDaemonOwner>,
     >,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let transport_budget = transport_budget::Selection::from_cli(&cli)?;
     let limits = read_local_limits(cli.limits.as_deref())?;
     #[cfg(any(target_os = "linux", target_os = "android"))]
     let local_control = if let Some(directory) = cli.control_directory {
@@ -1577,6 +1656,19 @@ async fn execute(
         LocalSpace::open(data)?.with_limits(limits.clone())
     };
     match cli.command {
+        Command::TransportAttemptPolicySign {
+            storage_config,
+            output,
+            ..
+        } => {
+            transport_budget.sign(storage_config.as_deref(), &output)?;
+        }
+        Command::TransportAttemptBudgetInit { storage_config, .. } => {
+            transport_budget.init(storage_config.as_deref())?;
+        }
+        Command::TransportAttemptBudgetStatus { .. } => {
+            transport_budget.status()?;
+        }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         Command::LocalControl {
             directory,
@@ -1625,6 +1717,23 @@ async fn execute(
         Command::ManagementCheck { config } => management::check_config(&config)?,
         Command::ManagementStatus { config } => management::control_status(&config)?,
         Command::ManagementDashboard { config } => management::control_dashboard(&config)?,
+        Command::ManagementRestorePreview {
+            config,
+            deployment,
+            request_hex,
+            context,
+            space_id,
+        } => {
+            let path = if let Some(path) = config {
+                path
+            } else {
+                deployment::load(&deployment.ok_or("preview deployment absent")?)?
+                    .management
+                    .ok_or("deployment management configuration absent")?
+            };
+            let _ = context;
+            management::control_restore_preview(&path, request_hex.as_deref(), space_id.as_ref())?;
+        }
         Command::ManagementStop {
             config,
             owner_generation,
@@ -1697,10 +1806,19 @@ async fn execute(
                     address,
                     after_sequence,
                     Some(storage::load_snapshot_report(&path)?),
+                    &transport_budget,
                 )
                 .await?;
             } else {
-                storage::push(data_dir, origin, peer, address, after_sequence).await?;
+                storage::push(
+                    data_dir,
+                    origin,
+                    peer,
+                    address,
+                    after_sequence,
+                    &transport_budget,
+                )
+                .await?;
             }
         }
         Command::StorageSnapshotReport { data_dir } => {
@@ -1800,6 +1918,7 @@ async fn execute(
                 address,
                 after_sequence,
                 &limits,
+                &transport_budget,
             )
             .await?;
         }
@@ -1840,11 +1959,17 @@ async fn execute(
                 max_sessions,
                 session_timeout_secs,
                 between_sessions_secs,
+                &transport_budget,
             )
             .await?;
         }
         Command::StorageServe { config, forwarder } => {
-            storage::serve(storage::load(&config)?, storage::load(&forwarder)?).await?;
+            storage::serve(
+                storage::load(&config)?,
+                storage::load(&forwarder)?,
+                &transport_budget,
+            )
+            .await?;
         }
         Command::StoragePull {
             config,
@@ -1861,6 +1986,7 @@ async fn execute(
                 address,
                 after_sequence,
                 attempt_policy.as_deref().map(storage::load).transpose()?,
+                &transport_budget,
             )
             .await?;
         }
@@ -1961,13 +2087,25 @@ async fn execute(
             snapshot,
             baseline,
             path,
+            directory,
+            select_path,
+            destination_prefix,
+            current_extra_policy,
+            occupied_target_policy,
+            selection_v2,
             budgets,
         } => {
-            restore_preview_cli::run(
+            restore_preview_cli::run_selection(
                 &data_dir,
                 &snapshot,
                 baseline.as_deref(),
                 path.as_deref(),
+                directory.as_deref(),
+                &select_path,
+                destination_prefix.as_deref(),
+                current_extra_policy.as_deref(),
+                occupied_target_policy.as_deref(),
+                selection_v2,
                 &budgets,
             )?;
         }
@@ -2092,7 +2230,7 @@ async fn execute(
             let identity = local.transport_identity()?;
             local.resume_original_paired_native_lineage(&origin)?;
             local.scan_original_paired_worker()?;
-            let listener = sync_extend_transport::Listener::bind(listen, &identity, &peer)?;
+            let listener = transport_budget.listener(&data_dir, listen, &identity, &peer)?;
             print(
                 &serde_json::json!({"listening": listener.local_address()?, "max_original_rounds": max_rounds,
                     "bounded_original_attempts": attempts, "post_attempt_delay_seconds": delay_seconds}),
@@ -2159,9 +2297,9 @@ async fn execute(
                 let peer = local.read_transport_peer(&origin)?;
                 let identity = local.transport_identity()?;
                 let action = async {
-                    let mut connection =
-                        sync_extend_transport::Connection::connect(address, &identity, &peer)
-                            .await?;
+                    let mut connection = transport_budget
+                        .connect(&data_dir, address, &identity, &peer)
+                        .await?;
                     let result = local
                         .exchange_original_paired_cycle(
                             &mut connection,
@@ -2210,8 +2348,9 @@ async fn execute(
             let mut local = open(&data_dir)?;
             let peer = local.read_transport_peer(&peer_device.parse()?)?;
             let identity = local.transport_identity()?;
-            let mut connection =
-                sync_extend_transport::Connection::connect(address, &identity, &peer).await?;
+            let mut connection = transport_budget
+                .connect(&data_dir, address, &identity, &peer)
+                .await?;
             let result = local
                 .exchange_original_paired_cycle(
                     &mut connection,
@@ -2232,7 +2371,7 @@ async fn execute(
             let local = open(&data_dir)?;
             let peer = local.read_transport_peer(&peer_device.parse()?)?;
             let identity = local.transport_identity()?;
-            let listener = sync_extend_transport::Listener::bind(listen, &identity, &peer)?;
+            let listener = transport_budget.listener(&data_dir, listen, &identity, &peer)?;
             print(
                 &serde_json::json!({"listening": listener.local_address()?, "bounded_conflict_attempts": 1}),
             )?;
@@ -2252,8 +2391,9 @@ async fn execute(
             let mut local = open(&data_dir)?;
             let peer = local.read_transport_peer(&peer_device.parse()?)?;
             let identity = local.transport_identity()?;
-            let mut connection =
-                sync_extend_transport::Connection::connect(address, &identity, &peer).await?;
+            let mut connection = transport_budget
+                .connect(&data_dir, address, &identity, &peer)
+                .await?;
             let receipt = local
                 .pull_original_conflict_resolution(&mut connection)
                 .await?;
@@ -2315,7 +2455,8 @@ async fn execute(
                 let identity = local.transport_identity()?;
                 let after = local.original_worker_after(&origin)?;
                 let action = async {
-                    match sync_extend_transport::Connection::connect(address, &identity, &peer)
+                    match transport_budget
+                        .connect(&data_dir, address, &identity, &peer)
                         .await
                     {
                         Ok(mut connection) => {
@@ -2414,8 +2555,9 @@ async fn execute(
             let mut local = open(&data_dir)?;
             let peer = local.read_transport_peer(&peer_device.parse()?)?;
             let identity = local.transport_identity()?;
-            let mut connection =
-                sync_extend_transport::Connection::connect(address, &identity, &peer).await?;
+            let mut connection = transport_budget
+                .connect(&data_dir, address, &identity, &peer)
+                .await?;
             let outcome = local
                 .pull_original_exchange(&mut connection, after_sequence)
                 .await?;
@@ -2433,7 +2575,7 @@ async fn execute(
             let local = open(&data_dir)?;
             let peer = local.read_transport_peer(&peer_device.parse()?)?;
             let identity = local.transport_identity()?;
-            let listener = sync_extend_transport::Listener::bind(listen, &identity, &peer)?;
+            let listener = transport_budget.listener(&data_dir, listen, &identity, &peer)?;
             print(&serde_json::json!({
                 "listening": listener.local_address()?,
                 "paired_device": peer.device_id,
@@ -2495,7 +2637,7 @@ async fn execute(
             let device = peer_device.parse()?;
             let peer = local.read_transport_peer(&device)?;
             let identity = local.transport_identity()?;
-            let listener = sync_extend_transport::Listener::bind(listen, &identity, &peer)?;
+            let listener = transport_budget.listener(&data_dir, listen, &identity, &peer)?;
             shutdown::ready()?;
             print(&serde_json::json!({
                 "listening": listener.local_address()?,
@@ -2529,8 +2671,9 @@ async fn execute(
             let mut local = open(&data_dir)?;
             let peer = local.read_transport_peer(&peer_device.parse()?)?;
             let identity = local.transport_identity()?;
-            let mut connection =
-                sync_extend_transport::Connection::connect(address, &identity, &peer).await?;
+            let mut connection = transport_budget
+                .connect(&data_dir, address, &identity, &peer)
+                .await?;
             let result = local
                 .pull_peer_file(&mut connection, PortablePath::new(path)?)
                 .await?;
@@ -2546,7 +2689,7 @@ async fn execute(
             let device = peer_device.parse()?;
             let peer = local.read_transport_peer(&device)?;
             let identity = local.transport_identity()?;
-            let listener = sync_extend_transport::Listener::bind(listen, &identity, &peer)?;
+            let listener = transport_budget.listener(&data_dir, listen, &identity, &peer)?;
             print(&serde_json::json!({
                 "listening": listener.local_address()?,
                 "paired_device": device,
@@ -2580,8 +2723,9 @@ async fn execute(
             let mut local = open(&data_dir)?;
             let peer = local.read_transport_peer(&peer_device.parse()?)?;
             let identity = local.transport_identity()?;
-            let mut connection =
-                sync_extend_transport::Connection::connect(address, &identity, &peer).await?;
+            let mut connection = transport_budget
+                .connect(&data_dir, address, &identity, &peer)
+                .await?;
             let result = local
                 .pull_peer_operations(&mut connection, after_sequence)
                 .await?;
@@ -2741,8 +2885,9 @@ async fn execute(
             let peer = local.read_transport_peer(&peer_device.parse()?)?;
             let identity = local.transport_identity()?;
             local.scan()?;
-            let mut connection =
-                sync_extend_transport::Connection::connect(address, &identity, &peer).await?;
+            let mut connection = transport_budget
+                .connect(&data_dir, address, &identity, &peer)
+                .await?;
             let result = local
                 .exchange_peer_metadata(&mut connection, rounds)
                 .await?;
@@ -2759,8 +2904,10 @@ async fn execute(
             let device = peer_device.parse()?;
             let peer = local.read_transport_peer(&device)?;
             let identity = local.transport_identity()?;
-            let listener = sync_extend_transport::Listener::bind(listen, &identity, &peer)?;
-            management::observe_local_space(&local);
+            let listener = transport_budget.listener(&data_dir, listen, &identity, &peer)?;
+            management::observe_local_space(&mut local);
+            let mut preview_timer = tokio::time::interval(Duration::from_millis(100));
+            preview_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             shutdown::ready()?;
             print(&serde_json::json!({
                 "listening": listener.local_address()?,
@@ -2773,13 +2920,14 @@ async fn execute(
             loop {
                 tokio::select! {
                     shutdown = shutdown::requested() => { shutdown?; break; }
+                    _ = preview_timer.tick() => management::process_restore_preview(&mut local),
                     result = listener.accept(&identity, &peer) => {
                         match result {
                             Ok(mut connection) => {
                                 let result = async {
                                     // Stable local scans author only native local changes.
                                     local.scan()?;
-                                    management::observe_local_space(&local);
+                                    management::observe_local_space(&mut local);
                                     local.serve_peer_metadata_cycle(&mut connection, max_rounds).await
                                 }.await;
                                 if let Err(error) = result {
@@ -2816,19 +2964,21 @@ async fn execute(
             }))?;
             let shutdown = shutdown::requested();
             tokio::pin!(shutdown);
-            loop {
+            let mut preview_timer = tokio::time::interval(Duration::from_millis(100));
+            preview_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            'metadata_attempts: loop {
                 // A local safety failure stops this worker; only transport
                 // failures retry. A settled native scan never applies remote rows.
                 local = tokio::task::spawn_blocking(move || {
                     local.scan()?;
-                    management::observe_local_space(&local);
+                    management::observe_local_space(&mut local);
                     Ok::<_, sync_extend_reconcile::ReconcileError>(local)
                 })
                 .await??;
                 let cycle = async {
-                    let mut connection =
-                        sync_extend_transport::Connection::connect(address, &identity, &peer)
-                            .await?;
+                    let mut connection = transport_budget
+                        .connect(&data_dir, address, &identity, &peer)
+                        .await?;
                     let receipt = local
                         .exchange_peer_metadata(&mut connection, rounds)
                         .await?;
@@ -2841,7 +2991,8 @@ async fn execute(
                         match result {
                             Ok(receipt) => print(&receipt)?,
                             Err(error) => {
-                                if error.downcast_ref::<sync_extend_reconcile::ReconcileError>().is_some() {
+                                if error.downcast_ref::<sync_extend_reconcile::ReconcileError>().is_some()
+                                    || transport_budget::is_budget_failure(error.as_ref()) {
                                     return Err(error);
                                 }
                                 print(&serde_json::json!({
@@ -2858,9 +3009,14 @@ async fn execute(
                 }
                 // Wait after each attempt; slow scans/peers never trigger
                 // catch-up bursts or an unbounded busy-loop on offline devices.
-                tokio::select! {
-                    result = &mut shutdown => { result?; break; }
-                    _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
+                let retry_delay = tokio::time::sleep(Duration::from_secs(interval_secs));
+                tokio::pin!(retry_delay);
+                loop {
+                    tokio::select! {
+                        result = &mut shutdown => { result?; break 'metadata_attempts; }
+                        _ = &mut retry_delay => break,
+                        _ = preview_timer.tick() => management::process_restore_preview(&mut local),
+                    }
                 }
             }
         }
@@ -3272,6 +3428,8 @@ async fn execute(
             let mut local = open(&data_dir)?;
             let mut timer = tokio::time::interval(Duration::from_secs(scan_interval_secs));
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut preview_timer = tokio::time::interval(Duration::from_millis(100));
+            preview_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             shutdown::ready()?;
             management::resources_deferred();
             let shutdown = shutdown::requested();
@@ -3279,11 +3437,17 @@ async fn execute(
             loop {
                 tokio::select! {
                     result = &mut shutdown => { result?; break; }
+                    _ = preview_timer.tick() => {
+                        local = tokio::task::spawn_blocking(move || {
+                            management::process_restore_preview(&mut local);
+                            local
+                        }).await?;
+                    }
                     _ = timer.tick() => {
                         local = tokio::task::spawn_blocking(move || {
                             match local.scan() {
                                 Ok(result) => {
-                                    management::observe_local_space(&local);
+                                    management::observe_local_space(&mut local);
                                     management::resources_ready();
                                     println!("{}", serde_json::to_string(&result).unwrap_or_default());
                                 }

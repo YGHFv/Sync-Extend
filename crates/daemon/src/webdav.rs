@@ -132,9 +132,10 @@ pub fn serve(
         .enabled
         .then(|| Gateway::bind(&runtime))
         .transpose()?;
-    // A Linux publisher retains one LocalSpace and one Journal issuer even
-    // without periodic scanning. The synchronous loop is its bounded actor.
-    let shared_locals = scan_interval_secs.is_some();
+    // An explicitly configured preview owner or Linux publisher retains one
+    // LocalSpace and Journal even without scanning. This loop is its actor.
+    let shared_locals =
+        scan_interval_secs.is_some() || super::management::restore_preview_owner_configured();
     #[cfg(target_os = "linux")]
     let shared_locals = shared_locals || linux_owner.is_some();
     let mut polling = if shared_locals {

@@ -2,6 +2,7 @@
 use crate::{LocalSpace, OriginalExchangeReceipt, ReconcileError, Result};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::{ContentId, DeviceId, EntryId, SpaceId, PROTOCOL_VERSION};
+use sync_extend_transport::ProducerKind;
 use sync_extend_transport::{Connection, SignedOriginalConflictTargetReceipt};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -39,6 +40,7 @@ impl LocalSpace {
         rounds: u32,
         resolve_at_ms: Option<u64>,
     ) -> Result<OriginalPairedCycle> {
+        let hello_permit = connection.reserve_outgoing_json(ProducerKind::OriginalCycleControl)?;
         let hello = Hello {
             protocol_version: PROTOCOL_VERSION,
             space_id: self.space_id.clone(),
@@ -53,8 +55,16 @@ impl LocalSpace {
                 "original paired cycle round/time limits",
             ));
         }
-        connection.send_json(&hello).await?;
-        if connection.receive_json::<Hello>().await? != hello {
+        connection
+            .send_json_with_permit(hello_permit, &hello)
+            .await?;
+        if connection
+            .receive_json_with_permit::<Hello>(
+                connection.reserve_incoming_json(ProducerKind::OriginalCycleControl)?,
+            )
+            .await?
+            != hello
+        {
             return Err(ReconcileError::Invariant(
                 "original paired cycle handshake differs",
             ));
@@ -69,7 +79,11 @@ impl LocalSpace {
         max_rounds: u32,
         allow_resolution: bool,
     ) -> Result<OriginalPairedCycle> {
-        let hello: Hello = connection.receive_json().await?;
+        let hello: Hello = connection
+            .receive_json_with_permit(
+                connection.reserve_incoming_json(ProducerKind::OriginalCycleControl)?,
+            )
+            .await?;
         if !(1..=64).contains(&max_rounds)
             || hello.rounds == 0
             || hello.rounds > max_rounds
@@ -86,7 +100,12 @@ impl LocalSpace {
                 "original paired cycle unapproved bounds/resolution",
             ));
         }
-        connection.send_json(&hello).await?;
+        connection
+            .send_json_with_permit(
+                connection.reserve_outgoing_json(ProducerKind::OriginalCycleControl)?,
+                &hello,
+            )
+            .await?;
         self.original_paired_cycle_inner(connection, hello, false)
             .await
     }
@@ -118,6 +137,8 @@ impl LocalSpace {
         // as ordinary originals on reconnect. Exchange immutable admissions first.
         for source in [true, false] {
             if initiator == source {
+                let choice_permit =
+                    connection.reserve_outgoing_json(ProducerKind::OriginalCycleControl)?;
                 let mut own = Vec::new();
                 for admission in self.conflict_resolution_admissions()? {
                     let proof = self
@@ -139,9 +160,12 @@ impl LocalSpace {
                 }
                 let id = own.pop();
                 connection
-                    .send_json(&ResolutionChoice {
-                        transaction: id.clone(),
-                    })
+                    .send_json_with_permit(
+                        choice_permit,
+                        &ResolutionChoice {
+                            transaction: id.clone(),
+                        },
+                    )
                     .await?;
                 if let Some(id) = id {
                     result.retained_resolution_acknowledged.push(
@@ -150,7 +174,11 @@ impl LocalSpace {
                     );
                 }
             } else {
-                let choice: ResolutionChoice = connection.receive_json_after_application().await?;
+                let choice: ResolutionChoice = connection
+                    .receive_json_after_application_with_permit(
+                        connection.reserve_incoming_json(ProducerKind::OriginalCycleControl)?,
+                    )
+                    .await?;
                 if choice.transaction.is_some() {
                     result
                         .retained_resolution_acknowledged
@@ -179,6 +207,8 @@ impl LocalSpace {
             result.completed_rounds += 1;
         }
         if initiator {
+            let choice_permit =
+                connection.reserve_outgoing_json(ProducerKind::OriginalCycleControl)?;
             let candidate = if let Some(time) = hello.resolve_at_ms {
                 if !self.conflict_resolution_admissions()?.is_empty() {
                     if result
@@ -192,7 +222,10 @@ impl LocalSpace {
                         ));
                     }
                     connection
-                        .send_json(&ResolutionChoice { transaction: None })
+                        .send_json_with_permit(
+                            choice_permit,
+                            &ResolutionChoice { transaction: None },
+                        )
                         .await?;
                     self.verify_root()?;
                     return Ok(result);
@@ -216,9 +249,12 @@ impl LocalSpace {
                 None
             };
             connection
-                .send_json(&ResolutionChoice {
-                    transaction: candidate.clone(),
-                })
+                .send_json_with_permit(
+                    choice_permit,
+                    &ResolutionChoice {
+                        transaction: candidate.clone(),
+                    },
+                )
                 .await?;
             if let Some(id) = candidate {
                 result.resolution_acknowledged = Some(
@@ -229,7 +265,11 @@ impl LocalSpace {
         } else {
             // The initiator completes its durable native Final before choosing
             // an export. Keep the application wait bounded, not ordinary 30s I/O.
-            let choice: ResolutionChoice = connection.receive_json_after_application().await?;
+            let choice: ResolutionChoice = connection
+                .receive_json_after_application_with_permit(
+                    connection.reserve_incoming_json(ProducerKind::OriginalCycleControl)?,
+                )
+                .await?;
             if choice.transaction.is_some() && hello.resolve_at_ms.is_none() {
                 return Err(ReconcileError::Invariant(
                     "original paired cycle resolution not opted in",

@@ -145,6 +145,12 @@ pub use tree_native_owner::{TreeNativeRestoreResult, TreeOwnerCreation, TreeOwne
 pub use tree_restore_capture::TreeRestoreCapture;
 pub use tree_restore_pipeline::TreeRestoreBudgets;
 mod restore_preview;
+mod restore_selection_preview;
+pub use restore_selection_preview::{
+    project_restore_selection_preview, RestoreProposedOperation, RestoreSelectionDifference,
+    RestoreSelectionPreview, RestoreSelectionPreviewCounts, RestoreSelectionPreviewEntry,
+    RestoreSelectionPreviewRequest, RestoreSelectionPreviewSource, RestoreSelectionSourceKind,
+};
 pub use restore_preview::{
     project_restore_preview, RestorePreview, RestorePreviewCounts, RestorePreviewDifference,
     RestorePreviewEntry, RestorePreviewLimits, RestorePreviewRequest, RestorePreviewSelection,

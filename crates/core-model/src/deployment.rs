@@ -1,5 +1,5 @@
 //! Explicit per-process deployment roles; existing identities must be provisioned first.
-use crate::{DeviceId, FORMAT_VERSION, ModelError, Result};
+use crate::{DeviceId, ModelError, Result, FORMAT_VERSION};
 use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
@@ -13,6 +13,10 @@ pub struct DeploymentConfig {
     pub role: DeploymentRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub management: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_attempt_policy: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_attempt_budget_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -67,6 +71,28 @@ impl DeploymentConfig {
         }
         if self.management.as_ref().is_some_and(|value| !path(value)) {
             return Err(ModelError::InvalidConfig("deployment management path"));
+        }
+        if self
+            .transport_attempt_policy
+            .as_ref()
+            .is_some_and(|value| !path(value))
+            || self
+                .transport_attempt_budget_dir
+                .as_ref()
+                .is_some_and(|value| !path(value))
+            || self.transport_attempt_budget_dir.is_some()
+                && self.transport_attempt_policy.is_none()
+            || self.transport_attempt_policy.is_some()
+                && !matches!(
+                    self.role,
+                    DeploymentRole::MetadataClient { .. }
+                        | DeploymentRole::MetadataServer { .. }
+                        | DeploymentRole::Storage { .. }
+                )
+        {
+            return Err(ModelError::InvalidConfig(
+                "explicit Sync application-frame policy/control directory",
+            ));
         }
         let valid = match &self.role {
             DeploymentRole::LocalPolling {

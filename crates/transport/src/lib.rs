@@ -1,4 +1,9 @@
+mod application_budget;
 mod conflict_resolution;
+pub use application_budget::{
+    ApplicationBudget, FramePermit, ProducerKind, ProducerLimit, ProducerUsage,
+    SignedTransportAttemptPolicy, TransportAttemptPolicy, TransportAttemptStatus,
+};
 mod connection;
 mod observation;
 pub use observation::{
@@ -81,6 +86,8 @@ pub enum TransportError {
     Authorization(&'static str),
     #[error("transport resource limit exceeded: {0}")]
     Limit(&'static str),
+    #[error("explicit application-frame budget refused: {0}")]
+    Budget(String),
     #[error("transport protocol violation: {0}")]
     Protocol(&'static str),
     #[error("QUIC connection failed: {0}")]

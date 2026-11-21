@@ -1,11 +1,13 @@
 //! Explicit bounded storage invocations; origin signatures stay independent of channel peer.
+use super::transport_budget::Selection;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use sync_extend_core_model::{storage_node::StorageNodeConfig, ChunkRef, ContentId};
 use sync_extend_journal::{StoragePullAttemptLedger, StoragePullAttemptPolicy};
 use sync_extend_reconcile::StorageNode;
+use sync_extend_transport::ProducerKind;
 use sync_extend_transport::{
-    Connection, ForwardedSnapshotEnvelope, Listener, PeerIdentity, SignedForwardStoreReceipt,
+    Connection, ForwardedSnapshotEnvelope, PeerIdentity, SignedForwardStoreReceipt,
     SignedForwardedOperationPage, SignedStorageSnapshotReceipt,
 };
 
@@ -132,7 +134,11 @@ enum Response {
 }
 
 /// One paired QUIC connection and one bounded page, then the process closes.
-pub async fn serve(config: StorageNodeConfig, forwarder: PeerIdentity) -> Result<()> {
+pub async fn serve(
+    config: StorageNodeConfig,
+    forwarder: PeerIdentity,
+    transport_budget: &Selection,
+) -> Result<()> {
     config.validate()?;
     forwarder.validate()?;
     let mut node = StorageNode::open(config.clone())?;
@@ -140,7 +146,8 @@ pub async fn serve(config: StorageNodeConfig, forwarder: PeerIdentity) -> Result
     node.recover_forwarded_pages()?;
     node.recover_forwarded_snapshots()?;
     let identity = node.transport_identity()?;
-    let listener = Listener::bind(config.bind, &identity, &forwarder)?;
+    let listener =
+        transport_budget.listener(&config.data_dir, config.bind, &identity, &forwarder)?;
     super::management::observe_storage(&node);
     super::shutdown::ready()?;
     println!(
@@ -164,7 +171,11 @@ async fn serve_session(
     node: &mut StorageNode,
     connection: &mut Connection,
 ) -> Result<()> {
-    let request: Request = connection.receive_json().await?;
+    let request: Request = connection
+        .receive_json_with_permit(
+            connection.reserve_incoming_json(ProducerKind::StorageDispatchControl)?,
+        )
+        .await?;
     match request {
         Request::StorePage {
             origin,
@@ -178,16 +189,24 @@ async fn serve_session(
             )?;
             let id = signed_page.page.storage_id()?;
             connection
-                .send_json(&Response::Stored {
-                    receipt: node.stored_receipt(&received)?,
-                })
+                .send_json_with_permit(
+                    connection.reserve_outgoing_json(ProducerKind::StoragePageControl)?,
+                    &Response::Stored {
+                        receipt: node.stored_receipt(&received)?,
+                    },
+                )
                 .await?;
             let mut count = 0usize;
             let mut bytes = 0u64;
             let mut snapshot_received = None;
             loop {
                 node.verify_forwarding_peer(connection.peer_identity())?;
-                match connection.receive_json::<Request>().await? {
+                match connection
+                    .receive_json_with_permit::<Request>(
+                        connection.reserve_incoming_json(ProducerKind::StorageDispatchControl)?,
+                    )
+                    .await?
+                {
                     Request::Chunk { storage_id, chunk } if storage_id == id => {
                         count += 1;
                         bytes = bytes
@@ -200,13 +219,25 @@ async fn serve_session(
                         }
                         node.admit_forwarded_chunk(&received, &chunk)?;
                         let content = connection
-                            .receive_block(&chunk.content_id, chunk.length)
+                            .receive_block_with_permit(
+                                connection.reserve_incoming_block(
+                                    ProducerKind::StoragePageBlock,
+                                    &chunk.content_id,
+                                    chunk.length,
+                                )?,
+                                &chunk.content_id,
+                                chunk.length,
+                            )
                             .await?;
                         node.ingest_forwarded_chunk(&received, &chunk, &content)?;
                         connection
-                            .send_json(&Response::Stored {
-                                receipt: node.stored_receipt(&received)?,
-                            })
+                            .send_json_with_permit(
+                                connection
+                                    .reserve_outgoing_json(ProducerKind::StorageChunkControl)?,
+                                &Response::Stored {
+                                    receipt: node.stored_receipt(&received)?,
+                                },
+                            )
                             .await?;
                     }
                     Request::Snapshot { envelope } => {
@@ -221,10 +252,14 @@ async fn serve_session(
                         )?;
                         let snapshot_id = envelope.storage_id()?;
                         connection
-                            .send_json(&Response::SnapshotStored {
-                                storage_id: snapshot_id.clone(),
-                                receipt: node.stored_snapshot_receipt(&snapshot)?,
-                            })
+                            .send_json_with_permit(
+                                connection
+                                    .reserve_outgoing_json(ProducerKind::StorageSnapshotControl)?,
+                                &Response::SnapshotStored {
+                                    storage_id: snapshot_id.clone(),
+                                    receipt: node.stored_snapshot_receipt(&snapshot)?,
+                                },
+                            )
                             .await?;
                         snapshot_received = Some((snapshot_id, snapshot));
                     }
@@ -246,21 +281,37 @@ async fn serve_session(
                         }
                         node.admit_snapshot_chunk(snapshot, &chunk)?;
                         let content = connection
-                            .receive_block(&chunk.content_id, chunk.length)
+                            .receive_block_with_permit(
+                                connection.reserve_incoming_block(
+                                    ProducerKind::StorageSnapshotBlock,
+                                    &chunk.content_id,
+                                    chunk.length,
+                                )?,
+                                &chunk.content_id,
+                                chunk.length,
+                            )
                             .await?;
                         node.ingest_snapshot_chunk(snapshot, &chunk, &content)?;
                         connection
-                            .send_json(&Response::SnapshotStored {
-                                storage_id: expected.clone(),
-                                receipt: node.stored_snapshot_receipt(snapshot)?,
-                            })
+                            .send_json_with_permit(
+                                connection
+                                    .reserve_outgoing_json(ProducerKind::StorageChunkControl)?,
+                                &Response::SnapshotStored {
+                                    storage_id: expected.clone(),
+                                    receipt: node.stored_snapshot_receipt(snapshot)?,
+                                },
+                            )
                             .await?;
                     }
                     Request::Finish { storage_id } if storage_id == id => {
                         connection
-                            .send_json(&Response::Stored {
-                                receipt: node.stored_receipt(&received)?,
-                            })
+                            .send_json_with_permit(
+                                connection
+                                    .reserve_outgoing_json(ProducerKind::StorageFinishControl)?,
+                                &Response::Stored {
+                                    receipt: node.stored_receipt(&received)?,
+                                },
+                            )
                             .await?;
                         break;
                     }
@@ -272,6 +323,7 @@ async fn serve_session(
             origin,
             after_sequence,
         } => {
+            let page_permit = connection.reserve_outgoing_json(ProducerKind::StoragePageControl)?;
             let offer = node.forwarded_offer(
                 &origin,
                 connection.peer_identity(),
@@ -285,15 +337,23 @@ async fn serve_session(
                 connection.channel_binding().clone(),
             )?;
             connection
-                .send_json(&Response::Page {
-                    signed_page: offer.clone(),
-                    snapshot: snapshot.clone().map(Box::new),
-                })
+                .send_json_with_permit(
+                    page_permit,
+                    &Response::Page {
+                        signed_page: offer.clone(),
+                        snapshot: snapshot.clone().map(Box::new),
+                    },
+                )
                 .await?;
             let mut count = 0usize;
             let mut bytes = 0u64;
             loop {
-                match connection.receive_json::<Request>().await? {
+                match connection
+                    .receive_json_with_permit::<Request>(
+                        connection.reserve_incoming_json(ProducerKind::StorageDispatchControl)?,
+                    )
+                    .await?
+                {
                     Request::Chunk { storage_id, chunk } if storage_id == id => {
                         count += 1;
                         bytes = bytes
@@ -304,6 +364,13 @@ async fn serve_session(
                         {
                             return Err("storage egress request quota".into());
                         }
+                        let control_permit =
+                            connection.reserve_outgoing_json(ProducerKind::StorageChunkControl)?;
+                        let block_permit = connection.reserve_outgoing_block(
+                            ProducerKind::StoragePageBlock,
+                            &chunk.content_id,
+                            chunk.length,
+                        )?;
                         let content = node.read_forwarded_chunk(
                             &origin,
                             connection.peer_identity(),
@@ -312,12 +379,17 @@ async fn serve_session(
                             &chunk,
                         )?;
                         connection
-                            .send_json(&Response::Chunk {
-                                storage_id: id.clone(),
-                                chunk: chunk.clone(),
-                            })
+                            .send_json_with_permit(
+                                control_permit,
+                                &Response::Chunk {
+                                    storage_id: id.clone(),
+                                    chunk: chunk.clone(),
+                                },
+                            )
                             .await?;
-                        connection.send_block(&chunk.content_id, &content).await?;
+                        connection
+                            .send_block_with_permit(block_permit, &chunk.content_id, &content)
+                            .await?;
                     }
                     Request::SnapshotChunk { storage_id, chunk } => {
                         let snapshot = snapshot.as_ref().ok_or("storage snapshot offer absent")?;
@@ -333,6 +405,13 @@ async fn serve_session(
                         {
                             return Err("storage egress request quota".into());
                         }
+                        let control_permit =
+                            connection.reserve_outgoing_json(ProducerKind::StorageChunkControl)?;
+                        let block_permit = connection.reserve_outgoing_block(
+                            ProducerKind::StorageSnapshotBlock,
+                            &chunk.content_id,
+                            chunk.length,
+                        )?;
                         let content = node.read_snapshot_chunk(
                             &origin,
                             connection.peer_identity(),
@@ -341,16 +420,25 @@ async fn serve_session(
                             &chunk,
                         )?;
                         connection
-                            .send_json(&Response::Chunk {
-                                storage_id,
-                                chunk: chunk.clone(),
-                            })
+                            .send_json_with_permit(
+                                control_permit,
+                                &Response::Chunk {
+                                    storage_id,
+                                    chunk: chunk.clone(),
+                                },
+                            )
                             .await?;
-                        connection.send_block(&chunk.content_id, &content).await?;
+                        connection
+                            .send_block_with_permit(block_permit, &chunk.content_id, &content)
+                            .await?;
                     }
                     Request::Finish { storage_id } if storage_id == id => {
                         connection
-                            .send_json(&Response::Finished { storage_id: id })
+                            .send_json_with_permit(
+                                connection
+                                    .reserve_outgoing_json(ProducerKind::StorageFinishControl)?,
+                                &Response::Finished { storage_id: id },
+                            )
                             .await?;
                         break;
                     }
@@ -372,6 +460,7 @@ pub async fn run(
     max_sessions: u32,
     session_timeout_secs: u64,
     between_sessions_secs: u64,
+    transport_budget: &Selection,
 ) -> Result<()> {
     if !(1..=1_000_000).contains(&max_sessions)
         || !(1..=86_400).contains(&session_timeout_secs)
@@ -386,7 +475,8 @@ pub async fn run(
     node.recover_forwarded_pages()?;
     node.recover_forwarded_snapshots()?;
     let identity = node.transport_identity()?;
-    let listener = Listener::bind(config.bind, &identity, &forwarder)?;
+    let listener =
+        transport_budget.listener(&config.data_dir, config.bind, &identity, &forwarder)?;
     super::shutdown::ready()?;
     println!(
         "{}",
@@ -440,6 +530,7 @@ pub async fn pull(
     address: std::net::SocketAddr,
     after: u64,
     attempt_policy: Option<StoragePullAttemptPolicy>,
+    transport_budget: &Selection,
 ) -> Result<()> {
     if let Some(policy) = &attempt_policy {
         policy.validate(&config, &policy.storage_device)?;
@@ -470,17 +561,26 @@ pub async fn pull(
             Err(error) => return Err(error.into()),
         }
     };
-    let mut connection = Connection::connect(address, &identity, &source).await?;
+    let mut connection = transport_budget
+        .connect(&config.data_dir, address, &identity, &source)
+        .await?;
     connection
-        .send_json(&Request::PullPage {
-            origin: origin.clone(),
-            after_sequence: after,
-        })
+        .send_json_with_permit(
+            connection.reserve_outgoing_json(ProducerKind::StoragePageControl)?,
+            &Request::PullPage {
+                origin: origin.clone(),
+                after_sequence: after,
+            },
+        )
         .await?;
     let Response::Page {
         signed_page,
         snapshot,
-    } = connection.receive_json::<Response>().await?
+    } = connection
+        .receive_json_with_permit::<Response>(
+            connection.reserve_incoming_json(ProducerKind::StoragePageControl)?,
+        )
+        .await?
     else {
         return Err("storage peer page response required".into());
     };
@@ -520,16 +620,28 @@ pub async fn pull(
         if let (Some(ledger), Some(page)) = (&attempt_ledger, &verified_attempt_page) {
             ledger.reserve_page(page, chunk, attempt_now_ms()?)?;
         }
+        let block_permit = connection.reserve_incoming_block(
+            ProducerKind::StoragePageBlock,
+            &chunk.content_id,
+            chunk.length,
+        )?;
         connection
-            .send_json(&Request::Chunk {
-                storage_id: id.clone(),
-                chunk: chunk.clone(),
-            })
+            .send_json_with_permit(
+                connection.reserve_outgoing_json(ProducerKind::StorageChunkControl)?,
+                &Request::Chunk {
+                    storage_id: id.clone(),
+                    chunk: chunk.clone(),
+                },
+            )
             .await?;
         let Response::Chunk {
             storage_id,
             chunk: actual,
-        } = connection.receive_json::<Response>().await?
+        } = connection
+            .receive_json_with_permit::<Response>(
+                connection.reserve_incoming_json(ProducerKind::StorageChunkControl)?,
+            )
+            .await?
         else {
             return Err("storage expected chunk response".into());
         };
@@ -537,7 +649,7 @@ pub async fn pull(
             return Err("storage response chunk identity".into());
         }
         let bytes = connection
-            .receive_block(&chunk.content_id, chunk.length)
+            .receive_block_with_permit(block_permit, &chunk.content_id, chunk.length)
             .await?;
         node.ingest_forwarded_chunk(&received, chunk, &bytes)?;
     }
@@ -594,16 +706,28 @@ pub async fn pull(
                     attempt_now_ms()?,
                 )?;
             }
+            let block_permit = connection.reserve_incoming_block(
+                ProducerKind::StorageSnapshotBlock,
+                &chunk.content_id,
+                chunk.length,
+            )?;
             connection
-                .send_json(&Request::SnapshotChunk {
-                    storage_id: snapshot_id.clone(),
-                    chunk: chunk.clone(),
-                })
+                .send_json_with_permit(
+                    connection.reserve_outgoing_json(ProducerKind::StorageChunkControl)?,
+                    &Request::SnapshotChunk {
+                        storage_id: snapshot_id.clone(),
+                        chunk: chunk.clone(),
+                    },
+                )
                 .await?;
             let Response::Chunk {
                 storage_id,
                 chunk: actual,
-            } = connection.receive_json::<Response>().await?
+            } = connection
+                .receive_json_with_permit::<Response>(
+                    connection.reserve_incoming_json(ProducerKind::StorageChunkControl)?,
+                )
+                .await?
             else {
                 return Err("storage expected snapshot chunk response".into());
             };
@@ -611,7 +735,7 @@ pub async fn pull(
                 return Err("storage snapshot response chunk identity".into());
             }
             let bytes = connection
-                .receive_block(&chunk.content_id, chunk.length)
+                .receive_block_with_permit(block_permit, &chunk.content_id, chunk.length)
                 .await?;
             node.ingest_snapshot_chunk(&snapshot, chunk, &bytes)?;
         }
@@ -621,11 +745,19 @@ pub async fn pull(
         });
     }
     connection
-        .send_json(&Request::Finish {
-            storage_id: id.clone(),
-        })
+        .send_json_with_permit(
+            connection.reserve_outgoing_json(ProducerKind::StorageFinishControl)?,
+            &Request::Finish {
+                storage_id: id.clone(),
+            },
+        )
         .await?;
-    let Response::Finished { storage_id } = connection.receive_json::<Response>().await? else {
+    let Response::Finished { storage_id } = connection
+        .receive_json_with_permit::<Response>(
+            connection.reserve_incoming_json(ProducerKind::StorageFinishControl)?,
+        )
+        .await?
+    else {
         return Err("storage final response required".into());
     };
     if storage_id != id {
@@ -663,8 +795,18 @@ pub async fn push(
     storage: PeerIdentity,
     address: std::net::SocketAddr,
     after: u64,
+    transport_budget: &Selection,
 ) -> Result<()> {
-    push_with_snapshot(data, origin, storage, address, after, None).await
+    push_with_snapshot(
+        data,
+        origin,
+        storage,
+        address,
+        after,
+        None,
+        transport_budget,
+    )
+    .await
 }
 
 /// Preserve exact independently signed originals while the original device is offline.
@@ -676,6 +818,7 @@ pub async fn client_pull(
     address: std::net::SocketAddr,
     after: u64,
     limits: &sync_extend_core_model::limits::LocalLimits,
+    transport_budget: &Selection,
 ) -> Result<()> {
     let mut local = sync_extend_reconcile::LocalSpace::open_with_limits(&data, limits.clone())?;
     if local.read_transport_peer(&source.device_id)? != source
@@ -686,17 +829,26 @@ pub async fn client_pull(
         );
     }
     let identity = local.transport_identity()?;
-    let mut connection = Connection::connect(address, &identity, &source).await?;
+    let mut connection = transport_budget
+        .connect(&data, address, &identity, &source)
+        .await?;
     connection
-        .send_json(&Request::PullPage {
-            origin: origin.clone(),
-            after_sequence: after,
-        })
+        .send_json_with_permit(
+            connection.reserve_outgoing_json(ProducerKind::StoragePageControl)?,
+            &Request::PullPage {
+                origin: origin.clone(),
+                after_sequence: after,
+            },
+        )
         .await?;
     let Response::Page {
         signed_page,
         snapshot: _,
-    } = connection.receive_json::<Response>().await?
+    } = connection
+        .receive_json_with_permit::<Response>(
+            connection.reserve_incoming_json(ProducerKind::StoragePageControl)?,
+        )
+        .await?
     else {
         return Err("client storage expected forwarded page".into());
     };
@@ -722,22 +874,49 @@ pub async fn client_pull(
         return Err("client forwarded page exceeds bounded chunk request count".into());
     }
     if !prepared.missing_chunks.is_empty() {
+        let block_permits = connection.reserve_incoming_blocks(
+            ProducerKind::StoragePageBlock,
+            prepared
+                .missing_chunks
+                .iter()
+                .map(|chunk| (&chunk.content_id, chunk.length)),
+        )?;
+        let mut control_permits = Vec::new();
+        control_permits
+            .try_reserve_exact(prepared.missing_chunks.len())
+            .map_err(|_| "bounded client chunk control permit allocation")?;
+        for _ in &prepared.missing_chunks {
+            control_permits
+                .push(connection.reserve_outgoing_json(ProducerKind::StorageChunkControl)?);
+        }
         let request = sync_extend_transport::SignedOriginalContentRequest::sign(
             &identity,
             &offer,
             offer.request(prepared.missing_chunks.clone())?,
         )?;
-        for chunk in &prepared.missing_chunks {
+        for ((chunk, block_permit), control_permit) in prepared
+            .missing_chunks
+            .iter()
+            .zip(block_permits)
+            .zip(control_permits)
+        {
             connection
-                .send_json(&Request::Chunk {
-                    storage_id: storage_id.clone(),
-                    chunk: chunk.clone(),
-                })
+                .send_json_with_permit(
+                    control_permit,
+                    &Request::Chunk {
+                        storage_id: storage_id.clone(),
+                        chunk: chunk.clone(),
+                    },
+                )
                 .await?;
             let Response::Chunk {
                 storage_id: actual_id,
                 chunk: actual,
-            } = connection.receive_json::<Response>().await?
+            } = connection
+                .receive_json_with_permit::<Response>(
+                    connection.reserve_incoming_json(ProducerKind::StorageChunkControl)?,
+                )
+                .await?
             else {
                 return Err("client storage expected exact chunk response".into());
             };
@@ -745,7 +924,7 @@ pub async fn client_pull(
                 return Err("client storage response request/chunk differs".into());
             }
             let bytes = connection
-                .receive_block(&chunk.content_id, chunk.length)
+                .receive_block_with_permit(block_permit, &chunk.content_id, chunk.length)
                 .await?;
             local.ingest_forwarded_content_block(
                 &envelope,
@@ -762,13 +941,20 @@ pub async fn client_pull(
     }
     let received = local.receive_forwarded_page(&prepared.page_request_id)?;
     connection
-        .send_json(&Request::Finish {
-            storage_id: storage_id.clone(),
-        })
+        .send_json_with_permit(
+            connection.reserve_outgoing_json(ProducerKind::StorageFinishControl)?,
+            &Request::Finish {
+                storage_id: storage_id.clone(),
+            },
+        )
         .await?;
     let Response::Finished {
         storage_id: actual_id,
-    } = connection.receive_json::<Response>().await?
+    } = connection
+        .receive_json_with_permit::<Response>(
+            connection.reserve_incoming_json(ProducerKind::StorageFinishControl)?,
+        )
+        .await?
     else {
         return Err("client storage final response required".into());
     };
@@ -787,10 +973,14 @@ pub async fn push_with_snapshot(
     address: std::net::SocketAddr,
     after: u64,
     report: Option<sync_extend_transport::SignedStorageSnapshotReport>,
+    transport_budget: &Selection,
 ) -> Result<()> {
     let local = sync_extend_reconcile::LocalSpace::open(&data)?;
     let identity = local.transport_identity()?;
-    let mut connection = Connection::connect(address, &identity, &storage).await?;
+    let mut connection = transport_budget
+        .connect(&data, address, &identity, &storage)
+        .await?;
+    let page_permit = connection.reserve_outgoing_json(ProducerKind::StoragePageControl)?;
     let signed = StorageNode::local_forwarding_page(
         &local,
         &origin,
@@ -799,12 +989,20 @@ pub async fn push_with_snapshot(
         after,
     )?;
     connection
-        .send_json(&Request::StorePage {
-            origin: origin.clone(),
-            signed_page: signed.clone(),
-        })
+        .send_json_with_permit(
+            page_permit,
+            &Request::StorePage {
+                origin: origin.clone(),
+                signed_page: signed.clone(),
+            },
+        )
         .await?;
-    let Response::Stored { receipt } = connection.receive_json::<Response>().await? else {
+    let Response::Stored { receipt } = connection
+        .receive_json_with_permit::<Response>(
+            connection.reserve_incoming_json(ProducerKind::StoragePageControl)?,
+        )
+        .await?
+    else {
         return Err("storage initial signed receipt required".into());
     };
     receipt.verify(&storage, &signed.page)?;
@@ -829,21 +1027,39 @@ pub async fn push_with_snapshot(
         {
             return Err("client forward bounded request".into());
         }
+        let control_permit = connection.reserve_outgoing_json(ProducerKind::StorageChunkControl)?;
+        let block_permit = connection.reserve_outgoing_block(
+            ProducerKind::StoragePageBlock,
+            &chunk.content_id,
+            chunk.length,
+        )?;
         let bytes = StorageNode::local_forwarded_chunk(&local, &origin, &storage, &signed, chunk)?;
         connection
-            .send_json(&Request::Chunk {
-                storage_id: id.clone(),
-                chunk: chunk.clone(),
-            })
+            .send_json_with_permit(
+                control_permit,
+                &Request::Chunk {
+                    storage_id: id.clone(),
+                    chunk: chunk.clone(),
+                },
+            )
             .await?;
-        connection.send_block(&chunk.content_id, &bytes).await?;
-        let Response::Stored { receipt } = connection.receive_json::<Response>().await? else {
+        connection
+            .send_block_with_permit(block_permit, &chunk.content_id, &bytes)
+            .await?;
+        let Response::Stored { receipt } = connection
+            .receive_json_with_permit::<Response>(
+                connection.reserve_incoming_json(ProducerKind::StorageChunkControl)?,
+            )
+            .await?
+        else {
             return Err("storage signed chunk receipt required".into());
         };
         receipt.verify(&storage, &signed.page)?;
     }
     let mut stored_snapshot_receipt = None;
     if let Some(report) = report {
+        let snapshot_permit =
+            connection.reserve_outgoing_json(ProducerKind::StorageSnapshotControl)?;
         let envelope = StorageNode::local_forwarding_snapshot(
             &local,
             &origin,
@@ -853,14 +1069,21 @@ pub async fn push_with_snapshot(
         )?;
         let snapshot_id = envelope.storage_id()?;
         connection
-            .send_json(&Request::Snapshot {
-                envelope: Box::new(envelope.clone()),
-            })
+            .send_json_with_permit(
+                snapshot_permit,
+                &Request::Snapshot {
+                    envelope: Box::new(envelope.clone()),
+                },
+            )
             .await?;
         let Response::SnapshotStored {
             storage_id,
             receipt,
-        } = connection.receive_json::<Response>().await?
+        } = connection
+            .receive_json_with_permit::<Response>(
+                connection.reserve_incoming_json(ProducerKind::StorageSnapshotControl)?,
+            )
+            .await?
         else {
             return Err("storage snapshot report response required".into());
         };
@@ -903,19 +1126,35 @@ pub async fn push_with_snapshot(
             if transferred > sync_extend_transport::MAX_ORIGINAL_CONTENT_BYTES {
                 return Err("snapshot transfer bounded request".into());
             }
+            let control_permit =
+                connection.reserve_outgoing_json(ProducerKind::StorageChunkControl)?;
+            let block_permit = connection.reserve_outgoing_block(
+                ProducerKind::StorageSnapshotBlock,
+                &chunk.content_id,
+                chunk.length,
+            )?;
             let bytes =
                 StorageNode::local_snapshot_chunk(&local, &origin, &storage, &envelope, chunk)?;
             connection
-                .send_json(&Request::SnapshotChunk {
-                    storage_id: snapshot_id.clone(),
-                    chunk: chunk.clone(),
-                })
+                .send_json_with_permit(
+                    control_permit,
+                    &Request::SnapshotChunk {
+                        storage_id: snapshot_id.clone(),
+                        chunk: chunk.clone(),
+                    },
+                )
                 .await?;
-            connection.send_block(&chunk.content_id, &bytes).await?;
+            connection
+                .send_block_with_permit(block_permit, &chunk.content_id, &bytes)
+                .await?;
             let Response::SnapshotStored {
                 storage_id,
                 receipt,
-            } = connection.receive_json::<Response>().await?
+            } = connection
+                .receive_json_with_permit::<Response>(
+                    connection.reserve_incoming_json(ProducerKind::StorageChunkControl)?,
+                )
+                .await?
             else {
                 return Err("storage snapshot chunk response required".into());
             };
@@ -928,9 +1167,17 @@ pub async fn push_with_snapshot(
         stored_snapshot_receipt = Some(snapshot_receipt);
     }
     connection
-        .send_json(&Request::Finish { storage_id: id })
+        .send_json_with_permit(
+            connection.reserve_outgoing_json(ProducerKind::StorageFinishControl)?,
+            &Request::Finish { storage_id: id },
+        )
         .await?;
-    let Response::Stored { receipt } = connection.receive_json::<Response>().await? else {
+    let Response::Stored { receipt } = connection
+        .receive_json_with_permit::<Response>(
+            connection.reserve_incoming_json(ProducerKind::StorageFinishControl)?,
+        )
+        .await?
+    else {
         return Err("storage final signed receipt required".into());
     };
     receipt.verify(&storage, &signed.page)?;

@@ -7,8 +7,8 @@ use sync_extend_core_model::{
     ContentId, Entry, EntryKind, FileManifest, PortablePath, SnapshotId, SpaceId,
 };
 use sync_extend_journal::{
-    ReadOnlyRestorePreviewSource, ReadOnlySnapshotPreviewLimits, ReadOnlySnapshotPreviewSource,
-    validate_preview_manifest,
+    validate_preview_manifest, ReadOnlyRestorePreviewSource, ReadOnlySnapshotPreviewLimits,
+    ReadOnlySnapshotPreviewSource,
 };
 
 #[cfg(not(target_os = "linux"))]
@@ -245,40 +245,19 @@ impl ReadOnlyLocalSpace {
         Self::restore_preview_available()?;
         #[cfg(target_os = "linux")]
         {
-            let files = sync_extend_platform_fs::ReadOnlyJournalFiles::preflight(
-                &data_dir.join("journal.sqlite"),
-            )?;
-            let input = sync_extend_platform_fs::ReadOnlyControlInput::open(budgets, &files)?;
-            let original_digest = ContentId::hash(input.bytes());
-            let result = (|| {
+            with_budget_source(data_dir, budgets, |reader, limits| {
                 let request = RestorePreviewRequest {
                     format_version: 1,
                     snapshot,
                     expected_baseline,
                     selection,
-                    limits: serde_json::from_slice(input.bytes())?,
+                    limits,
                 };
                 request.validate()?;
-                input.verify()?;
-                let reader =
-                    sync_extend_journal::ReadOnlyRestorePreviewJournal::from_existing_files(
-                        files,
-                        request.limits.source,
-                    )?;
                 let source =
                     reader.snapshots(&request.snapshot, request.expected_baseline.as_ref())?;
-                let preview = project_restore_preview(&source, &request)?;
-                reader.verify()?;
-                Ok(preview)
-            })();
-            // Success and typed control-input refusal both recheck the retained
-            // original raw bytes, name chain, identity and descriptor owner.
-            if ContentId::hash(&input.read_verified()?) != original_digest {
-                return Err(ReconcileError::Invariant(
-                    "readonly restore preview control input digest changed",
-                ));
-            }
-            result
+                project_restore_preview(&source, &request)
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -324,7 +303,7 @@ fn add(total: &mut u64, value: u64, limit: u64) -> Result<()> {
     Ok(())
 }
 
-fn validate_source(
+pub(super) fn validate_source(
     source: &ReadOnlySnapshotPreviewSource,
     space: &SpaceId,
     bounds: ReadOnlySnapshotPreviewLimits,
@@ -357,6 +336,76 @@ fn validate_source(
         return Err(ReconcileError::Invariant(
             "readonly restore preview typed snapshot metadata mismatch",
         ));
+    }
+    Ok(())
+}
+
+/// The v1 and v2 offline routes retain the same one-flock source and no-atime
+/// control input. A refusal also verifies the original control bytes.
+#[cfg(target_os = "linux")]
+pub(super) fn with_budget_source<T>(
+    data_dir: &std::path::Path,
+    budgets: &std::path::Path,
+    project: impl FnOnce(
+        &sync_extend_journal::ReadOnlyRestorePreviewJournal,
+        RestorePreviewLimits,
+    ) -> Result<T>,
+) -> Result<T> {
+    let files =
+        sync_extend_platform_fs::ReadOnlyJournalFiles::preflight(&data_dir.join("journal.sqlite"))?;
+    let input = sync_extend_platform_fs::ReadOnlyControlInput::open(budgets, &files)?;
+    let original_digest = ContentId::hash(input.bytes());
+    let result = (|| {
+        let limits: RestorePreviewLimits = serde_json::from_slice(input.bytes())?;
+        limits.validate()?;
+        input.verify()?;
+        let reader = sync_extend_journal::ReadOnlyRestorePreviewJournal::from_existing_files(
+            files,
+            limits.source,
+        )?;
+        let preview = project(&reader, limits);
+        reader.verify()?;
+        preview
+    })();
+    if ContentId::hash(&input.read_verified()?) != original_digest {
+        return Err(ReconcileError::Invariant(
+            "readonly restore preview control input digest changed",
+        ));
+    }
+    result
+}
+
+pub(super) fn validate_content_descriptions<'a>(
+    snapshots: impl IntoIterator<Item = &'a sync_extend_journal::RetainedSnapshot>,
+) -> Result<()> {
+    let mut files = BTreeMap::<ContentId, &FileManifest>::new();
+    let mut chunks = BTreeMap::<ContentId, u32>::new();
+    for snapshot in snapshots {
+        for content in snapshot
+            .manifest
+            .entries
+            .values()
+            .filter_map(|entry| entry.content.as_ref())
+        {
+            if files
+                .insert(content.content_id.clone(), content)
+                .is_some_and(|previous| previous != content)
+            {
+                return Err(ReconcileError::Invariant(
+                    "readonly restore preview conflicting file description",
+                ));
+            }
+            for chunk in &content.chunks {
+                if chunks
+                    .insert(chunk.content_id.clone(), chunk.length)
+                    .is_some_and(|previous| previous != chunk.length)
+                {
+                    return Err(ReconcileError::Invariant(
+                        "readonly restore preview conflicting chunk length",
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -414,35 +463,7 @@ pub fn project_restore_preview(
     }
     // Conflicting file/chunk descriptions are metadata corruption, even before
     // CAS availability is checked. Never treat a hash as authenticated bytes.
-    let mut file_descriptions = BTreeMap::<ContentId, &FileManifest>::new();
-    let mut chunk_descriptions = BTreeMap::<ContentId, u32>::new();
-    for snapshot in [baseline, target].into_iter().flatten() {
-        for content in snapshot
-            .manifest
-            .entries
-            .values()
-            .filter_map(|entry| entry.content.as_ref())
-        {
-            if file_descriptions
-                .insert(content.content_id.clone(), content)
-                .is_some_and(|previous| previous != content)
-            {
-                return Err(ReconcileError::Invariant(
-                    "readonly restore preview conflicting file description",
-                ));
-            }
-            for chunk in &content.chunks {
-                if chunk_descriptions
-                    .insert(chunk.content_id.clone(), chunk.length)
-                    .is_some_and(|previous| previous != chunk.length)
-                {
-                    return Err(ReconcileError::Invariant(
-                        "readonly restore preview conflicting chunk length",
-                    ));
-                }
-            }
-        }
-    }
+    validate_content_descriptions([baseline, target].into_iter().flatten())?;
     let all_baseline: BTreeMap<_, _> = baseline
         .into_iter()
         .flat_map(|snapshot| snapshot.manifest.entries.values())

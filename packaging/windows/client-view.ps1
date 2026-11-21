@@ -1,6 +1,214 @@
 #Requires -Version 7.0
 # Pure display projection. This file never opens a workspace or a ledger.
 
+function Assert-SyncExtendRestorePath($Value) {
+    Assert-SyncExtendViewText $Value 4096
+    if ($Value -cmatch '[\x00-\x1f<>:"\\|?*]' -or
+        [Text.Encoding]::UTF8.GetByteCount($Value) -gt 4096) { throw 'Invalid portable restore path.' }
+    foreach ($part in $Value.Split('/')) {
+        if (!$part -or $part -ceq '.' -or $part -ceq '..' -or $part.EndsWith('.') -or $part.EndsWith(' ')) {
+            throw 'Invalid portable restore path component.'
+        }
+    }
+}
+
+function Assert-SyncExtendRestoreContext($Context) {
+    Assert-SyncExtendViewObject $Context
+    Assert-SyncExtendViewId $Context.owner_generation 32
+    Assert-SyncExtendViewFlag $Context.available
+    Assert-SyncExtendViewFlag $Context.snapshots_truncated
+    Assert-SyncExtendViewList $Context.snapshots 128
+    Assert-SyncExtendViewList $Context.spaces 64
+    Assert-SyncExtendViewFlag $Context.spaces_truncated
+    foreach ($space in $Context.spaces) { Assert-SyncExtendViewId $space 32 }
+    if ($Context.cache_max_age_ms -ne 10000 -or $Context.spaces_limit -ne 64 -or
+        $Context.snapshots_limit -ne 128 -or
+        ($Context.available -and ($null -eq $Context.cache_age_ms -or $Context.cache_age_ms -gt 10000))) {
+        throw 'Restore context freshness or record bound differs.'
+    }
+    if ($Context.preview_context_format_version -ne 2) { throw 'Invalid restore context version.' }
+    foreach ($flag in @('restoration_performed', 'native_authority', 'cleanup_authority',
+            'pending_resume_authority', 'execution_available_from_preview')) {
+        Assert-SyncExtendViewFlag $Context[$flag]
+        if ($Context[$flag]) { throw 'Restore context cannot grant execution authority.' }
+    }
+    if ($null -ne $Context.space_id) { Assert-SyncExtendViewId $Context.space_id 32 }
+    if ($null -ne $Context.current_snapshot_id) { Assert-SyncExtendViewId $Context.current_snapshot_id }
+    if ($Context.available -and (!$Context.space_id -or !$Context.snapshots.Count)) {
+        throw 'Available restore context requires current owner history.'
+    }
+    foreach ($snapshot in $Context.snapshots) {
+        Assert-SyncExtendViewObject $snapshot
+        Assert-SyncExtendViewId $snapshot.snapshot_id
+        foreach ($flag in @('locked', 'content_retained', 'current')) { Assert-SyncExtendViewFlag $snapshot[$flag] }
+        if ($snapshot.state -cnotin @('metadata_only', 'content_closed', 'materialized')) {
+            throw 'Invalid restore snapshot state.'
+        }
+    }
+    Assert-SyncExtendViewObject $Context.limits
+    Assert-SyncExtendViewObject $Context.limits.source
+    foreach ($key in @('max_journal_bytes', 'max_manifest_bytes', 'max_entries', 'max_chunk_visits',
+            'max_reference_rows', 'max_vm_instructions', 'max_query_millis')) {
+        $null = Get-SyncExtendViewInteger $Context.limits.source[$key]
+    }
+    foreach ($key in @('max_output_entries', 'max_output_cas_references', 'max_output_bytes',
+            'max_selected_logical_bytes', 'max_resource_estimate_bytes')) {
+        $null = Get-SyncExtendViewInteger $Context.limits[$key]
+    }
+    if ($Context.limits.max_output_entries -gt 128 -or $Context.limits.max_output_cas_references -gt 128 -or
+        $Context.limits.max_output_bytes -gt 262144) { throw 'Restore context exceeds client limits.' }
+}
+
+function New-SyncExtendRestoreRequest {
+    param($Context, [string]$SnapshotId, [string]$Mode, [string]$Paths,
+        [string]$DestinationPrefix, [string]$CurrentExtraPolicy = 'preserve',
+        [string]$OccupiedTargetPolicy = 'report_conflicts')
+    Assert-SyncExtendRestoreContext $Context
+    if (!$Context.available) { throw 'Current owner restore history is unavailable.' }
+    Assert-SyncExtendViewId $SnapshotId
+    if ($Mode -cnotin @('full', 'file', 'directory', 'paths') -or
+        $CurrentExtraPolicy -cnotin @('preserve', 'replace_selected_scope') -or
+        $OccupiedTargetPolicy -cnotin @('report_conflicts', 'replace_files')) {
+        throw 'Invalid explicit restore selection policy.'
+    }
+    $selection = [ordered]@{ type = $Mode }
+    if ($Mode -cne 'full') {
+        $names = @($Paths -split '\r?\n' | Where-Object { $_.Length -gt 0 })
+        if (!$names.Count -or $names.Count -gt 64 -or
+            ($Mode -cne 'paths' -and $names.Count -ne 1)) { throw 'Specify the explicit restore source paths.' }
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $bytes = 0
+        foreach ($name in $names) {
+            Assert-SyncExtendRestorePath $name
+            $bytes += [Text.Encoding]::UTF8.GetByteCount($name)
+            if (!$seen.Add($name)) { throw 'Duplicate restore source path.' }
+        }
+        if ($bytes -gt 16384) { throw 'Restore source paths exceed their byte limit.' }
+        if ($Mode -ceq 'paths') { $selection.paths = $names } else { $selection.path = $names[0] }
+    }
+    $prefix = $null
+    if ($DestinationPrefix.Length) {
+        Assert-SyncExtendRestorePath $DestinationPrefix
+        $prefix = $DestinationPrefix
+    }
+    return [ordered]@{
+        owner_generation = $Context.owner_generation
+        request = [ordered]@{
+            format_version = 2; space_id = $Context.space_id; snapshot = $SnapshotId
+            expected_baseline = $Context.current_snapshot_id; selection = $selection
+            destination_prefix = $prefix; current_extra_policy = $CurrentExtraPolicy
+            occupied_target_policy = $OccupiedTargetPolicy; limits = $Context.limits
+        }
+    }
+}
+
+function Get-SyncExtendRestoreRequestHex($Request) {
+    $json = $Request | ConvertTo-Json -Depth 24 -Compress
+    $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+    # Keep the native Windows command line below its 32767-character bound.
+    if ($bytes.Length -gt 8192) { throw 'Restore request exceeds the Windows client command limit.' }
+    return [Convert]::ToHexString($bytes).ToLowerInvariant()
+}
+
+function New-SyncExtendRestorePreviewView($Response, $Request) {
+    Assert-SyncExtendViewObject $Response
+    Assert-SyncExtendViewId $Response.owner_generation 32
+    if ($Response.preview_format_version -ne 2 -or $Response.owner_generation -cne $Request.owner_generation -or
+        $Response.space_id -cne $Request.request.space_id -or
+        $Response.target.snapshot_id -cne $Request.request.snapshot -or
+        $Response.source_interpretation -cne 'live_owner_deferred_transaction' -or
+        $null -ne $Response.source_image_bytes -or $null -ne $Response.source_image_digest -or
+        $null -ne $Response.memory_header_projected -or
+        $Response.destination_prefix -cne $Request.request.destination_prefix -or
+        $Response.current_extra_policy -cne $Request.request.current_extra_policy -or
+        $Response.occupied_target_policy -cne $Request.request.occupied_target_policy -or
+        $Response.selection.type -cne $Request.request.selection.type -or
+        $Response.selection.path -cne $Request.request.selection.path -or
+        [string]::Join([char]0, [string[]]@($Response.selection.paths)) -cne
+        [string]::Join([char]0, [string[]]@($Request.request.selection.paths))) {
+        throw 'Restore preview owner or requested scope changed.'
+    }
+    foreach ($flag in @('restoration_performed', 'preparation_performed', 'native_authority', 'cleanup_authority',
+            'pending_resume_authority', 'execution_available_from_preview', 'content_hashes_verified',
+            'worktree_scanned', 'native_conflicts_checked')) {
+        Assert-SyncExtendViewFlag $Response[$flag]
+        if ($Response[$flag]) { throw 'Restore preview cannot grant execution authority.' }
+    }
+    Assert-SyncExtendViewFlag $Response.entries_truncated
+    Assert-SyncExtendViewFlag $Response.cas_references_truncated
+    Assert-SyncExtendViewList $Response.entries 128
+    Assert-SyncExtendViewList $Response.cas_references 128
+    foreach ($key in @('output_byte_limit', 'output_bytes_including_lf', 'entries_limit', 'cas_references_limit')) {
+        $null = Get-SyncExtendViewInteger $Response[$key]
+    }
+    if ($Response.output_byte_limit -gt 262144 -or $Response.output_bytes_including_lf -gt $Response.output_byte_limit -or
+        $Response.entries_limit -gt 128 -or $Response.cas_references_limit -gt 128) {
+        throw 'Restore preview exceeds its client output bound.'
+    }
+    $operationNames = @{
+        preserve_current = '保留当前项'; new_create_file = '描述新建文件'; new_create_directory = '描述新建目录'
+        new_replace_file = '描述新的覆盖操作'; new_delete_file = '描述新的删除操作'
+        new_remove_directory = '描述新的目录移除'; report_conflict = '报告冲突'; unknown = '未知'
+    }
+    $differenceNames = @{
+        unchanged = '元数据相同'; target_only = '仅历史存在'; file_contents_differ = '文件描述不同'
+        current_only = '仅当前存在'; type_conflict = '类型冲突'; case_conflict = '大小写冲突'
+        ancestor_file_conflict = '祖先路径是文件'; baseline_unchecked = '基线未验证'
+    }
+    $rows = [Collections.Generic.List[object]]::new()
+    foreach ($entry in $Response.entries) {
+        Assert-SyncExtendViewObject $entry
+        Assert-SyncExtendRestorePath $entry.destination_path
+        foreach ($key in @('source_path', 'conflict_path')) {
+            if ($null -ne $entry[$key]) { Assert-SyncExtendRestorePath $entry[$key] }
+        }
+        if (!$operationNames.ContainsKey($entry.proposed_operation) -or
+            !$differenceNames.ContainsKey($entry.difference) -or $entry.native_state -cne 'unchecked') {
+            throw 'Invalid inert restore operation description.'
+        }
+        foreach ($key in @('current_bytes', 'historical_bytes')) {
+            if ($null -ne $entry[$key]) { $null = Get-SyncExtendViewInteger $entry[$key] }
+        }
+        [void]$rows.Add(@(
+            $(if ($entry.source_path) { $entry.source_path } else { '当前额外项' }),
+            $entry.destination_path, $differenceNames[$entry.difference], $operationNames[$entry.proposed_operation],
+            $(if ($null -ne $entry.historical_bytes) { Format-SyncExtendViewBytes $entry.historical_bytes } else { '—' }),
+            $(if ($null -ne $entry.current_bytes) { Format-SyncExtendViewBytes $entry.current_bytes } else { '—' }),
+            $(if ($entry.conflict_path) { $entry.conflict_path } else { '—' })
+        ))
+    }
+    Assert-SyncExtendViewObject $Response.counts
+    Assert-SyncExtendViewObject $Response.resources
+    foreach ($key in @('selected_target_entries', 'compared_paths', 'preserved_current_paths',
+            'reported_conflicts', 'proposed_replace_files', 'proposed_delete_files', 'proposed_remove_directories')) {
+        $null = Get-SyncExtendViewInteger $Response.counts[$key]
+    }
+    $resources = $Response.resources
+    foreach ($key in @('target_logical_bytes', 'unique_target_chunk_bytes', 'metadata_bytes_estimate')) {
+        $null = Get-SyncExtendViewInteger $resources[$key]
+    }
+    foreach ($key in @('staging_bytes_estimate', 'baseline_original_bytes_estimate')) {
+        if ($null -ne $resources[$key]) { $null = Get-SyncExtendViewInteger $resources[$key] }
+    }
+    foreach ($key in @('physical_allocation_checked', 'free_space_checked', 'capacity_reserved')) {
+        Assert-SyncExtendViewFlag $resources[$key]
+        if ($resources[$key]) { throw 'Restore preview cannot certify physical capacity.' }
+    }
+    $staging = if ($null -eq $resources.staging_bytes_estimate) { '未知（存在冲突或基线未确认）' } else {
+        Format-SyncExtendViewBytes $resources.staging_bytes_estimate
+    }
+    $original = if ($null -eq $resources.baseline_original_bytes_estimate) { '未知' } else {
+        Format-SyncExtendViewBytes $resources.baseline_original_bytes_estimate
+    }
+    $details = "只读描述，尚未恢复。选中 $($Response.counts.selected_target_entries) 项；保留当前 $($Response.counts.preserved_current_paths) 项；冲突 $($Response.counts.reported_conflicts) 项。"
+    $details += "`r`n逻辑暂存：$staging；原内容估计：$original。CAS 内容、原生路径冲突、可用空间和实际物理分配均未验证。"
+    if ($Response.entries_truncated -or $Response.cas_references_truncated) {
+        $details += "`r`n结果表或块引用已按显示预算截断；完整选中数量仍保留。"
+    }
+    if ($Response.content_availability -ceq 'pruned') { $details += "`r`n此快照已裁剪，历史内容不可从本预览确认恢复。" }
+    return @{ Rows = $rows; Summary = $details }
+}
+
 function Assert-SyncExtendViewObject($Value) {
     if ($Value -isnot [Collections.IDictionary]) { throw 'The local observation has an invalid object.' }
 }

@@ -5,6 +5,7 @@ const commands = Object.freeze({
   stop: "/system/bin/sh /data/adb/modules/sync_extend/action.sh stop",
   stopped: "/system/bin/sh /data/adb/modules/sync_extend/action.sh wait-stopped",
   gateway: "/system/bin/sh /data/adb/modules/sync_extend/webroot/gateway.sh",
+  "preview-context": "/system/bin/sh /data/adb/modules/sync_extend/webroot/gateway.sh preview-context",
 });
 
 const fields = {};
@@ -15,6 +16,8 @@ const fields = {};
   "storage-state", "storage-detail", "storage-summary", "network-state", "network-detail", "network-summary",
   "easytier-state", "easytier-detail", "easytier-summary",
   "recovery-state", "recovery-detail", "recovery-summary", "recovery-guide",
+  "restore-space", "restore-snapshot", "restore-selection", "restore-paths", "restore-prefix", "restore-extra-policy",
+  "restore-occupied-policy", "restore-preview", "restore-detail", "restore-summary", "restore-results", "restore-rows",
 ].forEach((id) => { fields[id] = document.getElementById(id); });
 
 const canUseBridge = Boolean(window.ksu && typeof window.ksu.exec === "function");
@@ -28,17 +31,23 @@ let gatewayConfigured = false;
 let gatewayDisabled = false;
 let currentOwnerPid = null;
 let liveGateway = null;
+let restoreContext = null;
 const validExportName = (name) => typeof name === "string" && name.length >= 1 &&
   name.length <= 64 && !/[^A-Za-z0-9_-]/.test(name);
 
 function readJson(operation, selectedExport) {
   return new Promise((resolve, reject) => {
     let command;
-    if (Object.prototype.hasOwnProperty.call(commands, operation)) {
+    if (operation === "preview-context" && selectedExport !== undefined) {
+      if (restoreId(selectedExport, 32)) command = `${commands["preview-context"]} '${selectedExport}'`;
+    } else if (Object.prototype.hasOwnProperty.call(commands, operation)) {
       command = commands[operation];
     } else if (operation === "probe" && validExportName(selectedExport)) {
       // The only dynamic command segment is a validated literal export name.
       command = `/system/bin/sh /data/adb/modules/sync_extend/action.sh probe-webdav '${selectedExport}'`;
+    } else if (operation === "preview" && typeof selectedExport === "string" &&
+        selectedExport.length <= 131072 && selectedExport.length % 2 === 0 && /^[0-9a-f]+$/.test(selectedExport)) {
+      command = `/system/bin/sh /data/adb/modules/sync_extend/webroot/gateway.sh preview '${selectedExport}'`;
     }
     if (!canUseBridge || !command) {
       reject(new Error("KernelSU bridge unavailable"));
@@ -55,8 +64,10 @@ function readJson(operation, selectedExport) {
     }, 8000);
     window[callback] = (code, output) => {
       finish();
-      if (code !== 0 || typeof output !== "string" ||
-          output.length > (operation === "gateway" ? 65536 : 16384)) {
+      const responseLimit = operation === "preview" || operation === "preview-context" ? 262144 :
+        (operation === "gateway" ? 65536 : 16384);
+      if (code !== 0 || typeof output !== "string" || output.length > responseLimit ||
+          new TextEncoder().encode(output).length > responseLimit) {
         reject(new Error("Module operation refused"));
         return;
       }
@@ -64,8 +75,14 @@ function readJson(operation, selectedExport) {
         const value = JSON.parse(output);
         // The CLI pretty-prints native control JSON. Its display whitespace
         // does not enlarge the existing 4096-byte native protocol allowance.
-        if (operation !== "gateway" && new TextEncoder().encode(JSON.stringify(value)).length > 4096) {
+        if (!["gateway", "preview-context", "preview"].includes(operation) &&
+            new TextEncoder().encode(JSON.stringify(value)).length > 4096) {
           throw new Error("Native control response exceeds its bound");
+        }
+        if ((operation === "preview" || (operation === "preview-context" && Array.isArray(value.spaces))) &&
+            (!output.endsWith("\n") ||
+            value.output_bytes_including_lf !== new TextEncoder().encode(output).length)) {
+          throw new Error("Preview wire response differs");
         }
         resolve(value);
       } catch (error) {
@@ -95,6 +112,12 @@ function setBusy(value) {
   fields["ask-stop"].disabled = busy || !activeOwner || !canUseBridge;
   fields.stop.disabled = busy || !activeOwner || !canUseBridge;
   for (const button of probeButtons) button.disabled = busy || !ownerReady || !canUseBridge;
+  for (const name of ["snapshot", "selection", "prefix", "extra-policy", "occupied-policy", "preview"]) {
+    fields[`restore-${name}`].disabled = busy || !ownerReady || !canUseBridge || !restoreContext?.available;
+  }
+  fields["restore-paths"].disabled = busy || !ownerReady || !canUseBridge ||
+    !restoreContext?.available || fields["restore-selection"].value === "full";
+  fields["restore-space"].disabled = busy || !ownerReady || !canUseBridge || !restoreContext?.spaces?.length;
 }
 
 function hideConfirmation() {
@@ -111,6 +134,179 @@ function clearRuntime(detail = "当前没有可验证的运行摘要。") {
   fields["network-detail"].textContent = "当前没有已鉴权的连接样本；实际路径、外层 wire 和中继费用保持未知。";
   fields["easytier-detail"].textContent = "当前没有本机受管子进程与 RPC 属主绑定的样本。";
   fields["recovery-guide"].textContent = "没有可验证的当前历史来源。恢复须独立核对，不能使用旧观测执行。";
+  clearRestorePreview(detail, true);
+}
+
+function clearRestorePreview(detail, clearContext = false) {
+  fields["restore-detail"].textContent = detail;
+  fields["restore-summary"].textContent = "";
+  fields["restore-summary"].hidden = true;
+  fields["restore-rows"].textContent = "";
+  fields["restore-results"].hidden = true;
+  if (clearContext) {
+    restoreContext = null;
+    fields["restore-snapshot"].textContent = "";
+    fields["restore-space"].textContent = "";
+  }
+}
+
+const restoreId = (value, length) => typeof value === "string" &&
+  value.length === length && /^[0-9a-f]+$/.test(value);
+const restoreInteger = (value) => Number.isSafeInteger(value) && value >= 0;
+const inertRestoreFlags = (value) => ["restoration_performed", "native_authority", "cleanup_authority",
+  "pending_resume_authority", "execution_available_from_preview"].every((key) => value[key] === false);
+
+function showRestoreContext(value) {
+  if (!value || value.preview_context_format_version !== 2 || typeof value.available !== "boolean" ||
+      !inertRestoreFlags(value)) throw new Error("Invalid preview context");
+  clearRestorePreview(value.available ? "选择范围和目标前缀后生成只读预览。" :
+    "当前部署未提供已就绪的管理历史；需使用已有 dashboard 权限和同一 owner。", true);
+  if (!value.available && !Array.isArray(value.spaces)) return;
+  if (!restoreId(value.owner_generation, 32) || (value.space_id !== null && !restoreId(value.space_id, 32)) ||
+      (value.available && (!restoreId(value.space_id, 32) || !restoreId(value.current_snapshot_id, 64))) ||
+      (value.current_snapshot_id !== null && !restoreId(value.current_snapshot_id, 64)) ||
+      !Array.isArray(value.snapshots) || (value.available && value.snapshots.length < 1) || value.snapshots.length > 128 ||
+      !Array.isArray(value.spaces) || value.spaces.length > 64 || value.spaces.some((space) => !restoreId(space, 32)) ||
+      typeof value.spaces_truncated !== "boolean" || value.spaces_limit !== 64 || value.snapshots_limit !== 128 ||
+      value.cache_max_age_ms !== 10000 || (value.available && (!restoreInteger(value.cache_age_ms) || value.cache_age_ms > 10000)) ||
+      typeof value.snapshots_truncated !== "boolean" || !value.limits || !value.limits.source ||
+      !Object.values(value.limits.source).every(restoreInteger) ||
+      !Object.entries(value.limits).filter(([key]) => key !== "source").every(([, number]) => restoreInteger(number)) ||
+      value.limits.max_output_entries > 128 || value.limits.max_output_cas_references > 128 ||
+      value.limits.max_output_bytes > 262144) throw new Error("Invalid bounded preview context");
+  for (const space of value.spaces) {
+    const option = document.createElement("option");
+    option.value = space; option.textContent = space; fields["restore-space"].appendChild(option);
+  }
+  fields["restore-space"].value = value.space_id;
+  for (const snapshot of value.snapshots) {
+    if (!restoreId(snapshot.snapshot_id, 64) || !["metadata_only", "content_closed", "materialized"].includes(snapshot.state) ||
+        typeof snapshot.locked !== "boolean" || typeof snapshot.content_retained !== "boolean" ||
+        typeof snapshot.current !== "boolean") throw new Error("Invalid historical preview source");
+    const option = document.createElement("option");
+    option.value = snapshot.snapshot_id;
+    option.textContent = `${snapshot.snapshot_id.slice(0, 16)}… · ${snapshot.state}` +
+      (snapshot.current ? " · 当前" : "") + (snapshot.locked ? " · 锁定" : "") +
+      (snapshot.content_retained ? "" : " · 已裁剪");
+    option.title = snapshot.snapshot_id;
+    fields["restore-snapshot"].appendChild(option);
+  }
+  restoreContext = value;
+  if (value.snapshots_truncated) fields["restore-detail"].textContent += " 历史列表已按显示预算截断。";
+  if (value.spaces_truncated) fields["restore-detail"].textContent += " 空间列表已按注册上限截断。";
+}
+
+function validRestorePath(path) {
+  if (typeof path !== "string" || !path.length || new TextEncoder().encode(path).length > 4096 ||
+      /[\u0000-\u001f<>:"\\|?*]/.test(path)) return false;
+  return path.split("/").every((part) => part && part !== "." && part !== ".." && !/[. ]$/.test(part));
+}
+
+function restoreRequest(context) {
+  const mode = fields["restore-selection"].value;
+  const snapshot = fields["restore-snapshot"].value;
+  if (!["full", "file", "directory", "paths"].includes(mode) || !restoreId(snapshot, 64)) {
+    throw new Error("Explicit historical selection required");
+  }
+  const selection = { type: mode };
+  if (mode !== "full") {
+    const paths = fields["restore-paths"].value.split(/\r?\n/).filter((path) => path.length);
+    if (!paths.length || paths.length > 64 || paths.some((path) => !validRestorePath(path)) ||
+        new Set(paths).size !== paths.length || paths.reduce((total, path) =>
+          total + new TextEncoder().encode(path).length, 0) > 16384 ||
+        (mode !== "paths" && paths.length !== 1)) throw new Error("Invalid portable source paths");
+    if (mode === "paths") selection.paths = paths; else selection.path = paths[0];
+  }
+  const prefix = fields["restore-prefix"].value || null;
+  if (prefix !== null && !validRestorePath(prefix)) throw new Error("Invalid portable destination prefix");
+  const extra = fields["restore-extra-policy"].value;
+  const occupied = fields["restore-occupied-policy"].value;
+  if (!["preserve", "replace_selected_scope"].includes(extra) ||
+      !["report_conflicts", "replace_files"].includes(occupied)) throw new Error("Invalid explicit restore policy");
+  return {
+    owner_generation: context.owner_generation,
+    request: { format_version: 2, space_id: context.space_id, snapshot, expected_baseline: context.current_snapshot_id,
+      selection, destination_prefix: prefix, current_extra_policy: extra, occupied_target_policy: occupied,
+      limits: context.limits },
+  };
+}
+
+function sameRestoreSelection(actual, expected) {
+  if (!actual || actual.type !== expected.type || actual.path !== expected.path) return false;
+  if (expected.type === "paths") return Array.isArray(actual.paths) &&
+    actual.paths.length === expected.paths.length && actual.paths.every((path, index) => path === expected.paths[index]);
+  return actual.paths === undefined;
+}
+
+function restoreBytes(value) {
+  if (value === null) return "未知";
+  if (!restoreInteger(value)) throw new Error("Invalid logical estimate");
+  return `${value.toLocaleString()} B`;
+}
+
+function showRestorePreview(value, request) {
+  if (!value || value.preview_format_version !== 2 || !inertRestoreFlags(value) ||
+      ["preparation_performed", "content_hashes_verified", "worktree_scanned", "native_conflicts_checked"]
+        .some((key) => value[key] !== false) ||
+      value.owner_generation !== request.owner_generation || value.space_id !== request.request.space_id ||
+      value.target?.snapshot_id !== request.request.snapshot || !sameRestoreSelection(value.selection, request.request.selection) ||
+      value.destination_prefix !== request.request.destination_prefix ||
+      value.current_extra_policy !== request.request.current_extra_policy ||
+      value.occupied_target_policy !== request.request.occupied_target_policy ||
+      value.source_interpretation !== "live_owner_deferred_transaction" || value.source_image_bytes !== null ||
+      value.source_image_digest !== null || value.memory_header_projected !== null ||
+      !Array.isArray(value.entries) || value.entries.length > 128 ||
+      !Array.isArray(value.cas_references) || value.cas_references.length > 128 ||
+      typeof value.entries_truncated !== "boolean" || typeof value.cas_references_truncated !== "boolean" ||
+      !restoreInteger(value.output_bytes_including_lf) || !restoreInteger(value.output_byte_limit) ||
+      value.output_bytes_including_lf > value.output_byte_limit || value.output_byte_limit > 262144 ||
+      !value.counts || !Object.values(value.counts).every(restoreInteger) ||
+      !value.resources || ["physical_allocation_checked", "free_space_checked", "capacity_reserved"]
+        .some((key) => value.resources[key] !== false)) throw new Error("Preview owner or scope differs");
+  const operations = {
+    preserve_current: "保留当前项", new_create_file: "描述新建文件", new_create_directory: "描述新建目录",
+    new_replace_file: "描述新的覆盖操作", new_delete_file: "描述新的删除操作", new_remove_directory: "描述新的目录移除",
+    report_conflict: "报告冲突", unknown: "未知",
+  };
+  const differences = {
+    unchanged: "元数据相同", target_only: "仅历史存在", file_contents_differ: "文件描述不同", current_only: "仅当前存在",
+    type_conflict: "类型冲突", case_conflict: "大小写冲突", ancestor_file_conflict: "祖先路径是文件", baseline_unchecked: "基线未验证",
+  };
+  const rows = [];
+  for (const entry of value.entries) {
+    if (!validRestorePath(entry.destination_path) || (entry.source_path !== null && !validRestorePath(entry.source_path)) ||
+        (entry.conflict_path !== null && !validRestorePath(entry.conflict_path)) || entry.native_state !== "unchecked" ||
+        !Object.prototype.hasOwnProperty.call(operations, entry.proposed_operation) ||
+        !Object.prototype.hasOwnProperty.call(differences, entry.difference)) throw new Error("Invalid inert preview row");
+    rows.push([entry.source_path || "当前额外项", entry.destination_path, differences[entry.difference],
+      operations[entry.proposed_operation], `${restoreBytes(entry.historical_bytes)} / ${restoreBytes(entry.current_bytes)}`,
+      entry.conflict_path || "—"]);
+  }
+  clearRestorePreview("只读描述，尚未恢复。CAS 内容、原生路径、可用空间和实际物理分配均未验证。");
+  const summary = [
+    ["选中历史 / 比较路径", `${value.counts.selected_target_entries} / ${value.counts.compared_paths}`],
+    ["保留当前 / 报告冲突", `${value.counts.preserved_current_paths} / ${value.counts.reported_conflicts}`],
+    ["目标逻辑内容", restoreBytes(value.resources.target_logical_bytes)],
+    ["逻辑暂存估计", restoreBytes(value.resources.staging_bytes_estimate)],
+    ["原内容逻辑估计", restoreBytes(value.resources.baseline_original_bytes_estimate)],
+    ["内容可用性", value.content_availability === "pruned" ? "历史已裁剪，内容不可由本预览确认恢复" : "未验证"],
+    ["结果范围", value.entries_truncated || value.cas_references_truncated ? "表或块引用已截断，完整数量保留" : "在显示预算内完整"],
+  ];
+  for (const [label, detail] of summary) {
+    const term = document.createElement("dt");
+    const description = document.createElement("dd");
+    term.textContent = label; description.textContent = detail;
+    fields["restore-summary"].append(term, description);
+  }
+  fields["restore-summary"].hidden = false;
+  for (const values of rows) {
+    const row = document.createElement("tr");
+    for (const detail of values) {
+      const cell = document.createElement("td"); cell.textContent = detail; row.appendChild(cell);
+    }
+    fields["restore-rows"].appendChild(row);
+  }
+  fields["restore-results"].hidden = false;
 }
 
 function clearExportTests(detail = "连接待测试") {
@@ -595,6 +791,11 @@ async function refresh() {
     await readJson("gateway").then(showGateway).catch(() => {
       setStatus("gateway", "无法读取", "请检查模块私有目录中的部署和网关配置。", "warn");
     });
+    if (ownerReady) {
+      await readJson("preview-context").then(showRestoreContext).catch(() => {
+        clearRestorePreview("无法读取当前部署的选择预览。请检查已有管理配置和 dashboard 权限。", true);
+      });
+    }
   } finally {
     setBusy(false);
   }
@@ -637,6 +838,45 @@ async function testExport(name, expectedUrl) {
 }
 
 fields.refresh.addEventListener("click", refresh);
+fields["restore-space"].addEventListener("change", async () => {
+  if (busy || !ownerReady || !restoreContext?.spaces?.includes(fields["restore-space"].value)) return;
+  const space = fields["restore-space"].value;
+  setBusy(true);
+  clearRestorePreview("正在读取所选空间的当前 owner 历史…");
+  try { showRestoreContext(await readJson("preview-context", space)); }
+  catch (error) { clearRestorePreview("所选空间的上下文不可用，请刷新当前 owner 状态。", true); }
+  finally { setBusy(false); }
+});
+for (const name of ["snapshot", "selection", "extra-policy", "occupied-policy"]) {
+  fields[`restore-${name}`].addEventListener("change", () => {
+    clearRestorePreview("选择已改变，请重新生成只读预览。");
+    setBusy(busy);
+  });
+}
+for (const name of ["prefix", "paths"]) {
+  fields[`restore-${name}`].addEventListener("input", () => {
+    clearRestorePreview("路径已改变，请重新生成只读预览。");
+  });
+}
+fields["restore-preview"].addEventListener("click", async () => {
+  if (busy || !ownerReady || !restoreContext?.available) return;
+  const context = restoreContext;
+  setBusy(true);
+  clearRestorePreview("正在读取当前 owner 的同事务历史元数据…");
+  try {
+    const request = restoreRequest(context);
+    const bytes = new TextEncoder().encode(JSON.stringify(request));
+    if (bytes.length > 65536) throw new Error("Preview request exceeds byte limit");
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    const value = await readJson("preview", hex);
+    if (!ownerReady || restoreContext?.owner_generation !== context.owner_generation) {
+      throw new Error("Preview owner changed");
+    }
+    showRestorePreview(value, request);
+  } catch (error) {
+    clearRestorePreview("预览被拒绝或属主已变化。请刷新状态，检查相对路径和请求大小后重试。", true);
+  } finally { setBusy(false); }
+});
 fields["ask-stop"].addEventListener("click", () => {
   if (!busy && activeOwner) {
     fields["stop-confirmation"].hidden = false;

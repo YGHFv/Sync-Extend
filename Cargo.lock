@@ -1136,10 +1136,12 @@ dependencies = [
  "ed25519-dalek",
  "quinn",
  "rcgen",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",
  "sync-extend-core-model",
+ "sync-extend-platform-fs",
  "thiserror",
  "tokio",
 ]

@@ -162,7 +162,27 @@ impl CurrentUserSecurity {
 
 /// Audit only the actual retained regular-file handle, never an ACL pathname.
 pub fn verify_current_user_private_file(file: &File) -> io::Result<()> {
-    regular(file, false)?;
+    verify_private_object(file, false, 0, true)
+}
+
+/// This is a retained directory prerequisite, never a regular-file relaxation.
+pub(super) fn verify_current_user_private_directory(file: &File) -> io::Result<()> {
+    verify_private_object(file, true, 0x03, true)
+}
+
+/// SQLite's child inherits the sole owner ACE from an already proven directory.
+/// This separate check never grants the original explicit-file ACL contract.
+pub(super) fn verify_current_user_private_inherited_file(file: &File) -> io::Result<()> {
+    verify_private_object(file, false, 0x10, false)
+}
+
+fn verify_private_object(
+    file: &File,
+    directory: bool,
+    ace_flags: u8,
+    protected: bool,
+) -> io::Result<()> {
+    regular(file, directory)?;
     let user = ProcessUser::new()?;
     let mut owner = ptr::null_mut();
     let mut acl = ptr::null_mut();
@@ -194,7 +214,7 @@ pub fn verify_current_user_private_file(file: &File) -> io::Result<()> {
         || unsafe { IsValidAcl(acl) } == 0
         // SAFETY: owned native descriptor remains alive; outputs are sized.
         || unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
-        || control & SE_DACL_PROTECTED == 0
+        || protected && control & SE_DACL_PROTECTED == 0
     {
         return Err(invalid(
             "current process user owner and protected DACL required",
@@ -222,7 +242,7 @@ pub fn verify_current_user_private_file(file: &File) -> io::Result<()> {
     // SAFETY: GetAce returned an aligned ACE header in the validated ACL.
     let header = unsafe { &*ace.cast::<windows_sys::Win32::Security::ACE_HEADER>() };
     if header.AceType != 0
-        || header.AceFlags != 0
+        || header.AceFlags != ace_flags
         || (header.AceSize as usize) < size_of::<ACCESS_ALLOWED_ACE>()
     {
         return Err(invalid(

@@ -28,6 +28,12 @@ function Get-ClientSnapshot {
     Invoke-SyncExtendJson $binaryPath @('management-dashboard', '--config', $managementPath)
 }
 
+function Get-ClientRestoreContext([string]$SpaceId) {
+    $arguments = @('management-restore-preview', '--config', $managementPath, '--context')
+    if ($SpaceId) { $arguments += @('--space-id', $SpaceId) }
+    Invoke-SyncExtendJson $binaryPath $arguments
+}
+
 function Get-ClientBudgetRows {
     if (!$script:budgetConfig -or !$script:budgetPolicy) {
         return ,@('显式拉取预算', '未指定预算文件；可通过“查看拉取预算”只读检查已初始化的账本')
@@ -76,8 +82,8 @@ Add-Type -AssemblyName System.Drawing
 $form = [Windows.Forms.Form]::new()
 $form.Text = 'SyncExtend'
 $form.StartPosition = 'CenterScreen'
-$form.MinimumSize = [Drawing.Size]::new(900, 550)
-$form.Size = [Drawing.Size]::new(1120, 690)
+$form.MinimumSize = [Drawing.Size]::new(900, 720)
+$form.Size = [Drawing.Size]::new(1120, 850)
 $form.Font = [Drawing.Font]::new('Segoe UI', 10)
 $form.BackColor = [Drawing.Color]::White
 
@@ -144,6 +150,7 @@ Add-ColumnsTab 'Files' @('相对路径', '类型', '逻辑大小') @(480, 95, 23
 Add-ColumnsTab 'History' @('快照', '原状态', '快照创建时间', '当前 / 锁定', '内容状态', '裁剪时间') @(275, 100, 180, 140, 150, 180) '本机历史'
 Add-ColumnsTab 'Pruned history' @('快照', '原状态', '快照创建时间', '当前 / 锁定', '内容状态', '裁剪时间') @(275, 100, 180, 140, 150, 180) '裁剪审计'
 Add-ColumnsTab 'Recovery' @('项目', '只读观察与手动入口') @(230, 800) '恢复与预览'
+Add-ColumnsTab 'Selection preview' @('历史源路径', '实际目标路径', '差异', '新操作描述', '历史逻辑大小', '当前逻辑大小', '冲突路径') @(230, 250, 150, 180, 140, 140, 220) '选择恢复预览'
 Add-ColumnsTab 'Conflicts' @('事务', '处置', '文件已物化') @(510, 130, 130) '冲突'
 Add-ColumnsTab 'Unavailable chunks' @('样本来源', '不可读取块') @(150, 670) '缺块'
 Add-ColumnsTab 'WebDAV' @('导出地址', '配置权限', '上传上限') @(470, 140, 200)
@@ -152,6 +159,206 @@ Add-ColumnsTab 'Storage snapshots' @('来源设备', '快照报告', '报告时�
 Add-ColumnsTab 'Network' @('项目', '状态') @(225, 665) '连接与路径'
 Add-ColumnsTab 'Pull budget' @('项目', '状态') @(225, 665) '拉取预算'
 $lists['WebDAV'].MultiSelect = $false
+$lists['Selection preview'].Name = 'RestorePreviewRows'
+
+$restorePage = $lists['Selection preview'].Parent
+$restorePanel = [Windows.Forms.TableLayoutPanel]::new()
+$restorePanel.Dock = 'Top'
+$restorePanel.Height = 240
+$restorePanel.Padding = [Windows.Forms.Padding]::new(8)
+$restorePanel.ColumnCount = 4
+$restorePanel.RowCount = 6
+foreach ($style in @(
+        [Windows.Forms.ColumnStyle]::new('Absolute', 90),
+        [Windows.Forms.ColumnStyle]::new('Percent', 50),
+        [Windows.Forms.ColumnStyle]::new('Absolute', 90),
+        [Windows.Forms.ColumnStyle]::new('Percent', 50))) { [void]$restorePanel.ColumnStyles.Add($style) }
+foreach ($height in @(30, 30, 30, 64, 34, 34)) {
+    [void]$restorePanel.RowStyles.Add([Windows.Forms.RowStyle]::new('Absolute', $height))
+}
+function Add-RestoreLabel([string]$Text, [int]$Column, [int]$Row) {
+    $label = [Windows.Forms.Label]::new()
+    $label.Text = $Text
+    $label.Dock = 'Fill'
+    $label.TextAlign = 'MiddleLeft'
+    $restorePanel.Controls.Add($label, $Column, $Row)
+}
+function New-RestoreChoice([string]$Name, [object[]]$Choices) {
+    $choice = [Windows.Forms.ComboBox]::new()
+    $choice.Name = $Name
+    $choice.Dock = 'Fill'
+    $choice.DropDownStyle = 'DropDownList'
+    $choice.DropDownWidth = 620
+    if ($Choices.Count) { $choice.Items.AddRange($Choices); $choice.SelectedIndex = 0 }
+    return $choice
+}
+Add-RestoreLabel 'owner 空间' 0 0
+$restoreSpace = New-RestoreChoice 'RestoreOwnerSpace' @()
+$restorePanel.Controls.Add($restoreSpace, 1, 0)
+$restorePanel.SetColumnSpan($restoreSpace, 3)
+Add-RestoreLabel '历史快照' 0 1
+$restoreSnapshot = New-RestoreChoice 'RestoreSnapshot' @()
+$restoreSnapshot.DisplayMember = 'Label'
+$restorePanel.Controls.Add($restoreSnapshot, 1, 1)
+$restorePanel.SetColumnSpan($restoreSnapshot, 3)
+Add-RestoreLabel '选择范围' 0 2
+$restoreMode = New-RestoreChoice 'RestoreSelectionMode' @('完整快照', '单个文件', '目录子树', '多个明确路径')
+$restorePanel.Controls.Add($restoreMode, 1, 2)
+Add-RestoreLabel '目标前缀' 2 2
+$restorePrefix = [Windows.Forms.TextBox]::new()
+$restorePrefix.Name = 'RestoreDestinationPrefix'
+$restorePrefix.Dock = 'Fill'
+$restorePrefix.MaxLength = 4096
+$restorePrefix.PlaceholderText = '可留空；如 archive/2026，完整源路径保留在其下'
+$restorePanel.Controls.Add($restorePrefix, 3, 2)
+Add-RestoreLabel '源相对路径' 0 3
+$restorePaths = [Windows.Forms.TextBox]::new()
+$restorePaths.Name = 'RestoreSourcePaths'
+$restorePaths.Dock = 'Fill'
+$restorePaths.Multiline = $true
+$restorePaths.ScrollBars = 'Vertical'
+$restorePaths.MaxLength = 16384
+$restorePaths.PlaceholderText = '文件或目录填写一个路径；多路径逐行填写。使用 /，不得填写主机绝对路径。'
+$restorePanel.Controls.Add($restorePaths, 1, 3)
+$restorePanel.SetColumnSpan($restorePaths, 3)
+Add-RestoreLabel '当前额外项' 0 4
+$restoreExtra = New-RestoreChoice 'RestoreCurrentExtraPolicy' @('保留当前额外项（默认）', '描述删除选中范围中的额外项')
+$restorePanel.Controls.Add($restoreExtra, 1, 4)
+Add-RestoreLabel '目标已占用' 2 4
+$restoreOccupied = New-RestoreChoice 'RestoreOccupiedTargetPolicy' @('报告已有文件冲突（默认）', '描述新的文件覆盖操作')
+$restorePanel.Controls.Add($restoreOccupied, 3, 4)
+$restoreButton = [Windows.Forms.Button]::new()
+$restoreButton.Name = 'RestorePreviewButton'
+$restoreButton.Text = '生成预览'
+$restoreButton.Dock = 'Fill'
+$restoreButton.Enabled = $false
+$restorePanel.Controls.Add($restoreButton, 0, 5)
+$restoreGuide = [Windows.Forms.Label]::new()
+$restoreGuide.Text = '仅描述新的操作。未选区域保留；原生执行和恢复由独立流程再次核对。'
+$restoreGuide.Dock = 'Fill'
+$restoreGuide.TextAlign = 'MiddleLeft'
+$restorePanel.Controls.Add($restoreGuide, 1, 5)
+$restorePanel.SetColumnSpan($restoreGuide, 3)
+$restoreNotes = [Windows.Forms.Label]::new()
+$restoreNotes.Name = 'RestorePreviewSummary'
+$restoreNotes.Dock = 'Bottom'
+$restoreNotes.Height = 118
+$restoreNotes.Padding = [Windows.Forms.Padding]::new(8)
+$restoreNotes.Text = '等待当前 owner 的已鉴权历史列表。'
+$restorePage.Controls.Add($restoreNotes)
+$restorePage.Controls.Add($restorePanel)
+$restorePanel.BringToFront()
+$restoreNotes.BringToFront()
+$script:restoreContext = $null
+
+function Set-ClientRestoreBusy([bool]$Value) {
+    $available = [bool](!$Value -and $script:restoreContext -and $script:restoreContext.available)
+    $restoreSpace.Enabled = [bool](!$Value -and $script:restoreContext -and $script:restoreContext.spaces.Count)
+    foreach ($control in @($restoreSnapshot, $restoreMode, $restorePrefix, $restoreExtra, $restoreOccupied, $restoreButton)) {
+        $control.Enabled = $available
+    }
+    $restorePaths.Enabled = $available -and $restoreMode.SelectedIndex -ne 0
+}
+
+function Clear-ClientRestore {
+    if ($restoreSnapshot.SelectedItem) { $script:restoreRememberedSnapshot = $restoreSnapshot.SelectedItem.Id }
+    if ($restoreSpace.SelectedItem) { $script:restoreRememberedSpace = [string]$restoreSpace.SelectedItem }
+    $script:restoreContext = $null
+    $restoreSnapshot.Items.Clear()
+    $restoreSpace.Items.Clear()
+    $lists['Selection preview'].Items.Clear()
+    $restoreNotes.Text = '当前没有可验证的恢复预览；请选择当前 owner 历史后生成。'
+    Set-ClientRestoreBusy $false
+}
+
+function Set-ClientRestoreContext($Context) {
+    Assert-SyncExtendRestoreContext $Context
+    if ($Context.owner_generation -cne $script:current.owner_generation) {
+        throw 'Restore context owner changed.'
+    }
+    $script:restoreContext = $Context
+    $script:settingRestoreContext = $true
+    $restoreSpace.Items.Clear()
+    $restoreSnapshot.Items.Clear()
+    foreach ($space in $Context.spaces) { [void]$restoreSpace.Items.Add($space) }
+    if ($Context.space_id) { $restoreSpace.SelectedItem = $Context.space_id }
+    foreach ($snapshot in $Context.snapshots) {
+        $label = "$($snapshot.snapshot_id) · $($snapshot.state)"
+        if ($snapshot.current) { $label += ' · 当前' }
+        if ($snapshot.locked) { $label += ' · 锁定' }
+        if (!$snapshot.content_retained) { $label += ' · 已裁剪' }
+        [void]$restoreSnapshot.Items.Add([pscustomobject]@{ Id = $snapshot.snapshot_id; Label = $label })
+    }
+    if ($restoreSnapshot.Items.Count) {
+        $restoreSnapshot.SelectedIndex = 0
+        for ($index = 0; $index -lt $restoreSnapshot.Items.Count; $index++) {
+            if ($restoreSnapshot.Items[$index].Id -ceq $script:restoreRememberedSnapshot) {
+                $restoreSnapshot.SelectedIndex = $index; break
+            }
+        }
+    }
+    $restoreNotes.Text = if ($Context.available) {
+        '选择快照、范围和可选目标前缀。已有文件默认报告冲突，当前额外项默认保留。'
+    } else { '该服务当前没有可验证的 owner 历史，预览不可用。' }
+    if ($Context.snapshots_truncated) { $restoreNotes.Text += "`r`n历史下拉列表已按显示预算截断。" }
+    if ($Context.spaces_truncated) { $restoreNotes.Text += "`r`n空间下拉列表已按注册上限截断。" }
+    $script:settingRestoreContext = $false
+    Set-ClientRestoreBusy $false
+}
+
+$restoreSpace.Add_SelectedIndexChanged({
+    if ($script:busy -or $script:settingRestoreContext -or !$restoreSpace.SelectedItem -or
+        $restoreSpace.SelectedItem -ceq $script:restoreContext.space_id) { return }
+    $script:busy = $true
+    Set-ClientRestoreBusy $true
+    $lists['Selection preview'].Items.Clear()
+    try { Set-ClientRestoreContext (Get-ClientRestoreContext ([string]$restoreSpace.SelectedItem)) }
+    catch {
+        Clear-ClientRestore
+        $restoreNotes.Text = '选中空间的当前 owner 上下文不可用，请刷新状态后重试。'
+    } finally { $script:busy = $false; Set-ClientRestoreBusy $false }
+})
+
+foreach ($control in @($restoreSnapshot, $restoreMode, $restoreExtra, $restoreOccupied)) {
+    $control.Add_SelectedIndexChanged({
+        $lists['Selection preview'].Items.Clear()
+        $restoreNotes.Text = '选择已改变；请重新生成只读预览。'
+        Set-ClientRestoreBusy $script:busy
+    })
+}
+foreach ($control in @($restorePrefix, $restorePaths)) {
+    $control.Add_TextChanged({
+        $lists['Selection preview'].Items.Clear()
+        $restoreNotes.Text = '路径已改变；请重新生成只读预览。'
+    })
+}
+$restoreButton.Add_Click({
+    if ($script:busy -or !$script:restoreContext -or !$restoreSnapshot.SelectedItem) { return }
+    $script:busy = $true
+    Set-ClientRestoreBusy $true
+    $form.UseWaitCursor = $true
+    $lists['Selection preview'].Items.Clear()
+    $restoreNotes.Text = '正在请求当前 owner 的同事务历史元数据…'
+    $form.Refresh()
+    try {
+        $request = New-SyncExtendRestoreRequest $script:restoreContext $restoreSnapshot.SelectedItem.Id `
+            (@('full', 'file', 'directory', 'paths')[$restoreMode.SelectedIndex]) $restorePaths.Text $restorePrefix.Text `
+            (@('preserve', 'replace_selected_scope')[$restoreExtra.SelectedIndex]) `
+            (@('report_conflicts', 'replace_files')[$restoreOccupied.SelectedIndex])
+        $hex = Get-SyncExtendRestoreRequestHex $request
+        $response = Invoke-SyncExtendJson $binaryPath @('management-restore-preview', '--config', $managementPath, '--request-hex', $hex)
+        $view = New-SyncExtendRestorePreviewView $response $request
+        foreach ($row in $view.Rows) { Add-ClientRow 'Selection preview' $row }
+        $restoreNotes.Text = $view.Summary
+    } catch {
+        Clear-ClientRestore
+        $restoreNotes.Text = '预览被拒绝或当前属主已变化。请刷新状态，检查所选相对路径和请求大小后重试。'
+    } finally {
+        $script:busy = $false
+        $form.UseWaitCursor = $false
+        Set-ClientRestoreBusy $false
+    }
+})
 
 function Add-ClientRow {
     param([string]$Tab, [object[]]$Values)
@@ -166,6 +373,7 @@ function Add-ClientRow {
 function Clear-Client {
     $script:current = $null
     foreach ($list in $lists.Values) { $list.Items.Clear() }
+    Clear-ClientRestore
     $stopButton.Enabled = $false
     $testButton.Enabled = $false
     if ($Managed) {
@@ -205,6 +413,15 @@ function Update-Client {
     try {
         $script:current = Get-ClientSnapshot
         $view = New-SyncExtendClientView $script:current
+        try {
+            $context = try { Get-ClientRestoreContext $script:restoreRememberedSpace }
+                catch { Get-ClientRestoreContext }
+            Set-ClientRestoreContext $context
+        }
+        catch {
+            Clear-ClientRestore
+            $restoreNotes.Text = '当前服务的选择预览不可用。需要已启用 dashboard 权限且资源就绪的同一 owner。'
+        }
         $summary.Text = $view.Summary
         foreach ($tab in $view.Rows.Keys) {
             foreach ($row in $view.Rows[$tab]) { Add-ClientRow $tab $row }

@@ -1,8 +1,9 @@
 //! One bounded own-origin signed content page; no durable signed inbox or apply.
 use crate::{LocalSpace, OriginalContentPreparation, ReconcileError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{ContentId, DeviceId, SpaceId, PROTOCOL_VERSION};
+use sync_extend_transport::ProducerKind;
 use sync_extend_transport::{
     Connection, OriginalOperationPage, SignedOperation, SignedOriginalContentRequest,
     SignedOriginalOperationPage, MAX_ORIGINAL_CONTENT_CHUNKS,
@@ -65,7 +66,11 @@ impl LocalSpace {
         connection: &mut Connection,
     ) -> Result<SignedOriginalOperationPage> {
         self.original_transfer_approval(connection)?;
-        let request = connection.receive_json::<Request>().await?;
+        let request = connection
+            .receive_json_with_permit::<Request>(
+                connection.reserve_incoming_json(ProducerKind::OriginalPageControl)?,
+            )
+            .await?;
         if request.protocol_version != PROTOCOL_VERSION
             || request.space_id != self.space_id
             || request.source != self.device_id
@@ -77,6 +82,7 @@ impl LocalSpace {
             ));
         }
         let identity = self.transport_identity()?;
+        let page_permit = connection.reserve_outgoing_json(ProducerKind::OriginalPageControl)?;
         let batch = self.journal.own_operation_batch(
             &self.space_id,
             &self.device_id,
@@ -118,14 +124,21 @@ impl LocalSpace {
             .request_id()
             .map_err(|_| ReconcileError::Invariant("original source page id"))?;
         let _session = self.cas.acquire_session()?;
-        for file in offer.files() {
-            self.cas.verify(file)?;
-        }
-        connection.send_json(&signed).await?;
+        // The page is authenticated metadata. Keep the CAS session/reference
+        // fence, but do not read payload that the peer has not requested.
+        connection
+            .send_json_with_permit(page_permit, &signed)
+            .await?;
         let mut seen = BTreeSet::new();
         let mut bytes = 0u64;
+        let mut frame_bytes = 0u64;
         for _ in 0..2 {
-            match connection.receive_json::<ContentControl>().await? {
+            match connection
+                .receive_json_with_permit::<ContentControl>(
+                    connection.reserve_incoming_json(ProducerKind::OriginalContentControl)?,
+                )
+                .await?
+            {
                 ContentControl::Chunks { request } => {
                     self.original_transfer_approval(connection)?;
                     request
@@ -133,8 +146,9 @@ impl LocalSpace {
                         .map_err(|_| {
                             ReconcileError::Invariant("original signed content request invalid")
                         })?;
+                    let (requested_bytes, requested_frame_bytes) =
+                        self.original_content_frame_liability(&request.request.chunks)?;
                     for chunk in &request.request.chunks {
-                        self.original_transfer_approval(connection)?;
                         if !seen.insert(chunk.content_id.clone())
                             || seen.len() > MAX_ORIGINAL_CONTENT_CHUNKS
                         {
@@ -142,24 +156,61 @@ impl LocalSpace {
                                 "original one-page chunk requests",
                             ));
                         }
+                    }
+                    bytes = bytes
+                        .checked_add(requested_bytes)
+                        .filter(|n| {
+                            *n <= self
+                                .limits
+                                .max_staging_bytes
+                                .min(sync_extend_transport::MAX_ORIGINAL_CONTENT_BYTES)
+                        })
+                        .ok_or(ReconcileError::ResourceLimit(
+                            "original one-page transfer bytes",
+                        ))?;
+                    frame_bytes = frame_bytes
+                        .checked_add(requested_frame_bytes)
+                        .filter(|n| {
+                            *n <= self
+                                .limits
+                                .max_staging_bytes
+                                .min(sync_extend_transport::MAX_ORIGINAL_CONTENT_BYTES)
+                                + 5 * MAX_ORIGINAL_CONTENT_CHUNKS as u64
+                        })
+                        .ok_or(ReconcileError::ResourceLimit(
+                            "original one-page transfer frame bytes",
+                        ))?;
+                    let mut block_permits = Vec::new();
+                    block_permits
+                        .try_reserve_exact(request.request.chunks.len())
+                        .map_err(|_| {
+                            ReconcileError::ResourceLimit("original outgoing block permit list")
+                        })?;
+                    // A later budget refusal keeps earlier unused liabilities
+                    // charged, and precedes every corresponding payload read.
+                    for chunk in &request.request.chunks {
+                        self.original_transfer_approval(connection)?;
+                        block_permits.push(connection.reserve_outgoing_block(
+                            ProducerKind::OriginalContentBlock,
+                            &chunk.content_id,
+                            chunk.length,
+                        )?);
+                    }
+                    for (chunk, block_permit) in request.request.chunks.iter().zip(block_permits) {
+                        self.original_transfer_approval(connection)?;
                         let block = self.cas.read(chunk)?;
-                        bytes = bytes
-                            .checked_add(block.len() as u64)
-                            .filter(|n| {
-                                *n <= self
-                                    .limits
-                                    .max_staging_bytes
-                                    .min(sync_extend_transport::MAX_ORIGINAL_CONTENT_BYTES)
-                            })
-                            .ok_or(ReconcileError::ResourceLimit(
-                                "original one-page transfer bytes",
-                            ))?;
-                        connection.send_block(&chunk.content_id, &block).await?;
+                        connection
+                            .send_block_with_permit(block_permit, &chunk.content_id, &block)
+                            .await?;
                     }
                 }
                 ContentControl::Finish { page_request_id } if page_request_id == page_id => {
                     connection
-                        .send_json(&ContentControl::Finish { page_request_id })
+                        .send_json_with_permit(
+                            connection
+                                .reserve_outgoing_json(ProducerKind::OriginalContentControl)?,
+                            &ContentControl::Finish { page_request_id },
+                        )
                         .await?;
                     return Ok(signed);
                 }
@@ -181,6 +232,7 @@ impl LocalSpace {
         self.original_transfer_approval(connection)?;
         let identity = self.transport_identity()?;
         let peer = connection.peer_identity().clone();
+        let request_permit = connection.reserve_outgoing_json(ProducerKind::OriginalPageControl)?;
         let request = Request {
             protocol_version: PROTOCOL_VERSION,
             space_id: self.space_id.clone(),
@@ -189,9 +241,13 @@ impl LocalSpace {
             channel_binding: connection.channel_binding().clone(),
             after_sequence: after,
         };
-        connection.send_json(&request).await?;
+        connection
+            .send_json_with_permit(request_permit, &request)
+            .await?;
         let signed = connection
-            .receive_json::<SignedOriginalOperationPage>()
+            .receive_json_with_permit::<SignedOriginalOperationPage>(
+                connection.reserve_incoming_json(ProducerKind::OriginalPageControl)?,
+            )
             .await?;
         let offer = signed
             .verify_content_offer(
@@ -202,10 +258,32 @@ impl LocalSpace {
                 &self.limits,
             )
             .map_err(|_| ReconcileError::Invariant("original connection page invalid"))?;
+        let planned_chunks = self.original_content_chunk_plan(&offer)?;
+        let mut request_permit = if planned_chunks.is_empty() {
+            None
+        } else {
+            Some(connection.reserve_outgoing_json(ProducerKind::OriginalContentControl)?)
+        };
+        let admitted = connection.reserve_incoming_blocks(
+            ProducerKind::OriginalContentBlock,
+            planned_chunks
+                .iter()
+                .map(|chunk| (&chunk.content_id, chunk.length)),
+        )?;
+        let mut block_permits = planned_chunks
+            .into_iter()
+            .zip(admitted)
+            .map(|(chunk, permit)| (chunk.content_id, permit))
+            .collect::<BTreeMap<_, _>>();
+        // Complete incoming admission precedes provenance/reference preparation
+        // and cached payload verification. Unused cached permits are not refunded.
         let mut preparation = self.prepare_original_content(&peer, &signed)?;
         let mut transferred_bytes = 0u64;
         let transferred_chunks = preparation.missing_chunks.len();
         if !preparation.missing_chunks.is_empty() {
+            let request_permit = request_permit.take().ok_or(ReconcileError::Invariant(
+                "original missing content control permit",
+            ))?;
             let request = offer
                 .request(preparation.missing_chunks.clone())
                 .map_err(|_| {
@@ -213,14 +291,23 @@ impl LocalSpace {
                 })?;
             let request = SignedOriginalContentRequest::sign(&identity, &offer, request)
                 .map_err(|_| ReconcileError::Invariant("original target request signing"))?;
-            connection
-                .send_json(&ContentControl::Chunks {
-                    request: request.clone(),
-                })
-                .await?;
+            let mut missing_permits = Vec::new();
             for chunk in &request.request.chunks {
+                missing_permits.push(block_permits.remove(&chunk.content_id).ok_or(
+                    ReconcileError::Invariant("original missing content exact admitted permit"),
+                )?);
+            }
+            connection
+                .send_json_with_permit(
+                    request_permit,
+                    &ContentControl::Chunks {
+                        request: request.clone(),
+                    },
+                )
+                .await?;
+            for (chunk, block_permit) in request.request.chunks.iter().zip(missing_permits) {
                 let block = connection
-                    .receive_block(&chunk.content_id, chunk.length)
+                    .receive_block_with_permit(block_permit, &chunk.content_id, chunk.length)
                     .await?;
                 self.ingest_original_content_block(
                     &peer,
@@ -229,15 +316,27 @@ impl LocalSpace {
                     &chunk.content_id,
                     &block,
                 )?;
-                transferred_bytes += block.len() as u64;
+                transferred_bytes = transferred_bytes
+                    .checked_add(block.len() as u64)
+                    .ok_or(ReconcileError::ResourceLimit("original received byte sum"))?;
             }
             preparation = self.prepare_original_content(&peer, &signed)?;
         }
+        let finish_permit =
+            connection.reserve_outgoing_json(ProducerKind::OriginalContentControl)?;
         let finish = ContentControl::Finish {
             page_request_id: preparation.page_request_id.clone(),
         };
-        connection.send_json(&finish).await?;
-        if connection.receive_json::<ContentControl>().await? != finish {
+        connection
+            .send_json_with_permit(finish_permit, &finish)
+            .await?;
+        if connection
+            .receive_json_with_permit::<ContentControl>(
+                connection.reserve_incoming_json(ProducerKind::OriginalContentControl)?,
+            )
+            .await?
+            != finish
+        {
             return Err(ReconcileError::Invariant(
                 "original page finish response differs",
             ));

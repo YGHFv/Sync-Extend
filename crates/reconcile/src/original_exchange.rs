@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use sync_extend_core_model::{ContentId, PROTOCOL_VERSION};
 #[cfg(windows)]
+use sync_extend_transport::ProducerKind;
+#[cfg(windows)]
 use sync_extend_transport::{
     Connection, SignedOriginalPageAppliedReceipt, SignedOriginalPageReceiveReceipt,
 };
@@ -28,7 +30,11 @@ impl LocalSpace {
         connection: &mut Connection,
     ) -> Result<OriginalExchangeReceipt> {
         let signed = self.serve_original_content_page_inner(connection).await?;
-        let outcome: OriginalExchangeReceipt = connection.receive_json_after_application().await?;
+        let outcome: OriginalExchangeReceipt = connection
+            .receive_json_after_application_with_permit(
+                connection.reserve_incoming_json(ProducerKind::OriginalOutcomeControl)?,
+            )
+            .await?;
         let request = signed
             .page
             .request_id()
@@ -65,7 +71,12 @@ impl LocalSpace {
                     ReconcileError::Invariant("original applied target outcome signature")
                 })?;
         }
-        connection.send_json(&request).await?;
+        connection
+            .send_json_with_permit(
+                connection.reserve_outgoing_json(ProducerKind::OriginalOutcomeControl)?,
+                &request,
+            )
+            .await?;
         Ok(outcome)
     }
 
@@ -76,13 +87,8 @@ impl LocalSpace {
     ) -> Result<OriginalExchangeReceipt> {
         let pulled = self.pull_original_content_page(connection, after).await?;
         let request = pulled.preparation.page_request_id;
-        let mut outcome = OriginalExchangeReceipt {
-            protocol_version: PROTOCOL_VERSION,
-            request_id: request.clone(),
-            received: None,
-            applied: None,
-            target_refusal: None,
-        };
+        let mut received_receipt = None;
+        let mut applied_receipt = None;
         let attempt = (|| -> Result<()> {
             if pulled.signed_page.page.operations.is_empty() {
                 return Err(ReconcileError::Invariant(
@@ -90,8 +96,8 @@ impl LocalSpace {
                 ));
             }
             let received = self.receive_original_page(&request)?;
-            outcome.received = received.signed_receipt;
-            if outcome.received.is_none() {
+            received_receipt = received.signed_receipt;
+            if received_receipt.is_none() {
                 return Err(ReconcileError::Invariant(
                     "original exchange received gap remains pending",
                 ));
@@ -107,18 +113,38 @@ impl LocalSpace {
                     ));
                 }
             }
-            outcome.applied = Some(self.original_applied_receipt(&request)?);
+            applied_receipt = Some(self.original_applied_receipt(&request)?);
             Ok(())
         })();
-        if let Err(error) = attempt {
+        // Final and its independent signed durable receipts remain authoritative
+        // if this later transport reservation fails. Prepare the wire outcome
+        // only after that reservation; no rollback of native state is claimed.
+        let outcome_permit =
+            connection.reserve_outgoing_json(ProducerKind::OriginalOutcomeControl)?;
+        let target_refusal = if let Err(error) = attempt {
             let mut text = error.to_string();
             while text.len() > 4096 {
                 text.pop();
             }
-            outcome.target_refusal = Some(text);
-        }
-        connection.send_json(&outcome).await?;
-        let acknowledged: ContentId = connection.receive_json().await?;
+            Some(text)
+        } else {
+            None
+        };
+        let outcome = OriginalExchangeReceipt {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request.clone(),
+            received: received_receipt,
+            applied: applied_receipt,
+            target_refusal,
+        };
+        connection
+            .send_json_with_permit(outcome_permit, &outcome)
+            .await?;
+        let acknowledged: ContentId = connection
+            .receive_json_with_permit(
+                connection.reserve_incoming_json(ProducerKind::OriginalOutcomeControl)?,
+            )
+            .await?;
         if acknowledged != request {
             return Err(ReconcileError::Invariant(
                 "original exchange acknowledgement differs",

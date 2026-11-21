@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use sync_extend_core_model::{
     conflict_resolution::ResolutionLimits, ContentId, EntryId, EntryKind, PROTOCOL_VERSION,
 };
+use sync_extend_transport::ProducerKind;
 use sync_extend_transport::{
     Connection, OriginalConflictTargetReceipt, PeerIdentity, SignedFileResolution,
     SignedOriginalConflictOffer, SignedOriginalConflictTargetReceipt, SignedOriginalContentRequest,
@@ -131,6 +132,7 @@ impl LocalSpace {
         connection: &mut Connection,
         transaction: &EntryId,
     ) -> Result<SignedOriginalConflictTargetReceipt> {
+        let offer_permit = connection.reserve_outgoing_json(ProducerKind::ConflictOfferControl)?;
         self.original_conflict_wire_native_root()?;
         let resolution: SignedFileResolution = serde_json::from_value(serde_json::to_value(
             self.journal.conflict_resolution_proof(transaction)?,
@@ -152,10 +154,17 @@ impl LocalSpace {
         for file in offer.files() {
             self.cas.verify(file)?;
         }
-        connection.send_json(&signed).await?;
+        connection
+            .send_json_with_permit(offer_permit, &signed)
+            .await?;
         let mut requested = BTreeSet::new();
         for _ in 0..2 {
-            match connection.receive_json::<Control>().await? {
+            match connection
+                .receive_json_with_permit::<Control>(
+                    connection.reserve_incoming_json(ProducerKind::ConflictContentControl)?,
+                )
+                .await?
+            {
                 Control::Chunks { request } => {
                     request.verify(connection.peer_identity(), &offer)?;
                     for chunk in &request.request.chunks {
@@ -170,18 +179,40 @@ impl LocalSpace {
                                 "conflict wire duplicate request",
                             ));
                         }
+                        let block_permit = connection.reserve_outgoing_block(
+                            ProducerKind::ConflictContentBlock,
+                            &chunk.content_id,
+                            chunk.length,
+                        )?;
+                        let bytes = self.cas.read(chunk)?;
                         connection
-                            .send_block(&chunk.content_id, &self.cas.read(chunk)?)
+                            .send_block_with_permit(block_permit, &chunk.content_id, &bytes)
                             .await?;
                     }
                 }
                 Control::Finish { request_id } if request_id == signed.request_id()? => {
-                    connection.send_json(&request_id).await?;
-                    let receipt: SignedOriginalConflictTargetReceipt =
-                        connection.receive_json_after_application().await?;
+                    connection
+                        .send_json_with_permit(
+                            connection
+                                .reserve_outgoing_json(ProducerKind::ConflictContentControl)?,
+                            &request_id,
+                        )
+                        .await?;
+                    let receipt: SignedOriginalConflictTargetReceipt = connection
+                        .receive_json_after_application_with_permit(
+                            connection
+                                .reserve_incoming_json(ProducerKind::ConflictReceiptControl)?,
+                        )
+                        .await?;
                     self.original_conflict_wire_approval(connection)?;
                     receipt.verify(connection.peer_identity(), &signed)?;
-                    connection.send_json(&request_id).await?;
+                    connection
+                        .send_json_with_permit(
+                            connection
+                                .reserve_outgoing_json(ProducerKind::ConflictReceiptControl)?,
+                            &request_id,
+                        )
+                        .await?;
                     return Ok(receipt);
                 }
                 _ => {
@@ -202,7 +233,11 @@ impl LocalSpace {
         &mut self,
         connection: &mut Connection,
     ) -> Result<SignedOriginalConflictTargetReceipt> {
-        let signed: SignedOriginalConflictOffer = connection.receive_json().await?;
+        let signed: SignedOriginalConflictOffer = connection
+            .receive_json_with_permit(
+                connection.reserve_incoming_json(ProducerKind::ConflictOfferControl)?,
+            )
+            .await?;
         let identity = self.transport_identity()?;
         let source = connection.peer_identity().clone();
         let offer = self.original_conflict_wire_content(
@@ -257,19 +292,31 @@ impl LocalSpace {
         };
         let prepared = self.prepare_signed_conflict_branches(resolution, wire_limits())?;
         if !prepared.missing_chunks.is_empty() {
+            let request_permit =
+                connection.reserve_outgoing_json(ProducerKind::ConflictContentControl)?;
+            let block_permits = connection.reserve_incoming_blocks(
+                ProducerKind::ConflictContentBlock,
+                prepared
+                    .missing_chunks
+                    .iter()
+                    .map(|chunk| (&chunk.content_id, chunk.length)),
+            )?;
             let request = SignedOriginalContentRequest::sign(
                 &identity,
                 &offer,
                 offer.request(prepared.missing_chunks.clone())?,
             )?;
             connection
-                .send_json(&Control::Chunks {
-                    request: request.clone(),
-                })
+                .send_json_with_permit(
+                    request_permit,
+                    &Control::Chunks {
+                        request: request.clone(),
+                    },
+                )
                 .await?;
-            for chunk in &request.request.chunks {
+            for (chunk, block_permit) in request.request.chunks.iter().zip(block_permits) {
                 let bytes = connection
-                    .receive_block(&chunk.content_id, chunk.length)
+                    .receive_block_with_permit(block_permit, &chunk.content_id, chunk.length)
                     .await?;
                 self.original_conflict_wire_content(
                     connection,
@@ -317,11 +364,20 @@ impl LocalSpace {
         }
         let request_id = signed.request_id()?;
         connection
-            .send_json(&Control::Finish {
-                request_id: request_id.clone(),
-            })
+            .send_json_with_permit(
+                connection.reserve_outgoing_json(ProducerKind::ConflictContentControl)?,
+                &Control::Finish {
+                    request_id: request_id.clone(),
+                },
+            )
             .await?;
-        if connection.receive_json::<ContentId>().await? != request_id {
+        if connection
+            .receive_json_with_permit::<ContentId>(
+                connection.reserve_incoming_json(ProducerKind::ConflictContentControl)?,
+            )
+            .await?
+            != request_id
+        {
             return Err(ReconcileError::Invariant(
                 "conflict wire content finish differs",
             ));
@@ -348,6 +404,10 @@ impl LocalSpace {
                 self.apply_admitted_conflict_native(&id)?;
             }
         }
+        // Native Final is already durable. A quota refusal here preserves that
+        // exact outcome and its existing recovery lineage.
+        let receipt_permit =
+            connection.reserve_outgoing_json(ProducerKind::ConflictReceiptControl)?;
         let manifest = self.original_conflict_wire_native_root()?;
         let mut received = manifest.version_vector.clone();
         for original in resolution
@@ -384,8 +444,16 @@ impl LocalSpace {
         )?;
         receipt.verify(identity.peer_identity(), &signed)?;
         self.original_conflict_wire_approval(connection)?;
-        connection.send_json(&receipt).await?;
-        if connection.receive_json::<ContentId>().await? != request_id {
+        connection
+            .send_json_with_permit(receipt_permit, &receipt)
+            .await?;
+        if connection
+            .receive_json_with_permit::<ContentId>(
+                connection.reserve_incoming_json(ProducerKind::ConflictReceiptControl)?,
+            )
+            .await?
+            != request_id
+        {
             return Err(ReconcileError::Invariant(
                 "conflict wire receipt acknowledgement differs",
             ));

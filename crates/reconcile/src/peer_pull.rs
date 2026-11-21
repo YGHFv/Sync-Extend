@@ -1,6 +1,7 @@
 use crate::{LocalSpace, ReconcileError, Result};
 use serde::Serialize;
 use sync_extend_core_model::{remote_file::RemoteFileOffer, PortablePath, FORMAT_VERSION};
+use sync_extend_transport::ProducerKind;
 use sync_extend_transport::{Connection, FileRequest, FileResponse};
 
 #[derive(Serialize)]
@@ -55,13 +56,18 @@ impl LocalSpace {
             return Err(ReconcileError::Invariant("peer file content is not closed"));
         }
         connection
-            .send_json(&FileRequest::Finish {
-                request_id: request_id.clone(),
-            })
+            .send_json_with_permit(
+                connection.reserve_outgoing_json(ProducerKind::DirectFileControl)?,
+                &FileRequest::Finish {
+                    request_id: request_id.clone(),
+                },
+            )
             .await
             .map_err(|_| ReconcileError::Invariant("peer finish request failed"))?;
         match connection
-            .receive_json::<FileResponse>()
+            .receive_json_with_permit::<FileResponse>(
+                connection.reserve_incoming_json(ProducerKind::DirectFileControl)?,
+            )
             .await
             .map_err(|_| ReconcileError::Invariant("peer finish response failed"))?
         {

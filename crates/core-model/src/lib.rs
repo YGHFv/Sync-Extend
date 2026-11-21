@@ -16,6 +16,7 @@ pub mod path;
 pub mod persisted_rename;
 pub mod reference_owner;
 pub mod remote_file;
+pub mod restore_selection;
 pub mod storage_node;
 pub mod storage_retention;
 pub mod storage_retirement;
@@ -53,6 +54,9 @@ pub mod webdav_partial_response;
 pub use ids::*;
 pub use operation::*;
 pub use path::PortablePath;
+pub use restore_selection::{
+    RestoreCurrentExtraPolicy, RestoreOccupiedTargetPolicy, RestoreSelection,
+};
 
 pub const FORMAT_VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: u32 = 1;

@@ -24,6 +24,15 @@ pub struct DashboardSnapshot {
     pub pruned_at_ms: Option<u64>,
 }
 
+#[derive(Serialize)]
+pub struct RestorePreviewOwnerContext {
+    pub space_id: SpaceId,
+    pub current_snapshot_id: Option<SnapshotId>,
+    pub snapshots: Vec<DashboardSnapshot>,
+    pub snapshots_limit: usize,
+    pub snapshots_truncated: bool,
+}
+
 impl DashboardSnapshot {
     fn from_audit(
         snapshot: &sync_extend_journal::SnapshotAudit,
@@ -104,6 +113,83 @@ pub struct DashboardReadLeases {
 }
 
 impl LocalSpace {
+    pub fn management_restore_preview_space(&self) -> &SpaceId {
+        &self.space_id
+    }
+
+    pub fn management_restore_preview_context(
+        &mut self,
+        bounds: sync_extend_journal::ReadOnlySnapshotPreviewLimits,
+        deadline: std::time::Instant,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<RestorePreviewOwnerContext> {
+        let (space_id, current_snapshot_id, sources, snapshots_truncated) = self
+            .journal
+            .restore_preview_context(&self.space_id, bounds, deadline, cancelled)?;
+        let mut snapshots = Vec::new();
+        for source in sources {
+            let snapshot = source
+                .metadata
+                .ok_or(ReconcileError::Invariant("context snapshot absent"))?;
+            snapshots.push(DashboardSnapshot {
+                current: current_snapshot_id.as_ref() == Some(&snapshot.snapshot_id),
+                snapshot_id: snapshot.snapshot_id,
+                state: snapshot.state,
+                created_at_ms: snapshot.created_at_ms,
+                locked: snapshot.locked,
+                content_retained: source.pruning.is_none(),
+                pruned_at_ms: source.pruning.map(|pruning| pruning.pruned_at_ms),
+            });
+        }
+        Ok(RestorePreviewOwnerContext {
+            space_id,
+            current_snapshot_id,
+            snapshots,
+            snapshots_limit: 128,
+            snapshots_truncated,
+        })
+    }
+
+    /// Pure history metadata on this live owner, with no root/CAS/scan access.
+    pub fn management_restore_preview(
+        &mut self,
+        request: &crate::RestoreSelectionPreviewRequest,
+        deadline: std::time::Instant,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<crate::RestoreSelectionPreview> {
+        request.validate()?;
+        if request.space_id != self.space_id {
+            return Err(ReconcileError::Invariant(
+                "live preview owner space differs",
+            ));
+        }
+        let (space_id, current_snapshot, current, baseline, target) =
+            self.journal.restore_preview_metadata(
+                &self.space_id,
+                &request.snapshot,
+                request.expected_baseline.as_ref(),
+                request.limits.source,
+                deadline,
+                cancelled.clone(),
+            )?;
+        crate::restore_selection_preview::project_until(
+            &crate::RestoreSelectionPreviewSource {
+                kind: crate::RestoreSelectionSourceKind::LiveOwner,
+                space_id,
+                current_snapshot,
+                current,
+                baseline,
+                target,
+                source_image_bytes: None,
+                source_image_digest: None,
+                memory_header_projected: None,
+            },
+            request,
+            deadline,
+            &cancelled,
+        )
+    }
+
     /// Use one validated metadata snapshot, retain CAS coordination, and bound
     /// both response records and content verification. No native effect is issued.
     pub fn management_dashboard(&self) -> Result<DashboardObservation> {

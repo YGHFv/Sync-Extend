@@ -1,4 +1,4 @@
-//! Two closed private SQLite ledger kinds use retained local Unix descriptors.
+//! Closed private SQLite ledger kinds use retained local Unix descriptors.
 //! SQLite never opens a pathname. A process-wide file lock serializes writers;
 //! WAL/FULL remains responsible for durable commit and crash recovery.
 use crate::UnixFileKey;
@@ -25,6 +25,7 @@ mod callbacks;
 enum LedgerKind {
     StoragePullAttempt,
     StorageTraffic,
+    TransportAttempt,
 }
 
 impl LedgerKind {
@@ -32,6 +33,7 @@ impl LedgerKind {
         match self {
             Self::StoragePullAttempt => "storage-pull-attempt-budget.sqlite",
             Self::StorageTraffic => "storage-traffic.sqlite",
+            Self::TransportAttempt => "transport-attempt-budget.sqlite",
         }
     }
 
@@ -39,6 +41,7 @@ impl LedgerKind {
         match self {
             Self::StoragePullAttempt => 100_000 * 4096 + 1024 * 1024,
             Self::StorageTraffic => 1_000_000 * 4096 + 1024 * 1024,
+            Self::TransportAttempt => 100_000 * 4096 + 1024 * 1024,
         }
     }
 
@@ -46,6 +49,7 @@ impl LedgerKind {
         match self {
             Self::StoragePullAttempt => "budget",
             Self::StorageTraffic => "storage-traffic",
+            Self::TransportAttempt => "transport-attempt",
         }
     }
 }
@@ -94,6 +98,149 @@ struct HeldDirectory {
     component: Option<CString>,
 }
 
+fn hold_directory(path: &Path) -> io::Result<Vec<HeldDirectory>> {
+    if !path.is_absolute() || path.as_os_str().as_bytes().len() > MAX_PATH {
+        return Err(refused(
+            "bounded absolute transport control directory required",
+        ));
+    }
+    // SAFETY: terminated root path and non-following directory flags.
+    let root = descriptor(unsafe {
+        libc::open(
+            c"/".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    })?;
+    let mut directories = vec![HeldDirectory {
+        key: identity(&root)?,
+        file: root,
+        component: None,
+    }];
+    for part in path.components() {
+        match part {
+            Component::RootDir => {}
+            Component::Normal(part) => {
+                let name = component(part.as_bytes())?;
+                // SAFETY: retained original parent and bounded terminated child.
+                let file = descriptor(unsafe {
+                    libc::openat(
+                        directories.last().expect("parent").file.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                    )
+                })?;
+                directories.push(HeldDirectory {
+                    key: identity(&file)?,
+                    file,
+                    component: Some(name),
+                });
+            }
+            _ => return Err(refused("normalized transport directory lineage required")),
+        }
+    }
+    Ok(directories)
+}
+
+fn verify_directory_lineage(directories: &[HeldDirectory]) -> io::Result<()> {
+    for (index, directory) in directories.iter().enumerate() {
+        if !directory.file.metadata()?.is_dir() || identity(&directory.file)? != directory.key {
+            return Err(refused("retained transport directory identity changed"));
+        }
+        let observed = if index == 0 {
+            // SAFETY: terminated root path with non-following directory flags.
+            descriptor(unsafe {
+                libc::open(
+                    c"/".as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                )
+            })?
+        } else {
+            // SAFETY: retained predecessor and its acquired bounded component.
+            descriptor(unsafe {
+                libc::openat(
+                    directories[index - 1].file.as_raw_fd(),
+                    directory.component.as_ref().expect("child").as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                )
+            })?
+        };
+        if identity(&observed)? != directory.key {
+            return Err(refused("transport directory slot was replaced"));
+        }
+    }
+    Ok(())
+}
+
+fn metadata_owner_present(directory: &File) -> io::Result<bool> {
+    let mut output = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: retained directory, terminated fixed marker, sized output.
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            c"journal.sqlite.metadata-owner".as_ptr(),
+            output.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+/// Read-only actual directory lineage, prepared before the private worker starts.
+/// File/CString fields can move to that worker without moving any SQLite VFS.
+/// No caller can manufacture this proof or extract a mutable directory handle.
+pub struct UnixTransportAttemptRoots {
+    data: Vec<HeldDirectory>,
+    control: Vec<HeldDirectory>,
+    control_path: PathBuf,
+    owner: u32,
+    process: u32,
+}
+
+impl UnixTransportAttemptRoots {
+    pub fn verify(&self) -> io::Result<()> {
+        // SAFETY: effective-uid query has no arguments or pointers.
+        if self.owner != unsafe { libc::geteuid() } || self.process != std::process::id() {
+            return Err(refused("transport directory owner/process changed"));
+        }
+        verify_directory_lineage(&self.data)?;
+        verify_directory_lineage(&self.control)?;
+        let data = self.data.last().expect("data root");
+        let control = self.control.last().expect("control root");
+        let metadata = control.file.metadata()?;
+        if metadata.uid() != self.owner || metadata.mode() & 0o077 != 0 {
+            return Err(refused("transport control root must remain owner-only"));
+        }
+        for directory in &self.control {
+            if metadata_owner_present(&directory.file)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "transport control root cannot be owned metadata or its subtree",
+                ));
+            }
+        }
+        if metadata_owner_present(&data.file)?
+            && self
+                .control
+                .iter()
+                .any(|directory| directory.key == data.key)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "transport control directory aliases an owned data root",
+            ));
+        }
+        Ok(())
+    }
+}
+
 struct HeldFile {
     file: File,
     key: UnixFileKey,
@@ -111,6 +258,7 @@ struct State {
     owner: u32,
     process: u32,
     poisoned: AtomicBool,
+    transport_roots: Option<UnixTransportAttemptRoots>,
 }
 
 impl State {
@@ -149,6 +297,9 @@ impl State {
     }
 
     fn verify(&self) -> io::Result<()> {
+        if let Some(roots) = &self.transport_roots {
+            roots.verify()?;
+        }
         // SAFETY: argument-free effective-uid query.
         let owner = unsafe { libc::geteuid() };
         if self.poisoned.load(Ordering::Acquire)
@@ -280,6 +431,7 @@ impl UnixSqliteLedger {
             max_bytes,
             fresh,
             read_only,
+            None,
         )
     }
 
@@ -297,6 +449,62 @@ impl UnixSqliteLedger {
             max_bytes,
             fresh,
             read_only,
+            None,
+        )
+    }
+
+    /// Independently selected roots are retained and checked before worker spawn.
+    pub fn hold_transport_attempt_roots(
+        data_root: &Path,
+        control_root: &Path,
+    ) -> io::Result<UnixTransportAttemptRoots> {
+        let data = hold_directory(data_root)?;
+        let control = hold_directory(control_root)?;
+        // SAFETY: argument-free effective owner query.
+        let owner = unsafe { libc::geteuid() };
+        let final_control = &control.last().expect("control root").file;
+        let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: retained actual control directory and sized statfs output.
+        if unsafe { libc::fstatfs(final_control.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful fstatfs initialized the entire output.
+        let filesystem = unsafe { filesystem.assume_init() };
+        if !matches!(filesystem.f_type as u64, 0xef53 | 0xf2f52010) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "transport control directory requires local ext4 or F2FS",
+            ));
+        }
+        let roots = UnixTransportAttemptRoots {
+            data,
+            control,
+            control_path: control_root.to_path_buf(),
+            owner,
+            process: std::process::id(),
+        };
+        roots.verify()?;
+        Ok(roots)
+    }
+
+    /// Only the separately proven transport roots can issue this closed basename.
+    pub fn open_transport_attempt(
+        roots: UnixTransportAttemptRoots,
+        max_bytes: u64,
+        fresh: bool,
+        read_only: bool,
+    ) -> io::Result<Self> {
+        roots.verify()?;
+        let path = roots
+            .control_path
+            .join(LedgerKind::TransportAttempt.basename());
+        Self::open_kind(
+            LedgerKind::TransportAttempt,
+            &path,
+            max_bytes,
+            fresh,
+            read_only,
+            Some(roots),
         )
     }
 
@@ -306,8 +514,17 @@ impl UnixSqliteLedger {
         max_bytes: u64,
         fresh: bool,
         read_only: bool,
+        transport_roots: Option<UnixTransportAttemptRoots>,
     ) -> io::Result<Self> {
         let file_name = kind.basename();
+        if matches!(kind, LedgerKind::TransportAttempt) != transport_roots.is_some() {
+            return Err(refused(
+                "transport ledger requires its independently retained roots",
+            ));
+        }
+        if let Some(roots) = &transport_roots {
+            roots.verify()?;
+        }
         let raw = path.as_os_str().as_bytes();
         if !path.is_absolute()
             || raw.len() > MAX_PATH
@@ -404,6 +621,7 @@ impl UnixSqliteLedger {
             owner,
             process: std::process::id(),
             poisoned: AtomicBool::new(false),
+            transport_roots,
         };
         let shm = component(format!("{file_name}-shm").as_bytes())?;
         if state.observe(&shm)?.is_some() {

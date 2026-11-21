@@ -67,11 +67,18 @@ pub fn prepare(cli: Cli) -> Result<(Cli, Option<super::management::ManagementGua
         return Ok((cli, None));
     };
     let config = load(config)?;
-    let management = config
-        .management
-        .as_ref()
-        .map(|path| super::management::start(path, config.role_name()))
-        .transpose()?;
+    let transport_attempt_policy = super::transport_budget::merge_path(
+        cli.transport_attempt_policy.clone(),
+        config.transport_attempt_policy.clone(),
+    )?;
+    let transport_attempt_budget_dir = super::transport_budget::merge_path(
+        cli.transport_attempt_budget_dir.clone(),
+        config.transport_attempt_budget_dir.clone(),
+    )?;
+    // Conflict/role/root validation precedes the management listener thread too.
+    super::transport_budget::preflight(&cli)?;
+    let management_path = config.management.clone();
+    let role_name = config.role_name();
     let command = match config.role {
         DeploymentRole::LocalPolling {
             data_dir,
@@ -126,15 +133,20 @@ pub fn prepare(cli: Cli) -> Result<(Cli, Option<super::management::ManagementGua
         },
         DeploymentRole::EasyTier { config, seconds } => Command::EasytierRun { config, seconds },
     };
-    Ok((
-        Cli {
-            limits: cli.limits,
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            control_directory: cli.control_directory,
-            #[cfg(target_os = "linux")]
-            linux_namespace_config: cli.linux_namespace_config,
-            command,
-        },
-        management,
-    ))
+    let expanded = Cli {
+        limits: cli.limits,
+        transport_attempt_policy,
+        transport_attempt_budget_dir,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        control_directory: cli.control_directory,
+        #[cfg(target_os = "linux")]
+        linux_namespace_config: cli.linux_namespace_config,
+        command,
+    };
+    super::transport_budget::preflight(&expanded)?;
+    let management = management_path
+        .as_ref()
+        .map(|path| super::management::start(path, role_name))
+        .transpose()?;
+    Ok((expanded, management))
 }

@@ -63,6 +63,9 @@ impl Polling {
                 },
             );
         }
+        for space in spaces.values_mut().filter(|space| space.ready) {
+            super::super::management::register_restore_preview_context(&mut space.local);
+        }
         Ok(Self {
             spaces,
             interval: interval_secs.map(Duration::from_secs),
@@ -76,12 +79,20 @@ impl Polling {
             &super::super::linux_namespace::LinuxDaemonOwner,
         >,
     ) {
-        let Some(interval) = self.interval else {
-            return;
-        };
         if shutdown.load(Ordering::Acquire) {
             return;
         }
+        // Service the registered preview owners even when polling is disabled
+        // or the next scan is distant. Preview registration never restricts
+        // the deployment's existing resource initialization or scan range.
+        for (id, space) in self.spaces.iter_mut() {
+            if space.ready && super::super::management::restore_preview_space_registered(id) {
+                super::super::management::process_restore_preview(&mut space.local);
+            }
+        }
+        let Some(interval) = self.interval else {
+            return;
+        };
         let Some((id, space)) = self
             .spaces
             .iter_mut()
@@ -102,7 +113,7 @@ impl Polling {
         // scan or several due spaces cannot starve pending HTTP requests.
         space.ready = match space.local.scan() {
             Ok(scan) => {
-                super::super::management::observe_local_space(&space.local);
+                super::super::management::observe_local_space(&mut space.local);
                 if let Ok(report) = serde_json::to_string(&scan) {
                     println!("{report}");
                 }

@@ -4,27 +4,36 @@ use std::{
     net::{TcpListener, TcpStream},
     path::Path,
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 use sync_extend_core_model::{
-    EntryId,
     management::{
-        ControlOperation, ControlSession, ManagementConfig, authenticated_control_request,
+        authenticated_control_request, ControlOperation, ControlSession, ManagementConfig,
     },
+    EntryId,
 };
 
 mod client;
-pub use client::{dashboard as control_dashboard, status as control_status, stop as control_stop};
+pub use client::{
+    dashboard as control_dashboard, process_restore_preview, register_restore_preview_context,
+    restore_preview as control_restore_preview, restore_preview_owner_configured,
+    restore_preview_space_registered, status as control_status, stop as control_stop,
+};
 mod dashboard;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) use dashboard::{
-    LocalDashboardRegistration, MAX_LOCAL_DASHBOARD, local_dashboard, register_local_dashboard,
+    local_dashboard, register_local_dashboard, LocalDashboardRegistration, MAX_LOCAL_DASHBOARD,
 };
-pub use dashboard::{observe_gateway, observe_local_space, observe_storage};
+pub use dashboard::{observe_gateway, observe_storage};
+
+pub fn observe_local_space(local: &mut sync_extend_reconcile::LocalSpace) {
+    client::process_restore_preview(local);
+    dashboard::observe_local_space(local);
+}
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 static READY: AtomicBool = AtomicBool::new(false);
@@ -33,6 +42,7 @@ static CONTROL_STOP: AtomicBool = AtomicBool::new(false);
 fn request_stop() {
     CONTROL_STOP.store(true, Ordering::Release);
     READY.store(false, Ordering::Release);
+    client::configure_preview(None);
     super::easytier::clear_observations();
 }
 
@@ -49,6 +59,7 @@ pub fn resources_ready() {
 
 pub fn resources_deferred() {
     READY.store(false, Ordering::Release);
+    client::defer_preview();
 }
 
 pub struct ManagementGuard {
@@ -61,6 +72,7 @@ impl Drop for ManagementGuard {
     fn drop(&mut self) {
         READY.store(false, Ordering::Release);
         self.stop.store(true, Ordering::Release);
+        client::configure_preview(None);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -115,6 +127,17 @@ pub fn start(path: &Path, role: &'static str) -> Result<ManagementGuard> {
     let listener = TcpListener::bind(config.address)?;
     listener.set_nonblocking(true)?;
     dashboard::configure(&config)?;
+    client::configure_preview(
+        control
+            .as_ref()
+            .filter(|_| {
+                config
+                    .control
+                    .as_ref()
+                    .is_some_and(|policy| policy.dashboard)
+            })
+            .map(ControlSession::generation),
+    );
     let connections = config
         .control
         .as_ref()
@@ -230,9 +253,29 @@ fn serve(
     mut control: Option<&mut ControlSession>,
 ) -> Result<()> {
     let timeout = Duration::from_secs(config.request_timeout_secs);
+    let deadline = Instant::now() + timeout;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let bytes = request(stream, timeout)?;
+    if bytes.starts_with(b"POST /v2/restore-preview ") {
+        return client::serve_preview(
+            stream,
+            &bytes,
+            config,
+            secret,
+            control.as_deref().map(ControlSession::generation),
+            deadline,
+        );
+    }
+    if bytes.starts_with(b"GET /v2/restore-preview/context ") {
+        return client::serve_context(
+            stream,
+            &bytes,
+            config,
+            secret,
+            control.as_deref().map(ControlSession::generation),
+        );
+    }
     if bytes.starts_with(b"GET /v1/ui ") || bytes.starts_with(b"GET /v1/dashboard ") {
         return dashboard::serve(
             stream,

@@ -52,7 +52,52 @@
       </div>
       <p id="recovery-detail" class="detail">保留历史不等于已验证可恢复；历史内容 hash 尚未验证。</p>
       <dl id="recovery-summary" class="summary" hidden></dl>
-      <p id="recovery-guide" class="detail">本页只读展示历史元数据；恢复需在独立终端手动选择来源并再次核对。</p>
+      <p id="recovery-guide" class="detail">选择历史范围并预览新的操作描述；执行恢复由独立流程再次核对。</p>
+      <div class="restore-controls" aria-label="选择历史恢复预览">
+        <label class="restore-field restore-wide">当前 owner 空间
+          <select id="restore-space" disabled aria-label="当前 owner 空间"></select>
+        </label>
+        <label class="restore-field restore-wide">历史快照
+          <select id="restore-snapshot" disabled aria-label="历史快照"></select>
+        </label>
+        <label class="restore-field">选择范围
+          <select id="restore-selection" disabled>
+            <option value="full">完整快照</option>
+            <option value="file">单个文件</option>
+            <option value="directory">目录子树</option>
+            <option value="paths">多个明确路径</option>
+          </select>
+        </label>
+        <label class="restore-field">目标相对前缀（可留空）
+          <input id="restore-prefix" maxlength="4096" placeholder="archive/2026" disabled>
+        </label>
+        <label class="restore-field restore-wide">源相对路径
+          <textarea id="restore-paths" rows="3" maxlength="16384" placeholder="文件或目录填写一个路径；多路径逐行填写，使用 /。" disabled></textarea>
+        </label>
+        <label class="restore-field">当前额外项
+          <select id="restore-extra-policy" disabled>
+            <option value="preserve">保留当前额外项（默认）</option>
+            <option value="replace_selected_scope">描述删除选中范围中的额外项</option>
+          </select>
+        </label>
+        <label class="restore-field">目标文件已占用
+          <select id="restore-occupied-policy" disabled>
+            <option value="report_conflicts">报告已有文件冲突（默认）</option>
+            <option value="replace_files">描述新的文件覆盖操作</option>
+          </select>
+        </label>
+      </div>
+      <p class="detail">目标前缀保留完整源相对路径。未选区域始终保留；类型、大小写和祖先文件冲突会报告。</p>
+      <div class="actions"><button id="restore-preview" type="button" class="primary" disabled>生成只读预览</button></div>
+      <p id="restore-detail" class="detail" role="status">等待当前部署的已鉴权历史列表。</p>
+      <dl id="restore-summary" class="summary" hidden></dl>
+      <div id="restore-results" class="restore-table-wrap" hidden>
+        <table class="restore-table">
+          <caption>有界的新操作描述，尚未执行恢复</caption>
+          <thead><tr><th scope="col">历史源路径</th><th scope="col">实际目标路径</th><th scope="col">差异</th><th scope="col">新操作描述</th><th scope="col">历史 / 当前逻辑大小</th><th scope="col">冲突路径</th></tr></thead>
+          <tbody id="restore-rows"></tbody>
+        </table>
+      </div>
     </section>
 
     <section class="panel" aria-labelledby="storage-title">
