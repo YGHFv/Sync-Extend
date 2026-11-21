@@ -14,6 +14,7 @@ const fields = {};
   "workspace-state", "workspace-detail", "workspace-summary",
   "storage-state", "storage-detail", "storage-summary", "network-state", "network-detail", "network-summary",
   "easytier-state", "easytier-detail", "easytier-summary",
+  "recovery-state", "recovery-detail", "recovery-summary", "recovery-guide",
 ].forEach((id) => { fields[id] = document.getElementById(id); });
 
 const canUseBridge = Boolean(window.ksu && typeof window.ksu.exec === "function");
@@ -102,13 +103,14 @@ function hideConfirmation() {
 
 function clearRuntime(detail = "当前没有可验证的运行摘要。") {
   liveGateway = null;
-  for (const category of ["workspace", "storage", "network", "easytier"]) {
+  for (const category of ["workspace", "storage", "network", "easytier", "recovery"]) {
     fields[`${category}-summary`].textContent = "";
     fields[`${category}-summary`].hidden = true;
     setStatus(category, "暂无观察", detail);
   }
   fields["network-detail"].textContent = "当前没有已鉴权的连接样本；实际路径、外层 wire 和中继费用保持未知。";
   fields["easytier-detail"].textContent = "当前没有本机受管子进程与 RPC 属主绑定的样本。";
+  fields["recovery-guide"].textContent = "没有可验证的当前历史来源。恢复须独立核对，不能使用旧观测执行。";
 }
 
 function clearExportTests(detail = "连接待测试") {
@@ -175,6 +177,111 @@ function showSummary(category, rows) {
     target.append(label, detail);
   }
   target.hidden = false;
+}
+
+function showRecovery(local, age) {
+  const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+  const optional = (value, name, valid) => {
+    if (!Object.hasOwn(value, name)) return undefined;
+    if (!valid(value[name])) throw new Error("Invalid recovery metadata field");
+    return value[name];
+  };
+  const flag = (value) => typeof value === "boolean";
+  const time = (value) => {
+    if (value === undefined) return "未知";
+    if (value === null) return "未裁剪";
+    const date = new Date(value);
+    return Number.isNaN(date.valueOf()) ? `${value} ms (Unix epoch)` :
+      date.toISOString().replace("T", " ").replace(".000Z", " UTC");
+  };
+  const seen = new Set();
+  function snapshotText(snapshot, pruned) {
+    if (!object(snapshot) || !identifier(snapshot.snapshot_id, 64) ||
+        typeof snapshot.state !== "string" || snapshot.state.length < 1 || snapshot.state.length > 64 ||
+        snapshot.state.includes("\0") || !flag(snapshot.current) || seen.has(snapshot.snapshot_id)) {
+      throw new Error("Invalid recovery snapshot");
+    }
+    seen.add(snapshot.snapshot_id);
+    const created = optional(snapshot, "created_at_ms", count);
+    const locked = optional(snapshot, "locked", flag);
+    const retained = optional(snapshot, "content_retained", flag);
+    const prunedAt = optional(snapshot, "pruned_at_ms", (value) => value === null || count(value));
+    if ((retained === true && prunedAt !== undefined && prunedAt !== null) ||
+        (retained === false && (snapshot.current || locked === true || prunedAt === null)) ||
+        (prunedAt !== undefined && prunedAt !== null &&
+          (snapshot.current || locked === true || created !== undefined && created > prunedAt)) ||
+        (pruned && (snapshot.current || locked === true || retained === true)) ||
+        (!pruned && retained === false)) throw new Error("Contradictory recovery snapshot");
+    return `${snapshot.snapshot_id}；原状态 ${snapshot.state}；快照创建时间 ${time(created)}；` +
+      `${snapshot.current ? "当前" : "历史"} / ${locked === undefined ? "锁定未知" : locked ? "锁定" : "未锁定"}；` +
+      `${retained === undefined ? "保留状态未知" : retained ? "已保留；内容未验" : "内容已修剪"}；裁剪时间 ${time(prunedAt)}`;
+  }
+  const rows = [["采样距今", `${age} ms；不代表当前内容可恢复`]];
+  if (Object.hasOwn(local, "history_metadata")) {
+    const limit = optional(local, "history_metadata_limit", (value) => value === 1);
+    const truncated = optional(local, "history_metadata_truncated", flag);
+    if (!Array.isArray(local.history_metadata) || local.history_metadata.length > (limit ?? 1) ||
+        local.history_metadata.length > local.total_snapshots ||
+        truncated !== undefined && (truncated !== (local.total_snapshots > local.history_metadata.length) ||
+          local.history_metadata.length !== Math.min(1, local.total_snapshots))) {
+      throw new Error("Invalid retained history summary");
+    }
+    for (const snapshot of local.history_metadata) rows.push(["最近保留快照", snapshotText(snapshot, false)]);
+    rows.push(["保留列表范围", truncated === undefined ? "摘要是否截取未知" :
+      truncated ? "摘要最近 1 条；其余保留历史未展示" : "摘要最多最近 1 条"]);
+  } else {
+    rows.push(["保留快照元数据", "旧版本未提供；创建时间、锁定和保留状态未知"]);
+  }
+  const recovery = local.recovery;
+  let guide = "在独立终端人工选择保留来源并再核对内容，正常停止当前资源属主后，显式执行 " +
+    "syncd restore --data-dir <数据目录> --snapshot <保留快照> --path <相对文件>。占用路径保留冲突副本。" +
+    "完整只读恢复预览当前尚未提供；本页不创建恢复预备状态。";
+  if (recovery !== undefined && recovery !== null) {
+    if (!object(recovery)) throw new Error("Invalid recovery summary");
+    const retained = optional(recovery, "retained_snapshots", count);
+    const pruned = optional(recovery, "pruned_snapshots", count);
+    const consistent = optional(recovery, "metadata_snapshot_consistent", flag);
+    for (const name of ["historical_content_hashes_verified", "restoration_performed",
+      "native_authority", "cleanup_authority", "pending_resume_authority"]) {
+      if (optional(recovery, name, flag) === true) throw new Error("Unsupported recovery claim or authority");
+    }
+    if (retained !== undefined && retained !== local.total_snapshots) throw new Error("Retained count differs");
+    rows.push(["保留 / 内容已修剪快照", `${retained ?? "未知"} / ${pruned ?? "未知"}`]);
+    rows.push(["元数据一致性", consistent === true ? "同一元数据快照；历史内容未验" : "未知；未确认"]);
+    rows.push(["历史内容 hash", Object.hasOwn(recovery, "historical_content_hashes_verified") ?
+      "未验证；保留不等于已验证可恢复" : "未知；旧载荷未提供"]);
+    rows.push(["恢复 / 原生 / 清理 / pending 权限",
+      ["restoration_performed", "native_authority", "cleanup_authority", "pending_resume_authority"]
+        .every((name) => Object.hasOwn(recovery, name)) ? "未执行 / 无 / 无 / 无" : "未知；本页不执行恢复或清理"]);
+    const limit = optional(recovery, "pruned_history_limit", (value) => value === 1);
+    const truncated = optional(recovery, "pruned_history_truncated", flag);
+    if (Object.hasOwn(recovery, "pruned_history")) {
+      if (!Array.isArray(recovery.pruned_history) || recovery.pruned_history.length > (limit ?? 1) ||
+          pruned !== undefined && (recovery.pruned_history.length > pruned ||
+            truncated !== undefined && (truncated !== (pruned > recovery.pruned_history.length) ||
+              recovery.pruned_history.length !== Math.min(1, pruned)))) throw new Error("Invalid pruned summary");
+      for (const snapshot of recovery.pruned_history) rows.push(["最近裁剪审计", snapshotText(snapshot, true)]);
+    }
+    rows.push(["裁剪审计范围", !Object.hasOwn(recovery, "pruned_history") ? "未知；旧载荷未提供" :
+      truncated === undefined ? "是否截取未知；内容已修剪" :
+        truncated ? "摘要最近 1 条；其他裁剪审计未展示" : "摘要最多最近 1 条；内容已修剪"]);
+    for (const [name, command] of [["restore_command", "restore"], ["whole_tree_restore_command", "tree-prepare"],
+      ["recovered_archive_command", "recovered-local"]]) {
+      if (Object.hasOwn(recovery, name) && recovery[name] !== null && recovery[name] !== command) {
+        throw new Error("Invalid manual recovery command name");
+      }
+    }
+    if (recovery.whole_tree_restore_command === "tree-prepare") {
+      guide += " Windows 整树 tree-prepare 需要显式预算，会写入预备状态，不是只读预览。";
+    }
+    if (recovery.recovered_archive_command === "recovered-local") {
+      guide += " Windows 原归档可手动使用 recovered-local --descriptor <归档描述文件> inspect 预检。";
+    }
+  } else rows.push(["恢复元数据", "旧版本未提供；裁剪、验证和执行权限均未知"]);
+  showSummary("recovery", rows);
+  fields["recovery-guide"].textContent = guide;
+  setStatus("recovery", "历史元数据", "摘要只展示最近保留和裁剪各 1 条，真实总数分别列出。" +
+    "后台保留列表最多 128 条、裁剪审计最多 16 条；本页不检查历史内容、不执行恢复。");
 }
 
 function validSocket(value) {
@@ -348,6 +455,7 @@ function showDashboard(owner) {
       `${chunks.all_current_chunks_checked ? "已检查当前块。" : "块检查仅为部分抽样。"} ` +
       `${leases.explicit_recovery_required ? "到期租约仍受保护，需要显式回收。" : "没有到期待回收租约。"} ` +
       `${local.entries_truncated || local.snapshots_truncated ? "后台列表已有截取。 " : ""}本页展示摘要；远端备份尚未确认。`);
+    showRecovery(local, observation.age_ms);
   }
   if (value.storage) {
     const observation = value.storage;
@@ -574,6 +682,12 @@ fields["verify-stop"].addEventListener("click", async () => {
     fields["probe-result"].hidden = true;
     setStatus("service", "已停止", "当前没有持有模块控制权的后台服务。", "ready");
   } catch (error) {
+    activeOwner = false;
+    ownerReady = false;
+    currentOwnerPid = null;
+    clearRuntime("停止状态未确认；旧运行摘要已清除。");
+    clearExportTests("状态未确认");
+    showGatewayAvailability();
     setStatus("service", "未确认停止", "后台服务可能仍在运行或正在退出。", "warn");
   } finally {
     setBusy(false);

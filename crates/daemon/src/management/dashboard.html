@@ -30,6 +30,8 @@ td,th{text-align:left;padding:8px;border-bottom:1px solid #304057;overflow-wrap:
 <section><h2>缺块与读取检查</h2><div id="chunks"></div></section>
 <section><h2>冲突处置</h2><div id="conflicts" class="scroll"></div></section>
 <section><h2>历史快照</h2><div id="history" class="scroll"></div></section>
+<section><h2>恢复与元数据预览</h2><div id="recovery"></div><p id="recovery-guide"></p></section>
+<section><h2>内容已修剪的历史审计</h2><div id="pruned-history" class="scroll"></div></section>
 <section><h2>当前路径</h2><div id="paths" class="scroll"></div></section>
 </main>
 <script>
@@ -118,12 +120,76 @@ return state+"。受管启动代 "+sample.generation+"；PID "+sample.child_pid+
 (sample.peers_truncated?"（已截取）":"")+"；采样距今 "+observation.age_ms+" ms。"+rows.join("；")+
 "。overlay ID 不是 SyncExtend 设备身份，未关联到已鉴权的同步连接；不授予 P2P 费用豁免。外层 wire 和费用未知。";
 }
+function historyView(local,age){
+const object=value=>value!==null&&typeof value==="object"&&!Array.isArray(value);
+const count=value=>Number.isSafeInteger(value)&&value>=0;
+const flag=value=>typeof value==="boolean";
+const id=value=>typeof value==="string"&&/^[0-9a-f]{64}$/.test(value);
+const optional=(value,name,valid)=>{if(!Object.hasOwn(value,name))return undefined;
+if(!valid(value[name]))throw Error("历史元数据字段无法验证。");return value[name];};
+const time=value=>{if(value===undefined)return "未知";if(value===null)return "未裁剪";
+const date=new Date(value);return Number.isNaN(date.valueOf())?value+" ms (Unix epoch)":
+date.toISOString().replace("T"," ").replace(".000Z"," UTC");};
+if(!object(local)||!count(age)||!count(local.total_snapshots)||!Array.isArray(local.snapshots)||
+local.snapshots.length>128||!flag(local.snapshots_truncated)||
+local.snapshots.length>local.total_snapshots||
+(!local.snapshots_truncated&&local.snapshots.length!==local.total_snapshots))throw Error("历史列表无法验证。");
+const seen=new Set();
+function row(snapshot,pruned){
+if(!object(snapshot)||!id(snapshot.snapshot_id)||typeof snapshot.state!=="string"||
+snapshot.state.length<1||snapshot.state.length>64||snapshot.state.includes("\0")||
+!flag(snapshot.current)||seen.has(snapshot.snapshot_id))throw Error("历史快照无法验证。");
+seen.add(snapshot.snapshot_id);
+const created=optional(snapshot,"created_at_ms",count),locked=optional(snapshot,"locked",flag);
+const retained=optional(snapshot,"content_retained",flag),prunedAt=optional(snapshot,"pruned_at_ms",value=>value===null||count(value));
+if((retained===true&&prunedAt!==undefined&&prunedAt!==null)||
+(retained===false&&(snapshot.current||locked===true||prunedAt===null))||
+(prunedAt!==undefined&&prunedAt!==null&&(snapshot.current||locked===true||created!==undefined&&created>prunedAt))||
+(pruned&&(snapshot.current||locked===true||retained===true))||(!pruned&&retained===false))throw Error("历史保留状态矛盾。");
+return [snapshot.snapshot_id,snapshot.state,time(created),
+(snapshot.current?"当前":"历史")+" / "+(locked===undefined?"锁定未知":locked?"锁定":"未锁定"),
+retained===undefined?"保留状态未知":retained?"已保留；内容未验":"内容已修剪",time(prunedAt)];
+}
+const snapshots=local.snapshots.map(snapshot=>row(snapshot,false));let prunedRows=[];
+let summary="采样距今 "+age+" ms。旧载荷未提供恢复元数据；历史保留、裁剪和内容验证状态未知。";
+let guide="在历史页人工选择保留来源并再核对内容，正常停止当前资源属主后，在独立终端显式执行 "+
+"syncd restore --data-dir <数据目录> --snapshot <保留快照> --path <相对文件>。占用路径保留冲突副本。"+
+"完整只读恢复预览当前尚未提供；本页仅预览元数据，不创建恢复预备状态。";
+if(local.recovery!==undefined&&local.recovery!==null){
+const recovery=local.recovery;if(!object(recovery))throw Error("恢复摘要无法验证。");
+const retained=optional(recovery,"retained_snapshots",count),pruned=optional(recovery,"pruned_snapshots",count);
+const consistent=optional(recovery,"metadata_snapshot_consistent",flag);
+for(const name of ["historical_content_hashes_verified","restoration_performed","native_authority","cleanup_authority","pending_resume_authority"]){
+if(optional(recovery,name,flag)===true)throw Error("恢复摘要含不支持的验证或权限声明。");}
+if(retained!==undefined&&(retained!==local.total_snapshots||local.snapshots.length!==Math.min(128,retained)||
+local.snapshots_truncated!==(retained>128)))throw Error("保留计数与历史不一致。");
+const truncated=optional(recovery,"pruned_history_truncated",flag);
+if(Object.hasOwn(recovery,"pruned_history")){
+if(!Array.isArray(recovery.pruned_history)||recovery.pruned_history.length>16||
+pruned!==undefined&&(recovery.pruned_history.length>pruned||truncated!==undefined&&
+(truncated!==(pruned>recovery.pruned_history.length)||recovery.pruned_history.length!==Math.min(16,pruned))))
+throw Error("裁剪审计计数或截断无法验证。");
+prunedRows=recovery.pruned_history.map(snapshot=>row(snapshot,true));}
+for(const [name,command] of [["restore_command","restore"],["whole_tree_restore_command","tree-prepare"],["recovered_archive_command","recovered-local"]]){
+if(Object.hasOwn(recovery,name)&&recovery[name]!==null&&recovery[name]!==command)throw Error("手动恢复入口名称无法验证。");}
+summary="采样距今 "+age+" ms；保留 / 内容已修剪快照 "+(retained??"未知")+" / "+(pruned??"未知")+"。"+
+(consistent===true?"同一元数据快照；":"元数据一致性未知；")+
+(Object.hasOwn(recovery,"historical_content_hashes_verified")?"历史内容 hash 未验证，保留不等于已验证可恢复。":"历史内容验证未知。")+
+(["restoration_performed","native_authority","cleanup_authority","pending_resume_authority"].every(name=>Object.hasOwn(recovery,name))?
+"恢复未执行；无原生、清理或 pending 权限。":"执行和权限信息未完整提供；本页不执行恢复。")+
+(truncated===true?"裁剪审计已截取，最多 16 条。":truncated===undefined?"裁剪审计是否截取未知。":"裁剪审计最多 16 条。");
+if(recovery.whole_tree_restore_command==="tree-prepare")guide+=" Windows 整树 tree-prepare 需原基线、目标和显式预算，会写入预备状态，不是只读预览。";
+if(recovery.recovered_archive_command==="recovered-local")guide+=" Windows 原归档可手动预检：syncd recovered-local --descriptor <归档描述文件> inspect。";
+}
+return {snapshots,prunedRows,summary,guide};
+}
 let requestEpoch=0;let activeController=null;let ownerGeneration=null;
-function forget(){ownerGeneration=null;byId("stop").disabled=true;byId("storage-section").hidden=true;byId("storage").replaceChildren();requestEpoch++;activeController?.abort();activeController=null;byId("refresh").disabled=false;byId("token").value="";byId("content").hidden=true;for(const id of ["space","queue","network","easytier","dav","chunks","conflicts","history","paths"]){byId(id).replaceChildren();}text("message","凭据与展示已清除。");}
+function clearObservationDisplay(){ownerGeneration=null;byId("stop").disabled=true;byId("content").hidden=true;byId("storage-section").hidden=true;for(const id of ["storage","space","queue","network","easytier","dav","chunks","conflicts","history","paths","recovery","recovery-guide","pruned-history"]){byId(id).replaceChildren();}}
+function forget(){clearObservationDisplay();requestEpoch++;activeController?.abort();activeController=null;byId("refresh").disabled=false;byId("token").value="";text("message","凭据与展示已清除。");}
 byId("forget").addEventListener("click",forget);
 byId("refresh").addEventListener("click",async()=>{
-const token=byId("token").value;if(!/^[0-9a-f]{64}$/.test(token)){text("message","请输入有效的本机管理凭据。");return;}
-byId("refresh").disabled=true;byId("content").hidden=true;text("network","");text("easytier","");text("message","正在读取本机状态…");
+clearObservationDisplay();const token=byId("token").value;if(!/^[0-9a-f]{64}$/.test(token)){requestEpoch++;activeController?.abort();activeController=null;byId("refresh").disabled=false;text("message","请输入有效的本机管理凭据。");return;}
+byId("refresh").disabled=true;text("message","正在读取本机状态…");
 const epoch=++requestEpoch;const controller=new AbortController();activeController=controller;const timeout=setTimeout(()=>controller.abort(),5000);
 try{
 const response=await fetch("/v1/dashboard",{method:"GET",headers:{Authorization:"Bearer "+token},credentials:"omit",cache:"no-store",mode:"same-origin",redirect:"error",signal:controller.signal});
@@ -139,25 +205,27 @@ text("storage",storage?"空间 "+storage.space_id+"；设备 "+storage.device_id
 text("network",connectionText(value.connection));
 text("easytier",easyTierText(value.easytier));
 text("dav",gateway?"连接地址 http://"+gateway.address+"；认证已启用；授权导出 "+gateway.exports.map(x=>x.url+(x.writable?"（读写）":"（只读）")).join("、")+"。凭据通过本机配置管理。":"当前没有网关观测。");
-if(!value.observation){text("message","当前角色没有空间观测；连接和网关状态见下方。");for(const id of ["space","queue","chunks","conflicts","history","paths"]){byId(id).replaceChildren();}return;}
-const local=value.observation.local;
+if(!value.observation){text("message","当前角色没有空间观测；连接和网关状态见下方。");for(const id of ["space","queue","chunks","conflicts","history","paths","recovery","recovery-guide","pruned-history"]){byId(id).replaceChildren();}return;}
+const local=value.observation.local;const history=historyView(local,value.observation.age_ms);
 text("message","观测距今 "+value.observation.age_ms+" 毫秒；"+(value.resources_ready?"本机资源已就绪。":"本机资源尚未就绪。")+" 远端备份状态尚未认证。");
 text("space","空间 "+local.space_id+"；设备 "+local.device_id+"；当前条目 "+local.total_entries);
 text("queue","待发布 "+local.outstanding_publications+"；待文件变更 "+local.outstanding_mutations);
 const leases=local.read_leases;if(leases){text("queue",byId("queue").textContent+"；活跃读租约 "+leases.active+"；到期待回收 "+leases.expired_pending_recovery);}
 const c=local.chunks;text("chunks","已检查 "+c.checked_chunks+"/"+c.total_current_chunks+" 个当前块，共 "+c.checked_bytes+" 字节；不可读取 "+c.unavailable_chunks.length+" 个。"+(c.all_current_chunks_checked?"已覆盖当前块。":"仅覆盖部分块。"));
 table("conflicts",["事务","状态","文件已物化"],local.conflict_admissions.map(x=>[x.transaction_id,x.resolution_applied?"已提交":"待处理",x.worktree_materialized?"是":"否"]));
-table("history",["快照","状态","当前"],local.snapshots.map(x=>[x.snapshot_id,x.state,x.current?"是":""]));
+table("history",["快照","原状态","快照创建时间","当前 / 锁定","内容状态","裁剪时间"],history.snapshots);
+table("pruned-history",["快照","原状态","快照创建时间","当前 / 锁定","内容状态","裁剪时间"],history.prunedRows);
+text("recovery",history.summary);text("recovery-guide",history.guide);
 table("paths",["相对路径","类型","逻辑字节"],local.entries.map(x=>[x.path,x.kind,x.logical_bytes??"—"]));
 if(local.entries_truncated||local.snapshots_truncated||local.conflict_admissions_truncated){text("message",byId("message").textContent+" 列表已按展示上限截取。");}
-}catch(error){if(epoch!==requestEpoch)return;ownerGeneration=null;byId("stop").disabled=true;byId("content").hidden=true;text("network","");text("easytier","");text("message",error.name==="AbortError"?"读取超时，请稍后重试。":error.message==="管理请求被拒绝。"?"管理请求被拒绝。":"无法读取本机状态，请检查服务和凭据。");}
+}catch(error){if(epoch!==requestEpoch)return;clearObservationDisplay();text("message",error.name==="AbortError"?"读取超时，请稍后重试。":error.message==="管理请求被拒绝。"?"管理请求被拒绝。":"无法读取本机状态，请检查服务和凭据。");}
 finally{clearTimeout(timeout);if(epoch===requestEpoch){activeController=null;byId("refresh").disabled=false;}}
 });
 byId("stop").addEventListener("click",async()=>{
 const token=byId("token").value;const generation=ownerGeneration;
 if(!/^[0-9a-f]{64}$/.test(token)||!generation){text("message","请先读取当前本机状态。");return;}
 activeController?.abort();const epoch=++requestEpoch;const controller=new AbortController();
-activeController=controller;byId("stop").disabled=true;byId("refresh").disabled=true;text("network","");text("easytier","");
+activeController=controller;byId("refresh").disabled=true;clearObservationDisplay();
 text("message","正在请求停止本机服务…");
 const requestId=Array.from(crypto.getRandomValues(new Uint8Array(16)),x=>x.toString(16).padStart(2,"0")).join("");
 const timeout=setTimeout(()=>controller.abort(),5000);
@@ -174,7 +242,7 @@ const joined=new Uint8Array(size);let offset=0;for(const part of parts){joined.s
 const value=JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(joined));
 if(value.owner_generation!==generation||value.stop_requested!==true||value.resources_ready!==false||
 value.process_exit_verified!==false){throw Error("响应无法验证。");}
-ownerGeneration=null;byId("content").hidden=true;text("network","");text("easytier","");
+clearObservationDisplay();
 text("message","停止请求已接受，服务正在退出。");
 }catch(error){if(epoch!==requestEpoch)return;ownerGeneration=null;
 text("message",error.message==="停止请求被拒绝。"?"停止请求被拒绝，请重新读取状态。":

@@ -289,6 +289,25 @@ pub fn observe_local_space(local: &LocalSpace) {
                             "all_current_chunks_checked": value.chunks.all_current_chunks_checked,
                         },
                         "read_leases": value.read_leases,
+                        "history_metadata": value.snapshots.iter().take(1).collect::<Vec<_>>(),
+                        "history_metadata_limit": 1,
+                        "history_metadata_truncated": value.total_snapshots > 1,
+                        "recovery": {
+                            "retained_snapshots": value.recovery.retained_snapshots,
+                            "pruned_snapshots": value.recovery.pruned_snapshots,
+                            "pruned_history": value.recovery.pruned_history.iter().take(1).collect::<Vec<_>>(),
+                            "pruned_history_limit": 1,
+                            "pruned_history_truncated": value.recovery.pruned_snapshots > 1,
+                            "metadata_snapshot_consistent": value.recovery.metadata_snapshot_consistent,
+                            "historical_content_hashes_verified": value.recovery.historical_content_hashes_verified,
+                            "restore_command": value.recovery.restore_command,
+                            "whole_tree_restore_command": value.recovery.whole_tree_restore_command,
+                            "recovered_archive_command": value.recovery.recovered_archive_command,
+                            "restoration_performed": value.recovery.restoration_performed,
+                            "native_authority": value.recovery.native_authority,
+                            "cleanup_authority": value.recovery.cleanup_authority,
+                            "pending_resume_authority": value.recovery.pending_resume_authority,
+                        },
                         "remote_backup_complete": false,
                     }),
                 )
@@ -532,7 +551,7 @@ pub fn serve(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
          Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
          Referrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; \
-         script-src 'sha256-hrPpTtuPU9QimkU+9eu0t1p7iUnjELGC2F9AxGlp1QQ='; style-src 'unsafe-inline'; \
+         script-src 'sha256-ICQotszEltO0BaHm+fqyw3R+cP3xSZOv7nGOGv2S51M='; style-src 'unsafe-inline'; \
          connect-src 'self'; img-src 'none'; frame-ancestors 'none'; base-uri 'none'; \
          form-action 'none'\r\n\r\n",
         body.len()

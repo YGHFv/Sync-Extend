@@ -48,6 +48,20 @@ function Get-ClientBudgetRows {
     }
 }
 
+function Test-ClientVerifiedStopStatus($Status) {
+    # manage-user records stopped only after its original retained process
+    # exits with zero. A ManagementStatus reply or failed health read is not
+    # that record. Also honour an explicit future exit-verification field.
+    if ($null -eq $Status -or $Status.state -cne 'stopped' -or
+        $Status.process_active -isnot [bool] -or $Status.process_active -cne $false) { return $false }
+    $hasExit = if ($Status -is [Collections.IDictionary]) { $Status.Contains('process_exit_verified') } else {
+        $null -ne $Status.PSObject.Properties['process_exit_verified']
+    }
+    if ($hasExit -and ($Status.process_exit_verified -isnot [bool] -or
+            $Status.process_exit_verified -cne $true)) { return $false }
+    return $true
+}
+
 if ($Snapshot) {
     $value = Get-ClientSnapshot
     $null = New-SyncExtendClientView $value
@@ -63,7 +77,7 @@ $form = [Windows.Forms.Form]::new()
 $form.Text = 'SyncExtend'
 $form.StartPosition = 'CenterScreen'
 $form.MinimumSize = [Drawing.Size]::new(900, 550)
-$form.Size = [Drawing.Size]::new(980, 650)
+$form.Size = [Drawing.Size]::new(1120, 690)
 $form.Font = [Drawing.Font]::new('Segoe UI', 10)
 $form.BackColor = [Drawing.Color]::White
 
@@ -116,6 +130,7 @@ function Add-ColumnsTab {
     $list.View = 'Details'
     $list.GridLines = $true
     $list.FullRowSelect = $true
+    $list.ShowItemToolTips = $true
     for ($index = 0; $index -lt $Names.Length; $index++) {
         [void]$list.Columns.Add($Names[$index], $Widths[$index])
     }
@@ -126,7 +141,9 @@ function Add-ColumnsTab {
 
 Add-ColumnsTab 'Status' @('项目', '状态') @(225, 665) '本机状态'
 Add-ColumnsTab 'Files' @('相对路径', '类型', '逻辑大小') @(480, 95, 230) '工作区'
-Add-ColumnsTab 'History' @('快照', '状态', '当前') @(530, 145, 100) '本机历史'
+Add-ColumnsTab 'History' @('快照', '原状态', '快照创建时间', '当前 / 锁定', '内容状态', '裁剪时间') @(275, 100, 180, 140, 150, 180) '本机历史'
+Add-ColumnsTab 'Pruned history' @('快照', '原状态', '快照创建时间', '当前 / 锁定', '内容状态', '裁剪时间') @(275, 100, 180, 140, 150, 180) '裁剪审计'
+Add-ColumnsTab 'Recovery' @('项目', '只读观察与手动入口') @(230, 800) '恢复与预览'
 Add-ColumnsTab 'Conflicts' @('事务', '处置', '文件已物化') @(510, 130, 130) '冲突'
 Add-ColumnsTab 'Unavailable chunks' @('样本来源', '不可读取块') @(150, 670) '缺块'
 Add-ColumnsTab 'WebDAV' @('导出地址', '配置权限', '上传上限') @(470, 140, 200)
@@ -142,6 +159,7 @@ function Add-ClientRow {
     for ($index = 1; $index -lt $Values.Count; $index++) {
         [void]$item.SubItems.Add([string]$Values[$index])
     }
+    $item.ToolTipText = ($Values -join "`r`n")
     [void]$lists[$Tab].Items.Add($item)
 }
 
@@ -162,7 +180,7 @@ function Show-ClientUnavailable {
     if ($Managed) {
         try {
             $status = & (Join-Path $PSScriptRoot 'manage-user.ps1') status -InstallRoot $InstallRoot
-            if ($status.state -ceq 'stopped' -and !$status.process_active) {
+            if (Test-ClientVerifiedStopStatus $status) {
                 $summary.Text = "本机服务已停止。可启动原来选定的已安装版本。`r`n工作树、历史与配置继续保留。"
                 Add-ClientRow 'Status' @('本机服务', '已停止')
                 Add-ClientRow 'Status' @('已选版本', $status.version)
@@ -175,6 +193,7 @@ function Show-ClientUnavailable {
         } catch { }
     }
     Add-ClientRow 'Network' @('实际路径与流量', '无可验证的运行样本')
+    Add-ClientRow 'Recovery' @('历史恢复元数据', '无可验证的当前样本；停止后历史内容仍须独立核对')
 }
 
 function Update-Client {
@@ -331,6 +350,9 @@ $null = Add-ClientButton '查看拉取预算' {
         foreach ($row in @(Get-ClientBudgetRows)) { Add-ClientRow 'Pull budget' $row }
         $tabs.SelectedTab = $lists['Pull budget'].Parent
     } finally { $picker.Dispose() }
+}
+$null = Add-ClientButton '恢复与预览说明' {
+    $tabs.SelectedTab = $lists['Recovery'].Parent
 }
 $null = Add-ClientButton '打开配置目录' {
     Invoke-Item -LiteralPath ([IO.Path]::GetDirectoryName($deploymentPath))

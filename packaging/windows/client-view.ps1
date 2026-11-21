@@ -202,6 +202,117 @@ function New-SyncExtendEasyTierView($Observation) {
     return $rows.ToArray()
 }
 
+function Get-SyncExtendOptionalRecoveryFlag($Value, [string]$Name) {
+    if (!$Value.Contains($Name)) { return $null }
+    Assert-SyncExtendViewFlag $Value[$Name]
+    return $Value[$Name]
+}
+
+function Get-SyncExtendOptionalRecoveryCount($Value, [string]$Name) {
+    if (!$Value.Contains($Name)) { return $null }
+    return Get-SyncExtendViewInteger $Value[$Name]
+}
+
+function New-SyncExtendSnapshotView($Snapshot, $Seen, [bool]$Pruned = $false) {
+    Assert-SyncExtendViewObject $Snapshot
+    Assert-SyncExtendViewId $Snapshot.snapshot_id
+    Assert-SyncExtendViewText $Snapshot.state 64
+    Assert-SyncExtendViewFlag $Snapshot.current
+    if (!$Seen.Add($Snapshot.snapshot_id)) { throw 'The history repeats a snapshot identifier.' }
+    $created = Get-SyncExtendOptionalRecoveryCount $Snapshot 'created_at_ms'
+    $locked = Get-SyncExtendOptionalRecoveryFlag $Snapshot 'locked'
+    $retained = Get-SyncExtendOptionalRecoveryFlag $Snapshot 'content_retained'
+    $prunedAt = if ($Snapshot.Contains('pruned_at_ms') -and $null -ne $Snapshot.pruned_at_ms) {
+        Get-SyncExtendViewInteger $Snapshot.pruned_at_ms
+    }
+    if (($retained -ceq $true -and $null -ne $prunedAt) -or
+        ($retained -ceq $false -and ($Snapshot.current -or $locked -ceq $true)) -or
+        ($Snapshot.Contains('pruned_at_ms') -and $retained -ceq $false -and $null -eq $prunedAt) -or
+        ($null -ne $prunedAt -and ($Snapshot.current -or $locked -ceq $true)) -or
+        ($null -ne $created -and $null -ne $prunedAt -and $created -gt $prunedAt) -or
+        ($Pruned -and ($Snapshot.current -or $retained -ceq $true -or $locked -ceq $true)) -or
+        (!$Pruned -and $retained -ceq $false)) {
+        throw 'The history retention metadata is contradictory.'
+    }
+    $retention = if ($retained -ceq $true) { '已保留；内容未验' } elseif ($retained -ceq $false) {
+        '内容已修剪'
+    } else { '保留状态未知' }
+    return ,@($Snapshot.snapshot_id, $Snapshot.state,
+        $(if ($null -ne $created) { Format-SyncExtendViewTime $created } else { '未知' }),
+        "$(if ($Snapshot.current) { '当前' } else { '历史' }) / $(if ($null -eq $locked) { '锁定未知' } elseif ($locked) { '锁定' } else { '未锁定' })",
+        $retention,
+        $(if ($null -ne $prunedAt) { Format-SyncExtendViewTime $prunedAt } elseif ($Snapshot.Contains('pruned_at_ms')) { '未裁剪' } else { '未知' }))
+}
+
+function Add-SyncExtendRecoveryView($View, $Local, [long]$Age, $Seen) {
+    Add-SyncExtendViewRow $View 'Recovery' @('元数据采样距今', "$Age ms；不代表当前内容可恢复")
+    $recovery = $Local.recovery
+    if ($null -eq $recovery) {
+        Add-SyncExtendViewRow $View 'Recovery' @('历史恢复元数据', '旧版本未提供；保留、裁剪、锁定及历史内容验证均未知')
+    } else {
+        Assert-SyncExtendViewObject $recovery
+        $retained = Get-SyncExtendOptionalRecoveryCount $recovery 'retained_snapshots'
+        $pruned = Get-SyncExtendOptionalRecoveryCount $recovery 'pruned_snapshots'
+        $consistent = Get-SyncExtendOptionalRecoveryFlag $recovery 'metadata_snapshot_consistent'
+        foreach ($name in @('historical_content_hashes_verified', 'restoration_performed',
+                'native_authority', 'cleanup_authority', 'pending_resume_authority')) {
+            $flag = Get-SyncExtendOptionalRecoveryFlag $recovery $name
+            if ($flag -ceq $true) { throw 'The recovery observation grants an unsupported claim.' }
+        }
+        if ($null -ne $retained -and ($retained -ne $Local.total_snapshots -or
+            $Local.snapshots.Count -ne [Math]::Min(128, $retained) -or
+            $Local.snapshots_truncated -cne ($retained -gt 128))) {
+            throw 'The retained snapshot count differs from the history.'
+        }
+        Add-SyncExtendViewRow $View 'Recovery' @('保留 / 内容已修剪快照',
+            "$(if ($null -eq $retained) { '未知' } else { $retained }) / $(if ($null -eq $pruned) { '未知' } else { $pruned })")
+        Add-SyncExtendViewRow $View 'Recovery' @('元数据一致性',
+            $(if ($consistent -ceq $true) { '同一元数据快照；历史内容未验' } else { '未知；未确认同一元数据快照' }))
+        Add-SyncExtendViewRow $View 'Recovery' @('历史内容 hash',
+            $(if ($recovery.Contains('historical_content_hashes_verified')) { '未验证；保留不等于已验证可恢复' } else { '未知；旧载荷未提供验证信息' }))
+        Add-SyncExtendViewRow $View 'Recovery' @('恢复 / 原生 / 清理 / pending 权限',
+            $(if (@('restoration_performed', 'native_authority', 'cleanup_authority', 'pending_resume_authority').Where({ !$recovery.Contains($_) }).Count) {
+                '未知；本页不执行任何恢复或清理'
+            } else { '未执行 / 无 / 无 / 无' }))
+        $truncated = Get-SyncExtendOptionalRecoveryFlag $recovery 'pruned_history_truncated'
+        if ($recovery.Contains('pruned_history')) {
+            Assert-SyncExtendViewList $recovery.pruned_history 16
+            if ($null -ne $pruned -and ($recovery.pruned_history.Count -gt $pruned -or
+                    ($null -ne $truncated -and ($truncated -cne ($pruned -gt $recovery.pruned_history.Count) -or
+                    $recovery.pruned_history.Count -ne [Math]::Min(16, $pruned))))) {
+                throw 'The pruned history count or truncation cannot be verified.'
+            }
+            foreach ($snapshot in $recovery.pruned_history) {
+                $row = New-SyncExtendSnapshotView $snapshot $Seen $true
+                Add-SyncExtendViewRow $View 'Pruned history' $row
+            }
+        }
+        Add-SyncExtendViewRow $View 'Recovery' @('裁剪审计列表',
+            $(if (!$recovery.Contains('pruned_history')) { '未知；旧载荷未提供列表' } elseif ($truncated -ceq $true) {
+                '最多 16 条；列表已截取，内容已修剪'
+            } elseif ($null -eq $truncated) { '最多 16 条；是否截取未知' } else { '最多 16 条；内容已修剪' }))
+        foreach ($name in @('restore_command', 'whole_tree_restore_command', 'recovered_archive_command')) {
+            if (!$recovery.Contains($name)) { continue }
+            $expected = switch ($name) { 'restore_command' { 'restore' } 'whole_tree_restore_command' { 'tree-prepare' } default { 'recovered-local' } }
+            if ($null -ne $recovery[$name] -and $recovery[$name] -cne $expected) {
+                throw 'The manual recovery command name cannot be verified.'
+            }
+        }
+        if ($recovery.whole_tree_restore_command -ceq 'tree-prepare') {
+            Add-SyncExtendViewRow $View 'Recovery' @('Windows 整树恢复',
+                '独立终端 tree-prepare 需原基线、目标和显式预算；会写入预备状态，不是只读预览')
+        }
+        if ($recovery.recovered_archive_command -ceq 'recovered-local') {
+            Add-SyncExtendViewRow $View 'Recovery' @('Windows 归档预检',
+                '独立终端：syncd recovered-local --descriptor <归档描述文件> inspect；仅检查原归档')
+        }
+    }
+    Add-SyncExtendViewRow $View 'Recovery' @('历史来源选择', '在快照历史页人工选择保留来源，再核对内容；裁剪审计不提供恢复内容')
+    Add-SyncExtendViewRow $View 'Recovery' @('单文件恢复（手动）', '独立终端：syncd restore --data-dir <数据目录> --snapshot <保留快照> --path <相对文件>')
+    Add-SyncExtendViewRow $View 'Recovery' @('执行前', '正常停止当前资源属主，再显式执行新恢复操作；占用路径保留冲突副本')
+    Add-SyncExtendViewRow $View 'Recovery' @('完整只读恢复预览', '当前尚未提供；本页只预览历史元数据，不检查历史内容、不创建恢复预备状态')
+}
+
 function New-SyncExtendClientView($Dashboard) {
     Assert-SyncExtendViewObject $Dashboard
     $null = Get-SyncExtendViewInteger $Dashboard.dashboard_format_version
@@ -218,7 +329,7 @@ function New-SyncExtendClientView($Dashboard) {
         Summary = if ($Dashboard.resources_ready) { '本机资源已就绪。' } else { '本机资源尚未就绪。' }
     }
     foreach ($tab in @('Status', 'Files', 'History', 'Conflicts', 'Unavailable chunks', 'WebDAV',
-            'Storage', 'Storage snapshots', 'Network', 'Pull budget')) {
+            'Storage', 'Storage snapshots', 'Network', 'Pull budget', 'Recovery', 'Pruned history')) {
         $view.Rows[$tab] = [Collections.Generic.List[object]]::new()
     }
     $view.Summary += "`r`n远端备份状态尚未确认。"
@@ -261,13 +372,12 @@ function New-SyncExtendClientView($Dashboard) {
             $bytes = if ($null -ne $entry.logical_bytes) { Format-SyncExtendViewBytes (Get-SyncExtendViewInteger $entry.logical_bytes) } else { '—' }
             Add-SyncExtendViewRow $view 'Files' @($entry.path, $entry.kind, $bytes)
         }
+        $seenSnapshots = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($snapshot in $local.snapshots) {
-            Assert-SyncExtendViewObject $snapshot
-            Assert-SyncExtendViewId $snapshot.snapshot_id
-            Assert-SyncExtendViewText $snapshot.state 64
-            Assert-SyncExtendViewFlag $snapshot.current
-            Add-SyncExtendViewRow $view 'History' @($snapshot.snapshot_id, $snapshot.state, $(if ($snapshot.current) { '是' } else { '' }))
+            $row = New-SyncExtendSnapshotView $snapshot $seenSnapshots
+            Add-SyncExtendViewRow $view 'History' $row
         }
+        Add-SyncExtendRecoveryView $view $local $age $seenSnapshots
         foreach ($conflict in $local.conflict_admissions) {
             Assert-SyncExtendViewObject $conflict
             Assert-SyncExtendViewId $conflict.transaction_id 32
@@ -309,6 +419,7 @@ function New-SyncExtendClientView($Dashboard) {
         if ($truncated.Count) { Add-SyncExtendViewRow $view 'Status' @('展示上限', '路径、历史或冲突列表有截取；每类最多 128 行') }
     } else {
         Add-SyncExtendViewRow $view 'Status' @('工作区观察', '当前角色没有可用的工作区样本')
+        Add-SyncExtendViewRow $view 'Recovery' @('历史恢复元数据', '当前没有可验证的工作区样本；旧历史观测已清除')
     }
 
     if ($null -ne $Dashboard.storage) {
