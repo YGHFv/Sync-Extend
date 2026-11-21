@@ -10,6 +10,12 @@ pub use unix_noreplace::{
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(unsafe_code)]
+mod unix_sqlite_ledger;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use unix_sqlite_ledger::{UnixSqliteLedger, UnixSqliteLedgerConnection};
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(unsafe_code)]
 mod local_control;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use local_control::{

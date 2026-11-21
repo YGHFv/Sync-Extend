@@ -1,10 +1,14 @@
 //! Explicit, independent reservations for each actual storage-pull block request.
 //! Reserved payload is conservative admission accounting, never wire-byte billing.
 use crate::{JournalError, Result};
-use rusqlite::{limits::Limit, params, Connection, OpenFlags, TransactionBehavior};
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+use rusqlite::OpenFlags;
+use rusqlite::{limits::Limit, params, Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+use std::fs::OpenOptions;
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -73,9 +77,13 @@ struct Attempt {
 
 type Permit = (u64, String, String);
 type QueryBudget = Arc<Mutex<(Instant, u64)>>;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+type LedgerConnection = sync_extend_platform_fs::UnixSqliteLedgerConnection;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+type LedgerConnection = Connection;
 
 pub struct StoragePullAttemptLedger {
-    connection: Connection,
+    connection: LedgerConnection,
     gate: Arc<Mutex<Option<Permit>>>,
     policy: StoragePullAttemptPolicy,
     policy_json: String,
@@ -147,15 +155,13 @@ impl StoragePullAttemptPolicy {
     }
 }
 
-// Other platforms need a retained-descriptor SQLite/VFS contract before this
-// optional ledger can be enabled. Metadata path observations do not prove that
-// SQLite opened the same inode across a concurrent A-to-B-to-A replacement.
+// Supported platforms retain the actual SQLite objects for the whole connection.
 fn require_attempt_platform() -> Result<()> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
     {
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
     {
         Err(JournalError::Invariant(
             "storage pull attempt budget requires the certified Windows handle path",
@@ -263,24 +269,38 @@ impl StoragePullAttemptLedger {
         } else {
             (Vec::new(), Vec::new(), false)
         };
-        let mut options = OpenOptions::new();
-        options.read(true).write(!read_only);
-        if initialize.is_some() {
-            options.create_new(true);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            options.share_mode(3).custom_flags(0x00200000);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(path)?;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let file = {
+            let mut options = OpenOptions::new();
+            options.read(true).write(!read_only);
+            if initialize.is_some() {
+                options.create_new(true);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                options.share_mode(3).custom_flags(0x00200000);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(path)?
+        };
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let unix_vfs = sync_extend_platform_fs::UnixSqliteLedger::open(
+            path,
+            Self::max_file_bytes(&policy)?,
+            initialize.is_some(),
+            read_only,
+        )?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let file = unix_vfs.main_file().try_clone()?;
         Self::verify_file(&file, path, Self::max_file_bytes(&policy)?)?;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         Self::guard_sidecars(path, Self::max_file_bytes(&policy)?, initialize.is_some())?;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let flags = if read_only {
             OpenFlags::SQLITE_OPEN_READ_ONLY
         } else {
@@ -300,9 +320,11 @@ impl StoragePullAttemptLedger {
         } else {
             Connection::open_with_flags(path, flags | OpenFlags::SQLITE_OPEN_NO_MUTEX)?
         };
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
         let mut connection =
             Connection::open_with_flags(path, flags | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let mut connection = unix_vfs.open_connection()?;
         Self::verify_file(&file, path, Self::max_file_bytes(&policy)?)?;
         #[cfg(windows)]
         if sync_extend_platform_fs::sqlite_main_file_identity(&connection)?
@@ -390,7 +412,7 @@ impl StoragePullAttemptLedger {
             .ok_or(JournalError::Invariant("attempt query bound overflow"))
     }
 
-    fn configure_limits(connection: &mut Connection, entries: u64) -> Result<QueryBudget> {
+    fn configure_limits(connection: &mut LedgerConnection, entries: u64) -> Result<QueryBudget> {
         for (category, limit) in [
             (Limit::SQLITE_LIMIT_LENGTH, 65_536),
             (Limit::SQLITE_LIMIT_SQL_LENGTH, 65_536),
@@ -457,6 +479,7 @@ impl StoragePullAttemptLedger {
         Ok(())
     }
 
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn guard_sidecars(path: &Path, max_bytes: u64, fresh: bool) -> Result<()> {
         for suffix in ["-wal", "-shm", "-journal"] {
             let mut sidecar = path.as_os_str().to_os_string();
@@ -497,11 +520,14 @@ impl StoragePullAttemptLedger {
             &self.policy.ledger_path,
             Self::max_file_bytes(&self.policy)?,
         )?;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         Self::guard_sidecars(
             &self.policy.ledger_path,
             Self::max_file_bytes(&self.policy)?,
             false,
         )?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        self.connection.verify()?;
         #[cfg(windows)]
         {
             for (path, file) in &self.readonly_files {
