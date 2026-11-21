@@ -18,6 +18,44 @@ pub struct DashboardSnapshot {
     pub snapshot_id: SnapshotId,
     pub state: String,
     pub current: bool,
+    pub created_at_ms: u64,
+    pub locked: bool,
+    pub content_retained: bool,
+    pub pruned_at_ms: Option<u64>,
+}
+
+impl DashboardSnapshot {
+    fn from_audit(
+        snapshot: &sync_extend_journal::SnapshotAudit,
+        current: Option<&SnapshotId>,
+    ) -> Self {
+        Self {
+            snapshot_id: snapshot.snapshot_id.clone(),
+            state: snapshot.state.clone(),
+            current: current == Some(&snapshot.snapshot_id),
+            created_at_ms: snapshot.created_at_ms,
+            locked: snapshot.locked,
+            content_retained: snapshot.content_retained,
+            pruned_at_ms: snapshot.pruning.as_ref().map(|record| record.pruned_at_ms),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct DashboardRecovery {
+    pub retained_snapshots: usize,
+    pub pruned_snapshots: usize,
+    pub pruned_history: Vec<DashboardSnapshot>,
+    pub pruned_history_truncated: bool,
+    pub metadata_snapshot_consistent: bool,
+    pub historical_content_hashes_verified: bool,
+    pub restore_command: &'static str,
+    pub whole_tree_restore_command: Option<&'static str>,
+    pub recovered_archive_command: Option<&'static str>,
+    pub restoration_performed: bool,
+    pub native_authority: bool,
+    pub cleanup_authority: bool,
+    pub pending_resume_authority: bool,
 }
 
 #[derive(Serialize)]
@@ -53,6 +91,7 @@ pub struct DashboardObservation {
     pub outstanding_mutations: usize,
     pub chunks: DashboardChunkCheck,
     pub read_leases: DashboardReadLeases,
+    pub recovery: DashboardRecovery,
     pub remote_backup_complete: bool,
 }
 
@@ -92,7 +131,39 @@ impl LocalSpace {
                     explicit_recovery_required: expired_pending_recovery != 0,
                 };
                 let manifest = self.manifest()?;
-                let snapshots = self.journal.snapshots(&self.space_id)?;
+                // Use the typed snapshot/pruning audit within this same
+                // existing read transaction. Historical content is not read.
+                let snapshots = self
+                    .journal
+                    .snapshot_audit(&self.space_id, self.limits.max_storage_entries)?;
+                let retained_snapshots = snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.content_retained)
+                    .count();
+                let pruned_snapshots = snapshots.len() - retained_snapshots;
+                let recovery = DashboardRecovery {
+                    retained_snapshots,
+                    pruned_snapshots,
+                    pruned_history: snapshots
+                        .iter()
+                        .rev()
+                        .filter(|snapshot| !snapshot.content_retained)
+                        .take(16)
+                        .map(|snapshot| {
+                            DashboardSnapshot::from_audit(snapshot, status.snapshot_id.as_ref())
+                        })
+                        .collect(),
+                    pruned_history_truncated: pruned_snapshots > 16,
+                    metadata_snapshot_consistent: true,
+                    historical_content_hashes_verified: false,
+                    restore_command: "restore",
+                    whole_tree_restore_command: cfg!(windows).then_some("tree-prepare"),
+                    recovered_archive_command: cfg!(windows).then_some("recovered-local"),
+                    restoration_performed: false,
+                    native_authority: false,
+                    cleanup_authority: false,
+                    pending_resume_authority: false,
+                };
                 let admissions = self
                     .journal
                     .conflict_resolution_admissions(&self.space_id)?;
@@ -149,16 +220,15 @@ impl LocalSpace {
                     total_entries: status.entries,
                     entries_truncated: status.entries > entries.len(),
                     entries,
-                    total_snapshots: snapshots.len(),
-                    snapshots_truncated: snapshots.len() > 128,
+                    total_snapshots: retained_snapshots,
+                    snapshots_truncated: retained_snapshots > 128,
                     snapshots: snapshots
-                        .into_iter()
+                        .iter()
                         .rev()
+                        .filter(|snapshot| snapshot.content_retained)
                         .take(128)
-                        .map(|(id, state)| DashboardSnapshot {
-                            current: status.snapshot_id.as_ref() == Some(&id),
-                            snapshot_id: id,
-                            state,
+                        .map(|snapshot| {
+                            DashboardSnapshot::from_audit(snapshot, status.snapshot_id.as_ref())
                         })
                         .collect(),
                     conflict_admissions_truncated: admissions.len() > 128,
@@ -175,6 +245,7 @@ impl LocalSpace {
                     outstanding_mutations: status.outstanding_mutations,
                     chunks,
                     read_leases,
+                    recovery,
                     remote_backup_complete: false,
                 };
                 self.verify_root()?;

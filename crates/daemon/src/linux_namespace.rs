@@ -213,37 +213,13 @@ pub fn prepare(cli: &Cli) -> Result<Option<LinuxDaemonOwner>> {
         &config.backing_image,
         &config.mount_root,
     )?);
-    // Publish keeps only the accepted pinned helper image during expensive
-    // metadata/CAS/full-plan preparation. No child and no ARM has started.
-    // Other ordinary commands retain their existing preparation/cancel path.
+    // Every ordinary command prepares its namespace and metadata without
+    // starting a native watchdog. Only an actual Publish/DAV transaction
+    // launches the accepted helpers immediately before its native ARM.
     let delayed = matches!(&cli.command, Command::Publish { .. }) || webdav_gateway.is_some();
     let initial_epoch = owner.initial_publication_epoch()?;
-    let mut helpers = if delayed {
-        None
-    } else {
-        Some(OutsideHelperSession::prepare(
-            &owner,
-            &initial_epoch,
-            &helper,
-        )?)
-    };
-    let prepared = if let Some(session) = helpers.as_ref() {
-        match capture_prepared(&owner, session) {
-            Ok(evidence) => evidence,
-            Err(error) => {
-                let terminal = helpers
-                    .take()
-                    .ok_or("original prepared session escaped")?
-                    .finish_unarmed()?;
-                Arc::try_unwrap(owner)
-                    .map_err(|_| "refused helper birth owner remains borrowed")?
-                    .release_mount_after_helpers(terminal)?;
-                return Err(error.into());
-            }
-        }
-    } else {
-        PreparedHelperEvidence::default()
-    };
+    let mut helpers: Option<OutsideHelperSession> = None;
+    let prepared = PreparedHelperEvidence::default();
     let metadata_limits = config.metadata_limits.into();
     let budget = if initialize {
         LinuxMetadataBudget::prepare_new(
@@ -654,7 +630,6 @@ impl LinuxDaemonOwner {
         let last_terminal_diagnostic = actor.last_terminal_diagnostic;
         drop(actor.publisher);
         drop(actor.initial_epoch);
-        let metadata = budget.checkpoint_closed();
         let persistent_generation = budget.persistent_owner_generation();
         let mut terminal = terminal
             .into_inner()
@@ -670,6 +645,7 @@ impl LinuxDaemonOwner {
                 return Err("both live helper session and terminal token were retained".into());
             }
             if helpers.arm_attempted() {
+                let metadata = budget.checkpoint_closed();
                 let ids = helpers.process_ids();
                 let refused = helpers.observe_refused_terminal_bytes()?;
                 if let Some(path) = terminal_receipt_output {
@@ -703,7 +679,9 @@ impl LinuxDaemonOwner {
             }
             terminal = Some(helpers.finish_unarmed()?);
         }
-        let metadata = metadata?;
+        // A partial unarmed publication preparation is cancelled while its
+        // original pidfds are live, before a potentially slow checkpoint.
+        let metadata = budget.checkpoint_closed()?;
         let helper_terminal = terminal
             .as_ref()
             .map(terminal_diagnostic)
@@ -751,6 +729,7 @@ impl LinuxDaemonOwner {
                 "owned_mount_released": true,
                 "owned_loop_released": true,
                 "helper_terminal": helper_terminal,
+                "prepared_helper_births_recorded": !prepared.process_births.is_empty(),
                 "before_runtime_prepared_process_ids": prepared.process_ids,
                 "before_runtime_prepared_startup_bytes": prepared.startup_bytes,
                 "before_runtime_prepared_process_births": prepared.process_births,
