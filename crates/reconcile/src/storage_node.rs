@@ -31,6 +31,8 @@ pub struct StorageNode {
     #[cfg(windows)]
     _parents: Vec<sync_extend_platform_fs::LockedDirectory>,
     _lock: File,
+    #[cfg(target_os = "linux")]
+    linux_storage_owner: Option<std::sync::Arc<crate::LinuxStorageOwner>>,
 }
 
 pub struct StorageReceivedPage {
@@ -350,7 +352,13 @@ impl StorageNode {
                 "storage provision expected identity differs",
             ));
         }
-        let node = Self::open_inner(config, true, Some(expected))?;
+        let node = Self::open_inner(
+            config,
+            true,
+            Some(expected),
+            #[cfg(target_os = "linux")]
+            None,
+        )?;
         if node.transport_identity()?.peer_identity() != expected {
             return Err(ReconcileError::Invariant(
                 "storage provision private identity differs",
@@ -374,18 +382,82 @@ impl StorageNode {
         }
         #[cfg(not(unix))]
         fs::create_dir(&config.data_dir)?;
-        Self::open_inner(config, true, None)
+        Self::open_inner(
+            config,
+            true,
+            None,
+            #[cfg(target_os = "linux")]
+            None,
+        )
     }
 
     pub fn open(config: StorageNodeConfig) -> Result<Self> {
         config.validate()?;
-        Self::open_inner(config, false, None)
+        Self::open_inner(
+            config,
+            false,
+            None,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+    }
+
+    /// Initialize only an explicitly acquired storage-only owner. Its five
+    /// original metadata slots already exist; no pathname SQLite VFS is opened.
+    #[cfg(target_os = "linux")]
+    pub fn initialize_with_linux_storage_owner(
+        config: StorageNodeConfig,
+        owner: std::sync::Arc<crate::LinuxStorageOwner>,
+    ) -> Result<Self> {
+        config.validate()?;
+        owner.verify_config(&config, true)?;
+        Self::open_inner(config, true, None, Some(owner))
+    }
+
+    /// Reopen through the original full main/WAL/SHM/rollback/owner budget.
+    /// Ordinary storage opening remains a separate, non-native constructor.
+    #[cfg(target_os = "linux")]
+    pub fn open_with_linux_storage_owner(
+        config: StorageNodeConfig,
+        owner: std::sync::Arc<crate::LinuxStorageOwner>,
+    ) -> Result<Self> {
+        config.validate()?;
+        owner.verify_config(&config, false)?;
+        Self::open_inner(config, false, None, Some(owner))
+    }
+
+    /// Descriptive full inventory from this exact storage-only original VFS.
+    #[cfg(target_os = "linux")]
+    pub fn linux_storage_journal_inventory(
+        &self,
+    ) -> Result<sync_extend_journal::JournalStorageInventory> {
+        let owner = self
+            .linux_storage_owner
+            .as_ref()
+            .ok_or(ReconcileError::Invariant(
+                "explicit Linux storage owner required",
+            ))?;
+        owner.verify_journal(&self.journal, &self.device)?;
+        let max = self.config.max_metadata_entries;
+        self.journal
+            .storage_inventory(
+                &self.config.space_id,
+                max,
+                sync_extend_journal::TreeRestoreInventoryLimits {
+                    max_rows: max,
+                    max_logical_bytes: (max as u64).saturating_mul(1024),
+                },
+            )
+            .map_err(Into::into)
     }
 
     fn open_inner(
         config: StorageNodeConfig,
         create: bool,
         provisioned: Option<&PeerIdentity>,
+        #[cfg(target_os = "linux")] linux_storage_owner: Option<
+            std::sync::Arc<crate::LinuxStorageOwner>,
+        >,
     ) -> Result<Self> {
         crate::check_ancestors(&config.data_dir)?;
         let metadata = fs::symlink_metadata(&config.data_dir)?;
@@ -480,13 +552,27 @@ impl StorageNode {
                 "storage provision private key differs",
             ));
         }
-        if create {
+        #[cfg(target_os = "linux")]
+        let original_linux_metadata = linux_storage_owner.as_ref().map(|owner| owner.budget());
+        #[cfg(not(target_os = "linux"))]
+        let original_linux_metadata: Option<()> = None;
+        if create && original_linux_metadata.is_none() {
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(config.data_dir.join("journal.sqlite"))?
                 .sync_all()?;
         }
+        #[cfg(target_os = "linux")]
+        let mut journal = if let Some(budget) = original_linux_metadata {
+            Journal::open_with_linux_metadata_budget(budget, config.max_metadata_entries)?
+        } else {
+            Journal::open_with_storage_limit(
+                &config.data_dir.join("journal.sqlite"),
+                config.max_metadata_entries,
+            )?
+        };
+        #[cfg(not(target_os = "linux"))]
         let mut journal = Journal::open_with_storage_limit(
             &config.data_dir.join("journal.sqlite"),
             config.max_metadata_entries,
@@ -503,6 +589,17 @@ impl StorageNode {
                 "storage identity must have no worktree",
             ));
         }
+        #[cfg(target_os = "linux")]
+        let cas = if let Some(budget) = original_linux_metadata {
+            crate::managed_cas_with_linux_metadata(
+                &config.data_dir,
+                budget,
+                config.max_metadata_entries,
+            )?
+        } else {
+            managed_cas(&config.data_dir)?
+        };
+        #[cfg(not(target_os = "linux"))]
         let cas = managed_cas(&config.data_dir)?;
         let traffic = sync_extend_journal::StorageTrafficLedger::open(
             &config.data_dir.join("storage-traffic.sqlite"),
@@ -518,6 +615,12 @@ impl StorageNode {
             "journal.sqlite",
             "storage-traffic.sqlite",
         ] {
+            if name == "journal.sqlite" && original_linux_metadata.is_some() {
+                // A separate pathname File/PathIdentity would break the
+                // mandatory main lease. The retained VFS verifies its exact
+                // original main and every sidecar instead.
+                continue;
+            }
             let path = config.data_dir.join(name);
             let metadata = fs::symlink_metadata(&path)?;
             if !metadata.is_file()
@@ -531,7 +634,7 @@ impl StorageNode {
                 crate::filesystem::PathIdentity::capture(&path)?,
             ));
         }
-        Ok(Self {
+        let node = Self {
             config,
             device,
             journal,
@@ -542,7 +645,14 @@ impl StorageNode {
             #[cfg(windows)]
             _parents: parents,
             _lock: lock,
-        })
+            #[cfg(target_os = "linux")]
+            linux_storage_owner,
+        };
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = &node.linux_storage_owner {
+            owner.verify_journal(&node.journal, &node.device)?;
+        }
+        Ok(node)
     }
 
     pub fn transport_identity(&self) -> Result<TransportIdentity> {
@@ -1850,6 +1960,10 @@ impl StorageNode {
     }
 
     pub(super) fn verify_storage(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = &self.linux_storage_owner {
+            owner.verify_journal(&self.journal, &self.device)?;
+        }
         self.data_identity.verify(&self.config.data_dir)?;
         for (path, identity) in &self.file_identities {
             identity.verify(path)?;

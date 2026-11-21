@@ -170,6 +170,14 @@ enum Command {
         #[command(subcommand)]
         action: storage_retirement_cli::Action,
     },
+    /// Own only a Linux storage Journal using an explicit preformatted private image.
+    #[cfg(target_os = "linux")]
+    StorageLinuxOwner {
+        #[arg(long)]
+        config: PathBuf,
+        #[command(subcommand)]
+        action: storage_retirement_cli::LinuxOwnerAction,
+    },
     /// Hand off one retained page owner using all explicitly required native target receipts.
     StorageRetentionHandoff {
         #[arg(long)]
@@ -1325,6 +1333,25 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     #[cfg(target_os = "linux")]
+    if let Command::StorageLinuxOwner { config, action } = &parsed.command {
+        // Route before ordinary namespace preparation, any watcher/helper
+        // thread, deployment expansion or Tokio runtime.
+        if parsed.linux_namespace_config.is_some()
+            || parsed.limits.is_some()
+            || parsed.control_directory.is_some()
+        {
+            eprintln!("syncd: storage-only owner uses only its explicit bounded configuration");
+            return ExitCode::FAILURE;
+        }
+        return match storage_retirement_cli::run_linux_owner_before_threads(config, action) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("syncd: Linux storage-only owner refused: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    #[cfg(target_os = "linux")]
     let linux_owner = match linux_namespace::prepare(&parsed) {
         Ok(owner) => owner,
         Err(error) => {
@@ -1517,7 +1544,9 @@ fn read_local_limits(
 
 async fn execute(
     cli: Cli,
-    #[cfg(target_os = "linux")] linux_owner: Option<std::sync::Arc<linux_namespace::LinuxDaemonOwner>>,
+    #[cfg(target_os = "linux")] linux_owner: Option<
+        std::sync::Arc<linux_namespace::LinuxDaemonOwner>,
+    >,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let limits = read_local_limits(cli.limits.as_deref())?;
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1642,6 +1671,10 @@ async fn execute(
         Command::StorageRetirementCancel { config, request_id } => {
             let node = sync_extend_reconcile::StorageNode::open(storage::load(&config)?)?;
             print(&node.cancel_storage_retirement(&request_id.parse()?)?)?;
+        }
+        #[cfg(target_os = "linux")]
+        Command::StorageLinuxOwner { .. } => {
+            return Err("storage-only owner must run before any runtime thread".into());
         }
         Command::StorageRetirementPhysical { config, action } => {
             storage_retirement_cli::run(&config, action)?;
@@ -2856,7 +2889,9 @@ async fn execute(
             data_dir,
             transaction,
         } => {
-            let owner = linux_owner.as_ref().ok_or("explicit acquired Linux owner configuration is required")?;
+            let owner = linux_owner
+                .as_ref()
+                .ok_or("explicit acquired Linux owner configuration is required")?;
             print(
                 &open(&data_dir)?
                     .cleanup_original_linux_native(&owner.owner, &transaction.parse()?)?,

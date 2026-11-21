@@ -85,6 +85,26 @@ impl LinuxNamespaceCapability {
     /// formatted ext4 and unmounted; this function never launches a formatter.
     /// A foreign outstanding open fails F_WRLCK before any loop/mount effect.
     pub fn acquire_private_ext4_image(image_path: &Path, mount_path: &Path) -> io::Result<Self> {
+        Self::acquire_private_ext4_image_impl(image_path, mount_path, None)
+    }
+
+    /// Storage-only admission validates the final unique original image FD,
+    /// while its early mandatory lease is held and before unshare/loop/mount.
+    /// That same descriptor is passed to LOOP_CONFIGURE; a preflight pathname
+    /// or observation cannot substitute a different image after admission.
+    pub fn acquire_storage_only_private_ext4_image(
+        image_path: &Path,
+        mount_path: &Path,
+        expected_image: UnixFileKey,
+    ) -> io::Result<Self> {
+        Self::acquire_private_ext4_image_impl(image_path, mount_path, Some(expected_image))
+    }
+
+    fn acquire_private_ext4_image_impl(
+        image_path: &Path,
+        mount_path: &Path,
+        storage_original: Option<UnixFileKey>,
+    ) -> io::Result<Self> {
         if !image_path.is_absolute() || !mount_path.is_absolute() {
             return Err(refusal("absolute image and mount roots required"));
         }
@@ -122,6 +142,21 @@ impl LinuxNamespaceCapability {
         if !(16 * 1024 * 1024..=16 * 1024 * 1024 * 1024).contains(&image_length) {
             return Err(refusal("bounded preformatted private ext4 image required"));
         }
+        let storage_image_lease = if let Some(expected) = storage_original {
+            if image_key != expected {
+                return Err(refusal(
+                    "storage original image was substituted before mount",
+                ));
+            }
+            let lease = OriginalWriteLease::acquire(&image)?;
+            super::super::linux_metadata::LinuxMetadataBudget::preflight_storage_only_image(
+                &image,
+            )?;
+            lease.verify()?;
+            Some(lease)
+        } else {
+            None
+        };
         let initial_namespace = File::open("/proc/self/ns/mnt")?;
         // SAFETY: nondumpable setting blocks unprivileged proc/root/fd access.
         if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
@@ -150,7 +185,10 @@ impl LinuxNamespaceCapability {
         if namespace_key == super::super::key(&initial_namespace)? {
             return Err(refusal("new owner namespace was not acquired"));
         }
-        let image_lease = OriginalWriteLease::acquire(&image)?;
+        let image_lease = match storage_image_lease {
+            Some(lease) => lease,
+            None => OriginalWriteLease::acquire(&image)?,
+        };
         let control = OpenOptions::new()
             .read(true)
             .write(true)

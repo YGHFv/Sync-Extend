@@ -89,7 +89,15 @@ mod scan;
 mod snapshot_pruning;
 mod snapshot_retention;
 mod storage;
+#[cfg(target_os = "linux")]
+mod storage_linux_owner;
 mod storage_node;
+#[cfg(target_os = "linux")]
+pub use storage_linux_owner::{
+    read_linux_storage_owner_config, LinuxStorageMetadataLimits, LinuxStorageOwner,
+    LinuxStorageOwnerClosed, LinuxStorageOwnerConfig, LinuxStorageOwnerObservation,
+    LinuxStorageOwnerRole,
+};
 mod storage_retirement;
 mod storage_retirement_disposal;
 mod storage_retirement_fence;

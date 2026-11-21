@@ -41,6 +41,29 @@ pub enum JournalError {
 
 pub type Result<T> = std::result::Result<T, JournalError>;
 
+/// Pure-memory initialization accounting, not a writer or native certificate.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct StorageJournalBootstrapBudget {
+    pub accounting: &'static str,
+    pub schema_version: u32,
+    pub stored_tables: usize,
+    pub local_state_rows: usize,
+    pub device_value_bytes: usize,
+    pub page_size: u64,
+    pub main_pages: u64,
+    pub committed_transactions: u64,
+    pub wal_frame_upper_bound: u64,
+    pub main_bytes_minimum: u64,
+    pub wal_bytes_minimum: u64,
+    pub shm_bytes_minimum: u64,
+    pub rollback_journal_bytes_minimum: u64,
+    pub owner_record_bytes_minimum: u64,
+    pub total_data_bytes_minimum: u64,
+    pub class_physical_liability_bytes_minimum: [u64; 5],
+    pub total_physical_bytes_minimum: u64,
+}
+
 /// Refuse every path that would make an ordinary SQLite open cross a filesystem
 /// alias. Linux metadata-owned databases additionally require their held-VFS
 /// opener so SQLite cannot create unleased sidecars.
@@ -607,6 +630,13 @@ impl Journal {
         connection.pragma_update(None, "temp_store", "MEMORY")?;
         connection.pragma_update(None, "mmap_size", 0)?;
         connection.pragma_update(None, "cache_size", -4096)?;
+        if budget.is_storage_only() {
+            // Without dirty-page spilling, each initialized page contributes
+            // at most one WAL frame per committed migration/identity transaction.
+            // Other existing Linux metadata roles keep their original options.
+            connection.pragma_update(None, "cache_spill", false)?;
+            connection.pragma_update(None, "auto_vacuum", 0)?;
+        }
         vfs.verify()?;
         Self::initialize_connection(
             budget.database_path(),
@@ -627,13 +657,185 @@ impl Journal {
             .map_err(Into::into)
     }
 
+    /// Execute the exact production loader and initialize_storage in owned
+    /// memory. No pathname, named SQLite file, lease or Journal escapes.
+    #[cfg(target_os = "linux")]
+    pub fn storage_bootstrap_physical_budget(
+        space: &SpaceId,
+        max_storage_entries: usize,
+    ) -> Result<StorageJournalBootstrapBudget> {
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+        storage_policy::validate(max_storage_entries)?;
+        if max_storage_entries < 3 {
+            return Err(JournalError::Invariant(
+                "storage bootstrap requires its three original identity rows",
+            ));
+        }
+        let mut connection = Connection::open_in_memory()?;
+        connection.pragma_update(None, "page_size", 4096)?;
+        connection.pragma_update(None, "temp_store", "MEMORY")?;
+        connection.pragma_update(None, "mmap_size", 0)?;
+        connection.pragma_update(None, "cache_size", -4096)?;
+        connection.pragma_update(None, "cache_spill", false)?;
+        connection.pragma_update(None, "auto_vacuum", 0)?;
+        let commits = Arc::new(AtomicU64::new(0));
+        let observed = commits.clone();
+        connection.commit_hook(Some(move || {
+            observed
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    count.checked_add(1)
+                })
+                .is_err()
+        }))?;
+        let mut memory = Self::initialize_connection_inner(
+            Path::new(":memory:"),
+            max_storage_entries,
+            connection,
+            None,
+            true,
+        )?;
+        // Device IDs have the same fixed width; this value signs nothing and
+        // the initialized owned memory never becomes a persisted image.
+        let device = DeviceId::from_public_key(&[0; 32]);
+        memory.initialize_storage(space, &device)?;
+        let inventory = memory.storage_inventory(
+            space,
+            max_storage_entries,
+            TreeRestoreInventoryLimits {
+                max_rows: max_storage_entries,
+                max_logical_bytes: (max_storage_entries as u64)
+                    .checked_mul(1024)
+                    .ok_or(JournalError::Invariant("bootstrap logical budget overflow"))?,
+            },
+        )?;
+        let local_state_rows = inventory
+            .rows()
+            .iter()
+            .filter(|row| row.table() == "local_state")
+            .count();
+        let page_size: i64 = memory
+            .connection
+            .pragma_query_value(None, "page_size", |row| row.get(0))?;
+        let pages: i64 = memory
+            .connection
+            .pragma_query_value(None, "page_count", |row| row.get(0))?;
+        let auto_vacuum: i64 =
+            memory
+                .connection
+                .pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+        let cache_spill: i64 =
+            memory
+                .connection
+                .pragma_query_value(None, "cache_spill", |row| row.get(0))?;
+        let page_size = u64::try_from(page_size)
+            .map_err(|_| JournalError::Invariant("negative bootstrap page size"))?;
+        let pages = u64::try_from(pages)
+            .map_err(|_| JournalError::Invariant("negative bootstrap page count"))?;
+        let committed_transactions = commits.load(Ordering::Acquire);
+        if page_size != 4096
+            || pages == 0
+            || local_state_rows != 3
+            || auto_vacuum != 0
+            || cache_spill != 0
+            || committed_transactions < u64::from(SCHEMA_VERSION) + 1
+        {
+            return Err(JournalError::Invariant(
+                "storage bootstrap page/identity/transaction accounting changed",
+            ));
+        }
+        fn multiply(left: u64, right: u64) -> Result<u64> {
+            left.checked_mul(right).ok_or(JournalError::Invariant(
+                "bootstrap physical budget overflow",
+            ))
+        }
+        fn add(left: u64, right: u64) -> Result<u64> {
+            left.checked_add(right).ok_or(JournalError::Invariant(
+                "bootstrap physical budget overflow",
+            ))
+        }
+        fn block_round(bytes: u64) -> Result<u64> {
+            multiply(add(bytes, 4095)? / 4096, 4096)
+        }
+        // Canonical schema migrations contain no VACUUM. With auto_vacuum=0,
+        // page_count never shrinks while this fresh schema is constructed.
+        // cache_spill=0 bounds dirty-page writes to one frame/page/commit.
+        // Counting every final page for every commit deliberately includes
+        // unchanged pages. WAL contributes 32 header bytes and 24/frame.
+        let wal_frames = multiply(pages, committed_transactions)?;
+        let main = multiply(pages, page_size)?;
+        let wal = block_round(add(32, multiply(wal_frames, add(page_size, 24)?)?)?)?;
+        // A 32-KiB WAL-index region holds at least 4000 frames (the first
+        // region holds 4062, later regions 4096); one extra region is retained.
+        let shm_regions = add(add(wal_frames, 3999)? / 4000, 1)?;
+        let shm = multiply(shm_regions, 32 * 1024)?;
+        // Reserve a complete rollback copy too, including record checksums
+        // and a whole page for its sector-aligned header.
+        let rollback = block_round(add(4096, multiply(pages, add(page_size, 8)?)?)?)?;
+        let owner = 4096;
+        let total_data = [main, wal, shm, rollback, owner]
+            .into_iter()
+            .try_fold(0u64, add)?;
+        let liabilities = sync_extend_platform_fs::LinuxMetadataLimits {
+            main,
+            wal,
+            shm,
+            rollback_journal: rollback,
+            owner_record: owner,
+            total_physical: u64::MAX,
+        }
+        .storage_only_physical_liabilities()?;
+        let total_physical = liabilities.into_iter().try_fold(0u64, add)?;
+        Ok(StorageJournalBootstrapBudget {
+            accounting: "same-loader-storage-3rows;no-spill;monotone-pages;wal=32+frames*(page+24);shm>=4000-frames/32KiB;rollback=4096+pages*(page+8);physical=per-class-4KiB-ext4-data+depth5-mapping+one-EA-block;profile-admission-separate",
+            schema_version: SCHEMA_VERSION,
+            stored_tables: inventory.tables().len(),
+            local_state_rows,
+            device_value_bytes: device.as_str().len(),
+            page_size,
+            main_pages: pages,
+            committed_transactions,
+            wal_frame_upper_bound: wal_frames,
+            main_bytes_minimum: main,
+            wal_bytes_minimum: wal,
+            shm_bytes_minimum: shm,
+            rollback_journal_bytes_minimum: rollback,
+            owner_record_bytes_minimum: owner,
+            total_data_bytes_minimum: total_data,
+            class_physical_liability_bytes_minimum: liabilities,
+            total_physical_bytes_minimum: total_physical,
+        })
+    }
+
     fn initialize_connection(
+        path: &Path,
+        max_storage_entries: usize,
+        connection: Connection,
+        #[cfg(target_os = "linux")] linux_metadata_vfs: Option<
+            sync_extend_platform_fs::LinuxMetadataVfs,
+        >,
+    ) -> Result<Self> {
+        Self::initialize_connection_inner(
+            path,
+            max_storage_entries,
+            connection,
+            #[cfg(target_os = "linux")]
+            linux_metadata_vfs,
+            #[cfg(target_os = "linux")]
+            false,
+        )
+    }
+
+    fn initialize_connection_inner(
         path: &Path,
         max_storage_entries: usize,
         mut connection: Connection,
         #[cfg(target_os = "linux")] linux_metadata_vfs: Option<
             sync_extend_platform_fs::LinuxMetadataVfs,
         >,
+        #[cfg(target_os = "linux")] storage_bootstrap_memory: bool,
     ) -> Result<Self> {
         // Retain bounded bytecode and committed descriptive read proofs only
         // after the original identity and Linux VFS opening checks.
@@ -1125,6 +1327,21 @@ impl Journal {
         native_publication::validate_schema(&connection)?;
         #[cfg(windows)]
         let native_issuance = native_publication::issuance::register(&connection)?;
+        let database_path = {
+            #[cfg(target_os = "linux")]
+            if storage_bootstrap_memory {
+                if path != Path::new(":memory:") || linux_metadata_vfs.is_some() {
+                    return Err(JournalError::Invariant(
+                        "bootstrap memory cannot adopt a filesystem or original VFS",
+                    ));
+                }
+                path.to_path_buf()
+            } else {
+                std::fs::canonicalize(path)?
+            }
+            #[cfg(not(target_os = "linux"))]
+            std::fs::canonicalize(path)?
+        };
         Ok(Self {
             connection,
             webdav_native_read_charges: webdav_native::DavReadChargeCache::default(),
@@ -1141,7 +1358,7 @@ impl Journal {
             original_coordination_observer: false,
             #[cfg(windows)]
             original_main_handoff: None,
-            database_path: std::fs::canonicalize(path)?,
+            database_path,
             max_storage_entries,
             conflict_resolution_issuance,
             original_operation_issuance,

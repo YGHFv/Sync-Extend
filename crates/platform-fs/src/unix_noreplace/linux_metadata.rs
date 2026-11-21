@@ -6,11 +6,11 @@ use crate::{linux_write_lease::OriginalWriteLease, LinuxNamespaceCapability, Lin
 use std::{
     collections::BTreeMap,
     ffi::CString,
-    fs::File,
+    fs::{File, OpenOptions},
     io::{self, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::fs::{FileExt, MetadataExt},
+        unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
     sync::{
@@ -25,6 +25,11 @@ mod owner_record;
 
 const CLASSES: [&str; 5] = ["main", "wal", "shm", "rollback_journal", "owner_record"];
 const MAX_FILE_CAPACITY: u64 = 256 * 1024 * 1024;
+const STORAGE_BLOCK_BYTES: u64 = 4096;
+// The accepted driver is the exact kernel whose extent-depth and xattr
+// allocation contracts were retained with the storage-only acceptance record.
+// An unverified driver/profile is refused before mount or original CREATE.
+const STORAGE_EXT4_KERNEL: &str = "6.6.87.2-microsoft-standard-WSL2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LinuxMetadataLimits {
@@ -37,6 +42,39 @@ pub struct LinuxMetadataLimits {
 }
 
 impl LinuxMetadataLimits {
+    /// Conservative physical liability, distinct from data capacity and the
+    /// later observed allocation. A 4-KiB ext4 extent tree has depth <= 5.
+    /// Nonempty nodes at each level cannot outnumber its nonempty data extents,
+    /// and each extent contains >= one data block. Without EA_INODE, an inode
+    /// can additionally own at most one external 4-KiB xattr block.
+    /// P(C) = rounded_data + 4096 * (5 * data_blocks + 1).
+    /// This arithmetic grants no filesystem, owner, VFS or native authority.
+    pub fn storage_only_physical_liabilities(self) -> io::Result<[u64; 5]> {
+        let capacities = self.capacities(STORAGE_BLOCK_BYTES)?;
+        let mut liabilities = [0u64; 5];
+        let mut total = 0u64;
+        for (index, capacity) in capacities.into_iter().enumerate() {
+            let mapping_and_ea = (capacity / STORAGE_BLOCK_BYTES)
+                .checked_mul(5)
+                .and_then(|value| value.checked_add(1))
+                .and_then(|value| value.checked_mul(STORAGE_BLOCK_BYTES))
+                .ok_or_else(|| refuse("storage ext4 mapping/xattr liability overflow"))?;
+            liabilities[index] = capacity
+                .checked_add(mapping_and_ea)
+                .ok_or_else(|| refuse("storage ext4 class liability overflow"))?;
+            total = total
+                .checked_add(liabilities[index])
+                .ok_or_else(|| refuse("storage ext4 aggregate liability overflow"))?;
+        }
+        if total > self.total_physical {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "whole configured storage ext4 data/mapping/xattr liability refused",
+            ));
+        }
+        Ok(liabilities)
+    }
+
     fn capacities(self, block: u64) -> io::Result<[u64; 5]> {
         let mut capacities = [
             self.main,
@@ -89,6 +127,8 @@ pub struct LinuxMetadataFileReceipt {
     pub actual_file_bytes: u64,
     pub allocated_bytes: u64,
     pub capacity_bytes: u64,
+    pub sealed_allocated_bytes: Option<u64>,
+    pub physical_liability_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,6 +140,13 @@ pub struct LinuxMetadataReceipt {
     pub parent: UnixFileKey,
     pub total_allocated_bytes: u64,
     pub total_physical_budget: u64,
+    pub total_physical_liability_bytes: Option<u64>,
+    pub storage_metadata_device: Option<u64>,
+    pub storage_block_identity: Option<UnixFileKey>,
+    pub storage_superblock_uuid: Option<[u8; 16]>,
+    pub storage_ext4_features: Option<[u32; 3]>,
+    pub storage_kernel_contract: Option<&'static str>,
+    pub storage_active_sqlite_files: Option<u64>,
     pub disk_temp_files_allowed: bool,
     pub files: [LinuxMetadataFileReceipt; 5],
 }
@@ -119,6 +166,14 @@ struct SharedMemoryLock {
     shared: Vec<u64>,
 }
 
+#[derive(Clone, Copy)]
+struct StorageExt4Profile {
+    metadata_device: u64,
+    block_identity: UnixFileKey,
+    uuid: [u8; 16],
+    features: [u32; 3],
+}
+
 struct State {
     directory: File,
     directory_path: PathBuf,
@@ -132,6 +187,9 @@ struct State {
     owner_pid: u32,
     total_limit: u64,
     initial_allocated: u64,
+    storage_sealed: Option<[u64; 5]>,
+    storage_liabilities: Option<[u64; 5]>,
+    storage_profile: Option<StorageExt4Profile>,
     next_connection: AtomicU64,
     active_files: AtomicU64,
     locks: Mutex<BTreeMap<u64, i32>>,
@@ -150,6 +208,227 @@ fn file_blocks(file: &File) -> io::Result<u64> {
         .blocks()
         .checked_mul(512)
         .ok_or_else(|| io::Error::other("metadata allocated block overflow"))
+}
+
+fn storage_superblock(file: &File) -> io::Result<([u8; 16], [u32; 3])> {
+    let mut kernel = String::new();
+    use std::io::Read;
+    File::open("/proc/sys/kernel/osrelease")?
+        .take(4097)
+        .read_to_string(&mut kernel)?;
+    if kernel.len() > 4096 || kernel.trim_end() != STORAGE_EXT4_KERNEL {
+        return Err(refuse("storage-only ext4 kernel contract is unverified"));
+    }
+    let mut superblock = [0u8; 1024];
+    file.read_exact_at(&mut superblock, 1024)?;
+    let u32_at = |offset: usize| {
+        u32::from_le_bytes(
+            superblock[offset..offset + 4]
+                .try_into()
+                .expect("fixed ext4 superblock field"),
+        )
+    };
+    let features = [u32_at(92), u32_at(96), u32_at(100)];
+    let inode_bytes = u16::from_le_bytes(
+        superblock[88..90]
+            .try_into()
+            .expect("fixed ext4 inode-size field"),
+    );
+    let mut checksum = u32::MAX;
+    for byte in &superblock[..1020] {
+        checksum ^= u32::from(*byte);
+        for _ in 0..8 {
+            checksum = (checksum >> 1) ^ if checksum & 1 == 0 { 0 } else { 0x82f63b78 };
+        }
+    }
+    // Only this ext4 extent geometry is accepted. In particular EA_INODE,
+    // BIGALLOC, inline data, encryption, compression, verity and unreviewed
+    // feature bits cannot change the per-inode physical liability.
+    // RECOVER is the ordinary mounted-journal bit, not an extra file class.
+    if superblock[56..58] != [0x53, 0xef]
+        || u32_at(24) != 2
+        || u32_at(28) != 2
+        || u32_at(76) != 1
+        || u32_at(20) != 0
+        || u32_at(32) == 0
+        || u32_at(32) > 32_768
+        || u32_at(32) != u32_at(36)
+        || inode_bytes < 128
+        || !inode_bytes.is_power_of_two()
+        || u64::from(inode_bytes) > STORAGE_BLOCK_BYTES
+        || features[0] & !0x3c != 0
+        || features[1] & !0x2c6 != 0
+        || features[2] & !0x46b != 0
+        || features[1] & 0x40 == 0
+        || features[2] & 0x400 == 0
+        || superblock[0x175] != 1
+        || checksum != u32_at(1020)
+        || superblock[104..120] == [0u8; 16]
+    {
+        return Err(refuse(
+            "storage-only original ext4 data/mapping/xattr profile is unverified",
+        ));
+    }
+    let metadata = file.metadata()?;
+    if metadata.is_file() {
+        let blocks = u64::from(u32_at(4)) | (u64::from(u32_at(0x150)) << 32);
+        if blocks == 0
+            || blocks
+                .checked_mul(STORAGE_BLOCK_BYTES)
+                .is_none_or(|bytes| bytes > metadata.len())
+        {
+            return Err(refuse("original storage ext4 geometry exceeds its image"));
+        }
+    }
+    Ok((
+        superblock[104..120]
+            .try_into()
+            .map_err(|_| refuse("storage ext4 UUID encoding"))?,
+        features,
+    ))
+}
+
+fn storage_profile(directory: &File) -> io::Result<StorageExt4Profile> {
+    super::held_volume::private(directory, true)?;
+    let directory_key = key(directory)?;
+    let mut status = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: original retained directory and correctly sized statfs output.
+    if unsafe { libc::fstatfs(directory.as_raw_fd(), status.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful fstatfs initialized the complete output.
+    let status = unsafe { status.assume_init() };
+    if status.f_type != 0xef53 || u64::try_from(status.f_bsize).ok() != Some(STORAGE_BLOCK_BYTES) {
+        return Err(refuse("storage-only original metadata requires 4-KiB ext4"));
+    }
+    let device = directory.metadata()?.dev();
+    let device_path = PathBuf::from(format!(
+        "/dev/block/{}:{}",
+        libc::major(device),
+        libc::minor(device)
+    ));
+    let device_name = if std::fs::symlink_metadata(&device_path)?
+        .file_type()
+        .is_symlink()
+    {
+        let target = std::fs::read_link(&device_path)?;
+        let text = target
+            .to_str()
+            .and_then(|text| text.strip_prefix("../"))
+            .filter(|text| {
+                !text.is_empty()
+                    && text.len() <= 255
+                    && text
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            })
+            .ok_or_else(|| refuse("metadata original block node encoding is unsupported"))?;
+        PathBuf::from("/dev").join(text)
+    } else {
+        device_path
+    };
+    let block = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(device_name)?;
+    let block_metadata = block.metadata()?;
+    if !block_metadata.file_type().is_block_device()
+        || block_metadata.rdev() != device
+        || key(directory)? != directory_key
+    {
+        return Err(refuse(
+            "metadata original root FD and block FD device binding differs",
+        ));
+    }
+    let (uuid, features) = storage_superblock(&block)?;
+    if block.metadata()?.rdev() != directory.metadata()?.dev() || key(directory)? != directory_key {
+        return Err(refuse("metadata original ext4 block binding changed"));
+    }
+    Ok(StorageExt4Profile {
+        metadata_device: device,
+        block_identity: key(&block)?,
+        uuid,
+        features,
+    })
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct StorageExtent {
+    logical: u64,
+    physical: u64,
+    length: u64,
+    reserved64: [u64; 2],
+    flags: u32,
+    reserved: [u32; 3],
+}
+
+#[repr(C)]
+struct StorageFiemap {
+    start: u64,
+    length: u64,
+    flags: u32,
+    mapped: u32,
+    count: u32,
+    reserved: u32,
+    extent: StorageExtent,
+}
+
+fn verify_materialized(file: &File, capacity: u64) -> io::Result<()> {
+    let mut inode_flags: libc::c_long = 0;
+    // SAFETY: exact original regular descriptor and initialized flags output.
+    if unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            0x80086601 as libc::Ioctl,
+            &mut inode_flags,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if inode_flags != 0x80000 || file.metadata()?.len() != capacity {
+        return Err(refuse(
+            "storage materialization inode/extent contract differs",
+        ));
+    }
+    let mut cursor = 0u64;
+    while cursor < capacity {
+        let mut map = StorageFiemap {
+            start: cursor,
+            length: u64::MAX - cursor,
+            flags: 0,
+            mapped: 0,
+            count: 1,
+            reserved: 0,
+            extent: StorageExtent::default(),
+        };
+        // SAFETY: bounded one-extent FIEMAP structure for this exact original FD.
+        if unsafe { libc::ioctl(file.as_raw_fd(), 0xc020660b as libc::Ioctl, &mut map) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if map.mapped != 1
+            || map.extent.logical != cursor
+            || map.extent.physical == 0
+            || map.extent.physical % STORAGE_BLOCK_BYTES != 0
+            || map.extent.physical.checked_add(map.extent.length).is_none()
+            || map.extent.length == 0
+            || map.extent.length % STORAGE_BLOCK_BYTES != 0
+            || map.extent.flags & !1 != 0
+            || map
+                .extent
+                .logical
+                .checked_add(map.extent.length)
+                .is_none_or(|end| end > capacity)
+            || (map.extent.logical + map.extent.length == capacity && map.extent.flags & 1 == 0)
+        {
+            return Err(refuse(
+                "storage original capacity has holes, unwritten or unverified extents",
+            ));
+        }
+        cursor += map.extent.length;
+    }
+    Ok(())
 }
 
 fn mount_identity(file: &File) -> io::Result<u64> {
@@ -195,7 +474,7 @@ impl State {
             return Err(refuse("metadata original parent/mount/namespace changed"));
         }
         let mut total = 0u64;
-        for slot in &self.files {
+        for (index, slot) in self.files.iter().enumerate() {
             slot.lease.verify()?;
             let metadata = slot.file.metadata()?;
             // SAFETY: fixed uid query with no arguments or pointers.
@@ -204,6 +483,7 @@ impl State {
                 || metadata.uid() != unsafe { libc::geteuid() }
                 || metadata.mode() & 0o077 != 0
                 || metadata.len() > slot.capacity
+                || (self.storage_sealed.is_some() && metadata.len() != slot.capacity)
                 || key(&slot.file)? != slot.identity
                 || mount_identity(&slot.file)? != self.mount_id
             {
@@ -237,6 +517,17 @@ impl State {
             if allocated < slot.capacity {
                 return Err(refuse("metadata physical allocation was released"));
             }
+            if self
+                .storage_sealed
+                .is_some_and(|sealed| allocated != sealed[index])
+                || self
+                    .storage_liabilities
+                    .is_some_and(|liabilities| allocated > liabilities[index])
+            {
+                return Err(refuse(
+                    "storage metadata sealed class allocation changed or exceeded liability",
+                ));
+            }
             total = total
                 .checked_add(allocated)
                 .ok_or_else(|| refuse("metadata physical total overflow"))?;
@@ -266,6 +557,10 @@ impl State {
                 actual_file_bytes: slot.file.metadata()?.len(),
                 allocated_bytes: allocated,
                 capacity_bytes: slot.capacity,
+                sealed_allocated_bytes: self.storage_sealed.map(|sealed| sealed[index]),
+                physical_liability_bytes: self
+                    .storage_liabilities
+                    .map(|liabilities| liabilities[index]),
             });
         }
         self.verify()?;
@@ -277,6 +572,17 @@ impl State {
             parent: self.directory_key,
             total_allocated_bytes: total,
             total_physical_budget: self.total_limit,
+            total_physical_liability_bytes: self
+                .storage_liabilities
+                .map(|liabilities| liabilities.into_iter().sum()),
+            storage_metadata_device: self.storage_profile.map(|profile| profile.metadata_device),
+            storage_block_identity: self.storage_profile.map(|profile| profile.block_identity),
+            storage_superblock_uuid: self.storage_profile.map(|profile| profile.uuid),
+            storage_ext4_features: self.storage_profile.map(|profile| profile.features),
+            storage_kernel_contract: self.storage_profile.map(|_| STORAGE_EXT4_KERNEL),
+            storage_active_sqlite_files: self
+                .storage_profile
+                .map(|_| self.active_files.load(Ordering::Acquire)),
             disk_temp_files_allowed: false,
             files: receipts
                 .try_into()
@@ -289,20 +595,238 @@ impl State {
 /// opened by its VFS; a caller cannot add a new path or derive ownership from JSON.
 pub struct LinuxMetadataBudget {
     state: Arc<State>,
+    storage_only: bool,
 }
 
 impl LinuxMetadataBudget {
+    /// Fixed storage role; the complete original acquisition remains required.
+    /// The role selects SQLite bootstrap accounting, never native authority.
+    pub fn prepare_new_storage_only(
+        owner: &LinuxNamespaceCapability,
+        directory_path: &Path,
+        original_directory: &File,
+        limits: LinuxMetadataLimits,
+    ) -> io::Result<Self> {
+        Self::prepare_new_impl(
+            owner,
+            directory_path,
+            "journal.sqlite",
+            limits,
+            Some(original_directory),
+        )
+    }
+
+    pub fn reopen_storage_only(
+        owner: &LinuxNamespaceCapability,
+        directory_path: &Path,
+        original_directory: &File,
+        limits: LinuxMetadataLimits,
+    ) -> io::Result<Self> {
+        Self::reopen_existing_impl(
+            owner,
+            directory_path,
+            "journal.sqlite",
+            limits,
+            Some(original_directory),
+        )
+    }
+
+    pub fn is_storage_only(&self) -> bool {
+        self.storage_only
+    }
+
+    /// Read-only structural preflight for the explicit storage-only role.
+    /// This returns no original owner, lease, VFS, native attempt or authority.
+    /// The caller serializes storage opening before touching these old slots;
+    /// acquisition and every original lease are still required afterwards.
+    pub fn preflight_storage_only(
+        directory_path: &Path,
+        original_directory: &File,
+        backing_image: UnixFileKey,
+        limits: LinuxMetadataLimits,
+        initialize: bool,
+    ) -> io::Result<()> {
+        let directory = UnixDirectory::open(directory_path)?.file;
+        if key(&directory)? != key(original_directory)?
+            || mount_identity(&directory)? != mount_identity(original_directory)?
+        {
+            return Err(refuse("storage preflight original metadata parent differs"));
+        }
+        let _ = storage_profile(original_directory)?;
+        let liabilities = limits.storage_only_physical_liabilities()?;
+        super::held_volume::private(&directory, true)?;
+        let mut status = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: retained directory and properly sized writable statfs output.
+        if unsafe { libc::fstatfs(directory.as_raw_fd(), status.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful fstatfs initialized output.
+        let status = unsafe { status.assume_init() };
+        if status.f_type != 0xef53 {
+            return Err(refuse("storage-only metadata requires local ext4"));
+        }
+        let capacities = limits.capacities(
+            u64::try_from(status.f_bsize).map_err(|_| refuse("metadata block size"))?,
+        )?;
+        let components = [
+            "journal.sqlite",
+            "journal.sqlite-wal",
+            "journal.sqlite-shm",
+            "journal.sqlite-journal",
+            "journal.sqlite.metadata-owner",
+        ];
+        if initialize {
+            for component in components {
+                let component = name(component)?;
+                let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+                // SAFETY: held original directory and fixed nonfollowing component.
+                if unsafe {
+                    libc::fstatat(
+                        directory.as_raw_fd(),
+                        component.as_ptr(),
+                        status.as_mut_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                } == 0
+                {
+                    return Err(refuse("storage metadata preflight found an occupied slot"));
+                }
+                if io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            return Ok(());
+        }
+        let mut files = Vec::with_capacity(5);
+        for component in components {
+            let component = name(component)?;
+            // SAFETY: fixed component, exact held parent, read-only/no-follow open.
+            let descriptor = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    component.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                )
+            };
+            if descriptor < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: successful openat transferred this one read-only descriptor.
+            let file = unsafe { File::from_raw_fd(descriptor) };
+            super::held_volume::private(&file, false)?;
+            files.push(file);
+        }
+        let record = owner_record::Record::read_storage_only(&files[4])?;
+        if record.backing_image != backing_image
+            || record.directory != key(&directory)?
+            || record.capacities != capacities
+            || record.total_limit != limits.total_physical
+        {
+            return Err(refuse(
+                "storage preflight original image, parent or budget differs",
+            ));
+        }
+        let mut physical = 0u64;
+        for (index, file) in files.iter().enumerate() {
+            if key(file)? != record.files[index]
+                || file.metadata()?.len() != capacities[index]
+                || file_blocks(file)? < capacities[index]
+                || file_blocks(file)?
+                    != record
+                        .storage_sealed
+                        .ok_or_else(|| refuse("storage preflight v3 seal is absent"))?[index]
+                || file_blocks(file)? > liabilities[index]
+                || mount_identity(file)? != mount_identity(&directory)?
+            {
+                return Err(refuse(
+                    "storage preflight original metadata file was substituted",
+                ));
+            }
+            verify_materialized(file, capacities[index])?;
+            physical = physical
+                .checked_add(file_blocks(file)?)
+                .ok_or_else(|| refuse("storage preflight allocation overflow"))?;
+        }
+        if physical != record.allocated || physical > record.total_limit {
+            return Err(refuse("storage preflight physical allocation differs"));
+        }
+        Ok(())
+    }
+
+    /// Validate only the final acquired original image descriptor. The
+    /// namespace constructor invokes this before unshare/loop/mount and keeps
+    /// that same descriptor for the mandatory lease and LOOP_CONFIGURE.
+    pub fn preflight_storage_only_image(image: &File) -> io::Result<()> {
+        super::held_volume::private(image, false)?;
+        let before = image.metadata()?;
+        if !(16 * 1024 * 1024..=16 * 1024 * 1024 * 1024).contains(&before.len()) {
+            return Err(refuse("bounded original storage ext4 image required"));
+        }
+        let _ = storage_superblock(image)?;
+        let after = image.metadata()?;
+        if key(image)?
+            != (UnixFileKey {
+                device: before.dev(),
+                inode: before.ino(),
+            })
+            || before.len() != after.len()
+            || before.mtime() != after.mtime()
+            || before.mtime_nsec() != after.mtime_nsec()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            return Err(refuse("original storage image changed during preflight"));
+        }
+        Ok(())
+    }
+
     pub fn prepare_new(
         owner: &LinuxNamespaceCapability,
         directory_path: &Path,
         database_component: &str,
         limits: LinuxMetadataLimits,
     ) -> io::Result<Self> {
+        Self::prepare_new_impl(owner, directory_path, database_component, limits, None)
+    }
+
+    fn prepare_new_impl(
+        owner: &LinuxNamespaceCapability,
+        directory_path: &Path,
+        database_component: &str,
+        limits: LinuxMetadataLimits,
+        original_directory: Option<&File>,
+    ) -> io::Result<Self> {
         owner.verify()?;
         if directory_path.to_str().is_none() {
             return Err(refuse("metadata root requires UTF8 encoding"));
         }
-        let directory = UnixDirectory::open(directory_path)?.file;
+        let named_directory = UnixDirectory::open(directory_path)?.file;
+        let directory = if let Some(original) = original_directory {
+            if key(&named_directory)? != key(original)? {
+                return Err(refuse(
+                    "storage original metadata directory changed before CREATE",
+                ));
+            }
+            // unshare clones mount IDs. Keep the actual preflight original
+            // outside-volume parent FD rather than adopting its new pathname
+            // mount; every original is created/linked relative to this FD.
+            original.try_clone()?
+        } else {
+            named_directory
+        };
+        let storage_profile = if let Some(original) = original_directory {
+            if key(&directory)? != key(original)? {
+                return Err(refuse(
+                    "storage original metadata directory changed before CREATE",
+                ));
+            }
+            Some(storage_profile(original)?)
+        } else {
+            None
+        };
+        let storage_liabilities = original_directory
+            .map(|_| limits.storage_only_physical_liabilities())
+            .transpose()?;
         let metadata = directory.metadata()?;
         // SAFETY: fixed uid query.
         if metadata.uid() != unsafe { libc::geteuid() }
@@ -363,7 +887,8 @@ impl LinuxMetadataBudget {
         let dot = CString::new(".").expect("fixed anonymous parent");
         let mut prepared = Vec::with_capacity(5);
         let mut physical = 0u64;
-        for capacity in capacities {
+        let mut sealed = [0u64; 5];
+        for (index, capacity) in capacities.into_iter().enumerate() {
             // SAFETY: O_TMPFILE creates an unnamed original with one owned descriptor.
             let fd = unsafe {
                 libc::openat(
@@ -378,22 +903,42 @@ impl LinuxMetadataBudget {
             }
             // SAFETY: successful openat transferred one original fd.
             let file = unsafe { File::from_raw_fd(fd) };
-            // SAFETY: bounded checked length; KEEP_SIZE reserves physical blocks without padding main/WAL.
-            if unsafe {
-                libc::fallocate(
-                    file.as_raw_fd(),
-                    libc::FALLOC_FL_KEEP_SIZE,
-                    0,
-                    capacity as i64,
-                )
-            } != 0
-            {
-                return Err(io::Error::last_os_error());
+            if storage_liabilities.is_some() {
+                // Write every configured data block, including the owner file,
+                // before recording any seal or linking any named original.
+                // Fallocate unwritten extents are insufficient: their first
+                // WAL write can allocate an additional mapping block.
+                let zeroes = [0u8; 64 * 1024];
+                let mut offset = 0u64;
+                while offset < capacity {
+                    let amount = (capacity - offset).min(zeroes.len() as u64) as usize;
+                    file.write_all_at(&zeroes[..amount], offset)?;
+                    offset += amount as u64;
+                }
+                file.sync_all()?;
+                verify_materialized(&file, capacity)?;
+            } else {
+                // SAFETY: original generic role keeps KEEP_SIZE and its
+                // original main/WAL physical and logical behavior.
+                if unsafe {
+                    libc::fallocate(
+                        file.as_raw_fd(),
+                        libc::FALLOC_FL_KEEP_SIZE,
+                        0,
+                        capacity as i64,
+                    )
+                } != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
             }
             let allocated = file_blocks(&file)?;
-            if allocated < capacity {
+            if allocated < capacity
+                || storage_liabilities.is_some_and(|liability| allocated > liability[index])
+            {
                 return Err(refuse("metadata preallocation did not reserve all blocks"));
             }
+            sealed[index] = allocated;
             physical = physical
                 .checked_add(allocated)
                 .ok_or_else(|| refuse("metadata actual allocation overflow"))?;
@@ -408,7 +953,10 @@ impl LinuxMetadataBudget {
         }
         owner.verify()?;
         // SHM's fixed mapping extent exists physically and logically for every allowed region.
-        prepared[2].set_len(capacities[2])?;
+        if storage_liabilities.is_none() {
+            prepared[2].set_len(capacities[2])?;
+        }
+        let initial_logical = [0, 0, capacities[2], 0, owner_record::RECORD_BYTES as u64];
         let identities = prepared.iter().map(key).collect::<io::Result<Vec<_>>>()?;
         let owner_record = owner_record::Record {
             generation: owner.owner_generation(),
@@ -420,10 +968,24 @@ impl LinuxMetadataBudget {
                 .map_err(|_| refuse("metadata original identity count"))?,
             allocated: physical,
             total_limit: limits.total_physical,
-            logical: [0, 0, capacities[2], 0, owner_record::RECORD_BYTES as u64],
+            logical: initial_logical,
+            storage_sealed: storage_liabilities.map(|_| sealed),
         };
-        prepared[4].write_all(&owner_record.encode()?)?;
+        if storage_liabilities.is_some() {
+            prepared[4].write_all_at(&owner_record.encode()?, 0)?;
+        } else {
+            prepared[4].write_all(&owner_record.encode()?)?;
+        }
         prepared[4].sync_all()?;
+        if storage_liabilities.is_some() {
+            for (index, file) in prepared.iter().enumerate() {
+                if file_blocks(file)? != sealed[index] {
+                    return Err(refuse(
+                        "storage initialized owner-record write changed its seal",
+                    ));
+                }
+            }
+        }
         let empty = CString::new("").expect("fixed empty component");
         let mut files = Vec::with_capacity(5);
         for (index, file) in prepared.into_iter().enumerate() {
@@ -443,7 +1005,11 @@ impl LinuxMetadataBudget {
                 return Err(io::Error::last_os_error());
             }
             let identity = key(&file)?;
-            let logical_bytes = file.metadata()?.len();
+            let logical_bytes = if storage_liabilities.is_some() {
+                initial_logical[index]
+            } else {
+                file.metadata()?.len()
+            };
             let lease = OriginalWriteLease::acquire(&file)?;
             files.push(MetadataFile {
                 file,
@@ -477,6 +1043,9 @@ impl LinuxMetadataBudget {
             owner_pid: std::process::id(),
             total_limit: limits.total_physical,
             initial_allocated: physical,
+            storage_sealed: storage_liabilities.map(|_| sealed),
+            storage_liabilities,
+            storage_profile,
             next_connection: AtomicU64::new(1),
             active_files: AtomicU64::new(0),
             locks: Mutex::new(BTreeMap::new()),
@@ -489,7 +1058,10 @@ impl LinuxMetadataBudget {
             owner_record_lock: Mutex::new(()),
         });
         state.verify()?;
-        Ok(Self { state })
+        Ok(Self {
+            state,
+            storage_only: original_directory.is_some(),
+        })
     }
 
     pub fn receipt(&self) -> io::Result<LinuxMetadataReceipt> {
@@ -507,11 +1079,44 @@ impl LinuxMetadataBudget {
         database_component: &str,
         limits: LinuxMetadataLimits,
     ) -> io::Result<Self> {
+        Self::reopen_existing_impl(owner, directory_path, database_component, limits, None)
+    }
+
+    fn reopen_existing_impl(
+        owner: &LinuxNamespaceCapability,
+        directory_path: &Path,
+        database_component: &str,
+        limits: LinuxMetadataLimits,
+        original_directory: Option<&File>,
+    ) -> io::Result<Self> {
         owner.verify()?;
         if directory_path.to_str().is_none() {
             return Err(refuse("metadata root requires UTF8 encoding"));
         }
-        let directory = UnixDirectory::open(directory_path)?.file;
+        let named_directory = UnixDirectory::open(directory_path)?.file;
+        let directory = if let Some(original) = original_directory {
+            if key(&named_directory)? != key(original)? {
+                return Err(refuse(
+                    "storage original metadata directory changed before reopen",
+                ));
+            }
+            original.try_clone()?
+        } else {
+            named_directory
+        };
+        let storage_profile = if let Some(original) = original_directory {
+            if key(&directory)? != key(original)? {
+                return Err(refuse(
+                    "storage original metadata directory changed before reopen",
+                ));
+            }
+            Some(storage_profile(original)?)
+        } else {
+            None
+        };
+        let storage_liabilities = original_directory
+            .map(|_| limits.storage_only_physical_liabilities())
+            .transpose()?;
         let metadata = directory.metadata()?;
         // SAFETY: fixed uid query.
         if metadata.uid() != unsafe { libc::geteuid() }
@@ -566,7 +1171,11 @@ impl LinuxMetadataBudget {
         let record_file = open(&components[4])?;
         super::held_volume::private(&record_file, false)?;
         let record_lease = OriginalWriteLease::acquire(&record_file)?;
-        let record = owner_record::Record::read(&record_file)?;
+        let record = if original_directory.is_some() {
+            owner_record::Record::read_storage_only(&record_file)?
+        } else {
+            owner_record::Record::read(&record_file)?
+        };
         let directory_key = key(&directory)?;
         if record.backing_image != owner.backing_image_key()
             || record.directory != directory_key
@@ -583,9 +1192,15 @@ impl LinuxMetadataBudget {
         for index in 0..4 {
             let file = open(&components[index])?;
             super::held_volume::private(&file, false)?;
+            let allocated = file_blocks(&file)?;
             if key(&file)? != record.files[index]
                 || file.metadata()?.len() > capacities[index]
-                || file_blocks(&file)? < capacities[index]
+                || (storage_liabilities.is_some() && file.metadata()?.len() != capacities[index])
+                || allocated < capacities[index]
+                || record
+                    .storage_sealed
+                    .is_some_and(|sealed| allocated != sealed[index])
+                || storage_liabilities.is_some_and(|liability| allocated > liability[index])
                 || mount_identity(&file)? != mount_id
             {
                 return Err(refuse("persistent metadata original file was substituted"));
@@ -599,6 +1214,18 @@ impl LinuxMetadataBudget {
         let mut physical = 0u64;
         for (index, (file, lease)) in opened.into_iter().enumerate() {
             let allocated = file_blocks(&file)?;
+            if record
+                .storage_sealed
+                .is_some_and(|sealed| allocated != sealed[index])
+                || storage_liabilities.is_some_and(|liability| allocated > liability[index])
+            {
+                return Err(refuse(
+                    "persistent storage class allocation differs from its v3 seal",
+                ));
+            }
+            if storage_liabilities.is_some() {
+                verify_materialized(&file, capacities[index])?;
+            }
             physical = physical
                 .checked_add(allocated)
                 .ok_or_else(|| refuse("reopened metadata allocation overflow"))?;
@@ -648,6 +1275,9 @@ impl LinuxMetadataBudget {
             owner_pid: std::process::id(),
             total_limit: limits.total_physical,
             initial_allocated: physical,
+            storage_sealed: record.storage_sealed,
+            storage_liabilities,
+            storage_profile,
             next_connection: AtomicU64::new(1),
             active_files: AtomicU64::new(0),
             locks: Mutex::new(BTreeMap::new()),
@@ -670,7 +1300,10 @@ impl LinuxMetadataBudget {
         state.persist_owner_record()?;
         state.verify()?;
         owner.verify()?;
-        Ok(Self { state })
+        Ok(Self {
+            state,
+            storage_only: original_directory.is_some(),
+        })
     }
     pub fn persistent_owner_generation(&self) -> [u8; 16] {
         self.state.persistent_generation
