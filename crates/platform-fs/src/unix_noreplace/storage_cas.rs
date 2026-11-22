@@ -1825,8 +1825,10 @@ impl LinuxStorageCasCoordinationGuard {
         Ok(())
     }
 
-    /// Preserve the Journal's existing fail-fast upgrade semantics. A failed
-    /// real upgrade grants nothing and its caller must abandon the transaction.
+    /// Exclusive conversion is not atomic. A failed attempt grants no writer
+    /// authority. Reacquire only the shared lock on this same original
+    /// description when the kernel permits it, so a later explicit retry can
+    /// follow a conflicting guard's actual close.
     pub fn try_exclusive(&mut self) -> io::Result<()> {
         self.verify()?;
         if self.state == CoordinationLockState::Exclusive {
@@ -1839,7 +1841,18 @@ impl LinuxStorageCasCoordinationGuard {
         self.state = CoordinationLockState::Unlocked;
         // SAFETY: nonblocking upgrade only this retained original description.
         if unsafe { libc::flock(self.original.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(io::Error::last_os_error());
+            let upgrade_error = io::Error::last_os_error();
+            // The explicit unlock released this description's shared lock. A
+            // failed conversion must not invent possession or replace its FD.
+            // If another exclusive owner now wins, leave this exact guard
+            // unlocked and unusable until its explicit terminal close.
+            // SAFETY: nonblocking shared flock on the same retained original
+            // description, with no open, CREATE or descriptor substitution.
+            if unsafe { libc::flock(self.original.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0
+            {
+                self.state = CoordinationLockState::Shared;
+            }
+            return Err(upgrade_error);
         }
         self.state = CoordinationLockState::Exclusive;
         self.verify()
