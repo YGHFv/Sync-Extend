@@ -377,6 +377,14 @@ impl crate::JournalReadView<'_> {
             });
         }
         let retirement = crate::storage_retirement::outstanding(view.connection)?;
+        let unix_retirement = crate::storage_retirement_unix::outstanding(view.connection)?;
+        if unix_retirement.rows != 0 {
+            liabilities.obligations.push(JournalCapacityObligation {
+                family: "unix_storage_retirement_v1_cancellation_peak",
+                owner_key: Vec::new(),
+                charge: unix_retirement,
+            });
+        }
         let retirement_owner = crate::storage_retirement::owner::outstanding(view.connection)?;
         let retirement_payload = crate::storage_retirement::payload::outstanding(view.connection)?;
         let retirement_disposal =

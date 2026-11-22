@@ -179,6 +179,15 @@ impl Journal {
 
 impl crate::JournalReadView<'_> {
     pub(crate) fn require_cas_access(&self, content: &ContentId) -> Result<()> {
+        let unix = crate::storage_retirement_unix::audit(self.connection)?;
+        if unix
+            .iter()
+            .any(|row| row.content_fenced && row.request.content_id == *content)
+        {
+            return Err(JournalError::Invariant(
+                "CAS object fenced by Unix storage retirement",
+            ));
+        }
         crate::storage_retirement::schema::validate(self.connection)?;
         let storage_fenced: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM main.storage_retirement_requests r WHERE r.content_id=?1

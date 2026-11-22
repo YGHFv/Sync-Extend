@@ -103,6 +103,7 @@ pub(crate) fn tables() -> Vec<TableSpec> {
         crate::storage_page_handoff::TABLES,
         crate::storage_snapshot_handoff::TABLES,
         crate::storage_retirement::schema::TABLES,
+        crate::storage_retirement_unix::schema::TABLES,
         crate::storage_retirement::owner_schema::TABLES,
         crate::storage_retirement::payload_schema::TABLES,
         crate::storage_retirement::disposal_schema::TABLES,
@@ -184,6 +185,7 @@ impl Journal {
         crate::forwarded_page_inbox::audit(&self.connection)?;
         crate::storage_page_handoff::audit(&self.connection)?;
         crate::storage_snapshot_handoff::audit(&self.connection)?;
+        crate::storage_retirement_unix::audit(&self.connection)?;
         if rows
             .iter()
             .any(|row| row.table() == "native_publication_headers")

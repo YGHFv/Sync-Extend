@@ -4,6 +4,94 @@ use sync_extend_core_model::storage_retirement::StorageRetirementRequest;
 use sync_extend_journal::StorageRetirementAdmission;
 
 impl StorageNode {
+    #[cfg(target_os = "linux")]
+    pub fn admit_unix_storage_retirement_intent(
+        &self,
+        intent: &sync_extend_core_model::storage_retirement_unix::UnixStorageRetirementIntent,
+    ) -> Result<sync_extend_journal::UnixStorageRetirementAdmission> {
+        use crate::storage_retirement_inspection::combine_unix;
+        self.verify_storage()?;
+        self.cas.retirement_owner_observation()?;
+        let reference = sync_extend_core_model::ChunkRef {
+            content_id: intent.content_id.clone(),
+            length: intent.expected_original.length,
+        };
+        let (held, admitted) = self.journal.with_unix_storage_retirement_intent(
+            intent,
+            &self.config,
+            &self.device,
+            now_ms,
+            |exclusive| self.cas.inspect_retirement_original(exclusive, &reference),
+        )?;
+        let (coordination, original) = held.ok_or(ReconcileError::Invariant(
+            "fresh Unix intent must retain its actual original inspection",
+        ))?;
+        combine_unix(
+            Ok(admitted),
+            self.close_unix_retirement_original(coordination, original),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn replay_unix_storage_retirement(
+        &self,
+        request: &sync_extend_core_model::storage_retirement_unix::UnixStorageRetirementRequest,
+    ) -> Result<sync_extend_journal::UnixStorageRetirementAdmission> {
+        self.verify_storage()?;
+        self.journal
+            .replay_unix_storage_retirement(request, &self.config, &self.device)
+            .map_err(ReconcileError::from)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn unix_storage_retirement_admissions(
+        &self,
+    ) -> Result<Vec<sync_extend_journal::UnixStorageRetirementAdmission>> {
+        self.verify_storage()?;
+        self.journal
+            .unix_storage_retirement_admissions()
+            .map_err(ReconcileError::from)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn admit_unix_storage_retirement(
+        &self,
+        request: &sync_extend_core_model::storage_retirement_unix::UnixStorageRetirementRequest,
+    ) -> Result<sync_extend_journal::UnixStorageRetirementAdmission> {
+        use crate::storage_retirement_inspection::combine_unix;
+        self.verify_storage()?;
+        self.cas.retirement_owner_observation()?;
+        let reference = sync_extend_core_model::ChunkRef {
+            content_id: request.content_id.clone(),
+            length: request.binding.length,
+        };
+        let (held, admitted) = self.journal.with_unix_storage_retirement_admission(
+            request,
+            &self.config,
+            &self.device,
+            now_ms,
+            |exclusive| self.cas.inspect_retirement_original(exclusive, &reference),
+        )?;
+        let closed = match held {
+            Some((coordination, original)) => {
+                self.close_unix_retirement_original(coordination, original)
+            }
+            None => Ok(()),
+        };
+        combine_unix(Ok(admitted), closed)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn cancel_unix_storage_retirement(
+        &self,
+        request: &sync_extend_core_model::EntryId,
+    ) -> Result<sync_extend_journal::UnixStorageRetirementAdmission> {
+        self.verify_storage()?;
+        self.journal
+            .cancel_unix_storage_retirement(request, &self.config, &self.device, now_ms()?)
+            .map_err(ReconcileError::from)
+    }
+
     pub fn storage_retirement_admissions(&self) -> Result<Vec<StorageRetirementAdmission>> {
         self.verify_storage()?;
         self.journal

@@ -4,8 +4,8 @@
 mod unix_noreplace;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use unix_noreplace::{
-    NoReplaceProbeReport, UnixFileKey, acquire_sidecar_owner, create_anonymous_upload,
-    probe_no_replace,
+    acquire_sidecar_owner, create_anonymous_upload, probe_no_replace, NoReplaceProbeReport,
+    UnixFileKey,
 };
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -25,8 +25,8 @@ pub use readonly_journal::{ReadOnlyControlInput, ReadOnlyJournalFiles};
 mod local_control;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use local_control::{
-    LocalControlConnection, LocalControlListener, LocalControlOperation, LocalControlResponse,
-    request_local_control,
+    request_local_control, LocalControlConnection, LocalControlListener, LocalControlOperation,
+    LocalControlResponse,
 };
 
 #[cfg(target_os = "linux")]
@@ -43,6 +43,23 @@ pub use unix_noreplace::{
     OriginalPrivateVolumeFile, OriginalRetainedVolumeFile, OutsidePrivateIntentOwner,
     PreparedOriginalPairFreeze,
 };
+
+/// A borrow of the same original description after a successful exclusive
+/// flock. Only the actual coordination guard can issue this value.
+#[cfg(target_os = "linux")]
+pub struct LinuxStorageCasExclusiveCoordination<'a> {
+    pub(crate) guard: &'a LinuxStorageCasCoordinationGuard,
+}
+
+/// Owns one original payload FD and its mandatory lease. Every inspection
+/// operation also requires a borrow of the original exclusive description
+/// that acquired it; matching keys on a reopened description are insufficient.
+#[cfg(target_os = "linux")]
+pub struct LinuxStorageCasRetirementInspection {
+    pub(crate) original: LinuxStorageCasFileGuard,
+    pub(crate) possession: std::sync::Arc<()>,
+    pub(crate) layout: LinuxStorageCasObservation,
+}
 
 #[cfg(target_os = "linux")]
 mod publication_epoch;
@@ -61,17 +78,17 @@ mod linux_write_lease;
 mod windows;
 #[cfg(windows)]
 pub use windows::{
-    FreshExclusiveSqliteFile, GuardedReadFile, LockedDirectory, LockedDirectoryMutation,
-    LockedFile, OriginalDirectoryCreation, OriginalFileCreation, OwnedFileCreation,
-    PublishedOriginalFile, ReacquiredNodeFile, ReacquiredNodeLock,
+    regular_file_link_count, regular_file_matches_path, sqlite_main_file_identity,
+    verify_regular_file, FreshExclusiveSqliteFile, GuardedReadFile, LockedDirectory,
+    LockedDirectoryMutation, LockedFile, OriginalDirectoryCreation, OriginalFileCreation,
+    OwnedFileCreation, PublishedOriginalFile, ReacquiredNodeFile, ReacquiredNodeLock,
     ReleasedOriginalCoordinationFile, ReleasedOriginalFileIdentity, ReleasedOriginalReadFile,
-    RetainedWriterDirectory, SealedOriginalFile, regular_file_link_count,
-    regular_file_matches_path, sqlite_main_file_identity, verify_regular_file,
+    RetainedWriterDirectory, SealedOriginalFile,
 };
 
 #[allow(unsafe_code)]
 mod managed_process;
-pub use managed_process::{ManagedChild, read_available};
+pub use managed_process::{read_available, ManagedChild};
 
 #[allow(unsafe_code)]
 mod managed_rpc;
@@ -88,7 +105,7 @@ pub use sidecar_config::SidecarConfig;
 #[allow(unsafe_code)]
 mod held_disk_space;
 #[cfg(windows)]
-pub use held_disk_space::{HeldDiskSpace, held_disk_space};
+pub use held_disk_space::{held_disk_space, HeldDiskSpace};
 mod writer_owner;
 pub use writer_owner::WriterOwner;
 
@@ -97,7 +114,7 @@ pub use writer_owner::WriterOwner;
 mod windows_service;
 #[cfg(windows)]
 pub use windows_service::{
-    ServiceReporter, report_service_ready, run_windows_service, service_stop_requested,
+    report_service_ready, run_windows_service, service_stop_requested, ServiceReporter,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,7 +171,7 @@ pub use windows::{
 mod linux_guardian;
 #[cfg(target_os = "linux")]
 pub use linux_guardian::{
-    OriginalPairTerminalRelease, OutsideGuardian, OutsideHelperChild, OutsideHelperExitObservation,
-    OutsideHelperProgram, OutsideHelperSession, OutsidePreparationGate, OutsidePreparationPair,
-    OutsideSupervisor, ThawObservation, take_inherited_descriptor,
+    take_inherited_descriptor, OriginalPairTerminalRelease, OutsideGuardian, OutsideHelperChild,
+    OutsideHelperExitObservation, OutsideHelperProgram, OutsideHelperSession,
+    OutsidePreparationGate, OutsidePreparationPair, OutsideSupervisor, ThawObservation,
 };

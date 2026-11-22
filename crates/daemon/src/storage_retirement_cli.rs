@@ -12,10 +12,66 @@ pub enum LinuxOwnerAction {
     Status,
     /// Audit original metadata and retained storage history without native actions.
     Audit,
+    /// Inspect one retired original and report its complete stable expectations.
+    Inspect {
+        #[arg(long)]
+        storage_id: String,
+        #[arg(long)]
+        content_id: String,
+    },
+    /// Admit a versioned fresh intent after actual exclusive original inspection.
+    Admit {
+        #[arg(long)]
+        intent: std::path::PathBuf,
+    },
+    /// Replay an already stored complete request using only verified metadata.
+    Replay {
+        #[arg(long)]
+        request: std::path::PathBuf,
+    },
+    /// Read immutable Unix retirement requests and cancellation history.
+    History,
+    /// Cancel a Unix fence before native activation.
+    Cancel {
+        #[arg(long)]
+        request_id: String,
+    },
 }
 
-/// Dedicated storage-only routing. No Tokio runtime, helper or LocalSpace is
-/// constructed; native retirement actions remain unavailable in this phase.
+#[cfg(target_os = "linux")]
+enum ParsedLinuxOwnerAction {
+    Init,
+    Status,
+    Audit,
+    Inspect(
+        sync_extend_core_model::ContentId,
+        sync_extend_core_model::ContentId,
+    ),
+    Admit(Box<sync_extend_core_model::storage_retirement_unix::UnixStorageRetirementIntent>),
+    Replay(Box<sync_extend_core_model::storage_retirement_unix::UnixStorageRetirementRequest>),
+    History,
+    Cancel(sync_extend_core_model::EntryId),
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_unix_input<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<T, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let limit =
+        sync_extend_core_model::storage_retirement_unix::UNIX_STORAGE_RETIREMENT_REQUEST_BYTES;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() > limit {
+        return Err("bounded nonempty Unix retirement input required".into());
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Dedicated before-threads storage routing. A fresh intent is materialized
+/// inside this one live owner; complete requests have a separate replay mode.
 #[cfg(target_os = "linux")]
 pub fn run_linux_owner_before_threads(
     config_path: &Path,
@@ -23,10 +79,58 @@ pub fn run_linux_owner_before_threads(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
     use sync_extend_reconcile::{read_linux_storage_owner_config, LinuxStorageOwner};
-    let initialize = matches!(action, LinuxOwnerAction::Init);
+    // Parse both complete typed inputs and IDs before owner/native acquisition.
+    let parsed = match action {
+        LinuxOwnerAction::Init => ParsedLinuxOwnerAction::Init,
+        LinuxOwnerAction::Status => ParsedLinuxOwnerAction::Status,
+        LinuxOwnerAction::Audit => ParsedLinuxOwnerAction::Audit,
+        LinuxOwnerAction::Inspect {
+            storage_id,
+            content_id,
+        } => ParsedLinuxOwnerAction::Inspect(storage_id.parse()?, content_id.parse()?),
+        LinuxOwnerAction::Admit { intent } => {
+            ParsedLinuxOwnerAction::Admit(Box::new(bounded_unix_input(intent)?))
+        }
+        LinuxOwnerAction::Replay { request } => {
+            ParsedLinuxOwnerAction::Replay(Box::new(bounded_unix_input(request)?))
+        }
+        LinuxOwnerAction::History => ParsedLinuxOwnerAction::History,
+        LinuxOwnerAction::Cancel { request_id } => {
+            ParsedLinuxOwnerAction::Cancel(request_id.parse()?)
+        }
+    };
+    let initialize = matches!(&parsed, ParsedLinuxOwnerAction::Init);
     let config = read_linux_storage_owner_config(config_path)?;
     config.validate(initialize)?;
     let storage_config = config.storage.clone();
+    if matches!(
+        &parsed,
+        ParsedLinuxOwnerAction::Inspect(..)
+            | ParsedLinuxOwnerAction::Admit(..)
+            | ParsedLinuxOwnerAction::Cancel(..)
+    ) && config.format_version != 2
+    {
+        return Err(
+            "original Unix inspection and fresh admission require an explicit v2 owner".into(),
+        );
+    }
+    match &parsed {
+        ParsedLinuxOwnerAction::Admit(intent) => intent.validate(
+            &storage_config,
+            config
+                .expected_device
+                .as_ref()
+                .ok_or("actual storage device expectation required")?,
+        )?,
+        ParsedLinuxOwnerAction::Replay(request) => request.validate(
+            &storage_config,
+            config
+                .expected_device
+                .as_ref()
+                .ok_or("actual storage device expectation required")?,
+        )?,
+        _ => {}
+    }
     let owner = Arc::new(if initialize {
         LinuxStorageOwner::prepare_new(config)?
     } else {
@@ -40,16 +144,63 @@ pub fn run_linux_owner_before_threads(
     };
     let report = (|| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let node = opened?;
-        let inventory = node.linux_storage_journal_inventory()?;
-        let status = node.status()?;
-        let history = if matches!(action, LinuxOwnerAction::Audit) {
-            serde_json::json!({
+        let result = match &parsed {
+            ParsedLinuxOwnerAction::Init | ParsedLinuxOwnerAction::Status => {
+                serde_json::Value::Null
+            }
+            ParsedLinuxOwnerAction::Audit => serde_json::json!({
                 "admissions":node.storage_retirement_admissions()?,
                 "owners":node.storage_retirement_owner_receipts()?,
                 "payloads":node.storage_retirement_payloads()?,
                 "disposals":node.storage_retirement_disposals()?,
                 "terminals":node.storage_retirement_terminals()?,
-            })
+                "unix_admissions":node.unix_storage_retirement_admissions()?,
+            }),
+            ParsedLinuxOwnerAction::Inspect(storage_id, content_id) => {
+                let inspection =
+                    node.inspect_unix_retired_storage_object(storage_id, content_id)?;
+                let observed = serde_json::to_value(inspection.observation()?);
+                let closed = inspection.close();
+                match (observed, closed) {
+                    (Ok(observation), Ok(())) => serde_json::json!({
+                        "observation":observation, "original_inspection_closed":true,
+                    }),
+                    (Err(error), Ok(())) => return Err(error.into()),
+                    (Ok(_), Err(error)) => return Err(error.into()),
+                    (Err(error), Err(closed)) => {
+                        return Err(format!(
+                            "{error}; original inspection closure refused: {closed}"
+                        )
+                        .into())
+                    }
+                }
+            }
+            ParsedLinuxOwnerAction::Admit(intent) => {
+                serde_json::to_value(node.admit_unix_storage_retirement_intent(intent)?)?
+            }
+            ParsedLinuxOwnerAction::Replay(request) => {
+                serde_json::to_value(node.replay_unix_storage_retirement(request)?)?
+            }
+            ParsedLinuxOwnerAction::History => {
+                serde_json::to_value(node.unix_storage_retirement_admissions()?)?
+            }
+            ParsedLinuxOwnerAction::Cancel(request_id) => {
+                serde_json::to_value(node.cancel_unix_storage_retirement(request_id)?)?
+            }
+        };
+        let inventory = node.linux_storage_journal_inventory()?;
+        let status = if matches!(
+            &parsed,
+            ParsedLinuxOwnerAction::Init
+                | ParsedLinuxOwnerAction::Status
+                | ParsedLinuxOwnerAction::Audit
+        ) {
+            Some(node.status()?)
+        } else {
+            None
+        };
+        let history = if matches!(&parsed, ParsedLinuxOwnerAction::Audit) {
+            result.clone()
         } else {
             serde_json::Value::Null
         };
@@ -65,6 +216,7 @@ pub fn run_linux_owner_before_threads(
                 "fingerprint":inventory.fingerprint(),
                 "local_state_rows":inventory.rows().iter().filter(|row| row.table()=="local_state").count(),
             },
+            "retirement_result":result,
             "retirement_history":history,
             "restore_authority":false,
             "native_authority":false,

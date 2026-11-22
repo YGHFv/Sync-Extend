@@ -16,6 +16,7 @@ mod management;
 mod management_credentials;
 #[cfg(windows)]
 mod recovery;
+mod restore_preview_cli;
 mod shutdown;
 mod storage;
 mod storage_retirement_cli;
@@ -27,7 +28,6 @@ mod webdav_http;
 mod webdav_locks;
 mod webdav_upload;
 mod webdav_xml;
-mod restore_preview_cli;
 
 #[derive(Parser)]
 #[command(
@@ -235,7 +235,7 @@ enum Command {
         #[command(subcommand)]
         action: storage_retirement_cli::Action,
     },
-    /// Own only a Linux storage Journal using an explicit preformatted private image.
+    /// Run storage status, original inspection and Unix retirement using a private image.
     #[cfg(target_os = "linux")]
     StorageLinuxOwner {
         #[arg(long)]
@@ -1413,7 +1413,8 @@ fn main() -> ExitCode {
     }
     #[cfg(target_os = "linux")]
     if let Command::StorageLinuxOwner { config, action } = &parsed.command {
-        // Route before ordinary namespace preparation, any watcher/helper
+        // All original Unix inspection/admission modes run in this owner
+        // lifetime, before ordinary namespace preparation, any watcher/helper
         // thread, deployment expansion or Tokio runtime.
         if parsed.linux_namespace_config.is_some()
             || parsed.limits.is_some()

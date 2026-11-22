@@ -196,10 +196,27 @@ impl CasAccessGuard {
         self.verify()
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn linux_storage_exclusive(
+        &self,
+    ) -> Result<sync_extend_platform_fs::LinuxStorageCasExclusiveCoordination<'_>> {
+        if self.file.is_some() {
+            return Err(JournalError::Invariant(
+                "ordinary CAS descriptor cannot issue an original exclusive borrow",
+            ));
+        }
+        Ok(self
+            .original_linux
+            .as_ref()
+            .ok_or(JournalError::Invariant(
+                "actual original Linux CAS guard required for exclusive borrowing",
+            ))?
+            .exclusive_borrow()?)
+    }
+
     /// Actual typed guard release; a failed verification grants no close receipt.
     #[cfg(target_os = "linux")]
     pub fn close_linux_storage_original(self) -> Result<()> {
-        self.verify_linux_storage_original()?;
         let Self {
             file,
             original_linux,
@@ -229,6 +246,25 @@ fn unsafe_metadata(metadata: &fs::Metadata) -> bool {
 }
 
 impl Journal {
+    /// Inspection-only acquisition from the original v2 coordination loan.
+    /// Ordinary/v1 guards are rejected before any fallback open or CREATE.
+    #[cfg(target_os = "linux")]
+    pub fn acquire_linux_storage_retirement_exclusive(
+        &self,
+        content: &ContentId,
+    ) -> Result<CasAccessGuard> {
+        if self.original_linux_cas_coordination.is_none() {
+            return Err(JournalError::Invariant(
+                "Unix retirement requires an acquired original v2 CAS coordination loan",
+            ));
+        }
+        let mut guard = self.acquire_cas_coordination()?;
+        self.require_cas_access(content)?;
+        guard.try_exclusive()?;
+        guard.linux_storage_exclusive()?.verify()?;
+        Ok(guard)
+    }
+
     /// Acquire cooperative session exclusion before any per-content fence checks.
     /// This is not a persistent owner and cannot override an existing fence.
     pub fn acquire_cas_session(&self) -> Result<CasAccessGuard> {

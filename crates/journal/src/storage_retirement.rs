@@ -47,6 +47,37 @@ fn scope(
     device: &DeviceId,
 ) -> Result<()> {
     request.validate(config, device)?;
+    retained_scope(
+        connection,
+        config,
+        device,
+        RetainedScope {
+            storage_id: &request.storage_id,
+            original_owner_id: &request.original_owner_id,
+            content_id: &request.content_id,
+            metadata_hash: &request.original_metadata_hash,
+            length: request.length,
+        },
+    )
+}
+
+/// Pure logical provenance shared by the two independent request formats.
+/// It acquires no file, coordination guard or native authority.
+pub(crate) struct RetainedScope<'a> {
+    pub(crate) storage_id: &'a ContentId,
+    pub(crate) original_owner_id: &'a EntryId,
+    pub(crate) content_id: &'a ContentId,
+    pub(crate) metadata_hash: &'a ContentId,
+    pub(crate) length: u32,
+}
+
+pub(crate) fn retained_scope(
+    connection: &Connection,
+    config: &StorageNodeConfig,
+    device: &DeviceId,
+    object: RetainedScope<'_>,
+) -> Result<()> {
+    config.validate()?;
     let identity: Vec<(String, String)> = connection
         .prepare("SELECT key,value FROM main.local_state ORDER BY key")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -60,14 +91,14 @@ fn scope(
     {
         return Err(invalid());
     }
-    let owner = request.original_owner_id.as_str();
+    let owner = object.original_owner_id.as_str();
     let pages = crate::storage_page_handoff::audit(connection)?;
     let snapshots = crate::storage_snapshot_handoff::audit(connection)?;
     let page = pages.iter().find(|p| {
-        p.policy.storage_id == request.storage_id && &p.policy.storage_id.as_str()[..32] == owner
+        p.policy.storage_id == *object.storage_id && &p.policy.storage_id.as_str()[..32] == owner
     });
     let snapshot = snapshots.iter().find(|p| {
-        p.policy.storage_id == request.storage_id && &p.policy.storage_id.as_str()[..32] == owner
+        p.policy.storage_id == *object.storage_id && &p.policy.storage_id.as_str()[..32] == owner
     });
     if page.is_some() == snapshot.is_some() {
         return Err(invalid());
@@ -121,13 +152,13 @@ fn scope(
                 .collect(),
         )
     };
-    if fingerprint != request.original_metadata_hash
+    if fingerprint != *object.metadata_hash
         || !chunks
             .iter()
-            .any(|chunk| chunk.content_id == request.content_id && chunk.length == request.length)
+            .any(|chunk| chunk.content_id == *object.content_id && chunk.length == object.length)
         || chunks
             .iter()
-            .any(|chunk| chunk.content_id == request.content_id && chunk.length != request.length)
+            .any(|chunk| chunk.content_id == *object.content_id && chunk.length != object.length)
     {
         return Err(invalid());
     }

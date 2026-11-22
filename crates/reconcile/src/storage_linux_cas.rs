@@ -21,6 +21,49 @@ pub(super) struct StorageCasSessionGuard {
 }
 
 impl StorageCas {
+    pub(super) fn retirement_owner_observation(
+        &self,
+    ) -> crate::Result<crate::LinuxStorageOwnerObservation> {
+        match self {
+            Self::Inside(cas) => cas.owner.observation(),
+            Self::Ordinary(_) => Err(ReconcileError::Invariant(
+                "Unix retirement requires an acquired original v2 inside-image owner",
+            )),
+        }
+    }
+
+    pub(super) fn inspect_retirement_original(
+        &self,
+        exclusive: &sync_extend_platform_fs::LinuxStorageCasExclusiveCoordination<'_>,
+        reference: &ChunkRef,
+    ) -> crate::Result<sync_extend_platform_fs::LinuxStorageCasRetirementInspection> {
+        match self {
+            Self::Ordinary(_) => Err(ReconcileError::Invariant(
+                "ordinary/v1 storage cannot inspect an original inside-image payload",
+            )),
+            Self::Inside(cas) => {
+                cas.verify_owner()?;
+                let original = cas
+                    .owner
+                    .inside_cas()?
+                    .inspect_retirement_original(
+                        exclusive,
+                        reference.content_id.as_str(),
+                        u64::from(reference.length),
+                    )
+                    .map_err(|error| cas.actual_io(error))?;
+                cas.verify_owner()?;
+                Ok(original)
+            }
+        }
+    }
+
+    pub(super) fn retirement_failure(&self, error: &impl std::fmt::Display) {
+        if let Self::Inside(cas) = self {
+            cas.owner.poison_inside_cas(error);
+        }
+    }
+
     pub(super) fn inside(owner: Arc<LinuxStorageOwner>) -> crate::Result<Self> {
         if !owner.has_inside_cas() {
             return Err(ReconcileError::Invariant(

@@ -1,7 +1,10 @@
 //! Fixed inside-image storage CAS, acquired from the actual namespace owner.
 //! No arbitrary path, caller volume, observation constructor or Drop deletion.
 use super::{key, name, open_directory_at, owned_descriptor, UnixFileKey};
-use crate::{linux_write_lease::OriginalWriteLease, LinuxNamespaceCapability};
+use crate::{
+    linux_write_lease::OriginalWriteLease, LinuxNamespaceCapability,
+    LinuxStorageCasExclusiveCoordination, LinuxStorageCasRetirementInspection,
+};
 use std::{
     collections::BTreeSet,
     ffi::CString,
@@ -892,6 +895,31 @@ impl LinuxStorageCas {
         Ok(result)
     }
 
+    /// No second shared acquisition or second payload lease is hidden here.
+    /// The caller keeps the actual exclusive guard until the original payload
+    /// lease and FD have closed.
+    pub fn inspect_retirement_original(
+        &self,
+        exclusive: &LinuxStorageCasExclusiveCoordination<'_>,
+        content: &str,
+        length: u64,
+    ) -> io::Result<LinuxStorageCasRetirementInspection> {
+        exclusive.verify()?;
+        self.verify()?;
+        if !Arc::ptr_eq(&self.graph.owner, &exclusive.guard.owner) {
+            return Err(refuse(
+                "retirement inspection requires the same actual namespace owner",
+            ));
+        }
+        let inspection = LinuxStorageCasRetirementInspection {
+            original: self.original(content, length)?,
+            possession: Arc::clone(&exclusive.guard.possession),
+            layout: self.observation()?,
+        };
+        inspection.verify(exclusive)?;
+        Ok(inspection)
+    }
+
     pub fn stage_new(&self, content: &str, bytes: &[u8]) -> io::Result<LinuxStorageCasStaged> {
         validate_hex(content, 64)?;
         if bytes.is_empty() || bytes.len() as u64 > CHUNK_BYTES {
@@ -1502,6 +1530,8 @@ impl LinuxStorageCasCoordinationLoan {
             parent_key: self.parent_key,
             original_key: self.original_key,
             owner: Arc::clone(&self.owner),
+            state: CoordinationLockState::Shared,
+            possession: Arc::new(()),
         };
         result.verify()?;
         self.verify()?;
@@ -1517,16 +1547,25 @@ impl LinuxStorageCasCoordinationLoan {
 }
 
 /// Real original cooperative lock possession, never a native writer capability.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CoordinationLockState {
+    Shared,
+    Unlocked,
+    Exclusive,
+}
+
 pub struct LinuxStorageCasCoordinationGuard {
     parent: File,
     original: File,
     parent_key: UnixFileKey,
     original_key: UnixFileKey,
     owner: Arc<LinuxNamespaceCapability>,
+    state: CoordinationLockState,
+    possession: Arc<()>,
 }
 
 impl LinuxStorageCasCoordinationGuard {
-    pub fn verify(&self) -> io::Result<()> {
+    fn verify_identity(&self) -> io::Result<()> {
         self.owner.verify()?;
         private(&self.parent, true)?;
         if key(&self.parent)? != self.parent_key
@@ -1542,29 +1581,163 @@ impl LinuxStorageCasCoordinationGuard {
         self.owner.verify()
     }
 
+    pub fn verify(&self) -> io::Result<()> {
+        self.verify_identity()?;
+        if self.state == CoordinationLockState::Unlocked {
+            return Err(refuse("original CAS upgrade failed; guard has no lock"));
+        }
+        Ok(())
+    }
+
     /// Preserve the Journal's existing fail-fast upgrade semantics. A failed
     /// real upgrade grants nothing and its caller must abandon the transaction.
     pub fn try_exclusive(&mut self) -> io::Result<()> {
         self.verify()?;
+        if self.state == CoordinationLockState::Exclusive {
+            return Ok(());
+        }
         // SAFETY: unlock only this retained original description.
         if unsafe { libc::flock(self.original.as_raw_fd(), libc::LOCK_UN) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        self.state = CoordinationLockState::Unlocked;
         // SAFETY: nonblocking upgrade only this retained original description.
         if unsafe { libc::flock(self.original.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        self.state = CoordinationLockState::Exclusive;
         self.verify()
     }
 
+    pub fn exclusive_borrow(&self) -> io::Result<LinuxStorageCasExclusiveCoordination<'_>> {
+        let borrowed = LinuxStorageCasExclusiveCoordination { guard: self };
+        borrowed.verify()?;
+        Ok(borrowed)
+    }
+
     pub fn close(self) -> io::Result<()> {
-        self.verify()?;
-        // SAFETY: explicit release of this guard's original shared description.
+        // A failed upgrade still owns its original FDs and must release them.
+        // Identity verification grants closure, never exclusive inspection.
+        self.verify_identity()?;
+        // SAFETY: explicit release of this guard's retained original description.
         if unsafe { libc::flock(self.original.as_raw_fd(), libc::LOCK_UN) } != 0 {
             return Err(io::Error::last_os_error());
         }
         close_original(self.original)?;
         close_original(self.parent)?;
         self.owner.verify()
+    }
+}
+
+impl LinuxStorageCasExclusiveCoordination<'_> {
+    pub fn verify(&self) -> io::Result<()> {
+        self.guard.verify()?;
+        if self.guard.state != CoordinationLockState::Exclusive {
+            return Err(refuse("actual original exclusive CAS description required"));
+        }
+        Ok(())
+    }
+
+    pub fn outside_data_key(&self) -> io::Result<UnixFileKey> {
+        self.verify()?;
+        Ok(self.guard.parent_key)
+    }
+
+    pub fn coordination_key(&self) -> io::Result<UnixFileKey> {
+        self.verify()?;
+        Ok(self.guard.original_key)
+    }
+}
+
+impl LinuxStorageCasRetirementInspection {
+    pub fn verify(&self, exclusive: &LinuxStorageCasExclusiveCoordination<'_>) -> io::Result<()> {
+        exclusive.verify()?;
+        let graph = self
+            .original
+            .graph
+            .as_ref()
+            .ok_or_else(|| refuse("original retirement inspection payload has closed"))?;
+        if !Arc::ptr_eq(&self.possession, &exclusive.guard.possession)
+            || !Arc::ptr_eq(&graph.owner, &exclusive.guard.owner)
+        {
+            return Err(refuse(
+                "retirement inspection cannot adopt a reopened coordination guard",
+            ));
+        }
+        self.original.verify()?;
+        exclusive.verify()
+    }
+
+    pub fn read_bytes(
+        &self,
+        exclusive: &LinuxStorageCasExclusiveCoordination<'_>,
+    ) -> io::Result<Vec<u8>> {
+        self.verify(exclusive)?;
+        let bytes = self.original.read_bytes()?;
+        self.verify(exclusive)?;
+        Ok(bytes)
+    }
+
+    pub fn payload_observation(
+        &self,
+        exclusive: &LinuxStorageCasExclusiveCoordination<'_>,
+    ) -> io::Result<LinuxStorageCasFileObservation> {
+        self.verify(exclusive)?;
+        let observed = self.original.observation()?;
+        self.verify(exclusive)?;
+        Ok(observed)
+    }
+
+    pub fn layout_observation(
+        &self,
+        exclusive: &LinuxStorageCasExclusiveCoordination<'_>,
+    ) -> io::Result<LinuxStorageCasObservation> {
+        self.verify(exclusive)?;
+        let graph = self
+            .original
+            .graph
+            .as_ref()
+            .expect("verified original graph");
+        let root = key(&graph.root)?;
+        let cas = key(&graph.cas)?;
+        let objects = key(&graph.objects)?;
+        let temporary = key(&graph.temporary)?;
+        let realm = key(&graph.realm)?;
+        let limits = self.layout.limits;
+        let observed = LinuxStorageCasObservation {
+            expected_layout: LinuxStorageCasExpectedLayout {
+                format_version: 1,
+                backing_image: graph.owner.backing_image_key(),
+                image_filesystem_id: graph.filesystem_id,
+                mounted_root_inode: root.inode,
+                cas_inode: cas.inode,
+                objects_inode: objects.inode,
+                temporary_inode: temporary.inode,
+                realm_inode: realm.inode,
+                realm_fingerprint: graph.realm_fingerprint,
+                owner_uid: private(&graph.root, true)?.uid(),
+            },
+            owner_generation: graph.generation,
+            namespace: graph.owner.namespace_key(),
+            runtime_mount_id: graph.mount_id,
+            mounted_root: root,
+            cas,
+            objects,
+            temporary,
+            realm,
+            limits,
+            physical_liability_bytes: limits.physical_liability_bytes()?,
+        };
+        if observed != self.layout {
+            return Err(refuse("original retirement inspection layout changed"));
+        }
+        self.verify(exclusive)?;
+        Ok(observed)
+    }
+
+    /// Release the original payload lease/file/parent before the caller closes
+    /// its exclusive guard and then the returned original directory loan.
+    pub fn close_file(self) -> io::Result<LinuxStorageCasDirectoryGuard> {
+        self.original.close_file()
     }
 }

@@ -119,6 +119,10 @@ mod storage_retirement_inspection;
 #[cfg(windows)]
 pub use storage_retirement_inspection::StorageRetirementInspection;
 pub use storage_retirement_inspection::StorageRetirementObjectObservation;
+#[cfg(target_os = "linux")]
+pub use storage_retirement_inspection::{
+    LinuxStorageRetirementInspection, UnixStorageRetirementObjectObservation,
+};
 mod webdav;
 #[cfg(windows)]
 mod webdav_local_execution;

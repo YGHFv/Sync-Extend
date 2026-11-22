@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 67;
+const SCHEMA_VERSION: u32 = 68;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -215,6 +215,8 @@ pub use remote_delete::{RemoteDeleteObservation, RemoteDeleteSource};
 mod storage_page_handoff;
 mod storage_policy;
 mod storage_retirement;
+mod storage_retirement_unix;
+pub use storage_retirement_unix::UnixStorageRetirementAdmission;
 mod storage_snapshot_handoff;
 pub use storage_retirement::disposal::StorageRetirementDisposalReport;
 #[cfg(windows)]
@@ -270,6 +272,9 @@ pub struct Journal {
     original_operation_issuance: original_provenance::Gate,
     storage_retirement_issuance: storage_retirement::gate::Gate,
     storage_retirement_cancellation: storage_retirement::gate::Gate,
+    unix_storage_retirement_issuance: storage_retirement::gate::Gate,
+    unix_storage_retirement_cancellation: storage_retirement::gate::Gate,
+    unix_storage_retirement_clock_issue: storage_retirement::gate::Gate,
     deletion_retention_issuance: storage_retirement::gate::Gate,
     webdav_native_description_issue: storage_retirement::gate::Gate,
     webdav_native_object_issue: storage_retirement::gate::Gate,
@@ -1303,6 +1308,11 @@ impl Journal {
             tx.execute_batch(include_str!("migration-067.sql"))?;
             tx.commit()?;
         }
+        if version < 68 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-068.sql"))?;
+            tx.commit()?;
+        }
         deletion_retention::validate_schema(&connection)?;
         let deletion_retention_issuance =
             storage_retirement::gate::Gate::register(&connection, "sync_deletion_retention_issue")?;
@@ -1391,6 +1401,19 @@ impl Journal {
             &connection,
             "sync_storage_retirement_cancel",
         )?;
+        storage_retirement_unix::schema::validate(&connection)?;
+        let unix_storage_retirement_issuance = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_unix_storage_retirement_issue",
+        )?;
+        let unix_storage_retirement_cancellation = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_unix_storage_retirement_cancel",
+        )?;
+        let unix_storage_retirement_clock_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_unix_storage_retirement_clock",
+        )?;
         storage_page_handoff::validate_schema(&connection)?;
         storage_snapshot_handoff::validate_schema(&connection)?;
         tree_native_effects::validate_schema(&connection)?;
@@ -1458,6 +1481,9 @@ impl Journal {
             original_operation_issuance,
             storage_retirement_issuance,
             storage_retirement_cancellation,
+            unix_storage_retirement_issuance,
+            unix_storage_retirement_cancellation,
+            unix_storage_retirement_clock_issue,
             deletion_retention_issuance,
             webdav_native_description_issue,
             webdav_native_object_issue,
@@ -3012,6 +3038,7 @@ fn storage_metadata_budget_usage_using_dav_read(
             storage_inventory::reader::add(sum, table.logical_bytes)
         })?;
     let original_history = history_reservation::original_reservation_legacy_charge(connection)?;
+    let unix_retirement = storage_retirement_unix::metadata_budget(connection)?;
     Ok((
         (rows as u64)
             .checked_add(actual_rows)
@@ -3023,6 +3050,7 @@ fn storage_metadata_budget_usage_using_dav_read(
             .and_then(|n| n.checked_add(conflict_rows))
             .and_then(|n| n.checked_add(dav_rows))
             .and_then(|n| n.checked_add(original_history.rows))
+            .and_then(|n| n.checked_add(unix_retirement.rows))
             .ok_or(JournalError::Invariant("native budget row overflow"))?,
         (bytes as u64)
             .checked_add(actual_bytes)
@@ -3034,6 +3062,7 @@ fn storage_metadata_budget_usage_using_dav_read(
             .and_then(|n| n.checked_add(conflict_bytes))
             .and_then(|n| n.checked_add(dav_bytes))
             .and_then(|n| n.checked_add(original_history.logical_bytes))
+            .and_then(|n| n.checked_add(unix_retirement.logical_bytes))
             .ok_or(JournalError::Invariant("native budget byte overflow"))?,
     ))
 }
@@ -3514,7 +3543,9 @@ mod original_handoff;
 #[cfg(windows)]
 mod original_write_transition;
 #[cfg(windows)]
-pub use original_write_transition::{OriginalJournalTransitionFailure, OriginalJournalWriteTransition};
+pub use original_write_transition::{
+    OriginalJournalTransitionFailure, OriginalJournalWriteTransition,
+};
 
 pub use backup_image::{
     DetachedOriginalNodeHistory, OriginalHistoryContentReference,
@@ -3622,6 +3653,19 @@ impl Journal {
             &connection,
             "sync_storage_retirement_cancel",
         )?;
+        storage_retirement_unix::schema::validate(&connection)?;
+        let unix_storage_retirement_issuance = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_unix_storage_retirement_issue",
+        )?;
+        let unix_storage_retirement_cancellation = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_unix_storage_retirement_cancel",
+        )?;
+        let unix_storage_retirement_clock_issue = storage_retirement::gate::Gate::register(
+            &connection,
+            "sync_unix_storage_retirement_clock",
+        )?;
         storage_page_handoff::validate_schema(&connection)?;
         storage_snapshot_handoff::validate_schema(&connection)?;
         tree_native_effects::validate_schema(&connection)?;
@@ -3670,6 +3714,9 @@ impl Journal {
             original_operation_issuance,
             storage_retirement_issuance,
             storage_retirement_cancellation,
+            unix_storage_retirement_issuance,
+            unix_storage_retirement_cancellation,
+            unix_storage_retirement_clock_issue,
             deletion_retention_issuance,
             webdav_native_description_issue,
             webdav_native_object_issue,
