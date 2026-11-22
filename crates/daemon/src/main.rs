@@ -17,6 +17,7 @@ mod management_credentials;
 #[cfg(windows)]
 mod recovery;
 mod restore_preview_cli;
+mod tree_restore_selection_cli;
 mod shutdown;
 mod storage;
 mod storage_retirement_cli;
@@ -470,7 +471,7 @@ enum Command {
         #[arg(long)]
         budgets: PathBuf,
     },
-    /// Prepare one bounded historical whole-tree restore, retaining input pins.
+    /// Prepare bounded TREE history; explicit selection uses new-operation policies.
     TreePrepare {
         #[arg(long)]
         data_dir: PathBuf,
@@ -482,6 +483,8 @@ enum Command {
         transaction: String,
         #[arg(long)]
         budgets: PathBuf,
+        #[command(flatten)]
+        selection: tree_restore_selection_cli::SelectionArguments,
     },
     /// Explicitly admit the same TREE preparation; cancellation becomes fenced.
     #[cfg(windows)]
@@ -1403,6 +1406,10 @@ fn print(value: &impl serde::Serialize) -> Result<(), Box<dyn std::error::Error>
 
 fn main() -> ExitCode {
     let parsed = Cli::parse();
+    if let Err(error) = tree_restore_selection_cli::precheck(&parsed) {
+        eprintln!("syncd: {error}");
+        return ExitCode::FAILURE;
+    }
     if let Err(error) = restore_preview_cli::precheck(&parsed) {
         eprintln!("syncd: {error}");
         return ExitCode::FAILURE;
@@ -2116,14 +2123,27 @@ async fn execute(
             target,
             transaction,
             budgets,
+            selection,
         } => {
+            let selection = selection.parse()?;
             let budgets = read_tree_budgets(&budgets)?;
-            print(&open(&data_dir)?.prepare_tree_restore_pipeline(
-                &baseline.parse()?,
-                &target.parse()?,
-                transaction.parse()?,
-                &budgets,
-            )?)?;
+            let mut local = open(&data_dir)?;
+            let preparation = match selection {
+                Some(selection) => local.prepare_tree_restore_selection_pipeline(
+                    &baseline.parse()?,
+                    &target.parse()?,
+                    transaction.parse()?,
+                    &selection,
+                    &budgets,
+                )?,
+                None => local.prepare_tree_restore_pipeline(
+                    &baseline.parse()?,
+                    &target.parse()?,
+                    transaction.parse()?,
+                    &budgets,
+                )?,
+            };
+            print(&preparation)?;
         }
         #[cfg(windows)]
         Command::TreeAdmit {

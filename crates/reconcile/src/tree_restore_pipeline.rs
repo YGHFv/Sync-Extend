@@ -12,7 +12,10 @@ use sync_extend_core_model::{
     tree_native_action_layout::TreeNativeActionLayoutLimits,
     tree_native_future_obligations::TreeNativeFutureLimits,
     tree_original_reference::TreeOriginalReferenceLimits,
-    tree_restore::{plan_tree_restore, TreeRestoreAction, TreeRestoreLimits, TreeRestoreScope},
+    tree_restore::{
+        plan_tree_restore, TreeRestoreAction, TreeRestoreLimits, TreeRestoreScope,
+        TreeRestoreSelection,
+    },
     tree_restore_execution_intent::TreeExecutionIntentLimits,
     tree_restore_history::{TreeRestoreHistoryInput, TreeRestoreHistoryLimits},
     tree_restore_identity::TreeIdentityLimits,
@@ -102,7 +105,50 @@ impl LocalSpace {
         transaction: EntryId,
         budgets: &TreeRestoreBudgets,
     ) -> Result<TreeRestorePreparation> {
+        self.prepare_tree_restore_scoped_pipeline(expected, target, transaction, None, budgets)
+    }
+
+    /// Selection execution retains the Windows native TREE capability boundary.
+    /// A preview or non-Windows metadata preparation cannot authorize execution.
+    pub fn prepare_tree_restore_selection_pipeline(
+        &mut self,
+        expected: &SnapshotId,
+        target: &SnapshotId,
+        transaction: EntryId,
+        selection: &TreeRestoreSelection,
+        budgets: &TreeRestoreBudgets,
+    ) -> Result<TreeRestorePreparation> {
+        if !cfg!(windows) {
+            return Err(ReconcileError::Invariant(
+                "native TREE selection restore is available only on Windows",
+            ));
+        }
+        selection.validate()?;
+        self.prepare_tree_restore_scoped_pipeline(
+            expected,
+            target,
+            transaction,
+            Some(selection.clone()),
+            budgets,
+        )
+    }
+
+    fn prepare_tree_restore_scoped_pipeline(
+        &mut self,
+        expected: &SnapshotId,
+        target: &SnapshotId,
+        transaction: EntryId,
+        selection: Option<TreeRestoreSelection>,
+        budgets: &TreeRestoreBudgets,
+    ) -> Result<TreeRestorePreparation> {
         self.verify_root()?;
+        let scope = TreeRestoreScope {
+            format_version: 1,
+            space_id: self.space_id.clone(),
+            baseline_snapshot: expected.clone(),
+            target_snapshot: target.clone(),
+            selection,
+        };
         let existing = self
             .tree_restore_transactions()?
             .into_iter()
@@ -124,12 +170,10 @@ impl LocalSpace {
         }
         let baseline = self.journal.retained_snapshot(&self.space_id, expected)?;
         let historical = self.journal.retained_snapshot(&self.space_id, target)?;
+        let mut complete_preparation = None;
         let preparation = if let Some(existing) = existing {
             budgets.verify_persisted(&existing)?;
-            if existing.intent.scope.baseline_snapshot != *expected
-                || existing.intent.scope.target_snapshot != *target
-                || !existing.writer_gate_held
-            {
+            if existing.intent.scope != scope || !existing.writer_gate_held {
                 return Err(ReconcileError::Invariant(
                     "TREE preparation scope/budget/state differs",
                 ));
@@ -140,18 +184,16 @@ impl LocalSpace {
                         "TREE projected history budgets differ",
                     ));
                 }
-                return Ok(existing);
+                if existing.intent.scope.selection.is_none() {
+                    return Ok(existing);
+                }
+                complete_preparation = Some(existing.clone());
             }
             existing.intent
         } else {
             TreeRestorePreparationIntent {
                 transaction_id: transaction.clone(),
-                scope: TreeRestoreScope {
-                    format_version: 1,
-                    space_id: self.space_id.clone(),
-                    baseline_snapshot: expected.clone(),
-                    target_snapshot: target.clone(),
-                },
+                scope,
                 limits: budgets.plan,
                 prepared_at_ms: now_ms()?,
             }
@@ -186,6 +228,9 @@ impl LocalSpace {
                 self.check_publication_limits(content)?;
                 self.cas.verify(content)?;
             }
+        }
+        if let Some(existing) = complete_preparation {
+            return Ok(existing);
         }
         let (held, _) = self.journal.with_tree_restore_preparation(
             &preparation,

@@ -1,5 +1,5 @@
 #Requires -Version 7.0
-# Pure display projection. This file never opens a workspace or a ledger.
+# Pure display and request projection. This file never opens a workspace or a ledger.
 
 function Assert-SyncExtendRestorePath($Value) {
     Assert-SyncExtendViewText $Value 4096
@@ -207,6 +207,210 @@ function New-SyncExtendRestorePreviewView($Response, $Request) {
     }
     if ($Response.content_availability -ceq 'pruned') { $details += "`r`n此快照已裁剪，历史内容不可从本预览确认恢复。" }
     return @{ Rows = $rows; Summary = $details }
+}
+
+function Assert-SyncExtendRestoreKeys($Value, [string[]]$Keys) {
+    Assert-SyncExtendViewObject $Value
+    if ($Value.Count -ne $Keys.Count) { throw 'Restore object has unexpected fields.' }
+    foreach ($key in $Keys) {
+        if (!(@($Value.Keys) -ccontains $key)) { throw 'Restore object is missing an exact field.' }
+    }
+}
+
+function Assert-SyncExtendRestoreRequest($Value) {
+    Assert-SyncExtendRestoreKeys $Value @('owner_generation', 'request')
+    Assert-SyncExtendViewId $Value.owner_generation 32
+    $request = $Value.request
+    Assert-SyncExtendRestoreKeys $request @('format_version', 'space_id', 'snapshot', 'expected_baseline',
+        'selection', 'destination_prefix', 'current_extra_policy', 'occupied_target_policy', 'limits')
+    if ($request.format_version -ne 2) { throw 'Unsupported restore request version.' }
+    Assert-SyncExtendViewId $request.space_id 32
+    Assert-SyncExtendViewId $request.snapshot
+    Assert-SyncExtendViewId $request.expected_baseline
+    if ($request.current_extra_policy -cnotin @('preserve', 'replace_selected_scope') -or
+        $request.occupied_target_policy -cnotin @('report_conflicts', 'replace_files')) {
+        throw 'Unsupported explicit restoration policy.'
+    }
+    if ($null -ne $request.destination_prefix) { Assert-SyncExtendRestorePath $request.destination_prefix }
+    $selection = $request.selection
+    Assert-SyncExtendViewObject $selection
+    switch -CaseSensitive ($selection.type) {
+        'full' { Assert-SyncExtendRestoreKeys $selection @('type') }
+        { $_ -cin @('file', 'directory') } {
+            Assert-SyncExtendRestoreKeys $selection @('type', 'path')
+            Assert-SyncExtendRestorePath $selection.path
+        }
+        'paths' {
+            Assert-SyncExtendRestoreKeys $selection @('type', 'paths')
+            Assert-SyncExtendViewList $selection.paths 64
+            if (!$selection.paths.Count) { throw 'Choose at least one exact historical path.' }
+            $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            $bytes = 0
+            foreach ($path in $selection.paths) {
+                Assert-SyncExtendRestorePath $path
+                if (!$seen.Add($path)) { throw 'Duplicate historical path.' }
+                $bytes += [Text.Encoding]::UTF8.GetByteCount($path)
+            }
+            if ($bytes -gt 16384) { throw 'Selected historical paths exceed their byte limit.' }
+        }
+        default { throw 'Unsupported historical selection.' }
+    }
+    Assert-SyncExtendRestoreKeys $request.limits @('source', 'max_output_entries', 'max_output_cas_references',
+        'max_output_bytes', 'max_selected_logical_bytes', 'max_resource_estimate_bytes')
+    Assert-SyncExtendRestoreKeys $request.limits.source @('max_journal_bytes', 'max_manifest_bytes', 'max_entries',
+        'max_chunk_visits', 'max_reference_rows', 'max_vm_instructions', 'max_query_millis')
+    foreach ($key in $request.limits.source.Keys) { $null = Get-SyncExtendViewInteger $request.limits.source[$key] }
+    foreach ($key in @('max_output_entries', 'max_output_cas_references', 'max_output_bytes',
+            'max_selected_logical_bytes', 'max_resource_estimate_bytes')) {
+        $null = Get-SyncExtendViewInteger $request.limits[$key]
+    }
+    if ($request.limits.max_output_entries -gt 128 -or $request.limits.max_output_cas_references -gt 128 -or
+        $request.limits.max_output_bytes -gt 262144) { throw 'Restore request exceeds client preview limits.' }
+}
+
+function Get-SyncExtendRestoreByteDigest([byte[]]$Bytes) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return [Convert]::ToHexString($sha.ComputeHash($Bytes)).ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+function ConvertTo-SyncExtendRestoreCanonicalValue($Value) {
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [Collections.IDictionary]) {
+        $keys = [string[]]@($Value.Keys)
+        [Array]::Sort($keys, [StringComparer]::Ordinal)
+        $result = [ordered]@{}
+        foreach ($key in $keys) { $result[$key] = ConvertTo-SyncExtendRestoreCanonicalValue $Value[$key] }
+        return $result
+    }
+    if ($Value -is [Collections.IEnumerable] -and $Value -isnot [string]) {
+        $result = @($Value | ForEach-Object { ConvertTo-SyncExtendRestoreCanonicalValue $_ })
+        return ,$result
+    }
+    return $Value
+}
+
+function Get-SyncExtendRestoreObjectDigest($Value) {
+    $canonical = ConvertTo-SyncExtendRestoreCanonicalValue $Value
+    $json = ConvertTo-Json -InputObject $canonical -Depth 32 -Compress
+    return Get-SyncExtendRestoreByteDigest ([Text.Encoding]::UTF8.GetBytes($json))
+}
+
+function ConvertFrom-SyncExtendRestoreRequestHex([string]$Hex) {
+    if (!$Hex -or $Hex.Length -gt 16384 -or $Hex.Length % 2 -ne 0 -or $Hex -cnotmatch '\A[0-9a-f]+\z') {
+        throw 'Restore request must be bounded exact UTF-8 hexadecimal bytes.'
+    }
+    $bytes = [Convert]::FromHexString($Hex)
+    $json = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+    $request = ConvertFrom-Json -InputObject $json -AsHashtable -ErrorAction Stop
+    Assert-SyncExtendRestoreRequest $request
+    return $request
+}
+
+function Get-SyncExtendRestoreTreeScope($Request) {
+    Assert-SyncExtendRestoreRequest $Request
+    $request = $Request.request
+    $selection = [ordered]@{
+        format_version = 1; selection = $request.selection
+        current_extra_policy = $request.current_extra_policy
+        occupied_target_policy = $request.occupied_target_policy
+    }
+    # Match the native Option wire: a missing prefix is omitted, never added as null.
+    if ($null -ne $request.destination_prefix) { $selection.destination_prefix = $request.destination_prefix }
+    return [ordered]@{
+        format_version = 1; space_id = $request.space_id
+        baseline_snapshot = $request.expected_baseline; target_snapshot = $request.snapshot
+        selection = $selection
+    }
+}
+
+function Get-SyncExtendRestoreTreeArguments($Request) {
+    Assert-SyncExtendRestoreRequest $Request
+    $request = $Request.request
+    $arguments = [Collections.Generic.List[string]]::new()
+    $arguments.Add('--selection-v2')
+    switch -CaseSensitive ($request.selection.type) {
+        'file' { $arguments.Add('--path'); $arguments.Add($request.selection.path) }
+        'directory' { $arguments.Add('--directory'); $arguments.Add($request.selection.path) }
+        'paths' {
+            foreach ($path in $request.selection.paths) { $arguments.Add('--select-path'); $arguments.Add($path) }
+        }
+    }
+    if ($null -ne $request.destination_prefix) {
+        $arguments.Add('--destination-prefix'); $arguments.Add($request.destination_prefix)
+    }
+    $arguments.Add('--current-extra-policy'); $arguments.Add($request.current_extra_policy.Replace('_', '-'))
+    $arguments.Add('--occupied-target-policy'); $arguments.Add($request.occupied_target_policy.Replace('_', '-'))
+    return ,$arguments.ToArray()
+}
+
+function Get-SyncExtendRestorePreviewBinding($Response, $Request) {
+    Assert-SyncExtendRestoreRequest $Request
+    $null = New-SyncExtendRestorePreviewView $Response $Request
+    if ($Response.current_snapshot_id -cne $Request.request.expected_baseline -or
+        $Response.baseline.snapshot_id -cne $Request.request.expected_baseline -or
+        $Response.expected_baseline_is_current -cne $true -or $Response.selection_status -cne 'available' -or
+        $Response.metadata_diff_available -cne $true -or $Response.destination_mapping -cne 'prefix_plus_complete_source_relative_path' -or
+        $Response.baseline.exists -cne $true -or $Response.baseline.content_retained -cne $true -or
+        $Response.baseline.pruned -cne $false -or $Response.baseline.snapshot_metadata_validated -cne $true -or
+        $Response.target.exists -cne $true -or $Response.target.content_retained -cne $true -or
+        $Response.target.pruned -cne $false -or $Response.target.snapshot_metadata_validated -cne $true -or
+        $Response.counts.reported_conflicts -ne 0 -or $Response.counts.unchecked_paths -ne 0) {
+        throw 'A fresh current baseline and retained conflict-free historical selection are required.'
+    }
+    return Get-SyncExtendRestoreObjectDigest ([ordered]@{
+        format_version = 1; request = $Request; current_snapshot_id = $Response.current_snapshot_id
+        baseline = $Response.baseline; target = $Response.target; counts = $Response.counts
+        resources = $Response.resources; entries = $Response.entries; cas_references = $Response.cas_references
+        entries_truncated = $Response.entries_truncated; cas_references_truncated = $Response.cas_references_truncated
+        destination_mapping = $Response.destination_mapping
+    })
+}
+
+function Assert-SyncExtendRestoreBudgets($Budgets) {
+    Assert-SyncExtendRestoreKeys $Budgets @('plan', 'history', 'identity', 'execution', 'originals', 'coordinator',
+        'actions', 'future', 'inventory')
+    foreach ($part in $Budgets.Keys) {
+        Assert-SyncExtendViewObject $Budgets[$part]
+        foreach ($key in $Budgets[$part].Keys) { $null = Get-SyncExtendViewInteger $Budgets[$part][$key] }
+    }
+    # Native serde and resource gates validate exact inner fields and physical costs.
+}
+
+function New-SyncExtendPendingRestoreView($Pending) {
+    Assert-SyncExtendViewObject $Pending
+    Assert-SyncExtendViewId $Pending.transaction_id 32
+    Assert-SyncExtendViewId $Pending.request_sha256
+    Assert-SyncExtendViewId $Pending.scope_sha256
+    Assert-SyncExtendViewText $Pending.phase 64
+    Assert-SyncExtendViewFlag $Pending.original_process_exit_verified
+    Assert-SyncExtendViewFlag $Pending.native_final_verified
+    Assert-SyncExtendViewFlag $Pending.helper_active
+    $phaseNames = @{
+        requested = '请求已保存'; stop_requested = '等待原服务退出'; stopped = '原服务已停止'
+        preparation_requested = '正在准备恢复'; admission_requested = '正在核验原生执行前提'
+        owner_creation_requested = '已发出一次恢复创建请求'; owner_ready = '恢复准备就绪'
+        execution_requested = '正在恢复内容'; execution_resume_requested = '正在继续原恢复'
+        final_reopen_requested = '正在重开核验新历史与清理'; final_verified = '新历史和清理已验证'
+        restart_requested = '正在启动原配置服务'; completed = '恢复已完成'
+    }
+    $phase = if ($phaseNames.ContainsKey($Pending.phase)) { $phaseNames[$Pending.phase] } else { '需要核对持久事务' }
+    $summary = "恢复事务 $($Pending.transaction_id)`r`n$phase。普通启动、版本切换和 WebDAV 更改已暂停。"
+    if ($Pending.refusal_reason) {
+        Assert-SyncExtendViewText $Pending.refusal_reason 512
+        $summary += "`r`n拒绝原因：$($Pending.refusal_reason)"
+    }
+    return @{
+        Summary = $summary
+        ResumeAllowed = [bool]!$Pending.helper_active
+        Rows = @(
+            ,@('恢复事务', $Pending.transaction_id)
+            ,@('当前进度', $phase)
+            ,@('原属主已退出', $(if ($Pending.original_process_exit_verified) { '已由实际进程 wait 验证' } else { '尚待核实；不会执行原生恢复' }))
+            ,@('Final 与清理', $(if ($Pending.native_final_verified) { '已核新 Final、精确清理和独立重开' } else { '尚未完成' }))
+            ,@('继续入口', '继续原事务；原生 lineage 无法验证时仍会拒绝，失败保持 pending')
+        )
+    }
 }
 
 function Assert-SyncExtendViewObject($Value) {

@@ -2,7 +2,7 @@
 
 use crate::{
     limits,
-    tree_restore::{TreeRestoreAction, TreeRestorePlan},
+    tree_restore::{tree_restore_desired_entries, TreeRestoreAction, TreeRestorePlan},
     Change, ContentId, DeviceId, EntryId, Manifest, ModelError, Operation, OperationPayload,
     Result, SnapshotId, FORMAT_VERSION,
 };
@@ -156,6 +156,12 @@ pub fn plan_tree_restore_history(
     {
         return Err(ModelError::InvalidData("tree history scope mismatch"));
     }
+    let desired_entries = tree_restore_desired_entries(tree.scope(), baseline, target)?;
+    if desired_entries.len() > b.max_entries {
+        return Err(ModelError::InvalidData(
+            "tree history final inventory budget",
+        ));
+    }
     let fresh_steps: BTreeSet<_> = tree
         .steps()
         .iter()
@@ -213,8 +219,9 @@ pub fn plan_tree_restore_history(
                     .historical_target_entry
                     .clone()
                     .ok_or(ModelError::InvalidData("tree history missing target entry"))?;
+                entry.path = step.path.clone();
                 if let Some(old) = &step.baseline_entry {
-                    if manifest.entries.get(&old.entry_id) != Some(old) {
+                    if old.path != step.path || manifest.entries.get(&old.entry_id) != Some(old) {
                         return Err(ModelError::InvalidData("tree history replacement mismatch"));
                     }
                     entry.entry_id = old.entry_id.clone();
@@ -266,15 +273,14 @@ pub fn plan_tree_restore_history(
         }
         operations.push(operation);
     }
-    let desired: BTreeMap<_, _> = target
-        .entries
-        .values()
-        .map(|e| (&e.path, (e.kind, &e.content)))
+    let desired: BTreeMap<_, _> = desired_entries
+        .into_iter()
+        .map(|(path, entry)| (path, (entry.kind, &entry.content)))
         .collect();
     let actual: BTreeMap<_, _> = manifest
         .entries
         .values()
-        .map(|e| (&e.path, (e.kind, &e.content)))
+        .map(|e| (e.path.clone(), (e.kind, &e.content)))
         .collect();
     if actual != desired {
         return Err(ModelError::InvalidData(
