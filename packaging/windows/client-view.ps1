@@ -358,6 +358,11 @@ function Get-SyncExtendRestorePreviewBinding($Response, $Request) {
         $Response.counts.reported_conflicts -ne 0 -or $Response.counts.unchecked_paths -ne 0) {
         throw 'A fresh current baseline and retained conflict-free historical selection are required.'
     }
+    if ($Response.counts.proposed_create_files -eq 0 -and $Response.counts.proposed_create_directories -eq 0 -and
+        $Response.counts.proposed_replace_files -eq 0 -and $Response.counts.proposed_delete_files -eq 0 -and
+        $Response.counts.proposed_remove_directories -eq 0) {
+        throw 'The selected historical scope has no new native TREE operations.'
+    }
     return Get-SyncExtendRestoreObjectDigest ([ordered]@{
         format_version = 1; request = $Request; current_snapshot_id = $Response.current_snapshot_id
         baseline = $Response.baseline; target = $Response.target; counts = $Response.counts
@@ -368,13 +373,66 @@ function Get-SyncExtendRestorePreviewBinding($Response, $Request) {
 }
 
 function Assert-SyncExtendRestoreBudgets($Budgets) {
-    Assert-SyncExtendRestoreKeys $Budgets @('plan', 'history', 'identity', 'execution', 'originals', 'coordinator',
-        'actions', 'future', 'inventory')
-    foreach ($part in $Budgets.Keys) {
-        Assert-SyncExtendViewObject $Budgets[$part]
-        foreach ($key in $Budgets[$part].Keys) { $null = Get-SyncExtendViewInteger $Budgets[$part][$key] }
+    # Exact JSON projection of the nine native Tree*Limits structs (36 fields).
+    # Only their basic ranges are checked here; native admission owns costs.
+    $maxEntries = 1000000
+    $maxChunks = 1000000
+    $maxHistoryBytes = 16 * 1024 * 1024
+    $maxInventoryBytes = [long]$maxEntries * 1024
+    $schema = [ordered]@{
+        plan = [ordered]@{
+            max_entries = @(1, $maxEntries); max_steps = @(1, $maxEntries)
+            max_chunk_visits = @(1, $maxChunks)
+            max_target_bytes = @(0, [long]::MaxValue)
+            max_retained_and_staging_bytes = @(0, [long]::MaxValue)
+            max_plan_bytes = @(0, [long]::MaxValue)
+        }
+        history = [ordered]@{
+            max_operations = @(1, $maxEntries); max_entries = @(1, $maxEntries)
+            max_tombstones = @(0, $maxEntries); max_rows = @(0, $maxEntries)
+            max_metadata_bytes = @(0, $maxHistoryBytes)
+        }
+        identity = [ordered]@{
+            max_bindings = @(1, $maxEntries); max_metadata_bytes = @(0, [long]::MaxValue)
+        }
+        execution = [ordered]@{
+            max_steps = @(1, $maxEntries); max_encoded_bytes = @(0, $maxHistoryBytes)
+        }
+        originals = [ordered]@{
+            max_owners = @(1, $maxEntries); max_chunk_visits = @(0, $maxChunks)
+            max_reference_rows = @(0, $maxChunks); max_encoded_bytes = @(0, $maxHistoryBytes)
+        }
+        coordinator = [ordered]@{
+            max_steps = @(1, $maxEntries); max_owners = @(0, $maxEntries)
+            max_reference_rows = @(0, $maxChunks); max_input_bytes = @(0, $maxHistoryBytes)
+            max_encoded_bytes = @(0, $maxHistoryBytes)
+        }
+        actions = [ordered]@{
+            max_records = @(0, $maxEntries); max_input_bytes = @(0, $maxHistoryBytes)
+            max_encoded_bytes = @(0, $maxHistoryBytes)
+        }
+        future = [ordered]@{
+            max_records = @(0, $maxEntries); max_originals = @(0, $maxEntries)
+            max_reference_rows = @(0, $maxChunks); max_rows = @(0, $maxEntries)
+            max_input_bytes = @(0, $maxHistoryBytes); max_encoded_bytes = @(0, $maxHistoryBytes)
+            max_logical_bytes = @(0, $maxInventoryBytes)
+        }
+        inventory = [ordered]@{
+            max_rows = @(1, $maxEntries); max_logical_bytes = @(1, $maxInventoryBytes)
+        }
     }
-    # Native serde and resource gates validate exact inner fields and physical costs.
+    Assert-SyncExtendRestoreKeys $Budgets @($schema.Keys)
+    foreach ($part in $schema.Keys) {
+        $fields = $schema[$part]
+        Assert-SyncExtendRestoreKeys $Budgets[$part] @($fields.Keys)
+        foreach ($key in $fields.Keys) {
+            $value = Get-SyncExtendViewInteger $Budgets[$part][$key]
+            if ($value -lt $fields[$key][0] -or $value -gt $fields[$key][1]) {
+                throw "The explicit TREE $part.$key budget is outside its native basic range."
+            }
+        }
+    }
+    # Effective LocalLimits, exact costs and remaining physical capacity stay native.
 }
 
 function New-SyncExtendPendingRestoreView($Pending) {

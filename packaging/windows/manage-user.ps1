@@ -28,6 +28,9 @@ $statePath = Join-Path $root 'state.json'
 $versions = Join-Path $root 'versions'
 $pendingRestorePath = Join-Path $root 'pending-restore.json'
 $script:restoreLaunchPending = $null
+# In-memory ownership of the exact child created by this restore invocation.
+# This Process object is never serialized or used as a persistent grant.
+$script:restoreRestartProcess = $null
 
 if (!(Test-Path -LiteralPath $root)) {
     if ($Action -notin @('install', 'start')) { throw 'Install this client package first.' }
@@ -155,16 +158,27 @@ function Start-Installed {
         $record.gateway = $gateway.path
         $record.gateway_sha256 = $gateway.sha256
     }
+    $keepForRestore = $false
     $child = Start-Process -FilePath $image -ArgumentList @('deployment-run', '--config', ('"' + $deploymentPath + '"')) `
         -WorkingDirectory ([IO.Path]::GetDirectoryName($image)) -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput (Join-Path $logRoot "$logName.out") -RedirectStandardError (Join-Path $logRoot "$logName.err")
     try {
+        if ($script:restoreLaunchPending) { $null = $child.Handle }
         $record.process = @{ pid = $child.Id; birth = $child.StartTime.ToFileTimeUtc().ToString(); image = $image }
-        Save-State $record
         if ($script:restoreLaunchPending) {
+            $observedImage = $child.MainModule.FileName
+            if (![string]::Equals($observedImage, $image, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'The original restoration restart image differs.'
+            }
+            $script:restoreRestartProcess = [pscustomobject]@{
+                original = $child
+                identity = @{ pid = $child.Id; birth = $record.process.birth; image = $observedImage }
+            }
+            $keepForRestore = $true
             $script:restoreLaunchPending.restart_process = $record.process
-            Save-PendingRestore $script:restoreLaunchPending
         }
+        Save-State $record
+        if ($script:restoreLaunchPending) { Save-PendingRestore $script:restoreLaunchPending }
         $deadline = [Diagnostics.Stopwatch]::StartNew()
         while (!$child.HasExited -and $deadline.Elapsed.TotalSeconds -lt 25) {
             $status = $null
@@ -180,21 +194,23 @@ function Start-Installed {
         }
         throw 'The deployment did not reach authenticated readiness.'
     } catch {
-        if (!$child.HasExited) { $child.Kill() }
-        $child.WaitForExit()
-        $record.state = 'startup_failed'
-        $record.exit_code = $child.ExitCode
-        $record.process_exit_verified = $true
-        if ($record.process) {
-            $record.exit_receipt = @{
-                pid = $child.Id; birth = $record.process.birth; image = $record.process.image
-                actual_wait = $true; exit_code = $child.ExitCode
-                failed_restore_restart = [bool]$script:restoreLaunchPending
+        try { if (!$child.HasExited) { $child.Kill() } }
+        finally {
+            $child.WaitForExit()
+            $record.state = 'startup_failed'
+            $record.exit_code = $child.ExitCode
+            $record.process_exit_verified = $true
+            if ($record.process) {
+                $record.exit_receipt = @{
+                    pid = $child.Id; birth = $record.process.birth; image = $record.process.image
+                    actual_wait = $true; exit_code = $child.ExitCode
+                    failed_restore_restart = [bool]$script:restoreLaunchPending
+                }
             }
+            Save-State $record
         }
-        Save-State $record
         throw
-    } finally { $child.Dispose() }
+    } finally { if (!$keepForRestore) { $child.Dispose() } }
 }
 
 function Confirm-Configuration($Record) {
@@ -693,23 +709,43 @@ function Close-FailedRestoreRestart($Pending) {
     if (!$record.process -or !$Pending.restart_process -or $record.process.pid -ne $Pending.restart_process.pid -or
         $record.process.birth -cne $Pending.restart_process.birth -or $record.process.birth -ceq $Pending.original_process.birth -or
         ![string]::Equals($record.process.image, $Pending.image, [StringComparison]::OrdinalIgnoreCase)) { return }
-    $process = Get-OwnedProcess $record.process
+    $process = $null
+    $disposeProcess = $false
+    if ($script:restoreRestartProcess) {
+        $retained = $script:restoreRestartProcess
+        $identity = $retained.identity
+        if (!$retained.original -or !$identity -or $identity.pid -ne $record.process.pid -or
+            $identity.birth -cne $record.process.birth -or
+            ![string]::Equals($identity.image, $record.process.image, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The retained original restoration restart identity differs.'
+        }
+        $process = $retained.original
+        if ($process.Id -ne $identity.pid -or $process.StartTime.ToFileTimeUtc().ToString() -cne $identity.birth) {
+            throw 'The retained original restoration restart process differs.'
+        }
+    } else {
+        # A new invocation can close only an active exact owner. An absent or
+        # reused PID never supplies the missing original exit/wait receipt.
+        $process = Get-OwnedProcess $record.process
+        $disposeProcess = $true
+    }
     try {
         if ($process) {
-            # This exact process was created for the recorded restart. No
-            # unrelated PID or substituted image can be stopped here.
-            if (!$process.HasExited) { $process.Kill() }
-            $process.WaitForExit()
-            $record.exit_code = $process.ExitCode
-            $record.process_exit_verified = $true
-            $record.exit_receipt = @{
-                pid = $process.Id; birth = $record.process.birth; image = $record.process.image
-                actual_wait = $true; exit_code = $process.ExitCode; failed_restore_restart = $true
+            # Wait the retained original even when Kill races natural exit.
+            try { if (!$process.HasExited) { $process.Kill() } }
+            finally {
+                $process.WaitForExit()
+                $record.exit_code = $process.ExitCode
+                $record.process_exit_verified = $true
+                $record.exit_receipt = @{
+                    pid = $process.Id; birth = $record.process.birth; image = $record.process.image
+                    actual_wait = $true; exit_code = $process.ExitCode; failed_restore_restart = $true
+                }
+                $record.state = 'startup_failed'
+                Save-State $record
             }
-            $record.state = 'startup_failed'
-            Save-State $record
         }
-    } finally { if ($process) { $process.Dispose() } }
+    } finally { if ($disposeProcess -and $process) { $process.Dispose() } }
 }
 
 function Invoke-ManagedRestore($Record, $Pending, [bool]$Resume) {
@@ -810,6 +846,10 @@ function Invoke-ManagedRestore($Record, $Pending, [bool]$Resume) {
         $Pending.last_failure_reason = $failureReason.Substring(0, [Math]::Min(512, $failureReason.Length))
         Save-PendingRestore $Pending
         throw "Restoration transaction $($Pending.transaction_id) remains pending at $($Pending.phase). Keep the service stopped and explicitly continue this transaction after resolving the refusal."
+    } finally {
+        $retained = $script:restoreRestartProcess
+        $script:restoreRestartProcess = $null
+        if ($retained) { $retained.original.Dispose() }
     }
 }
 

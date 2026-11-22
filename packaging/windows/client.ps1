@@ -285,7 +285,7 @@ $script:restoreContext = $null
 
 function Set-ClientRestoreBusy([bool]$Value) {
     $available = [bool](!$Value -and !$script:pendingRestore -and $script:restoreContext -and $script:restoreContext.available)
-    $restoreSpace.Enabled = [bool](!$Value -and $script:restoreContext -and $script:restoreContext.spaces.Count)
+    $restoreSpace.Enabled = [bool](!$Value -and !$script:pendingRestore -and $script:restoreContext -and $script:restoreContext.spaces.Count)
     foreach ($control in @($restoreSnapshot, $restoreMode, $restorePrefix, $restoreExtra, $restoreOccupied, $restoreButton)) {
         $control.Enabled = $available
     }
@@ -674,7 +674,7 @@ function Update-Client {
         }
     } catch {
         Show-ClientUnavailable
-    } finally { $form.UseWaitCursor = $false; $script:busy = $false }
+    } finally { $form.UseWaitCursor = $false; $script:busy = $false; Set-ClientRestoreBusy $false }
 }
 
 $null = Add-ClientButton '刷新状态' { Update-Client }

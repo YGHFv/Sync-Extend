@@ -17,11 +17,11 @@ mod management_credentials;
 #[cfg(windows)]
 mod recovery;
 mod restore_preview_cli;
-mod tree_restore_selection_cli;
 mod shutdown;
 mod storage;
 mod storage_retirement_cli;
 mod transport_budget;
+mod tree_restore_selection_cli;
 mod webdav;
 mod webdav_conditions;
 mod webdav_credentials;
