@@ -8,6 +8,43 @@ use serde::{Deserialize, Serialize};
 pub const UNIX_STORAGE_RETIREMENT_VERSION: u32 = 1;
 pub const UNIX_STORAGE_RETIREMENT_REQUEST_BYTES: usize = 16384;
 
+// A tagged struct serializes its type without requiring it on deserialization.
+// Use an internally tagged variant while defining the model fields only once.
+macro_rules! strict_tagged_unix_description {
+    (
+        $(#[$meta:meta])*
+        pub struct $name:ident, $tag:literal {
+            $(pub $field:ident: $field_type:ty),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+        #[serde(tag = "type", rename = $tag, deny_unknown_fields)]
+        pub struct $name {
+            $(pub $field: $field_type),*
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                #[derive(Deserialize)]
+                #[serde(tag = "type", deny_unknown_fields)]
+                enum Tagged {
+                    #[serde(rename = $tag)]
+                    Value {
+                        $($field: $field_type),*
+                    },
+                }
+                match Tagged::deserialize(deserializer)? {
+                    Tagged::Value { $($field),* } => Ok(Self { $($field),* }),
+                }
+            }
+        }
+    };
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnixStorageRetirementKey {
@@ -148,23 +185,22 @@ impl UnixStorageRetirementBinding {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename = "unix_storage_retirement_request_v1")]
-#[serde(deny_unknown_fields)]
-pub struct UnixStorageRetirementRequest {
-    pub format_version: u32,
-    pub request_id: EntryId,
-    pub space_id: SpaceId,
-    pub storage_id: ContentId,
-    pub original_owner_id: EntryId,
-    pub content_id: ContentId,
-    pub original_metadata_hash: ContentId,
-    pub storage_device: DeviceId,
-    pub storage_policy: ContentId,
-    pub binding: UnixStorageRetirementBinding,
-    pub requested_at_ms: u64,
-    pub grace_until_ms: u64,
-    pub expires_at_ms: u64,
+strict_tagged_unix_description! {
+    pub struct UnixStorageRetirementRequest, "unix_storage_retirement_request_v1" {
+        pub format_version: u32,
+        pub request_id: EntryId,
+        pub space_id: SpaceId,
+        pub storage_id: ContentId,
+        pub original_owner_id: EntryId,
+        pub content_id: ContentId,
+        pub original_metadata_hash: ContentId,
+        pub storage_device: DeviceId,
+        pub storage_policy: ContentId,
+        pub binding: UnixStorageRetirementBinding,
+        pub requested_at_ms: u64,
+        pub grace_until_ms: u64,
+        pub expires_at_ms: u64,
+    }
 }
 
 impl UnixStorageRetirementRequest {
@@ -314,25 +350,24 @@ impl UnixStorageRetirementExpectation {
     }
 }
 
-/// A versioned fresh intent is a plan and rejection expectation, never a live
-/// capability. Materializing a request still grants no SQL/native authority.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename = "unix_storage_retirement_fresh_intent_v1")]
-#[serde(deny_unknown_fields)]
-pub struct UnixStorageRetirementIntent {
-    pub format_version: u32,
-    pub request_id: EntryId,
-    pub space_id: SpaceId,
-    pub storage_id: ContentId,
-    pub original_owner_id: EntryId,
-    pub content_id: ContentId,
-    pub original_metadata_hash: ContentId,
-    pub storage_device: DeviceId,
-    pub storage_policy: ContentId,
-    pub expected_original: UnixStorageRetirementExpectation,
-    pub requested_at_ms: u64,
-    pub grace_until_ms: u64,
-    pub expires_at_ms: u64,
+strict_tagged_unix_description! {
+    /// A versioned fresh intent is a plan and rejection expectation, never a live
+    /// capability. Materializing a request still grants no SQL/native authority.
+    pub struct UnixStorageRetirementIntent, "unix_storage_retirement_fresh_intent_v1" {
+        pub format_version: u32,
+        pub request_id: EntryId,
+        pub space_id: SpaceId,
+        pub storage_id: ContentId,
+        pub original_owner_id: EntryId,
+        pub content_id: ContentId,
+        pub original_metadata_hash: ContentId,
+        pub storage_device: DeviceId,
+        pub storage_policy: ContentId,
+        pub expected_original: UnixStorageRetirementExpectation,
+        pub requested_at_ms: u64,
+        pub grace_until_ms: u64,
+        pub expires_at_ms: u64,
+    }
 }
 
 impl UnixStorageRetirementIntent {
