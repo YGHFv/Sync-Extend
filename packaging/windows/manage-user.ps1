@@ -180,9 +180,18 @@ function Start-Installed {
         }
         throw 'The deployment did not reach authenticated readiness.'
     } catch {
-        if (!$child.HasExited) { $child.Kill(); $child.WaitForExit() }
+        if (!$child.HasExited) { $child.Kill() }
+        $child.WaitForExit()
         $record.state = 'startup_failed'
-        if ($child.HasExited) { $record.exit_code = $child.ExitCode }
+        $record.exit_code = $child.ExitCode
+        $record.process_exit_verified = $true
+        if ($record.process) {
+            $record.exit_receipt = @{
+                pid = $child.Id; birth = $record.process.birth; image = $record.process.image
+                actual_wait = $true; exit_code = $child.ExitCode
+                failed_restore_restart = [bool]$script:restoreLaunchPending
+            }
+        }
         Save-State $record
         throw
     } finally { $child.Dispose() }
@@ -409,7 +418,7 @@ function Invoke-InstalledRestoreJson($Pending, [string[]]$Arguments) {
         return ConvertFrom-Json -InputObject $result -AsHashtable -ErrorAction Stop
     } finally {
         try {
-            if (!$child.HasExited) { $child.WaitForExit() }
+            $child.WaitForExit()
             if (!$receiptSaved -and $birth) {
                 $Pending.last_command = @{
                     name = $Arguments[0]; pid = $child.Id; birth = $birth
@@ -689,7 +698,8 @@ function Close-FailedRestoreRestart($Pending) {
         if ($process) {
             # This exact process was created for the recorded restart. No
             # unrelated PID or substituted image can be stopped here.
-            if (!$process.HasExited) { $process.Kill(); $process.WaitForExit() }
+            if (!$process.HasExited) { $process.Kill() }
+            $process.WaitForExit()
             $record.exit_code = $process.ExitCode
             $record.process_exit_verified = $true
             $record.exit_receipt = @{
