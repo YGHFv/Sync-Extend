@@ -1272,7 +1272,7 @@ impl LinuxStorageOwner {
         identity: sync_extend_platform_fs::LinuxStorageOutsideFileClosed,
     ) -> Result<()> {
         if !self.control_loan_issued.load(Ordering::Acquire)
-            || traffic.original().parent != self.root_identity.into()
+            || LinuxStorageObjectIdentity::from(traffic.original().parent) != self.root_identity
             || traffic.original().active_sqlite_files != 0
             || traffic.original().files.len() != 3
             || lock.identity().device != self.root_identity.device
