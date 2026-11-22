@@ -19,6 +19,8 @@ use sync_extend_core_model::{
     ContentId, DeviceId, EntryId,
 };
 
+pub(crate) mod native;
+pub(crate) mod native_schema;
 pub(crate) mod schema;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -265,7 +267,7 @@ fn unchanged(before: &CapacitySnapshot, after: &CapacitySnapshot) -> Result<()> 
 }
 
 #[cfg(target_os = "linux")]
-fn native_binding(
+pub(super) fn native_binding(
     expected: &UnixStorageRetirementExpectation,
     exclusive: &sync_extend_platform_fs::LinuxStorageCasExclusiveCoordination<'_>,
     original: &sync_extend_platform_fs::LinuxStorageCasRetirementInspection,
@@ -696,8 +698,8 @@ impl Journal {
         Ok((Some((coordination, held)), result))
     }
 
-    /// This family has no native activation in this phase. A cancelled row
-    /// consumes its already charged finite liability and never releases an FD.
+    /// An unactivated request consumes its finite cancellation liability.
+    /// Once native activation exists, only its full terminal release can cancel.
     #[cfg(target_os = "linux")]
     pub fn cancel_unix_storage_retirement(
         &self,
@@ -728,6 +730,9 @@ impl Journal {
                 tx.commit()?;
                 return Ok(old);
             }
+            if native::has_activation(&tx, request_id)? {
+                return Err(invalid());
+            }
         }
         if self.original_linux_cas_coordination.is_none() {
             return Err(invalid());
@@ -751,6 +756,9 @@ impl Journal {
             tx.commit()?;
             coordination.close_linux_storage_original()?;
             return Ok(old);
+        }
+        if native::has_activation(&tx, request_id)? {
+            return Err(invalid());
         }
         let clock: u64 = tx.query_row(
             "SELECT observed_at_ms FROM main.unix_storage_retirement_v1_clock WHERE singleton=1",

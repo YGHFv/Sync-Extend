@@ -157,6 +157,8 @@ impl Journal {
                 &connection,
                 "sync_unix_storage_retirement_clock",
             )?;
+            let unix_storage_retirement_native_gates =
+                storage_retirement_unix::native::Gates::register(&connection)?;
             storage_page_handoff::validate_schema(&connection)?;
             storage_snapshot_handoff::validate_schema(&connection)?;
             tree_native_effects::validate_schema(&connection)?;
@@ -204,6 +206,7 @@ impl Journal {
                 unix_storage_retirement_issuance,
                 unix_storage_retirement_cancellation,
                 unix_storage_retirement_clock_issue,
+                unix_storage_retirement_native_gates,
                 deletion_retention_issuance,
                 webdav_native_description_issue,
                 webdav_native_object_issue,

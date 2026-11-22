@@ -18,7 +18,7 @@ use sync_extend_journal::{
 use sync_extend_platform_fs::{
     LinuxMetadataBudget, LinuxMetadataLimits, LinuxMetadataReceipt, LinuxNamespaceCapability,
     LinuxStorageCas, LinuxStorageCasCoordination, LinuxStorageCasExpectedLayout,
-    LinuxStorageCasLimits, UnixFileKey,
+    LinuxStorageCasLimits, LinuxStorageRetirementInventoryContext, UnixFileKey,
 };
 
 const MAX_CONFIG_BYTES: usize = 65_536;
@@ -516,6 +516,7 @@ pub struct LinuxStorageOwner {
     initialize: bool,
     bootstrap_budget: Option<StorageJournalBootstrapBudget>,
     cas_failure: Mutex<Option<String>>,
+    retirement_inventory: Mutex<Option<LinuxStorageRetirementInventoryContext>>,
 }
 
 fn identity(metadata: &Metadata) -> LinuxStorageObjectIdentity {
@@ -917,23 +918,12 @@ impl LinuxStorageOwner {
         let prepared = (|| {
             // Validate every inside scaffold, expectation and complete image
             // geometry before the first outside sentinel/metadata/CAS CREATE.
-            let existing_cas = if config.format_version == 2 {
+            let cas_limits = if config.format_version == 2 {
                 let limits = config.inside_cas_limits()?;
                 if initialize {
                     LinuxStorageCas::preflight_new(&owner, limits)?;
-                    None
-                } else {
-                    let expected = config
-                        .inside_image_cas
-                        .as_ref()
-                        .and_then(|cas| cas.expected_layout.as_ref())
-                        .ok_or(ReconcileError::Invariant("inside CAS expectation absent"))?;
-                    Some(LinuxStorageCas::reopen_existing(
-                        Arc::clone(&owner),
-                        limits,
-                        expected.platform(),
-                    )?)
                 }
+                Some(limits)
             } else {
                 None
             };
@@ -972,30 +962,70 @@ impl LinuxStorageOwner {
                     config.metadata_limits.into(),
                 )?
             };
-            let inside_cas = if config.format_version == 2 && initialize {
+            let (inside_cas, retirement_inventory) = if config.format_version == 2 && initialize {
                 let original_coordination = coordination
                     .as_ref()
                     .ok_or(ReconcileError::Invariant(
                         "inside CAS original coordination absent before realm CREATE",
                     ))?
                     .key()?;
-                Some(LinuxStorageCas::create_new(
-                    Arc::clone(&owner),
-                    config.inside_cas_limits()?,
-                    |layout| {
-                        realm_fingerprint(
-                            &config,
-                            budget.persistent_owner_generation(),
-                            root_identity,
-                            original_coordination,
-                            layout,
-                        )
-                        .map(|fingerprint| binding_bytes(&fingerprint))
-                        .map_err(|error| std::io::Error::other(error.to_string()))
-                    },
-                )?)
+                (
+                    Some(LinuxStorageCas::create_new(
+                        Arc::clone(&owner),
+                        config.inside_cas_limits()?,
+                        |layout| {
+                            realm_fingerprint(
+                                &config,
+                                budget.persistent_owner_generation(),
+                                root_identity,
+                                original_coordination,
+                                layout,
+                            )
+                            .map(|fingerprint| binding_bytes(&fingerprint))
+                            .map_err(|error| std::io::Error::other(error.to_string()))
+                        },
+                    )?),
+                    None,
+                )
+            } else if config.format_version == 2 {
+                let expected = config
+                    .inside_image_cas
+                    .as_ref()
+                    .and_then(|cas| cas.expected_layout.as_ref())
+                    .ok_or(ReconcileError::Invariant("inside CAS expectation absent"))?;
+                let journal = Journal::open_with_linux_storage_cas_coordination(
+                    &budget,
+                    config.storage.max_metadata_entries,
+                    coordination
+                        .as_ref()
+                        .ok_or(ReconcileError::Invariant(
+                            "original retirement catalog requires the reopened coordinator",
+                        ))?
+                        .loan()?,
+                )?;
+                let inventory =
+                    journal.unix_storage_retirement_inventory_context(expected.platform());
+                let closed = journal.close_linux_storage_cas_coordination();
+                let inventory = match (inventory, closed) {
+                    (Ok(inventory), Ok(())) => inventory,
+                    (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error.into()),
+                    (Err(error), Err(closed)) => return Err(std::io::Error::other(format!(
+                        "{error}; original retirement catalog connection close also refused: {closed}"
+                    )).into()),
+                };
+                (
+                    Some(LinuxStorageCas::reopen_existing_with_retirement_prefixes(
+                        Arc::clone(&owner),
+                        cas_limits.ok_or(ReconcileError::Invariant(
+                            "original inside CAS limits absent",
+                        ))?,
+                        expected.platform(),
+                        &inventory,
+                    )?),
+                    Some(inventory),
+                )
             } else {
-                existing_cas
+                (None, None)
             };
             if let Some(cas) = &inside_cas {
                 let original_coordination = coordination
@@ -1027,9 +1057,9 @@ impl LinuxStorageOwner {
                     ));
                 }
             }
-            Ok::<_, ReconcileError>((budget, inside_cas, coordination))
+            Ok::<_, ReconcileError>((budget, inside_cas, coordination, retirement_inventory))
         })();
-        let (budget, inside_cas, cas_coordination) = match prepared {
+        let (budget, inside_cas, cas_coordination, retirement_inventory) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 // Local original FDs have closed; no persistent prefix is
@@ -1062,6 +1092,7 @@ impl LinuxStorageOwner {
             initialize,
             bootstrap_budget,
             cas_failure: Mutex::new(None),
+            retirement_inventory: Mutex::new(retirement_inventory),
         };
         if let Err(error) = result.verify() {
             if let Err(closed) = result.finish() {
@@ -1104,6 +1135,22 @@ impl LinuxStorageOwner {
                 self.config.storage.max_metadata_entries,
             )?)
         }
+    }
+
+    /// Cache only fully audited accounting expectations before the original
+    /// Journal callbacks end. This never retains a native creator capability.
+    pub(crate) fn remember_retirement_inventory(&self, journal: &Journal) -> Result<()> {
+        self.verify()?;
+        let Some(cas) = &self.inside_cas else {
+            return Ok(());
+        };
+        let context = journal
+            .unix_storage_retirement_inventory_context(cas.observation()?.expected_layout)?;
+        cas.inventory_with_retirement_prefixes(&context)?;
+        *self.retirement_inventory.lock().map_err(|_| {
+            ReconcileError::Invariant("original retirement accounting mutex poisoned")
+        })? = Some(context);
+        self.verify()
     }
 
     pub(crate) fn poison_inside_cas(&self, error: impl std::fmt::Display) {
@@ -1362,12 +1409,17 @@ impl LinuxStorageOwner {
                 "actual full-FD SQLite files remain active before any owner FD close",
             ));
         }
-        self.inside_cas
-            .as_ref()
-            .ok_or(ReconcileError::Invariant(
-                "actual inside CAS base originals absent",
-            ))?
-            .verify_closed_constraints()?;
+        let cas = self.inside_cas.as_ref().ok_or(ReconcileError::Invariant(
+            "actual inside CAS base originals absent",
+        ))?;
+        let inventory = self.retirement_inventory.lock().map_err(|_| {
+            ReconcileError::Invariant("original retirement accounting mutex poisoned")
+        })?;
+        if let Some(inventory) = inventory.as_ref() {
+            cas.verify_closed_constraints_with_retirement_prefixes(inventory)?;
+        } else {
+            cas.verify_closed_constraints()?;
+        }
         self.cas_coordination
             .as_ref()
             .ok_or(ReconcileError::Invariant(
@@ -1395,15 +1447,22 @@ impl LinuxStorageOwner {
                 root,
                 inside_cas,
                 cas_coordination,
+                retirement_inventory,
                 ..
             } = self;
             // Outer owner Arc loans must already be gone. Each success below
             // comes only from the actual kernel/FD operation, never a flag.
-            inside_cas
-                .ok_or(ReconcileError::Invariant(
-                    "original inside CAS close absent",
-                ))?
-                .close()?;
+            let inside_cas = inside_cas.ok_or(ReconcileError::Invariant(
+                "original inside CAS close absent",
+            ))?;
+            let inventory = retirement_inventory.into_inner().map_err(|_| {
+                ReconcileError::Invariant("original retirement accounting mutex poisoned")
+            })?;
+            if let Some(inventory) = inventory.as_ref() {
+                inside_cas.close_with_retirement_prefixes(inventory)?;
+            } else {
+                inside_cas.close()?;
+            }
             cas_coordination
                 .ok_or(ReconcileError::Invariant(
                     "original CAS sentinel close absent",

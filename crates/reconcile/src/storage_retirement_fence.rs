@@ -4,6 +4,56 @@ use sync_extend_core_model::storage_retirement::StorageRetirementRequest;
 use sync_extend_journal::StorageRetirementAdmission;
 
 impl StorageNode {
+    /// Native activation requires this fresh intent and this process's actual
+    /// original inspection. A previously admitted request has no writer path.
+    #[cfg(target_os = "linux")]
+    pub fn execute_unix_storage_retirement_intent(
+        &self,
+        intent: &sync_extend_core_model::storage_retirement_unix::UnixStorageRetirementIntent,
+        disposition: sync_extend_journal::UnixStorageRetirementNativeDisposition,
+    ) -> Result<LinuxStorageRetirementNativeTerminal<'_>> {
+        self.verify_storage()?;
+        self.cas.retirement_owner_observation()?;
+        let reference = sync_extend_core_model::ChunkRef {
+            content_id: intent.content_id.clone(),
+            length: intent.expected_original.length,
+        };
+        let activation = sync_extend_core_model::EntryId::random()?;
+        let terminal = self.journal.execute_unix_storage_retirement_intent(
+            intent,
+            &self.config,
+            &self.device,
+            &activation,
+            disposition,
+            || {
+                now_ms().map_err(|error| {
+                    sync_extend_journal::JournalError::Io(std::io::Error::other(error.to_string()))
+                })
+            },
+            |exclusive| {
+                self.cas
+                    .inspect_retirement_original(exclusive, &reference)
+                    .map_err(|error| {
+                        sync_extend_journal::JournalError::Io(std::io::Error::other(
+                            error.to_string(),
+                        ))
+                    })
+            },
+        )?;
+        Ok(LinuxStorageRetirementNativeTerminal {
+            node: self,
+            original: Some(terminal),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn unix_storage_retirement_native_states(
+        &self,
+    ) -> Result<Vec<sync_extend_journal::UnixStorageRetirementNativeState>> {
+        self.verify_storage()?;
+        Ok(self.journal.unix_storage_retirement_native_states()?)
+    }
+
     #[cfg(target_os = "linux")]
     pub fn admit_unix_storage_retirement_intent(
         &self,
@@ -211,5 +261,74 @@ impl StorageNode {
         self.journal
             .cancel_storage_retirement(request, &self.config, &self.device, now_ms()?)
             .map_err(ReconcileError::from)
+    }
+}
+
+/// Borrowed live terminal holder. Serializable reports and old IDs cannot
+/// construct it or recover its actual independent parent witnesses.
+#[cfg(target_os = "linux")]
+#[must_use = "explicitly release or close the original terminal witnesses"]
+pub struct LinuxStorageRetirementNativeTerminal<'node> {
+    node: &'node StorageNode,
+    original: Option<sync_extend_journal::UnixStorageRetirementNativeTerminal<'node>>,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxStorageRetirementNativeTerminal<'_> {
+    pub fn observation(&self) -> Result<sync_extend_journal::UnixStorageRetirementNativeState> {
+        self.node.cas.retirement_owner_observation()?;
+        Ok(self
+            .original
+            .as_ref()
+            .ok_or(ReconcileError::Invariant(
+                "original Unix retirement terminal already closed",
+            ))?
+            .observation()?)
+    }
+
+    pub fn close(mut self) -> Result<()> {
+        let observed = self
+            .node
+            .cas
+            .remember_retirement_inventory(&self.node.journal);
+        let closed = self
+            .original
+            .take()
+            .ok_or(ReconcileError::Invariant(
+                "original Unix retirement terminal already closed",
+            ))?
+            .close()
+            .map_err(ReconcileError::from);
+        let result = crate::storage_retirement_inspection::combine_unix(observed, closed);
+        if let Err(error) = &result {
+            self.node.cas.retirement_failure(error);
+        }
+        result
+    }
+
+    /// Explicitly consume the live terminal in a second independently gated
+    /// release call. The twelve-step terminal itself keeps its content fence.
+    pub fn release(mut self) -> Result<sync_extend_journal::UnixStorageRetirementNativeState> {
+        let result = self
+            .original
+            .take()
+            .ok_or(ReconcileError::Invariant(
+                "original Unix retirement terminal already closed",
+            ))?
+            .release(|| {
+                now_ms().map_err(|error| {
+                    sync_extend_journal::JournalError::Io(std::io::Error::other(error.to_string()))
+                })
+            })
+            .map_err(ReconcileError::from);
+        let closed = self
+            .node
+            .cas
+            .remember_retirement_inventory(&self.node.journal);
+        let result = crate::storage_retirement_inspection::combine_unix(result, closed);
+        if let Err(error) = &result {
+            self.node.cas.retirement_failure(error);
+        }
+        result
     }
 }

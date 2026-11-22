@@ -39,6 +39,47 @@ pub struct StorageNode {
     linux_storage_owner: Option<std::sync::Arc<crate::LinuxStorageOwner>>,
 }
 
+#[cfg(target_os = "linux")]
+impl StorageNode {
+    /// End every actual storage Journal/CAS callback before the outer acquired
+    /// owner can finish. Native history does not supply a descriptor close.
+    pub fn close_linux_storage_owner_loan(self) -> Result<()> {
+        if self.linux_storage_owner.is_none() {
+            return Err(ReconcileError::Invariant(
+                "explicit acquired Linux storage owner required at node close",
+            ));
+        }
+        let observed = self.cas.remember_retirement_inventory(&self.journal);
+        let Self {
+            journal,
+            cas,
+            linux_storage_owner,
+            ..
+        } = self;
+        let callbacks = cas.close();
+        let journal = journal
+            .close_linux_storage_owner_connection()
+            .map_err(ReconcileError::from);
+        let mut first = observed.err();
+        if let Err(error) = callbacks {
+            first.get_or_insert(error);
+        }
+        if let Err(error) = journal {
+            first.get_or_insert(error);
+        }
+        if let Some(owner) = &linux_storage_owner {
+            if let Some(error) = &first {
+                owner.poison_inside_cas(error);
+            }
+            if let Err(error) = owner.verify() {
+                first.get_or_insert(error);
+            }
+        }
+        drop(linux_storage_owner);
+        first.map_or(Ok(()), Err)
+    }
+}
+
 pub struct StorageReceivedPage {
     verified: VerifiedForwardedPage,
     owner: Option<EntryId>,

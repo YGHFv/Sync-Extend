@@ -487,4 +487,10 @@ pub use storage_cas::{
     LinuxStorageCasCoordinationLoan, LinuxStorageCasDirectoryGuard, LinuxStorageCasExpectedLayout,
     LinuxStorageCasFileGuard, LinuxStorageCasFileObservation, LinuxStorageCasInventory,
     LinuxStorageCasLimits, LinuxStorageCasObservation, LinuxStorageCasStaged,
+    LinuxStorageRetirementBoundary, LinuxStorageRetirementClosedBoundary,
+    LinuxStorageRetirementClosedObservation, LinuxStorageRetirementCreatorReceipt,
+    LinuxStorageRetirementInventoryContext, LinuxStorageRetirementInventoryPhase,
+    LinuxStorageRetirementInventoryPrefix, LinuxStorageRetirementMarkerObservation,
+    LinuxStorageRetirementMarkerUnlinkObservation, LinuxStorageRetirementMoveObservation,
+    LinuxStorageRetirementPayloadSlot, LinuxStorageRetirementUnlinkObservation,
 };

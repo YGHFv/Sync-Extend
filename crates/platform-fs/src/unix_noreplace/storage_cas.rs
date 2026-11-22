@@ -17,6 +17,22 @@ use std::{
     sync::Arc,
 };
 
+#[path = "held_volume/storage_retirement.rs"]
+mod retirement;
+pub use retirement::{
+    LinuxStorageRetirementBoundary, LinuxStorageRetirementClosedBoundary,
+    LinuxStorageRetirementClosedObservation, LinuxStorageRetirementCreatorReceipt,
+    LinuxStorageRetirementMarkerObservation, LinuxStorageRetirementMarkerUnlinkObservation,
+    LinuxStorageRetirementMoveObservation, LinuxStorageRetirementPayloadSlot,
+    LinuxStorageRetirementUnlinkObservation,
+};
+#[path = "held_volume/storage_retirement_inventory.rs"]
+mod retirement_inventory;
+pub use retirement_inventory::{
+    LinuxStorageRetirementInventoryContext, LinuxStorageRetirementInventoryPhase,
+    LinuxStorageRetirementInventoryPrefix,
+};
+
 const CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 const BLOCK_BYTES: u64 = 4096;
 const MAX_ENTRIES: usize = 10_000;
@@ -401,10 +417,19 @@ impl Graph {
             let component = name(component)?;
             same_slot(parent, &component, original)?;
             let current = open_directory_at(parent, &component)?;
-            same_image(&current, &self.owner, true)?;
-            if key(&current)? != key(original)? {
-                return Err(refuse("inside CAS original directory slot substituted"));
+            let observed = (|| {
+                same_image(&current, &self.owner, true)?;
+                if key(&current)? != key(original)? {
+                    return Err(refuse("inside CAS original directory slot substituted"));
+                }
+                Ok(())
+            })();
+            let closed = close_original(current);
+            if let Err(error) = observed {
+                let _ = closed;
+                return Err(error);
             }
+            closed?;
         }
         self.realm_lease.verify()?;
         same_image(&self.realm, &self.owner, false)?;
@@ -441,38 +466,70 @@ impl Graph {
 
     fn duplicate(&self) -> io::Result<Self> {
         self.verify()?;
+        let mut originals = Vec::with_capacity(6);
+        let retained = (|| {
+            for original in [
+                &self.root,
+                &self.cas,
+                &self.objects,
+                &self.temporary,
+                &self.realm,
+            ] {
+                originals.push(original.try_clone()?);
+            }
+            if let Some(lost_found) = &self.lost_found {
+                originals.push(lost_found.try_clone()?);
+            }
+            Ok(())
+        })();
+        if let Err(error) = retained {
+            for file in originals {
+                let _ = close_original(file);
+            }
+            return Err(error);
+        }
+        let mut originals = originals.into_iter();
         let result = Self {
-            root: self.root.try_clone()?,
-            cas: self.cas.try_clone()?,
-            objects: self.objects.try_clone()?,
-            temporary: self.temporary.try_clone()?,
+            root: originals.next().expect("retained original root"),
+            cas: originals.next().expect("retained original CAS"),
+            objects: originals.next().expect("retained original objects"),
+            temporary: originals.next().expect("retained original temporary"),
             // A lease belongs to the original open description. Never open the
             // leased named seal again merely to construct a guard.
-            realm: self.realm.try_clone()?,
+            realm: originals.next().expect("retained original realm"),
             realm_lease: Arc::clone(&self.realm_lease),
             realm_fingerprint: self.realm_fingerprint,
             realm_before: self.realm_before.clone(),
-            lost_found: self.lost_found.as_ref().map(File::try_clone).transpose()?,
+            lost_found: originals.next(),
             filesystem_id: self.filesystem_id,
             mount_id: self.mount_id,
             generation: self.generation,
             owner: Arc::clone(&self.owner),
         };
-        result.verify()?;
+        if let Err(error) = result.verify() {
+            let _ = result.close(false);
+            return Err(error);
+        }
         Ok(result)
     }
 
     fn close(self, terminal: bool) -> io::Result<()> {
-        self.verify()?;
+        // Verification failure is not a close receipt, but it must not skip
+        // explicit attempts to end any descriptor owned by this invocation.
+        let mut failure = self.verify().err();
         if terminal && Arc::strong_count(&self.realm_lease) != 1 {
-            return Err(refuse(
-                "inside CAS original realm seal still has live guard loans",
-            ));
+            failure.get_or_insert_with(|| {
+                refuse("inside CAS original realm seal still has live guard loans")
+            });
         }
         for file in [&self.temporary, &self.objects, &self.cas, &self.root] {
-            file.sync_all()?;
+            if let Err(error) = file.sync_all() {
+                failure.get_or_insert(error);
+            }
         }
-        self.realm.sync_all()?;
+        if let Err(error) = self.realm.sync_all() {
+            failure.get_or_insert(error);
+        }
         let Self {
             owner,
             root,
@@ -484,7 +541,6 @@ impl Graph {
             lost_found,
             ..
         } = self;
-        let mut failure = None;
         // Guard close drops only its original seal loan; the layout retains the
         // real lease. Terminal close must release the final actual kernel lease.
         drop(realm_lease);
@@ -493,10 +549,12 @@ impl Graph {
             // the last lease owner has released F_SETLEASE and joined its watcher.
             let state = unsafe { libc::fcntl(realm.as_raw_fd(), F_GETLEASE) };
             if state != libc::F_UNLCK {
-                failure = Some(if state < 0 {
-                    io::Error::last_os_error()
-                } else {
-                    refuse("inside CAS original realm kernel lease did not release")
+                failure.get_or_insert_with(|| {
+                    if state < 0 {
+                        io::Error::last_os_error()
+                    } else {
+                        refuse("inside CAS original realm kernel lease did not release")
+                    }
                 });
             }
         }
@@ -515,7 +573,9 @@ impl Graph {
                 failure.get_or_insert(error);
             }
         }
-        owner.verify()?;
+        if let Err(error) = owner.verify() {
+            failure.get_or_insert(error);
+        }
         if let Some(error) = failure {
             return Err(error);
         }
@@ -623,6 +683,26 @@ impl LinuxStorageCas {
         limits: LinuxStorageCasLimits,
         expected: LinuxStorageCasExpectedLayout,
     ) -> io::Result<Self> {
+        Self::reopen_with_inventory(owner, limits, expected, None)
+    }
+
+    /// A complete original Journal catalog may account immutable retirement
+    /// residue. It cannot recover any old creator or native execution loan.
+    pub fn reopen_existing_with_retirement_prefixes(
+        owner: Arc<LinuxNamespaceCapability>,
+        limits: LinuxStorageCasLimits,
+        expected: LinuxStorageCasExpectedLayout,
+        inventory: &LinuxStorageRetirementInventoryContext,
+    ) -> io::Result<Self> {
+        Self::reopen_with_inventory(owner, limits, expected, Some(inventory))
+    }
+
+    fn reopen_with_inventory(
+        owner: Arc<LinuxNamespaceCapability>,
+        limits: LinuxStorageCasLimits,
+        expected: LinuxStorageCasExpectedLayout,
+        inventory: Option<&LinuxStorageRetirementInventoryContext>,
+    ) -> io::Result<Self> {
         limits.validate()?;
         owner.verify()?;
         let root = owner.mount_descriptor().try_clone()?;
@@ -670,7 +750,13 @@ impl LinuxStorageCas {
                 "inside CAS original directory inode expectation differs",
             ));
         }
-        if result.inventory()?.temporary_entries != 0 {
+        if let Some(inventory) = inventory {
+            retirement_inventory::require_only_durable_temporaries(
+                &result.graph,
+                inventory,
+                result.limits,
+            )?;
+        } else if result.inventory()?.temporary_entries != 0 {
             return Err(refuse(
                 "inside CAS unresolved original receive prefix; never adopted or deleted",
             ));
@@ -775,64 +861,20 @@ impl LinuxStorageCas {
 
     pub fn inventory(&self) -> io::Result<LinuxStorageCasInventory> {
         self.verify()?;
-        let mut result = LinuxStorageCasInventory {
-            object_entries: 0,
-            shard_entries: 0,
-            temporary_entries: 0,
-            payload_bytes: 0,
-            temporary_bytes: 0,
-        };
-        for shard in directory_names(&self.graph.objects, self.limits.max_entries)? {
-            validate_hex(&shard, 2)?;
-            let original = open_directory_at(&self.graph.objects, &name(&shard)?)?;
-            same_image(&original, &self.graph.owner, true)?;
-            result.shard_entries += 1;
-            let components = directory_names(&original, self.limits.max_entries)?;
-            if components.is_empty() {
-                return Err(refuse(
-                    "inside CAS unfinished empty shard prefix is preserved and refused",
-                ));
-            }
-            for component in components {
-                validate_hex(&component, 64)?;
-                if !component.starts_with(&shard) {
-                    return Err(refuse(
-                        "inside CAS payload does not belong to its exact shard",
-                    ));
-                }
-                // fstatat is metadata-only through the actual shard FD. A new
-                // read open would break a legitimate held payload write lease.
-                let length = inventory_file_length(&original, &name(&component)?, &self.graph)?;
-                if length == 0 || length > CHUNK_BYTES {
-                    return Err(refuse(
-                        "inside CAS original payload length exceeds chunk bound",
-                    ));
-                }
-                result.object_entries += 1;
-                result.payload_bytes = result
-                    .payload_bytes
-                    .checked_add(length)
-                    .ok_or_else(|| refuse("inside CAS payload inventory overflow"))?;
-                inventory_limit(result, self.limits)?;
-            }
-            same_slot(&self.graph.objects, &name(&shard)?, &original)?;
-        }
-        for component in directory_names(&self.graph.temporary, self.limits.max_entries)? {
-            validate_hex(&component, 32)?;
-            let length =
-                inventory_file_length(&self.graph.temporary, &name(&component)?, &self.graph)?;
-            if length > CHUNK_BYTES {
-                return Err(refuse(
-                    "inside CAS original receive prefix exceeds chunk bound",
-                ));
-            }
-            result.temporary_entries += 1;
-            result.temporary_bytes = result
-                .temporary_bytes
-                .checked_add(length)
-                .ok_or_else(|| refuse("inside CAS receive-prefix inventory overflow"))?;
-            inventory_limit(result, self.limits)?;
-        }
+        let result = retirement_inventory::bounded_inventory(&self.graph, self.limits, None)?;
+        self.verify()?;
+        Ok(result)
+    }
+
+    /// Only a complete typed durable catalog can account a retirement prefix.
+    /// This reads metadata through held parents and never opens a leased file.
+    pub fn inventory_with_retirement_prefixes(
+        &self,
+        context: &LinuxStorageRetirementInventoryContext,
+    ) -> io::Result<LinuxStorageCasInventory> {
+        self.verify()?;
+        let result =
+            retirement_inventory::bounded_inventory(&self.graph, self.limits, Some(context))?;
         self.verify()?;
         Ok(result)
     }
@@ -1011,13 +1053,33 @@ impl LinuxStorageCas {
     /// Rejection only, before closing any original FD. Observations cannot
     /// satisfy the actual shared lease ownership or unresolved-prefix checks.
     pub fn verify_closed_constraints(&self) -> io::Result<()> {
+        self.verify_close_inventory(None)
+    }
+
+    pub fn verify_closed_constraints_with_retirement_prefixes(
+        &self,
+        inventory: &LinuxStorageRetirementInventoryContext,
+    ) -> io::Result<()> {
+        self.verify_close_inventory(Some(inventory))
+    }
+
+    fn verify_close_inventory(
+        &self,
+        inventory: Option<&LinuxStorageRetirementInventoryContext>,
+    ) -> io::Result<()> {
         self.verify()?;
         if Arc::strong_count(&self.graph.realm_lease) != 1 {
             return Err(refuse(
                 "inside CAS original directory/file guards are still active",
             ));
         }
-        if self.inventory()?.temporary_entries != 0 {
+        if let Some(inventory) = inventory {
+            retirement_inventory::require_only_durable_temporaries(
+                &self.graph,
+                inventory,
+                self.limits,
+            )?;
+        } else if self.inventory()?.temporary_entries != 0 {
             return Err(refuse(
                 "inside CAS unresolved receive prefix prevents clean closure",
             ));
@@ -1029,6 +1091,16 @@ impl LinuxStorageCas {
     /// the namespace owner's normal unmount. No persistent slot is removed.
     pub fn close(self) -> io::Result<LinuxStorageCasObservation> {
         self.verify_closed_constraints()?;
+        let observation = self.observation()?;
+        self.graph.close(true)?;
+        Ok(observation)
+    }
+
+    pub fn close_with_retirement_prefixes(
+        self,
+        inventory: &LinuxStorageRetirementInventoryContext,
+    ) -> io::Result<LinuxStorageCasObservation> {
+        self.verify_closed_constraints_with_retirement_prefixes(inventory)?;
         let observation = self.observation()?;
         self.graph.close(true)?;
         Ok(observation)
@@ -1228,24 +1300,38 @@ impl LinuxStorageCasFileGuard {
     /// Close the actual payload lease/file/parent first. The caller closes its
     /// original Journal guard before closing the returned inside directory loan.
     pub fn close_file(mut self) -> io::Result<LinuxStorageCasDirectoryGuard> {
-        self.verify()?;
+        let mut failure = self.verify().err();
         drop(self.lease.take());
-        let file = self.file.take().expect("verified original FD");
-        // SAFETY: pointer-free kernel query through this still-live original FD
-        // confirms the actual mandatory lease was released before FD close.
-        let state = unsafe { libc::fcntl(file.as_raw_fd(), F_GETLEASE) };
-        if state != libc::F_UNLCK {
-            return Err(if state < 0 {
-                io::Error::last_os_error()
-            } else {
-                refuse("inside CAS original kernel lease did not release")
-            });
+        if let Some(file) = self.file.take() {
+            // SAFETY: pointer-free query through the still-live original FD.
+            let state = unsafe { libc::fcntl(file.as_raw_fd(), F_GETLEASE) };
+            if state != libc::F_UNLCK {
+                failure.get_or_insert_with(|| {
+                    if state < 0 {
+                        io::Error::last_os_error()
+                    } else {
+                        refuse("inside CAS original kernel lease did not release")
+                    }
+                });
+            }
+            if let Err(error) = close_original(file) {
+                failure.get_or_insert(error);
+            }
         }
-        close_original(file)?;
-        close_original(self.parent.take().expect("verified original parent"))?;
-        Ok(LinuxStorageCasDirectoryGuard {
-            graph: self.graph.take().expect("verified original graph"),
-        })
+        if let Some(parent) = self.parent.take() {
+            if let Err(error) = close_original(parent) {
+                failure.get_or_insert(error);
+            }
+        }
+        let graph = self
+            .graph
+            .take()
+            .ok_or_else(|| refuse("original graph already closed"))?;
+        if let Some(error) = failure {
+            let _ = graph.close(false);
+            return Err(error);
+        }
+        Ok(LinuxStorageCasDirectoryGuard { graph })
     }
 
     pub fn close(self) -> io::Result<()> {
@@ -1582,7 +1668,7 @@ impl LinuxStorageCasCoordinationGuard {
     }
 
     pub fn verify(&self) -> io::Result<()> {
-        self.verify_identity()?;
+        let mut failure = self.verify_identity().err();
         if self.state == CoordinationLockState::Unlocked {
             return Err(refuse("original CAS upgrade failed; guard has no lock"));
         }
@@ -1621,11 +1707,17 @@ impl LinuxStorageCasCoordinationGuard {
         self.verify_identity()?;
         // SAFETY: explicit release of this guard's retained original description.
         if unsafe { libc::flock(self.original.as_raw_fd(), libc::LOCK_UN) } != 0 {
-            return Err(io::Error::last_os_error());
+            failure.get_or_insert_with(io::Error::last_os_error);
         }
-        close_original(self.original)?;
-        close_original(self.parent)?;
-        self.owner.verify()
+        for file in [self.original, self.parent] {
+            if let Err(error) = close_original(file) {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Err(error) = self.owner.verify() {
+            failure.get_or_insert(error);
+        }
+        failure.map_or(Ok(()), Err)
     }
 }
 

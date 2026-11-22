@@ -107,6 +107,8 @@ pub use storage_linux_owner::{
 mod storage_retirement;
 mod storage_retirement_disposal;
 mod storage_retirement_fence;
+#[cfg(target_os = "linux")]
+pub use storage_retirement_fence::LinuxStorageRetirementNativeTerminal;
 mod storage_retirement_owner;
 mod storage_retirement_payload;
 mod storage_retirement_terminal;

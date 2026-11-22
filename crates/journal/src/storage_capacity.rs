@@ -385,6 +385,14 @@ impl crate::JournalReadView<'_> {
                 charge: unix_retirement,
             });
         }
+        let unix_native = crate::storage_retirement_unix::native::outstanding(view.connection)?;
+        if unix_native.rows != 0 {
+            liabilities.obligations.push(JournalCapacityObligation {
+                family: "unix_storage_retirement_native_v1_complete_prefix_peak",
+                owner_key: Vec::new(),
+                charge: unix_native,
+            });
+        }
         let retirement_owner = crate::storage_retirement::owner::outstanding(view.connection)?;
         let retirement_payload = crate::storage_retirement::payload::outstanding(view.connection)?;
         let retirement_disposal =

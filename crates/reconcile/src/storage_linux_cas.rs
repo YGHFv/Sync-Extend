@@ -126,14 +126,52 @@ impl StorageCas {
             Self::Ordinary(_) => Ok(None),
             Self::Inside(cas) => {
                 cas.verify_owner()?;
-                let inventory = cas
-                    .owner
-                    .inside_cas()
-                    .map_err(owner_error)?
-                    .inventory()
+                let original = cas.owner.inside_cas().map_err(owner_error)?;
+                let context = cas
+                    .journal(false)?
+                    .unix_storage_retirement_inventory_context(
+                        original
+                            .observation()
+                            .map_err(|error| cas.actual_io(error))?
+                            .expected_layout,
+                    )
+                    .map_err(|error| CasError::Io(io::Error::other(error.to_string())))?;
+                let inventory = original
+                    .inventory_with_retirement_prefixes(&context)
                     .map_err(|error| cas.actual_io(error))?;
                 cas.verify_owner()?;
                 Ok(Some(inventory))
+            }
+        }
+    }
+
+    pub(super) fn remember_retirement_inventory(&self, journal: &Journal) -> crate::Result<()> {
+        if let Self::Inside(cas) = self {
+            cas.owner.remember_retirement_inventory(journal)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn close(self) -> crate::Result<()> {
+        match self {
+            Self::Ordinary(cas) => {
+                drop(cas);
+                Ok(())
+            }
+            Self::Inside(mut cas) => {
+                let mut first = None;
+                for journal in [&mut cas.access_journal, &mut cas.session_journal] {
+                    if let Some(journal) = journal.take() {
+                        if let Err(error) = journal.close_linux_storage_cas_coordination() {
+                            first.get_or_insert(ReconcileError::from(error));
+                        }
+                    }
+                }
+                if let Some(error) = first {
+                    cas.owner.poison_inside_cas(&error);
+                    return Err(error);
+                }
+                cas.owner.verify()
             }
         }
     }
