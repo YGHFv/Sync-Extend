@@ -1,5 +1,5 @@
 //! Descriptor-only VFS callbacks. No callback opens a pathname or frees allocation.
-use super::{abi::*, refuse, State};
+use super::{abi::*, refuse, State, VfsRegistration};
 use std::{
     collections::BTreeMap,
     ffi::{c_char, c_int, c_void, CStr},
@@ -18,18 +18,23 @@ struct NativeFile {
 }
 struct OpenFile {
     state: Arc<State>,
+    registration: Arc<VfsRegistration>,
     class: usize,
     connection: u64,
     mappings: BTreeMap<i32, (*mut c_void, usize)>,
 }
 
-unsafe fn state(vfs: *mut Vfs) -> Arc<State> {
+unsafe fn registration(vfs: *mut Vfs) -> Arc<VfsRegistration> {
     // SAFETY: our registered table contains Arc::as_ptr from its live owner.
-    let original = unsafe { (*vfs).app.cast::<State>() };
+    let original = unsafe { (*vfs).app.cast::<VfsRegistration>() };
     // SAFETY: this table's live registration retains at least one strong reference.
     unsafe { Arc::increment_strong_count(original) };
     // SAFETY: the increment above transferred one independent strong reference.
     unsafe { Arc::from_raw(original) }
+}
+unsafe fn state(vfs: *mut Vfs) -> Arc<State> {
+    // SAFETY: the live registration owns the same shared metadata budget.
+    unsafe { registration(vfs) }.state.clone()
 }
 unsafe fn context<'a>(file: *mut SqliteFile) -> io::Result<&'a mut OpenFile> {
     if file.is_null() {
@@ -90,7 +95,8 @@ unsafe extern "C" fn open(
         (*file).methods = ptr::null();
     }
     // SAFETY: live registration and terminated SQLite filename.
-    let state = unsafe { state(vfs) };
+    let registration = unsafe { registration(vfs) };
+    let state = registration.state.clone();
     let result = catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
         state.verify()?;
         // SAFETY: SQLite supplies a terminated filename valid for this call.
@@ -121,11 +127,29 @@ unsafe extern "C" fn open(
         }
         let opened = Box::new(OpenFile {
             state: state.clone(),
+            registration: registration.clone(),
             class,
             connection,
             mappings: BTreeMap::new(),
         });
-        state.active_files.fetch_add(1, Ordering::AcqRel);
+        state
+            .active_files
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .map_err(|_| refuse("SQLite metadata active context count overflow"))?;
+        if registration
+            .active_files
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .is_err()
+        {
+            // Only this failed enrollment is removed; no original xOpen
+            // context has been transferred to SQLite yet.
+            state.active_files.fetch_sub(1, Ordering::AcqRel);
+            return Err(refuse("SQLite VFS active context count overflow"));
+        }
         // SAFETY: output file belongs to SQLite and the Box remains until xClose.
         unsafe {
             (*file.cast::<NativeFile>()).context = Box::into_raw(opened);
@@ -162,26 +186,78 @@ unsafe extern "C" fn close(file: *mut SqliteFile) -> c_int {
     let mut opened = unsafe { Box::from_raw(native.context) };
     native.context = ptr::null_mut();
     native.base.methods = ptr::null();
-    let mut result = OK;
-    for (_, (address, length)) in std::mem::take(&mut opened.mappings) {
+    let mut failure = None;
+    for (slot, (address, length)) in std::mem::take(&mut opened.mappings) {
         // SAFETY: these exact mappings were acquired by this original xShmMap.
         if unsafe { libc::munmap(address, length) } != 0 {
-            result = IOERR;
+            failure.get_or_insert_with(io::Error::last_os_error);
+            opened.mappings.insert(slot, (address, length));
         }
     }
-    if let Ok(mut locks) = opened.state.locks.lock() {
-        locks.remove(&opened.connection);
+    match opened.state.locks.lock() {
+        Ok(mut locks) => {
+            locks.remove(&opened.connection);
+        }
+        Err(_) => {
+            failure.get_or_insert_with(|| refuse("SQLite original file lock state poisoned"));
+        }
     }
-    if let Ok(mut locks) = opened.state.shm_locks.lock() {
-        for lock in locks.iter_mut() {
-            if lock.exclusive == Some(opened.connection) {
-                lock.exclusive = None;
+    match opened.state.shm_locks.lock() {
+        Ok(mut locks) => {
+            for lock in locks.iter_mut() {
+                if lock.exclusive == Some(opened.connection) {
+                    lock.exclusive = None;
+                }
+                lock.shared.retain(|id| *id != opened.connection);
             }
-            lock.shared.retain(|id| *id != opened.connection);
+        }
+        Err(_) => {
+            failure.get_or_insert_with(|| refuse("SQLite original SHM lock state poisoned"));
         }
     }
-    opened.state.active_files.fetch_sub(1, Ordering::AcqRel);
-    result
+    if failure.is_none()
+        && opened
+            .registration
+            .active_files
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_err()
+    {
+        failure = Some(refuse("SQLite VFS actual close context count underflow"));
+    }
+    if failure.is_none()
+        && opened
+            .state
+            .active_files
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .is_err()
+    {
+        // A failed global retirement cannot erase the local original context.
+        opened
+            .registration
+            .active_files
+            .fetch_add(1, Ordering::AcqRel);
+        failure = Some(refuse(
+            "SQLite metadata actual close context count underflow",
+        ));
+    }
+    if let Some(error) = failure {
+        opened
+            .registration
+            .close_failed
+            .store(true, Ordering::Release);
+        opened.state.poison(&error);
+        // SQLite may release its native-file allocation after an xClose
+        // error. Keep the exact context, any failed mappings, registration and
+        // original descriptor scope alive; neither active count grants close.
+        std::mem::forget(opened);
+        IOERR
+    } else {
+        OK
+    }
 }
 
 fn range(offset: i64, amount: c_int, capacity: u64) -> io::Result<(u64, usize)> {

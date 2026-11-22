@@ -1431,7 +1431,13 @@ impl LinuxMetadataBudget {
 pub struct LinuxMetadataVfs {
     table: Option<Box<abi::Vfs>>,
     name: Option<CString>,
+    registration: Arc<VfsRegistration>,
+}
+
+struct VfsRegistration {
     state: Arc<State>,
+    active_files: AtomicU64,
+    close_failed: AtomicBool,
 }
 
 // SAFETY: the registered table/name/app are stable heap allocations. All mutable
@@ -1445,9 +1451,14 @@ impl LinuxMetadataVfs {
         let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
         let name = CString::new(format!("sync-extend-held-metadata-{suffix}"))
             .map_err(|_| refuse("VFS name invalid"))?;
+        let registration = Arc::new(VfsRegistration {
+            state,
+            active_files: AtomicU64::new(0),
+            close_failed: AtomicBool::new(false),
+        });
         let mut table = callbacks::vfs_table();
         table.name = name.as_ptr();
-        table.app = Arc::as_ptr(&state).cast_mut().cast();
+        table.app = Arc::as_ptr(&registration).cast_mut().cast();
         // SAFETY: boxed table and all referenced state outlive every registered callback.
         if unsafe { abi::sqlite3_vfs_register(&mut *table, 0) } != abi::OK {
             return Err(refuse("SQLite refused the exact metadata VFS"));
@@ -1455,7 +1466,7 @@ impl LinuxMetadataVfs {
         Ok(Self {
             table: Some(table),
             name: Some(name),
-            state,
+            registration,
         })
     }
     pub fn name(&self) -> &str {
@@ -1466,18 +1477,25 @@ impl LinuxMetadataVfs {
             .expect("ASCII VFS name")
     }
     pub fn verify(&self) -> io::Result<()> {
-        self.state.verify()
+        self.registration.state.verify()
     }
     pub fn receipt(&self) -> io::Result<LinuxMetadataReceipt> {
-        self.state.snapshot()
+        self.registration.state.snapshot()
     }
     pub fn close_original(mut self) -> io::Result<()> {
         let mut failure = self.verify().err();
-        let active = self.state.active_files.load(Ordering::Acquire);
+        // Other connections legitimately share the original budget. This
+        // registration must close only its own actual xOpen contexts; the
+        // metadata owner's checkpoint still requires the global zero count.
+        let active = self.registration.active_files.load(Ordering::Acquire);
+        let close_failed = self.registration.close_failed.load(Ordering::Acquire);
         if active != 0 {
             failure.get_or_insert_with(|| {
                 refuse("actual metadata SQLite contexts remain active at VFS close")
             });
+        }
+        if close_failed {
+            failure.get_or_insert_with(|| refuse("actual metadata SQLite xClose failed"));
         }
         if let Some(mut table) = self.table.take() {
             // SAFETY: this owns the stable registration; SQLite close was
@@ -1486,10 +1504,10 @@ impl LinuxMetadataVfs {
             if unregistered != abi::OK {
                 failure.get_or_insert_with(|| refuse("actual metadata VFS unregister failed"));
             }
-            if active != 0 || unregistered != abi::OK {
+            if active != 0 || close_failed || unregistered != abi::OK {
                 // Preserve all callback addresses on a violated lifetime.
                 // This is an unresolved failure, never an all-closed receipt.
-                std::mem::forget(self.state.clone());
+                std::mem::forget(self.registration.clone());
                 std::mem::forget(table);
                 if let Some(name) = self.name.take() {
                     std::mem::forget(name);
@@ -1507,11 +1525,14 @@ impl Drop for LinuxMetadataVfs {
             return;
         };
         // SAFETY: owned boxed table remains alive during removal from SQLite's VFS registry.
-        unsafe { abi::sqlite3_vfs_unregister(&mut *table) };
-        if self.state.active_files.load(Ordering::Acquire) != 0 {
+        let unregistered = unsafe { abi::sqlite3_vfs_unregister(&mut *table) };
+        if self.registration.active_files.load(Ordering::Acquire) != 0
+            || self.registration.close_failed.load(Ordering::Acquire)
+            || unregistered != abi::OK
+        {
             // A violated close ordering cannot leave dangling VFS/app/name pointers.
             // Preserve their exact allocations until process exit; grant no new name.
-            let retained = self.state.clone();
+            let retained = self.registration.clone();
             std::mem::forget(retained);
             std::mem::forget(table);
             if let Some(name) = self.name.take() {
