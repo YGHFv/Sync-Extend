@@ -82,6 +82,56 @@ function New-SyncExtendProcess {
     return [Diagnostics.Process]::Start($info)
 }
 
+function New-SyncExtendLoggedProcess {
+    param(
+        [Parameter(Mandatory)][string]$Image,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)][string]$StandardOutputPath,
+        [Parameter(Mandatory)][string]$StandardErrorPath
+    )
+
+    $imagePath = Resolve-SyncExtendPath $Image -File
+    $outputPath = Resolve-SyncExtendPath $StandardOutputPath
+    $errorPath = Resolve-SyncExtendPath $StandardErrorPath
+    if (!('SyncExtend.Windows.LoggedProcess' -as [type])) {
+        Add-Type -Path (Resolve-SyncExtendPath (Join-Path $PSScriptRoot 'windows-native-launch.cs') -File) `
+            -ErrorAction Stop
+    }
+    $child = [SyncExtend.Windows.LoggedProcess]::Start(
+        $imagePath, $Arguments, [IO.Path]::GetDirectoryName($imagePath), $outputPath, $errorPath)
+    try {
+        $null = $child.Handle
+        $null = $child.StartTime
+        $observedImage = $child.MainModule.FileName
+        if (!$child.OriginalHandleReturnedByCreateProcess -or !$child.ImageObservedFromOriginalHandle -or
+                !$observedImage) {
+            throw 'The original logged process handle or image could not be observed.'
+        }
+        if (![string]::Equals($observedImage, $imagePath, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The original logged process image differs from the selected executable.'
+        }
+        return $child
+    } catch {
+        $exited = $false
+        try {
+            try { if (!$child.HasExited) { $child.Kill() } }
+            finally { $exited = $child.WaitForExit(5000) }
+        } finally {
+            if ($exited) { $child.Dispose() }
+            else {
+                if (!$script:syncExtendUnclosedHelpers) {
+                    $script:syncExtendUnclosedHelpers = [Collections.Generic.List[object]]::new()
+                }
+                $script:syncExtendUnclosedHelpers.Add(@{
+                    process = $child; process_exit_verified = $false
+                    command = $Arguments[0]; original_create_process_handle = $true
+                })
+            }
+        }
+        throw
+    }
+}
+
 function Invoke-SyncExtendJson {
     param([string]$Image, [string[]]$Arguments, [int]$TimeoutMs = 12000)
 

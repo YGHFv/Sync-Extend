@@ -9,10 +9,16 @@ param(
     [ValidateRange(1024, 65535)][int]$WebdavPort = 17842,
     [string]$StorageConfig,
     [string]$AttemptPolicy,
+    [switch]$ProtectedDeployment,
     [switch]$Snapshot
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'windows-common.ps1')
+if ($ProtectedDeployment) {
+    if ($Snapshot) { throw '-ProtectedDeployment opens the interactive deployment control window.' }
+    & (Join-Path $PSScriptRoot 'client.ps1') -Binary (Join-Path $PSScriptRoot 'syncd.exe') -ProtectedDeployment
+    return
+}
 $profilePath = Resolve-SyncExtendPath $ProfileDirectory
 $deploymentPath = Join-Path $profilePath 'deployment.json'
 $binaryPath = Join-Path $PSScriptRoot 'syncd.exe'

@@ -8,13 +8,20 @@ param(
     [string]$StorageConfig,
     [string]$AttemptPolicy,
     [string]$RestoreBudgets,
+    [switch]$ProtectedDeployment,
     [switch]$Managed,
     [switch]$Snapshot
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'windows-common.ps1')
 . (Join-Path $PSScriptRoot 'client-view.ps1')
+. (Join-Path $PSScriptRoot 'protected-deployment-client.ps1')
 $binaryPath = Resolve-SyncExtendPath $Binary -File
+if ($ProtectedDeployment) {
+    if ($Snapshot) { throw '-ProtectedDeployment opens the interactive deployment control window.' }
+    Show-SyncExtendProtectedDeploymentClient $binaryPath
+    return
+}
 $deploymentPath = Resolve-SyncExtendPath $Deployment -File
 $deploymentFile = Read-SyncExtendJson $deploymentPath
 $managementPath = Resolve-SyncExtendPath $deploymentFile.management -File
@@ -30,6 +37,7 @@ $script:restoreRequest = $null
 $script:restorePreviewDigest = $null
 $script:restorePreviewAtMs = 0
 $script:restoreBudgets = $RestoreBudgets
+$script:protectedClient = $null
 
 function Get-ClientSnapshot {
     Invoke-SyncExtendJson $binaryPath @('management-dashboard', '--config', $managementPath)
@@ -279,13 +287,15 @@ $restoreNotes.Padding = [Windows.Forms.Padding]::new(8)
 $restoreNotes.Text = '等待当前 owner 的已鉴权历史列表。'
 $restorePage.Controls.Add($restoreNotes)
 $restorePage.Controls.Add($restorePanel)
-$restorePanel.BringToFront()
-$restoreNotes.BringToFront()
+# Dock layout visits the controls from back to front. Reserve the top input
+# panel and bottom summary before assigning the remaining space to the list.
+$lists['Selection preview'].BringToFront()
 $script:restoreContext = $null
 
 function Set-ClientRestoreBusy([bool]$Value) {
-    $available = [bool](!$Value -and !$script:pendingRestore -and $script:restoreContext -and $script:restoreContext.available)
-    $restoreSpace.Enabled = [bool](!$Value -and !$script:pendingRestore -and $script:restoreContext -and $script:restoreContext.spaces.Count)
+    $protectedActive = Test-SyncExtendProtectedClientActive $script:protectedClient
+    $available = [bool](!$Value -and !$protectedActive -and !$script:pendingRestore -and $script:restoreContext -and $script:restoreContext.available)
+    $restoreSpace.Enabled = [bool](!$Value -and !$protectedActive -and !$script:pendingRestore -and $script:restoreContext -and $script:restoreContext.spaces.Count)
     foreach ($control in @($restoreSnapshot, $restoreMode, $restorePrefix, $restoreExtra, $restoreOccupied, $restoreButton)) {
         $control.Enabled = $available
     }
@@ -293,8 +303,8 @@ function Set-ClientRestoreBusy([bool]$Value) {
     $age = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $script:restorePreviewAtMs
     $restoreExecute.Enabled = [bool]($Managed -and $available -and $script:restoreRequest -and
         $script:restorePreviewDigest -and $script:restoreBudgets -and $age -ge 0 -and $age -le 10000)
-    $restoreResume.Enabled = [bool]($Managed -and !$Value -and $script:pendingRestore -and !$script:pendingRestore.helper_active)
-    $restoreBudgetButton.Enabled = [bool]($Managed -and !$Value -and !$script:pendingRestore)
+    $restoreResume.Enabled = [bool]($Managed -and !$Value -and !$protectedActive -and $script:pendingRestore -and !$script:pendingRestore.helper_active)
+    $restoreBudgetButton.Enabled = [bool]($Managed -and !$Value -and !$protectedActive -and !$script:pendingRestore)
 }
 
 function Reset-ClientRestorePreview {
@@ -791,9 +801,23 @@ $null = Add-ClientButton '打开配置目录' {
 
 $stopButton.Enabled = $false
 $testButton.Enabled = $false
+function Test-ClientProtectedBlocked {
+    return [bool]($script:busy -or $script:restoreWorker -or $script:pendingRestore)
+}
+function Set-ClientProtectedFence([bool]$Active) {
+    if ($Active) {
+        foreach ($control in @($stopButton, $gatewayButton, $startButton, $testButton)) {
+            if ($control) { $control.Enabled = $false }
+        }
+    }
+    Set-ClientRestoreBusy $script:busy
+}
+$script:protectedClient = New-SyncExtendProtectedClient -Form $form -Tabs $tabs -Image $binaryPath `
+    -IsBlocked { Test-ClientProtectedBlocked } -OnActivity { param($Active) Set-ClientProtectedFence $Active }
 $form.Add_Shown({ Update-Client })
 $form.Add_FormClosing({
     param($sender, $event)
+    if (Request-SyncExtendProtectedClientClose $script:protectedClient) { $event.Cancel = $true }
     if ($script:restoreWorker -or $script:busy) {
         $event.Cancel = $true
         $summary.Text = '当前操作仍在运行。完成实际等待并记录结果前，窗口将保持打开。'
@@ -801,6 +825,7 @@ $form.Add_FormClosing({
 })
 try { [void]$form.ShowDialog() }
 finally {
+    Close-SyncExtendProtectedClient $script:protectedClient
     $restoreWorkerTimer.Stop()
     $restoreWorkerTimer.Dispose()
     if ($script:restoreWorker) {

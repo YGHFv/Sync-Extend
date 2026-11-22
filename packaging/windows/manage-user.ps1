@@ -159,9 +159,9 @@ function Start-Installed {
         $record.gateway_sha256 = $gateway.sha256
     }
     $keepForRestore = $false
-    $child = Start-Process -FilePath $image -ArgumentList @('deployment-run', '--config', ('"' + $deploymentPath + '"')) `
-        -WorkingDirectory ([IO.Path]::GetDirectoryName($image)) -WindowStyle Hidden -PassThru `
-        -RedirectStandardOutput (Join-Path $logRoot "$logName.out") -RedirectStandardError (Join-Path $logRoot "$logName.err")
+    $child = New-SyncExtendLoggedProcess $image @('deployment-run', '--config', $deploymentPath) `
+        -StandardOutputPath (Join-Path $logRoot "$logName.out") `
+        -StandardErrorPath (Join-Path $logRoot "$logName.err")
     try {
         if ($script:restoreLaunchPending) { $null = $child.Handle }
         $record.process = @{ pid = $child.Id; birth = $child.StartTime.ToFileTimeUtc().ToString(); image = $image }
