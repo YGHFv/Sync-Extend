@@ -192,6 +192,53 @@ impl BranchOwner {
         let plan = header.plan()?;
         let fingerprint = plan.fingerprint()?;
         let owner_id: EntryId = ContentId::hash(
+            format!("SyncExtend canonical conflict branch owner v2:{fingerprint}").as_bytes(),
+        )
+        .as_str()[..32]
+            .parse()?;
+        let proof = &header.intent.proof.payload;
+        let mut files = BTreeMap::new();
+        let mut chunks = BTreeMap::new();
+        for original in proof.originals.iter().chain(&proof.resolving) {
+            let sync_extend_core_model::Change::Put { entry } = &original.operation.payload.change
+            else {
+                continue;
+            };
+            let Some(file) = &entry.content else {
+                continue;
+            };
+            files
+                .entry(serde_json::to_vec(file)?)
+                .or_insert_with(|| file.clone());
+            for chunk in &file.chunks {
+                if chunks
+                    .insert(chunk.content_id.clone(), chunk.clone())
+                    .is_some_and(|old| old != *chunk)
+                {
+                    return Err(invalid("conflict future canonical branch chunk differs"));
+                }
+            }
+        }
+        Ok(crate::ReferenceReservationIntent {
+            owner_id,
+            scope: ReferenceOwnerScope {
+                format_version: sync_extend_core_model::FORMAT_VERSION,
+                space_id: header.target.space_id.clone(),
+                kind: ReferenceOwnerKind::Conflict,
+                target_device: None,
+                files: files.into_values().collect(),
+            },
+            created_at_ms: 0,
+        })
+    }
+
+    // Persisted v1 owners and Native headers keep their original exact intent.
+    // This legacy algorithm must not be widened to the v2 inventory.
+    fn canonical_v1(header: &Header) -> Result<crate::ReferenceReservationIntent> {
+        use sync_extend_core_model::reference_owner::{ReferenceOwnerKind, ReferenceOwnerScope};
+        let plan = header.plan()?;
+        let fingerprint = plan.fingerprint()?;
+        let owner_id: EntryId = ContentId::hash(
             format!("SyncExtend canonical conflict branch owner v1:{fingerprint}").as_bytes(),
         )
         .as_str()[..32]
@@ -231,6 +278,11 @@ impl BranchOwner {
     }
     fn validate(&self, header: &Header) -> Result<()> {
         let canonical = Self::canonical(header)?;
+        let canonical = if self.owner_id == canonical.owner_id {
+            canonical
+        } else {
+            Self::canonical_v1(header)?
+        };
         if self.owner_id != canonical.owner_id
             || self.intent != canonical
             || self.objects != Self::objects(&canonical)
@@ -240,7 +292,52 @@ impl BranchOwner {
         Ok(())
     }
     fn from_actual(header: &Header, rows: &[JournalStoredRow]) -> Result<Vec<Self>> {
-        let canonical = Self::canonical(header)?;
+        let mut canonical = Self::canonical(header)?;
+        let native_headers: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row.table() == "conflict_resolution_native_headers"
+                    && row.primary_key() == [header.transaction_id.as_str()]
+            })
+            .collect();
+        if native_headers.len() > 1 {
+            return Err(invalid("conflict future persisted Native header ambiguous"));
+        }
+        if let Some(row) = native_headers.first() {
+            // This extracts the frozen selection inside the complete native
+            // inventory audit. Its caller validates the typed stored header
+            // and compares every actual column/template/effect before returning.
+            let Some(JournalStorageColumnValue::Text(json)) = row
+                .columns()
+                .iter()
+                .find(|column| column.name == "header")
+                .map(|column| &column.value)
+            else {
+                return Err(invalid("conflict future persisted Native header absent"));
+            };
+            let native: super::native_ledger::NativeHeader = serde_json::from_str(json)?;
+            if native.format != 1
+                || native.transaction_id != header.transaction_id
+                || native.parent_hash != hash(header)?
+                || encoded(&native)? != *json
+            {
+                return Err(invalid("conflict future persisted Native header differs"));
+            }
+            native.history.validate(header)?;
+            // An existing Native header keeps its frozen selection, including
+            // an empty one. Preparing v2 never migrates or releases a v1 owner.
+            let Some(owner) = native.history.branch_owners.first() else {
+                return Ok(Vec::new());
+            };
+            canonical = owner.intent.clone();
+        } else if !rows.iter().any(|row| {
+            row.table() == "reference_reservations"
+                && row.primary_key() == [canonical.owner_id.as_str()]
+        }) {
+            // Only a fresh Native selection prefers v2. Legacy v1-only state
+            // retains the original complete handoff checks without migration.
+            canonical = Self::canonical_v1(header)?;
+        }
         let matching: Vec<_> = rows
             .iter()
             .filter(|row| {

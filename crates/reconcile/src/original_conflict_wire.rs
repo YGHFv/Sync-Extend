@@ -290,7 +290,8 @@ impl LocalSpace {
                 .admission
                 .transaction_id
         };
-        let prepared = self.prepare_signed_conflict_branches(resolution, wire_limits())?;
+        let prepared =
+            self.prepare_signed_conflict_branches_for_native(resolution, wire_limits(), Some(&id))?;
         if !prepared.missing_chunks.is_empty() {
             let request_permit =
                 connection.reserve_outgoing_json(ProducerKind::ConflictContentControl)?;
@@ -330,10 +331,20 @@ impl LocalSpace {
                     &chunk.content_id,
                     &bytes,
                 )?;
-                let current = self.prepare_signed_conflict_branches(resolution, wire_limits())?;
+                let current = self.prepare_signed_conflict_branches_for_native(
+                    resolution,
+                    wire_limits(),
+                    Some(&id),
+                )?;
+                let owner = current
+                    .reservation
+                    .as_ref()
+                    .ok_or(ReconcileError::Invariant(
+                        "conflict wire frozen empty Native selection cannot ingest chunks",
+                    ))?;
                 let (guard, ()) = self.journal.with_reserved_chunk(
                     &self.space_id,
-                    &current.reservation.intent.owner_id,
+                    &owner.intent.owner_id,
                     &chunk.content_id,
                     self.limits.max_storage_entries,
                     |expected| -> Result<()> {
@@ -355,7 +366,7 @@ impl LocalSpace {
             }
         }
         if !self
-            .prepare_signed_conflict_branches(resolution, wire_limits())?
+            .prepare_signed_conflict_branches_for_native(resolution, wire_limits(), Some(&id))?
             .content_closed
         {
             return Err(ReconcileError::Invariant(

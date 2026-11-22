@@ -667,6 +667,96 @@ pub(crate) fn obligations(
 }
 
 impl Journal {
+    /// Read the frozen Native branch selection under the complete typed audit.
+    /// This describes an existing scope; it never creates, widens or releases it.
+    pub fn conflict_native_branch_preparation(
+        &self,
+        space: &SpaceId,
+        transaction: &EntryId,
+        expected: &ConflictResolutionProof,
+        max: usize,
+    ) -> Result<(
+        CasAccessGuard,
+        Option<(
+            ConflictResolutionAdmission,
+            Option<crate::ReferenceReservation>,
+        )>,
+    )> {
+        if !self.connection.is_autocommit() {
+            return Err(invalid(
+                "conflict branch Native inspection refuses caller transaction",
+            ));
+        }
+        let guard = self.acquire_cas_coordination()?;
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let before = self
+            .read_view()
+            .audit_local_commit_capacity(space, storage_policy::capacity_limits(max)?)?;
+        let json: String = self.connection.query_row(
+            "SELECT header FROM main.conflict_resolution_admissions WHERE transaction_id=?1",
+            [transaction.as_str()],
+            |row| row.get(0),
+        )?;
+        let parent: Header = serde_json::from_str(&json)?;
+        let plan = parent.plan()?;
+        if parent.transaction_id != *transaction
+            || parent.intent.proof.payload.space_id != *space
+            || expected.payload.space_id != *space
+            || parent.intent.proof.payload.originals != expected.payload.originals
+            || plan.fingerprint()? != expected.payload.plan_fingerprint
+            || serde_json::to_string(&parent)? != json
+        {
+            return Err(invalid(
+                "conflict branch exact admitted Native content scope differs",
+            ));
+        }
+        bind(&self.connection, &parent, &plan)?;
+        // The capacity audit above has already checked every native column,
+        // header_hash, template and effect row. stored also validates the full
+        // typed header, original binding, layout, ledger and canonical JSON.
+        let prepared =
+            if let Some(native) = native_ledger_storage::stored(&self.connection, &parent)? {
+                let selected = match native.history.branch_owners.first() {
+                    Some(selected) => {
+                        let owner = self
+                            .read_view()
+                            .reference_reservations(space, max)?
+                            .into_iter()
+                            .find(|owner| owner.intent.owner_id == selected.owner_id)
+                            .ok_or(invalid("conflict branch frozen Native reservation absent"))?;
+                        if owner.intent != selected.intent {
+                            return Err(invalid(
+                                "conflict branch frozen Native reservation intent differs",
+                            ));
+                        }
+                        Some(owner)
+                    }
+                    None => None,
+                };
+                let mut receipt = parent.receipt()?;
+                if native_final_state::present(&self.connection, &parent)? {
+                    native_final_state::exact_history(&self.connection, &parent)?;
+                    receipt.resolution_applied = true;
+                    receipt.worktree_materialized = true;
+                }
+                Some((receipt, selected))
+            } else {
+                None
+            };
+        let after = self
+            .read_view()
+            .audit_local_commit_capacity(space, storage_policy::capacity_limits(max)?)?;
+        if row_map(&before.rows) != row_map(&after.rows)
+            || before.report.accounted_total() != after.report.accounted_total()
+        {
+            return Err(invalid(
+                "conflict branch Native inspection changed exact capacity",
+            ));
+        }
+        tx.commit()?;
+        Ok((guard, prepared))
+    }
+
     /// Return only the independently validated immutable original envelope.
     pub fn conflict_resolution_proof(
         &self,
