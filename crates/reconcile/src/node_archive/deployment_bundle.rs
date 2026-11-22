@@ -699,11 +699,12 @@ pub(crate) fn derive_graph(
             DeploymentDocument::Node(value) => {
                 let id = node_data(*owner, "data_dir", &value.data_dir)?;
                 let node = graph.node(id)?;
+                let config_path = &graph.artifact(*owner)?.path;
                 if value.worktree.as_deref() != Some(node.worktree.as_path())
                     || !node
                         .captured_configs
                         .values()
-                        .any(|path| path == &graph.artifact(*owner)?.path)
+                        .any(|path| path == config_path)
                 {
                     return Err(ReconcileError::Invariant(
                         "selected Config original captured worktree scope",
@@ -1157,7 +1158,7 @@ impl FramedDeploymentBundle {
             let binding = row
                 .role
                 .protected()
-                .map(|role| {
+                .map(|role| -> Result<ProtectedArtifactBinding> {
                     Ok(ProtectedArtifactBinding {
                         format_version: 2,
                         artifact_id: row.id,
