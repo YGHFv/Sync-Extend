@@ -12,7 +12,10 @@ pub use unix_noreplace::{
 #[allow(unsafe_code)]
 mod unix_sqlite_ledger;
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub use unix_sqlite_ledger::{UnixSqliteLedger, UnixSqliteLedgerConnection};
+pub use unix_sqlite_ledger::{
+    UnixSqliteLedger, UnixSqliteLedgerClosed, UnixSqliteLedgerConnection,
+    UnixSqliteLedgerFileObservation, UnixSqliteLedgerObservation,
+};
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
@@ -38,16 +41,16 @@ pub use unix_noreplace::{
     LinuxStorageCasCoordinationLoan, LinuxStorageCasDirectoryGuard, LinuxStorageCasExpectedLayout,
     LinuxStorageCasFileGuard, LinuxStorageCasFileObservation, LinuxStorageCasInventory,
     LinuxStorageCasLimits, LinuxStorageCasObservation, LinuxStorageCasStaged,
-    LinuxStorageRetirementBoundary, LinuxStorageRetirementClosedBoundary,
-    LinuxStorageRetirementClosedObservation, LinuxStorageRetirementCreatorReceipt,
-    LinuxStorageRetirementInventoryContext, LinuxStorageRetirementInventoryPhase,
-    LinuxStorageRetirementInventoryPrefix, LinuxStorageRetirementMarkerObservation,
-    LinuxStorageRetirementMarkerUnlinkObservation, LinuxStorageRetirementMoveObservation,
-    LinuxStorageRetirementPayloadSlot, LinuxStorageRetirementUnlinkObservation,
-    OriginalCreateAllocationObservation, OriginalCreateVacatedObservation, OriginalOutsideIntent,
-    OriginalPairFrozenObservation, OriginalPrivateMountTopologyObservation,
-    OriginalPrivateVolumeFile, OriginalRetainedVolumeFile, OutsidePrivateIntentOwner,
-    PreparedOriginalPairFreeze,
+    LinuxStorageOutsideFileClosed, LinuxStorageRetirementBoundary,
+    LinuxStorageRetirementClosedBoundary, LinuxStorageRetirementClosedObservation,
+    LinuxStorageRetirementCreatorReceipt, LinuxStorageRetirementInventoryContext,
+    LinuxStorageRetirementInventoryPhase, LinuxStorageRetirementInventoryPrefix,
+    LinuxStorageRetirementMarkerObservation, LinuxStorageRetirementMarkerUnlinkObservation,
+    LinuxStorageRetirementMoveObservation, LinuxStorageRetirementPayloadSlot,
+    LinuxStorageRetirementUnlinkObservation, OriginalCreateAllocationObservation,
+    OriginalCreateVacatedObservation, OriginalOutsideIntent, OriginalPairFrozenObservation,
+    OriginalPrivateMountTopologyObservation, OriginalPrivateVolumeFile, OriginalRetainedVolumeFile,
+    OutsidePrivateIntentOwner, PreparedOriginalPairFreeze,
 };
 
 /// A borrow of the same original description after a successful exclusive

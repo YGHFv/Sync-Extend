@@ -9,7 +9,7 @@ use std::{
     fs::{File, OpenOptions},
     io,
     os::{
-        fd::AsRawFd,
+        fd::{AsRawFd, IntoRawFd},
         unix::{
             ffi::OsStrExt,
             fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -425,23 +425,25 @@ impl LinuxNamespaceCapability {
     /// Release only an unarmed acquired mount. This deletes no persistent
     /// image, journal, worktree object, directory or unfamiliar residue.
     pub fn release_unarmed_mount(self) -> io::Result<()> {
-        self.verify()?;
-        let cursor = self
-            .publication
-            .lock()
-            .map_err(|_| refusal("publication cursor poisoned"))?;
-        if cursor
-            .current
-            .helper_preparation_started
-            .load(Ordering::Acquire)
-            || cursor.current.attempt_issued.load(Ordering::Acquire)
-        {
-            return Err(refusal(
-                "started helpers require their retained original terminal release",
-            ));
-        }
-        drop(cursor);
-        self.release_owned_mount()
+        let original_gate = (|| {
+            self.verify()?;
+            let cursor = self
+                .publication
+                .lock()
+                .map_err(|_| refusal("publication cursor poisoned"))?;
+            if cursor
+                .current
+                .helper_preparation_started
+                .load(Ordering::Acquire)
+                || cursor.current.attempt_issued.load(Ordering::Acquire)
+            {
+                return Err(refusal(
+                    "started helpers require their retained original terminal release",
+                ));
+            }
+            Ok(())
+        })();
+        self.release_owned_mount(original_gate)
     }
 
     /// The token is issued only after the two exact originally armed helpers
@@ -450,10 +452,12 @@ impl LinuxNamespaceCapability {
         self,
         terminal: crate::OriginalPairTerminalRelease,
     ) -> io::Result<()> {
-        self.verify()?;
-        terminal.verify_owner(&self)?;
-        self.verify_original_terminal(&terminal)?;
-        self.release_owned_mount()
+        let original_gate = (|| {
+            self.verify()?;
+            terminal.verify_owner(&self)?;
+            self.verify_original_terminal(&terminal)
+        })();
+        self.release_owned_mount(original_gate)
     }
 
     pub(crate) fn verify_original_terminal(
@@ -472,26 +476,83 @@ impl LinuxNamespaceCapability {
         terminal.verify_attempt_state(scope.as_ref())
     }
 
-    fn release_owned_mount(self) -> io::Result<()> {
-        let target = terminated(&self.volume.path)?;
+    fn release_owned_mount(self, original_gate: io::Result<()>) -> io::Result<()> {
+        let mut failure = original_gate.err();
+        let target = if failure.is_none() {
+            match terminated(&self.volume.path) {
+                Ok(target) => Some(target),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let Self {
             volume,
             loop_device,
-            image_lease: _image_lease,
+            image,
+            image_lease,
+            image_parent,
+            initial_namespace,
+            namespace,
             ..
         } = self;
-        // These exact retained mount/root descriptors must close before normal unmount.
-        drop(volume);
-        // SAFETY: exact acquired mount; normal unmount refuses active external users.
-        if unsafe { libc::umount2(target.as_ptr(), 0) } != 0 {
-            return Err(io::Error::last_os_error());
+        // A failed original gate grants no unmount or loop-detach operation.
+        // Closing exclusively owned original FDs always remains permissible.
+        let original_root = volume.root.file;
+        // SAFETY: release only the cooperative flock on this original root.
+        if unsafe { libc::flock(original_root.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            failure.get_or_insert_with(io::Error::last_os_error);
         }
-        // SAFETY: clear only this exact now-unmounted owned loop configuration.
-        if unsafe { libc::ioctl(loop_device.as_raw_fd(), LOOP_CLR_FD, 0) } != 0 {
-            return Err(io::Error::last_os_error());
+        if let Err(error) = close_original(original_root) {
+            failure.get_or_insert(error);
         }
-        Ok(())
+        if failure.is_none() {
+            if let Some(target) = target {
+                // SAFETY: every original owner/helper gate passed and the same
+                // original root FD confirmed close. Normal umount refuses users.
+                if unsafe { libc::umount2(target.as_ptr(), 0) } == 0 {
+                    // SAFETY: only actual successful original unmount permits
+                    // clearing this exact retained loop-device configuration.
+                    if unsafe { libc::ioctl(loop_device.as_raw_fd(), LOOP_CLR_FD, 0) } != 0 {
+                        failure.get_or_insert_with(io::Error::last_os_error);
+                    }
+                } else {
+                    failure.get_or_insert_with(io::Error::last_os_error);
+                }
+            }
+        }
+        if let Err(error) = image.sync_all() {
+            failure.get_or_insert(error);
+        }
+        if let Err(error) = image_lease.close() {
+            failure.get_or_insert(error);
+        }
+        for file in [
+            loop_device,
+            image,
+            image_parent,
+            namespace,
+            initial_namespace,
+        ] {
+            if let Err(error) = close_original(file) {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
+}
+
+fn close_original(file: File) -> io::Result<()> {
+    let descriptor = file.into_raw_fd();
+    // SAFETY: consume this exact original descriptor once. Never retry EINTR,
+    // because Linux may already have closed and reused its descriptor number.
+    if unsafe { libc::close(descriptor) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub struct LinuxNativeAttempt<'a> {

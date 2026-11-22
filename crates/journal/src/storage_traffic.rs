@@ -35,11 +35,106 @@ pub struct StorageTrafficLedger {
     absent_sidecars: Vec<PathBuf>,
 }
 
+#[cfg(target_os = "linux")]
+pub struct StorageTrafficLedgerClosed {
+    ledger: sync_extend_platform_fs::UnixSqliteLedgerClosed,
+    duplicate: sync_extend_platform_fs::LinuxStorageOutsideFileClosed,
+}
+
+#[cfg(target_os = "linux")]
+impl StorageTrafficLedgerClosed {
+    pub fn original(&self) -> &sync_extend_platform_fs::UnixSqliteLedgerObservation {
+        self.ledger.original()
+    }
+
+    pub fn original_duplicate_identity(&self) -> sync_extend_platform_fs::UnixFileKey {
+        self.duplicate.identity()
+    }
+}
+
 fn sql_nonnegative(value: i64, index: usize) -> rusqlite::Result<u64> {
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
 }
 
 impl StorageTrafficLedger {
+    /// Every retained writable traffic class has the same enforced future cap.
+    /// This is capacity arithmetic, never a VFS, namespace or file authority.
+    pub fn control_file_capacities(config: &StorageNodeConfig) -> Result<[(&'static str, u64); 3]> {
+        config.validate()?;
+        let maximum = guard::max_file_bytes(config)?;
+        Ok([
+            ("storage_traffic_main", maximum),
+            ("storage_traffic_wal", maximum),
+            ("storage_traffic_rollback_journal", maximum),
+        ])
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn linux_descriptor_inventory(
+        &self,
+    ) -> Result<sync_extend_platform_fs::UnixSqliteLedgerObservation> {
+        self.connection.descriptor_inventory().map_err(Into::into)
+    }
+
+    /// Consume the actual traffic connection, VFS files/lineage, and duplicate
+    /// main description. A failed audit or close grants no successful token.
+    #[cfg(target_os = "linux")]
+    pub fn close_linux_original(
+        self,
+        config: &StorageNodeConfig,
+        device: &DeviceId,
+    ) -> Result<StorageTrafficLedgerClosed> {
+        use std::os::unix::fs::MetadataExt;
+        let mut failure = self.audit(config, device).err();
+        let expected = self
+            .file
+            .metadata()
+            .map(|metadata| sync_extend_platform_fs::UnixFileKey {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            });
+        let Self {
+            connection,
+            file,
+            max_file_bytes,
+            ..
+        } = self;
+        let ledger = connection.close();
+        if let Err(error) = &ledger {
+            failure.get_or_insert_with(|| {
+                JournalError::Io(std::io::Error::new(error.kind(), error.to_string()))
+            });
+        }
+        let expected = match expected {
+            Ok(expected) => expected,
+            Err(error) => {
+                failure.get_or_insert(JournalError::from(error));
+                sync_extend_platform_fs::UnixFileKey {
+                    device: 0,
+                    inode: 0,
+                }
+            }
+        };
+        let duplicate =
+            sync_extend_platform_fs::LinuxStorageCasCoordination::close_outside_regular_file(
+                file,
+                expected,
+                max_file_bytes,
+            );
+        if let Err(error) = &duplicate {
+            failure.get_or_insert_with(|| {
+                JournalError::Io(std::io::Error::new(error.kind(), error.to_string()))
+            });
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(StorageTrafficLedgerClosed {
+            ledger: ledger?,
+            duplicate: duplicate?,
+        })
+    }
+
     pub fn open(
         path: &Path,
         config: &StorageNodeConfig,

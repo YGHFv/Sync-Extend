@@ -37,6 +37,8 @@ pub struct StorageNode {
     _lock: File,
     #[cfg(target_os = "linux")]
     linux_storage_owner: Option<std::sync::Arc<crate::LinuxStorageOwner>>,
+    #[cfg(target_os = "linux")]
+    linux_identity_control: Option<File>,
 }
 
 #[cfg(target_os = "linux")]
@@ -44,15 +46,30 @@ impl StorageNode {
     /// End every actual storage Journal/CAS callback before the outer acquired
     /// owner can finish. Native history does not supply a descriptor close.
     pub fn close_linux_storage_owner_loan(self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        use sync_extend_platform_fs::{LinuxStorageCasCoordination, UnixFileKey};
         if self.linux_storage_owner.is_none() {
             return Err(ReconcileError::Invariant(
                 "explicit acquired Linux storage owner required at node close",
             ));
         }
         let observed = self.cas.remember_retirement_inventory(&self.journal);
+        let key = |file: &File| {
+            file.metadata().map(|metadata| UnixFileKey {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        };
+        let lock_key = key(&self._lock);
+        let identity_key = self.linux_identity_control.as_ref().map(&key);
         let Self {
             journal,
             cas,
+            traffic,
+            config,
+            device,
+            _lock,
+            linux_identity_control,
             linux_storage_owner,
             ..
         } = self;
@@ -60,6 +77,7 @@ impl StorageNode {
         let journal = journal
             .close_linux_storage_owner_connection()
             .map_err(ReconcileError::from);
+        let traffic = traffic.close_linux_original(&config, &device);
         let mut first = observed.err();
         if let Err(error) = callbacks {
             first.get_or_insert(error);
@@ -67,7 +85,67 @@ impl StorageNode {
         if let Err(error) = journal {
             first.get_or_insert(error);
         }
+        if let Err(error) = &traffic {
+            first.get_or_insert_with(|| {
+                ReconcileError::Io(std::io::Error::other(error.to_string()))
+            });
+        }
+        let lock_key = match lock_key {
+            Ok(key) => key,
+            Err(error) => {
+                first.get_or_insert(error.into());
+                UnixFileKey {
+                    device: 0,
+                    inode: 0,
+                }
+            }
+        };
+        let lock = LinuxStorageCasCoordination::close_outside_regular_file(_lock, lock_key, 0);
+        if let Err(error) = &lock {
+            first.get_or_insert_with(|| {
+                ReconcileError::Io(std::io::Error::new(error.kind(), error.to_string()))
+            });
+        }
+        let identity = match (linux_identity_control, identity_key) {
+            (Some(file), Some(key)) => {
+                let key = match key {
+                    Ok(key) => key,
+                    Err(error) => {
+                        first.get_or_insert(error.into());
+                        UnixFileKey {
+                            device: 0,
+                            inode: 0,
+                        }
+                    }
+                };
+                LinuxStorageCasCoordination::close_outside_regular_file(file, key, 32)
+            }
+            _ => Err(std::io::Error::other(
+                "original storage identity control FD absent",
+            )),
+        };
+        if let Err(error) = &identity {
+            first.get_or_insert_with(|| {
+                ReconcileError::Io(std::io::Error::new(error.kind(), error.to_string()))
+            });
+        }
         if let Some(owner) = &linux_storage_owner {
+            if first.is_none() {
+                match (traffic, lock, identity) {
+                    (Ok(traffic), Ok(lock), Ok(identity)) => {
+                        if let Err(error) =
+                            owner.record_original_control_close(traffic, lock, identity)
+                        {
+                            first.get_or_insert(error);
+                        }
+                    }
+                    _ => {
+                        first.get_or_insert(ReconcileError::Invariant(
+                            "actual original storage control closes incomplete",
+                        ));
+                    }
+                }
+            }
             if let Some(error) = &first {
                 owner.poison_inside_cas(error);
             }
@@ -77,6 +155,15 @@ impl StorageNode {
         }
         drop(linux_storage_owner);
         first.map_or(Ok(()), Err)
+    }
+
+    pub fn linux_traffic_descriptor_inventory(
+        &self,
+    ) -> Result<sync_extend_platform_fs::UnixSqliteLedgerObservation> {
+        self.verify_storage()?;
+        self.traffic
+            .linux_descriptor_inventory()
+            .map_err(Into::into)
     }
 }
 
@@ -715,6 +802,11 @@ impl StorageNode {
                 crate::filesystem::PathIdentity::capture(&path)?,
             ));
         }
+        #[cfg(target_os = "linux")]
+        let linux_identity_control = linux_storage_owner
+            .as_ref()
+            .map(|owner| owner.issue_original_identity_control_loan())
+            .transpose()?;
         let node = Self {
             config,
             device,
@@ -728,10 +820,20 @@ impl StorageNode {
             _lock: lock,
             #[cfg(target_os = "linux")]
             linux_storage_owner,
+            #[cfg(target_os = "linux")]
+            linux_identity_control,
         };
         #[cfg(target_os = "linux")]
         if let Some(owner) = &node.linux_storage_owner {
-            owner.verify_journal(&node.journal, &node.device)?;
+            if let Err(error) = owner.verify_journal(&node.journal, &node.device) {
+                return match node.close_linux_storage_owner_loan() {
+                    Ok(()) => Err(error),
+                    Err(closed) => Err(std::io::Error::other(format!(
+                        "{error}; original storage node close also refused: {closed}"
+                    ))
+                    .into()),
+                };
+            }
         }
         Ok(node)
     }
@@ -2045,6 +2147,14 @@ impl StorageNode {
         {
             if let Some(owner) = &self.linux_storage_owner {
                 owner.verify_journal(&self.journal, &self.device)?;
+                owner.verify_original_identity_control(
+                    self.linux_identity_control
+                        .as_ref()
+                        .ok_or(ReconcileError::Invariant(
+                            "original storage identity control FD absent",
+                        ))?,
+                    &self.device,
+                )?;
             }
             self.cas.verify_inside_owner()?;
         }

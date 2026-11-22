@@ -636,12 +636,12 @@ pub(crate) fn audit(connection: &Connection) -> Result<Vec<UnixStorageRetirement
     let actual_events: u64 = connection.query_row(
         "SELECT count(*) FROM main.unix_storage_retirement_native_v1_events",
         [],
-        |row| row.get(0),
+        |row| crate::sql_u64(row, 0),
     )?;
     let actual_releases: u64 = connection.query_row(
         "SELECT count(*) FROM main.unix_storage_retirement_native_v1_releases",
         [],
-        |row| row.get(0),
+        |row| crate::sql_u64(row, 0),
     )?;
     if actual_events != counted_events || actual_releases != counted_releases {
         return Err(invalid());

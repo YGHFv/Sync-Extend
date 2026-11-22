@@ -9,7 +9,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Write},
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd},
         unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
@@ -1322,6 +1322,65 @@ impl LinuxMetadataBudget {
         self.state.directory.sync_all()?;
         self.receipt()
     }
+    /// Consume the five exact original leases and all retained descriptors
+    /// after SQLite/VFS owners have ended. No pathname is deleted or recreated.
+    /// Any failed prerequisite or close remains an error after every resource
+    /// exclusively owned here has received its actual close attempt.
+    pub fn close_original(self) -> io::Result<LinuxMetadataReceipt> {
+        let checkpoint = self.checkpoint_closed();
+        let mut failure = checkpoint
+            .as_ref()
+            .err()
+            .map(|error| io::Error::new(error.kind(), error.to_string()));
+        if self.state.active_files.load(Ordering::Acquire) != 0 {
+            failure.get_or_insert_with(|| refuse("actual metadata SQLite files remain active"));
+        }
+        let state = match Arc::try_unwrap(self.state) {
+            Ok(state) => state,
+            Err(_state) => {
+                return Err(failure.unwrap_or_else(|| {
+                    refuse("actual metadata VFS/context loans still own original descriptors")
+                }));
+            }
+        };
+        let State {
+            files, directory, ..
+        } = state;
+        for slot in files {
+            let MetadataFile { file, lease, .. } = slot;
+            if let Err(error) = file.sync_all() {
+                failure.get_or_insert(error);
+            }
+            if let Err(error) = lease.close() {
+                failure.get_or_insert(error);
+            }
+            // SAFETY: actual original FD remains open after its lease and
+            // watcher duplicates have received their consuming closes.
+            let actual = unsafe { libc::fcntl(file.as_raw_fd(), 1025) };
+            if actual != libc::F_UNLCK {
+                failure.get_or_insert_with(|| {
+                    if actual < 0 {
+                        io::Error::last_os_error()
+                    } else {
+                        refuse("original metadata kernel lease did not release")
+                    }
+                });
+            }
+            if let Err(error) = close_original_descriptor(file) {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Err(error) = directory.sync_all() {
+            failure.get_or_insert(error);
+        }
+        if let Err(error) = close_original_descriptor(directory) {
+            failure.get_or_insert(error);
+        }
+        match (failure, checkpoint) {
+            (None, Ok(receipt)) => Ok(receipt),
+            (Some(error), _) | (None, Err(error)) => Err(error),
+        }
+    }
     pub fn database_path(&self) -> &Path {
         Path::new(
             self.state.files[0]
@@ -1412,6 +1471,35 @@ impl LinuxMetadataVfs {
     pub fn receipt(&self) -> io::Result<LinuxMetadataReceipt> {
         self.state.snapshot()
     }
+    pub fn close_original(mut self) -> io::Result<()> {
+        let mut failure = self.verify().err();
+        let active = self.state.active_files.load(Ordering::Acquire);
+        if active != 0 {
+            failure.get_or_insert_with(|| {
+                refuse("actual metadata SQLite contexts remain active at VFS close")
+            });
+        }
+        if let Some(mut table) = self.table.take() {
+            // SAFETY: this owns the stable registration; SQLite close was
+            // attempted first. Removing its name grants no replacement owner.
+            let unregistered = unsafe { abi::sqlite3_vfs_unregister(&mut *table) };
+            if unregistered != abi::OK {
+                failure.get_or_insert_with(|| refuse("actual metadata VFS unregister failed"));
+            }
+            if active != 0 || unregistered != abi::OK {
+                // Preserve all callback addresses on a violated lifetime.
+                // This is an unresolved failure, never an all-closed receipt.
+                std::mem::forget(self.state.clone());
+                std::mem::forget(table);
+                if let Some(name) = self.name.take() {
+                    std::mem::forget(name);
+                }
+            }
+        } else {
+            failure.get_or_insert_with(|| refuse("original metadata VFS registration absent"));
+        }
+        failure.map_or(Ok(()), Err)
+    }
 }
 impl Drop for LinuxMetadataVfs {
     fn drop(&mut self) {
@@ -1431,4 +1519,14 @@ impl Drop for LinuxMetadataVfs {
             }
         }
     }
+}
+
+fn close_original_descriptor(file: File) -> io::Result<()> {
+    let descriptor = file.into_raw_fd();
+    // SAFETY: close this consumed original descriptor once. Never retry EINTR,
+    // because the descriptor number may already have been closed and reused.
+    if unsafe { libc::close(descriptor) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }

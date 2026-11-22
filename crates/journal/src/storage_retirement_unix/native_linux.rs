@@ -593,12 +593,12 @@ impl Journal {
         Ok(state)
     }
 
-    fn native_pre_effect(
+    fn native_effect_time_and_scope(
         &self,
         activation: &Activation,
         config: &StorageNodeConfig,
         time: u64,
-    ) -> Result<()> {
+    ) -> Result<State> {
         if !self.connection.is_autocommit() {
             return Err(invalid());
         }
@@ -606,12 +606,21 @@ impl Journal {
             .into_iter()
             .find(|state| state.activation == *activation)
             .ok_or_else(invalid)?;
-        if time >= state.request.request.expires_at_ms
+        super::super::scope(
+            &self.connection,
+            &state.request.request,
+            config,
+            &state.request.request.storage_device,
+        )?;
+        if time < activation.activated_at_ms
+            || time >= state.request.request.expires_at_ms
             || state.release.is_some()
+            || state.request.cancelled_at_ms.is_some()
+            || !state.request.content_fenced
             || state
                 .events
                 .last()
-                .is_none_or(|event| !event.kind.request() || time < event.observed_at_ms)
+                .is_some_and(|event| time < event.observed_at_ms)
         {
             return Err(invalid());
         }
@@ -629,6 +638,23 @@ impl Journal {
             }
         }
         self.native_capacity(config)?;
+        Ok(state)
+    }
+
+    fn native_pre_effect(
+        &self,
+        activation: &Activation,
+        config: &StorageNodeConfig,
+        time: u64,
+    ) -> Result<()> {
+        let state = self.native_effect_time_and_scope(activation, config, time)?;
+        if state
+            .events
+            .last()
+            .is_none_or(|event| !event.kind.request())
+        {
+            return Err(invalid());
+        }
         Ok(())
     }
 
@@ -698,12 +724,11 @@ impl Journal {
                 live.layout_observation(&exclusive)?.expected_layout,
             )?;
             let create_time = now()?;
-            if create_time < activation.activated_at_ms
-                || create_time >= admission.request.expires_at_ms
-            {
+            let before_create =
+                self.native_effect_time_and_scope(&activation, config, create_time)?;
+            if !before_create.events.is_empty() {
                 return Err(invalid());
             }
-            self.native_capacity(config)?;
             live.create_marker(&exclusive, &context)?;
             {
                 let receipt = live.consume_creator_receipt(&exclusive)?;

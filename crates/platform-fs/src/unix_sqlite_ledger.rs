@@ -8,7 +8,7 @@ use std::{
     fs::File,
     io,
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd},
         unix::{ffi::OsStrExt, fs::MetadataExt},
     },
     path::{Component, Path, PathBuf},
@@ -392,6 +392,36 @@ pub struct UnixSqliteLedger {
     registration: Box<ffi::sqlite3_vfs>,
     name: CString,
     state: Arc<State>,
+    registered: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct UnixSqliteLedgerFileObservation {
+    pub class: &'static str,
+    pub identity: UnixFileKey,
+    pub actual_file_bytes: u64,
+    pub allocated_bytes: u64,
+    pub capacity_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct UnixSqliteLedgerObservation {
+    pub parent: UnixFileKey,
+    pub active_sqlite_files: usize,
+    pub retained_directory_descriptors: usize,
+    pub files: Vec<UnixSqliteLedgerFileObservation>,
+}
+
+/// Only an actual consuming close can produce this value. Its observations
+/// cannot recreate a connection, VFS, descriptor, lock or owner.
+pub struct UnixSqliteLedgerClosed {
+    original: UnixSqliteLedgerObservation,
+}
+
+impl UnixSqliteLedgerClosed {
+    pub fn original(&self) -> &UnixSqliteLedgerObservation {
+        &self.original
+    }
 }
 
 /// Field order closes SQLite before unregistering its VFS and releasing flock.
@@ -419,6 +449,27 @@ impl UnixSqliteLedgerConnection {
         F: FnMut() -> bool + Send + 'static,
     {
         self.connection.progress_handler(num_ops, handler)
+    }
+
+    pub fn descriptor_inventory(&self) -> io::Result<UnixSqliteLedgerObservation> {
+        self.vfs.descriptor_inventory()
+    }
+
+    /// Close SQLite before its actual retained files. A first verification or
+    /// SQLite-close error remains an error after all safely closable resources
+    /// have been attempted; Drop never supplies a successful close receipt.
+    pub fn close(self) -> io::Result<UnixSqliteLedgerClosed> {
+        let mut failure = self.verify().err();
+        let Self { connection, vfs } = self;
+        if let Err((connection, error)) = connection.close() {
+            failure.get_or_insert_with(|| io::Error::other(error));
+            drop(connection);
+        }
+        let closed = vfs.close_original_descriptors();
+        match (failure, closed) {
+            (None, Ok(closed)) => Ok(closed),
+            (Some(error), _) | (None, Err(error)) => Err(error),
+        }
     }
 }
 
@@ -764,6 +815,7 @@ impl UnixSqliteLedger {
             registration,
             name,
             state,
+            registered: true,
         })
     }
 
@@ -773,6 +825,102 @@ impl UnixSqliteLedger {
 
     pub fn verify(&self) -> io::Result<()> {
         self.state.verify()
+    }
+
+    fn descriptor_inventory(&self) -> io::Result<UnixSqliteLedgerObservation> {
+        self.verify()?;
+        let mut files = Vec::with_capacity(3);
+        for (index, class) in ["main", "wal", "rollback_journal"].into_iter().enumerate() {
+            if let Some(held) = &self.state.files[index] {
+                let metadata = held.file.metadata()?;
+                files.push(UnixSqliteLedgerFileObservation {
+                    class,
+                    identity: held.key,
+                    actual_file_bytes: metadata.len(),
+                    allocated_bytes: metadata
+                        .blocks()
+                        .checked_mul(512)
+                        .ok_or_else(|| refused("Unix ledger allocation count overflow"))?,
+                    capacity_bytes: self.state.max_bytes,
+                });
+            }
+        }
+        let retained_directory_descriptors = self.state.directories.len()
+            + self
+                .state
+                .transport_roots
+                .as_ref()
+                .map_or(0, |roots| roots.data.len() + roots.control.len());
+        self.verify()?;
+        Ok(UnixSqliteLedgerObservation {
+            parent: self.state.directories.last().expect("parent").key,
+            // Every remaining strong reference is one original xOpen context.
+            // IO callbacks are synchronous and have ended before this call.
+            active_sqlite_files: Arc::strong_count(&self.state) - 1,
+            retained_directory_descriptors,
+            files,
+        })
+    }
+
+    fn close_original_descriptors(mut self) -> io::Result<UnixSqliteLedgerClosed> {
+        let original = self.descriptor_inventory();
+        let mut failure = original
+            .as_ref()
+            .err()
+            .map(|error| io::Error::new(error.kind(), error.to_string()));
+        if Arc::strong_count(&self.state) != 1 {
+            return Err(failure.unwrap_or_else(|| {
+                refused("actual Unix ledger SQLite contexts remain active at descriptor close")
+            }));
+        }
+        // SAFETY: actual SQLite close completed and this owns the registration.
+        if unsafe { ffi::sqlite3_vfs_unregister(&mut *self.registration) } != ffi::SQLITE_OK {
+            return Err(
+                failure.unwrap_or_else(|| refused("actual Unix ledger VFS unregister failed"))
+            );
+        }
+        self.registered = false;
+        let state = Arc::get_mut(&mut self.state).expect("verified unique ledger state");
+        if let Some(main) = &state.files[0] {
+            // The duplicate main in the traffic ledger shares this description,
+            // so actual unlock must precede every descriptor close.
+            if unsafe { libc::flock(main.file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+                failure.get_or_insert_with(io::Error::last_os_error);
+            }
+        }
+        for held in &mut state.files {
+            if let Some(held) = held.take() {
+                if !state.read_only {
+                    if let Err(error) = held.file.sync_all() {
+                        failure.get_or_insert(error);
+                    }
+                }
+                if let Err(error) = close_descriptor(held.file) {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        for directory in state.directories.drain(..).rev() {
+            if let Err(error) = close_descriptor(directory.file) {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Some(mut roots) = state.transport_roots.take() {
+            for directory in roots
+                .control
+                .drain(..)
+                .rev()
+                .chain(roots.data.drain(..).rev())
+            {
+                if let Err(error) = close_descriptor(directory.file) {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        match (failure, original) {
+            (None, Ok(original)) => Ok(UnixSqliteLedgerClosed { original }),
+            (Some(error), _) | (None, Err(error)) => Err(error),
+        }
     }
 
     pub fn open_connection(self) -> rusqlite::Result<UnixSqliteLedgerConnection> {
@@ -814,8 +962,21 @@ impl UnixSqliteLedger {
 
 impl Drop for UnixSqliteLedger {
     fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
         // SAFETY: the caller drops SQLite first; live IO contexts independently retain State.
         unsafe { ffi::sqlite3_vfs_unregister(&mut *self.registration) };
         // Descriptors and their flock remain until State and every IO context are dropped.
     }
+}
+
+fn close_descriptor(file: File) -> io::Result<()> {
+    let descriptor = file.into_raw_fd();
+    // SAFETY: consume exactly this original descriptor once. Never retry
+    // close(EINTR), because Linux may already have reused the descriptor number.
+    if unsafe { libc::close(descriptor) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }

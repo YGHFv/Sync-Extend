@@ -38,6 +38,26 @@ impl PreparedOriginalNodeRestore {
     pub fn required_intents(&self) -> usize {
         self.required_intents
     }
+    pub fn reserved_record_bytes(&self) -> u64 {
+        self.reserved_record_bytes
+    }
+    pub fn completion_manifest_reserve(&self) -> u64 {
+        self.completion_manifest_reserve
+    }
+    pub fn reserved_database_bytes(&self) -> u64 {
+        self.reserved_database_bytes
+    }
+    pub fn original_journal_bytes(&self) -> u64 {
+        self.journal.bytes().len() as u64
+    }
+    /// Read-only original first-write budget. It supplies no native creator,
+    /// registered VFS, descriptor, ledger, or reactivation authority.
+    pub fn original_first_write_main_limit(&self) -> Result<u64> {
+        super::node_write_transition::original_write_main_limit(self.original_journal_bytes())
+    }
+    pub fn original_first_write_sidecar_limit(&self) -> u64 {
+        super::node_write_transition::ORIGINAL_WRITE_SIDECAR_LIMIT
+    }
     pub fn original_layout(&self) -> &NodeRestoreLayout {
         &self.original
     }

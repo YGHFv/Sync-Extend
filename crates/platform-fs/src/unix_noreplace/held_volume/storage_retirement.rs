@@ -204,20 +204,23 @@ fn same_named_payload(before: &Metadata, now: &libc::stat) -> bool {
 }
 
 fn close_leased(lease: Option<OriginalWriteLease>, file: File) -> io::Result<()> {
-    drop(lease);
+    let mut failure = lease.map_or(Ok(()), OriginalWriteLease::close).err();
     // SAFETY: query the still-live original description; the lease watcher has
     // joined and released every descriptor that it owned before this close.
     let actual = unsafe { libc::fcntl(file.as_raw_fd(), F_GETLEASE) };
-    let verified = if actual != libc::F_UNLCK {
-        Err(if actual < 0 {
-            io::Error::last_os_error()
-        } else {
-            refuse("original retirement mandatory kernel lease did not release")
-        })
-    } else {
-        Ok(())
-    };
-    combine_close(verified, close_original(file))
+    if actual != libc::F_UNLCK {
+        failure.get_or_insert_with(|| {
+            if actual < 0 {
+                io::Error::last_os_error()
+            } else {
+                refuse("original retirement mandatory kernel lease did not release")
+            }
+        });
+    }
+    if let Err(error) = close_original(file) {
+        failure.get_or_insert(error);
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 fn combine_close<T>(operation: io::Result<T>, closed: io::Result<()>) -> io::Result<T> {

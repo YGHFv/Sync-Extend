@@ -543,8 +543,19 @@ impl Graph {
         } = self;
         // Guard close drops only its original seal loan; the layout retains the
         // real lease. Terminal close must release the final actual kernel lease.
-        drop(realm_lease);
         if terminal {
+            match Arc::try_unwrap(realm_lease) {
+                Ok(lease) => {
+                    if let Err(error) = lease.close() {
+                        failure.get_or_insert(error);
+                    }
+                }
+                Err(_lease) => {
+                    failure.get_or_insert_with(|| {
+                        refuse("original realm lease cannot close while other loans remain")
+                    });
+                }
+            }
             // SAFETY: query through this still-live original description after
             // the last lease owner has released F_SETLEASE and joined its watcher.
             let state = unsafe { libc::fcntl(realm.as_raw_fd(), F_GETLEASE) };
@@ -557,6 +568,8 @@ impl Graph {
                     }
                 });
             }
+        } else {
+            drop(realm_lease);
         }
         for file in [
             Some(realm),
@@ -1090,20 +1103,30 @@ impl LinuxStorageCas {
     /// Actual original directory FD closes precede the metadata checkpoint and
     /// the namespace owner's normal unmount. No persistent slot is removed.
     pub fn close(self) -> io::Result<LinuxStorageCasObservation> {
-        self.verify_closed_constraints()?;
-        let observation = self.observation()?;
-        self.graph.close(true)?;
-        Ok(observation)
+        let verified = self.verify_closed_constraints();
+        let observation = self.observation();
+        let closed = self.graph.close(true);
+        match (verified, observation, closed) {
+            (Ok(()), Ok(observation), Ok(())) => Ok(observation),
+            (Err(error), _, _) | (Ok(()), Err(error), _) | (Ok(()), Ok(_), Err(error)) => {
+                Err(error)
+            }
+        }
     }
 
     pub fn close_with_retirement_prefixes(
         self,
         inventory: &LinuxStorageRetirementInventoryContext,
     ) -> io::Result<LinuxStorageCasObservation> {
-        self.verify_closed_constraints_with_retirement_prefixes(inventory)?;
-        let observation = self.observation()?;
-        self.graph.close(true)?;
-        Ok(observation)
+        let verified = self.verify_closed_constraints_with_retirement_prefixes(inventory);
+        let observation = self.observation();
+        let closed = self.graph.close(true);
+        match (verified, observation, closed) {
+            (Ok(()), Ok(observation), Ok(())) => Ok(observation),
+            (Err(error), _, _) | (Ok(()), Err(error), _) | (Ok(()), Ok(_), Err(error)) => {
+                Err(error)
+            }
+        }
     }
 }
 
@@ -1301,7 +1324,11 @@ impl LinuxStorageCasFileGuard {
     /// original Journal guard before closing the returned inside directory loan.
     pub fn close_file(mut self) -> io::Result<LinuxStorageCasDirectoryGuard> {
         let mut failure = self.verify().err();
-        drop(self.lease.take());
+        if let Some(lease) = self.lease.take() {
+            if let Err(error) = lease.close() {
+                failure.get_or_insert(error);
+            }
+        }
         if let Some(file) = self.file.take() {
             // SAFETY: pointer-free query through the still-live original FD.
             let state = unsafe { libc::fcntl(file.as_raw_fd(), F_GETLEASE) };
@@ -1435,6 +1462,17 @@ pub struct LinuxStorageCasCoordination {
     owner: Arc<LinuxNamespaceCapability>,
 }
 
+/// A consuming original regular-file close, never a serialized ownership proof.
+pub struct LinuxStorageOutsideFileClosed {
+    identity: UnixFileKey,
+}
+
+impl LinuxStorageOutsideFileClosed {
+    pub fn identity(&self) -> UnixFileKey {
+        self.identity
+    }
+}
+
 impl LinuxStorageCasCoordination {
     pub fn preflight_new(parent: &File) -> io::Result<()> {
         private(parent, true)?;
@@ -1536,20 +1574,126 @@ impl LinuxStorageCasCoordination {
     }
 
     pub fn close(self) -> io::Result<()> {
-        self.verify()?;
-        self.original.sync_all()?;
-        self.parent.sync_all()?;
-        close_original(self.original)?;
-        close_original(self.parent)?;
-        self.owner.verify()
+        let mut failure = self.verify().err();
+        for file in [&self.original, &self.parent] {
+            if let Err(error) = file.sync_all() {
+                failure.get_or_insert(error);
+            }
+        }
+        for file in [self.original, self.parent] {
+            if let Err(error) = close_original(file) {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Err(error) = self.owner.verify() {
+            failure.get_or_insert(error);
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     /// Explicitly close the final original outside root after the actual
     /// metadata checkpoint. Closing a descriptor grants no native permission.
     pub fn close_outside_root(original: File) -> io::Result<()> {
-        private(&original, true)?;
-        original.sync_all()?;
-        close_original(original)
+        let mut failure = private(&original, true).err();
+        if let Err(error) = original.sync_all() {
+            failure.get_or_insert(error);
+        }
+        // SAFETY: release only this retained cooperative root description.
+        if unsafe { libc::flock(original.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            failure.get_or_insert_with(io::Error::last_os_error);
+        }
+        if let Err(error) = close_original(original) {
+            failure.get_or_insert(error);
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Pure conservative 4-KiB ext4 data/extent/xattr arithmetic. This grants
+    /// neither allocation nor authority over a pathname or a filesystem.
+    pub fn outside_control_physical_liability(capacity: u64) -> io::Result<u64> {
+        let data_blocks = capacity
+            .checked_add(BLOCK_BYTES - 1)
+            .map(|value| value / BLOCK_BYTES)
+            .ok_or_else(|| refuse("outside control capacity rounding overflow"))?;
+        data_blocks
+            .checked_mul(6)
+            .and_then(|value| value.checked_add(1))
+            .and_then(|value| value.checked_mul(BLOCK_BYTES))
+            .ok_or_else(|| refuse("outside control physical liability overflow"))
+    }
+
+    /// Read-only gate on the acquired original outside root. The caller must
+    /// also retain the exact metadata ext4/kernel/profile preflight.
+    pub fn preflight_outside_physical_capacity(
+        original_root: &File,
+        complete_liability: u64,
+    ) -> io::Result<()> {
+        private(original_root, true)?;
+        let before = key(original_root)?;
+        let observed = geometry(original_root)?;
+        if key(original_root)? != before || complete_liability > observed.available_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "whole original outside metadata/control future liability exceeds actual free space",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Open only the fixed original 32-byte signing-secret slot through its
+    /// retained owner root. No CREATE, write, pathname fallback or authority.
+    pub fn retain_outside_identity(original_root: &File) -> io::Result<File> {
+        private(original_root, true)?;
+        let component = name("device.secret")?;
+        let original = open_file_at(original_root, &component, false, false)?;
+        if private(&original, false)?.len() != 32 {
+            return Err(refuse("exact original 32-byte storage identity required"));
+        }
+        Self::verify_outside_identity(original_root, &original)?;
+        Ok(original)
+    }
+
+    pub fn verify_outside_identity(original_root: &File, original: &File) -> io::Result<()> {
+        private(original_root, true)?;
+        if private(original, false)?.len() != 32
+            || key(original)?.device != key(original_root)?.device
+        {
+            return Err(refuse(
+                "original private storage identity FD or parent changed",
+            ));
+        }
+        same_slot(original_root, &name("device.secret")?, original)
+    }
+
+    pub fn close_outside_regular_file(
+        original: File,
+        expected: UnixFileKey,
+        maximum_bytes: u64,
+    ) -> io::Result<LinuxStorageOutsideFileClosed> {
+        let verified = (|| {
+            let metadata = private(&original, false)?;
+            if key(&original)? != expected || metadata.len() > maximum_bytes {
+                return Err(refuse(
+                    "original outside control identity or bound changed at close",
+                ));
+            }
+            Ok(())
+        })();
+        let mut failure = verified.err();
+        if let Err(error) = original.sync_all() {
+            failure.get_or_insert(error);
+        }
+        // Actual unlock also releases a lock shared by retained duplicates.
+        if unsafe { libc::flock(original.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            failure.get_or_insert_with(io::Error::last_os_error);
+        }
+        if let Err(error) = close_original(original) {
+            failure.get_or_insert(error);
+        }
+        failure.map_or(
+            Ok(LinuxStorageOutsideFileClosed { identity: expected }),
+            Err,
+        )
     }
 }
 
@@ -1625,10 +1769,16 @@ impl LinuxStorageCasCoordinationLoan {
     }
 
     pub fn close(self) -> io::Result<()> {
-        self.verify()?;
-        close_original(self.original)?;
-        close_original(self.parent)?;
-        self.owner.verify()
+        let mut failure = self.verify().err();
+        for file in [self.original, self.parent] {
+            if let Err(error) = close_original(file) {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Err(error) = self.owner.verify() {
+            failure.get_or_insert(error);
+        }
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -1668,7 +1818,7 @@ impl LinuxStorageCasCoordinationGuard {
     }
 
     pub fn verify(&self) -> io::Result<()> {
-        let mut failure = self.verify_identity().err();
+        self.verify_identity()?;
         if self.state == CoordinationLockState::Unlocked {
             return Err(refuse("original CAS upgrade failed; guard has no lock"));
         }
@@ -1704,7 +1854,7 @@ impl LinuxStorageCasCoordinationGuard {
     pub fn close(self) -> io::Result<()> {
         // A failed upgrade still owns its original FDs and must release them.
         // Identity verification grants closure, never exclusive inspection.
-        self.verify_identity()?;
+        let mut failure = self.verify_identity().err();
         // SAFETY: explicit release of this guard's retained original description.
         if unsafe { libc::flock(self.original.as_raw_fd(), libc::LOCK_UN) } != 0 {
             failure.get_or_insert_with(io::Error::last_os_error);

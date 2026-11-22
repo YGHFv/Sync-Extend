@@ -235,6 +235,8 @@ pub use storage_retirement::terminal::StorageRetirementTerminalReport;
 pub use storage_retirement::StorageRetirementAdmission;
 mod storage_traffic;
 pub use storage_traffic::StorageTrafficLedger;
+#[cfg(target_os = "linux")]
+pub use storage_traffic::StorageTrafficLedgerClosed;
 mod storage_pull_attempt_budget;
 pub use storage_pull_attempt_budget::{
     StoragePullAttemptLedger, StoragePullAttemptPolicy, StoragePullAttemptStatus,
@@ -726,39 +728,58 @@ impl Journal {
     /// connection. A busy/failed close remains an error and grants no receipt.
     #[cfg(target_os = "linux")]
     pub fn close_linux_storage_cas_coordination(self) -> Result<()> {
-        self.linux_storage_cas_coordination_key()?
-            .ok_or(JournalError::Invariant(
+        let original = self.linux_storage_cas_coordination_key().and_then(|key| {
+            key.ok_or(JournalError::Invariant(
                 "original Linux CAS Journal binding required at close",
-            ))?;
-        self.close_linux_storage_owner_connection()
+            ))
+        });
+        let closed = self.close_linux_storage_owner_connection();
+        match (original, closed) {
+            (Ok(_), Ok(())) => Ok(()),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
     }
 
     /// Explicit close for an actual v1/v2 storage metadata connection. Its
     /// full-FD VFS and every optional original coordination loan must end.
     #[cfg(target_os = "linux")]
     pub fn close_linux_storage_owner_connection(self) -> Result<()> {
-        self.linux_metadata_receipt()?
-            .ok_or(JournalError::Invariant(
-                "original full-FD Linux storage Journal required at close",
-            ))?;
+        let mut failure = self
+            .linux_metadata_receipt()
+            .and_then(|receipt| {
+                receipt.ok_or(JournalError::Invariant(
+                    "original full-FD Linux storage Journal required at close",
+                ))
+            })
+            .err();
         let Self {
             connection,
             linux_metadata_vfs,
             original_linux_cas_coordination,
             ..
         } = self;
-        connection
-            .close()
-            .map_err(|(_connection, error)| JournalError::from(error))?;
-        let vfs = linux_metadata_vfs.ok_or(JournalError::Invariant(
-            "original Linux CAS callback VFS absent at close",
-        ))?;
-        vfs.verify()?;
-        drop(vfs);
-        if let Some(original) = original_linux_cas_coordination {
-            original.close()?;
+        if let Err((connection, error)) = connection.close() {
+            failure.get_or_insert(JournalError::from(error));
+            drop(connection);
         }
-        Ok(())
+        match linux_metadata_vfs {
+            Some(vfs) => {
+                if let Err(error) = vfs.close_original() {
+                    failure.get_or_insert(error.into());
+                }
+            }
+            None => {
+                failure.get_or_insert(JournalError::Invariant(
+                    "original Linux CAS callback VFS absent at close",
+                ));
+            }
+        }
+        if let Some(original) = original_linux_cas_coordination {
+            if let Err(error) = original.close() {
+                failure.get_or_insert(error.into());
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     #[cfg(target_os = "linux")]

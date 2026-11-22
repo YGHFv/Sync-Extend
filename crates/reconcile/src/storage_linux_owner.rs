@@ -9,7 +9,10 @@ use std::{
     io::Read,
     os::unix::fs::{FileExt as UnixFileExt, MetadataExt, OpenOptionsExt},
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 use sync_extend_core_model::{storage_node::StorageNodeConfig, ContentId, DeviceId};
 use sync_extend_journal::{
@@ -255,8 +258,64 @@ impl LinuxStorageOwnerConfig {
                 "complete storage metadata class limits required",
             ));
         }
-        let _ = limits.storage_only_physical_liabilities()?;
+        let outside = self.outside_control_budget()?;
+        if outside.complete_physical_liability_bytes > limits.total_physical {
+            return Err(ReconcileError::ResourceLimit(
+                "complete outside metadata and control future physical liability",
+            ));
+        }
         Ok(())
+    }
+
+    /// Includes every enforced traffic future cap and original fixed control
+    /// file. Arithmetic and this report grant no filesystem/creator authority.
+    pub fn outside_control_budget(&self) -> Result<LinuxStorageOutsideControlBudget> {
+        let metadata_classes =
+            LinuxMetadataLimits::from(self.metadata_limits).storage_only_physical_liabilities()?;
+        let metadata_physical_liability_bytes =
+            metadata_classes.into_iter().try_fold(0u64, |sum, value| {
+                sum.checked_add(value).ok_or(ReconcileError::ResourceLimit(
+                    "outside metadata physical liability overflow",
+                ))
+            })?;
+        let mut caps =
+            sync_extend_journal::StorageTrafficLedger::control_file_capacities(&self.storage)?
+                .to_vec();
+        caps.extend([("storage_lock", 0), ("device_secret", 32)]);
+        if self.format_version == 2 {
+            caps.push(("cas_coordination", 0));
+        }
+        let mut control_physical_liability_bytes = 0u64;
+        let mut files = Vec::with_capacity(caps.len());
+        for (class, capacity_bytes) in caps {
+            let physical_liability_bytes =
+                LinuxStorageCasCoordination::outside_control_physical_liability(capacity_bytes)?;
+            control_physical_liability_bytes = control_physical_liability_bytes
+                .checked_add(physical_liability_bytes)
+                .ok_or(ReconcileError::ResourceLimit(
+                    "outside control physical liability overflow",
+                ))?;
+            files.push(LinuxStorageOutsideControlFileBudget {
+                class,
+                capacity_bytes,
+                physical_liability_bytes,
+            });
+        }
+        let fixed_directory_physical_liability_bytes =
+            LinuxStorageCasCoordination::outside_control_physical_liability(4096)?;
+        Ok(LinuxStorageOutsideControlBudget {
+            metadata_physical_liability_bytes,
+            control_physical_liability_bytes,
+            fixed_directory_physical_liability_bytes,
+            complete_physical_liability_bytes: metadata_physical_liability_bytes
+                .checked_add(control_physical_liability_bytes)
+                .and_then(|value| value.checked_add(fixed_directory_physical_liability_bytes))
+                .ok_or(ReconcileError::ResourceLimit(
+                    "complete outside physical liability overflow",
+                ))?,
+            configured_total_physical_bytes: self.metadata_limits.total_physical,
+            files,
+        })
     }
 
     fn inside_cas_limits(&self) -> Result<LinuxStorageCasLimits> {
@@ -390,6 +449,23 @@ pub struct LinuxStorageMetadataObservation {
     pub files: Vec<LinuxStorageMetadataFileObservation>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct LinuxStorageOutsideControlFileBudget {
+    pub class: &'static str,
+    pub capacity_bytes: u64,
+    pub physical_liability_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LinuxStorageOutsideControlBudget {
+    pub metadata_physical_liability_bytes: u64,
+    pub control_physical_liability_bytes: u64,
+    pub fixed_directory_physical_liability_bytes: u64,
+    pub complete_physical_liability_bytes: u64,
+    pub configured_total_physical_bytes: u64,
+    pub files: Vec<LinuxStorageOutsideControlFileBudget>,
+}
+
 fn metadata_observation(
     receipt: LinuxMetadataReceipt,
     persistent_owner_generation: [u8; 16],
@@ -438,6 +514,7 @@ pub struct LinuxStorageOwnerObservation {
     pub runtime_mount_id: u64,
     pub metadata: LinuxStorageMetadataObservation,
     pub bootstrap_budget: Option<StorageJournalBootstrapBudget>,
+    pub outside_control_budget: LinuxStorageOutsideControlBudget,
     pub native_inspection_authority: bool,
     pub marker_creation_authority: bool,
     pub payload_move_authority: bool,
@@ -501,6 +578,19 @@ pub struct LinuxStorageOwnerClosed {
     pub pending_resume_authority: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inside_cas: Option<LinuxStorageInsideCasClosed>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_control_close: Option<LinuxStorageControlClosedObservation>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LinuxStorageControlClosedObservation {
+    pub traffic_original_file_count: usize,
+    pub traffic_original_directory_descriptor_count: usize,
+    pub traffic_duplicate_main: LinuxStorageObjectIdentity,
+    pub storage_lock: LinuxStorageObjectIdentity,
+    pub device_secret: LinuxStorageObjectIdentity,
+    pub actual_traffic_sqlite_and_vfs_closed: bool,
+    pub actual_all_control_descriptors_closed: bool,
 }
 
 /// Acquired live objects only. Its serialized observations cannot construct it.
@@ -517,6 +607,14 @@ pub struct LinuxStorageOwner {
     bootstrap_budget: Option<StorageJournalBootstrapBudget>,
     cas_failure: Mutex<Option<String>>,
     retirement_inventory: Mutex<Option<LinuxStorageRetirementInventoryContext>>,
+    control_loan_issued: AtomicBool,
+    control_closed: Mutex<Option<OriginalStorageControlClosed>>,
+}
+
+struct OriginalStorageControlClosed {
+    _traffic: sync_extend_journal::StorageTrafficLedgerClosed,
+    _lock: sync_extend_platform_fs::LinuxStorageOutsideFileClosed,
+    _identity: sync_extend_platform_fs::LinuxStorageOutsideFileClosed,
 }
 
 fn identity(metadata: &Metadata) -> LinuxStorageObjectIdentity {
@@ -613,7 +711,9 @@ fn process_start_ticks() -> Result<u64> {
 
 fn root_names(path: &Path) -> Result<BTreeSet<std::ffi::OsString>> {
     Ok(fs::read_dir(path)?
-        .take(13)
+        // The complete fixed layout has at most thirteen legal entries.
+        // Observe one more so a foreign slot cannot hide after the bound.
+        .take(14)
         .map(|entry| entry.map(|entry| entry.file_name()))
         .collect::<std::io::Result<_>>()?)
 }
@@ -644,9 +744,13 @@ fn allowed_names(config: &LinuxStorageOwnerConfig) -> BTreeSet<std::ffi::OsStrin
     let mut names: BTreeSet<_> = required_names(config)
         .into_iter()
         .chain(
-            ["storage-traffic.sqlite-wal", "storage-traffic.sqlite-shm"]
-                .into_iter()
-                .map(std::ffi::OsString::from),
+            [
+                "storage-traffic.sqlite-wal",
+                "storage-traffic.sqlite-journal",
+                "storage-traffic.sqlite-shm",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
         )
         .collect();
     if config.format_version == 2 {
@@ -677,10 +781,16 @@ fn layout(config: &LinuxStorageOwnerConfig, initialize: bool, root: &File) -> Re
     for name in ["storage.lock", "device.secret", "storage-traffic.sqlite"] {
         drop(open_private(&config.storage.data_dir.join(name), false)?);
     }
-    for name in ["storage-traffic.sqlite-wal", "storage-traffic.sqlite-shm"] {
+    for name in [
+        "storage-traffic.sqlite-wal",
+        "storage-traffic.sqlite-journal",
+        "storage-traffic.sqlite-shm",
+    ] {
         if names.contains(&std::ffi::OsString::from(name)) {
             let file = open_private(&config.storage.data_dir.join(name), false)?;
-            if name == "storage-traffic.sqlite-wal" && file.metadata()?.len() != 0 {
+            if (name == "storage-traffic.sqlite-wal" || name == "storage-traffic.sqlite-journal")
+                && file.metadata()?.len() != 0
+            {
                 return Err(ReconcileError::Invariant(
                     "storage owner preflight requires the original closed traffic ledger",
                 ));
@@ -907,6 +1017,14 @@ impl LinuxStorageOwner {
             config.metadata_limits.into(),
             initialize,
         )?;
+        // Exact outside metadata ext4/kernel/profile validation above precedes
+        // this read-only gate on the same acquired original root descriptor.
+        LinuxStorageCasCoordination::preflight_outside_physical_capacity(
+            &root,
+            config
+                .outside_control_budget()?
+                .complete_physical_liability_bytes,
+        )?;
         let process_start_ticks = process_start_ticks()?;
         let owner = Arc::new(
             LinuxNamespaceCapability::acquire_storage_only_private_ext4_image(
@@ -1093,6 +1211,8 @@ impl LinuxStorageOwner {
             bootstrap_budget,
             cas_failure: Mutex::new(None),
             retirement_inventory: Mutex::new(retirement_inventory),
+            control_loan_issued: AtomicBool::new(false),
+            control_closed: Mutex::new(None),
         };
         if let Err(error) = result.verify() {
             if let Err(closed) = result.finish() {
@@ -1108,6 +1228,75 @@ impl LinuxStorageOwner {
 
     pub(crate) fn budget(&self) -> &LinuxMetadataBudget {
         &self.budget
+    }
+
+    pub(crate) fn issue_original_identity_control_loan(&self) -> Result<File> {
+        self.verify()?;
+        let original = LinuxStorageCasCoordination::retain_outside_identity(&self.root)?;
+        if self.control_loan_issued.swap(true, Ordering::AcqRel) {
+            return Err(ReconcileError::Invariant(
+                "original storage control loan cannot be reissued",
+            ));
+        }
+        Ok(original)
+    }
+
+    pub(crate) fn verify_original_identity_control(
+        &self,
+        original: &File,
+        device: &DeviceId,
+    ) -> Result<()> {
+        self.verify()?;
+        LinuxStorageCasCoordination::verify_outside_identity(&self.root, original)?;
+        let before = original.metadata()?;
+        let mut secret = [0u8; 32];
+        original.read_exact_at(&mut secret, 0)?;
+        let actual = ed25519_dalek::SigningKey::from_bytes(&secret);
+        let mut extra = [0u8; 1];
+        if original.read_at(&mut extra, 32)? != 0
+            || DeviceId::from_public_key(actual.verifying_key().as_bytes()) != *device
+            || !stable(&before, &original.metadata()?)
+        {
+            return Err(ReconcileError::Invariant(
+                "held original storage signing identity changed",
+            ));
+        }
+        LinuxStorageCasCoordination::verify_outside_identity(&self.root, original)?;
+        self.verify()
+    }
+
+    pub(crate) fn record_original_control_close(
+        &self,
+        traffic: sync_extend_journal::StorageTrafficLedgerClosed,
+        lock: sync_extend_platform_fs::LinuxStorageOutsideFileClosed,
+        identity: sync_extend_platform_fs::LinuxStorageOutsideFileClosed,
+    ) -> Result<()> {
+        if !self.control_loan_issued.load(Ordering::Acquire)
+            || traffic.original().parent != self.root_identity.into()
+            || traffic.original().active_sqlite_files != 0
+            || traffic.original().files.len() != 3
+            || lock.identity().device != self.root_identity.device
+            || identity.identity().device != self.root_identity.device
+        {
+            return Err(ReconcileError::Invariant(
+                "actual original storage control descriptor closure required",
+            ));
+        }
+        let mut closed = self
+            .control_closed
+            .lock()
+            .map_err(|_| ReconcileError::Invariant("original control close mutex poisoned"))?;
+        if closed.is_some() {
+            return Err(ReconcileError::Invariant(
+                "original control close already recorded",
+            ));
+        }
+        *closed = Some(OriginalStorageControlClosed {
+            _traffic: traffic,
+            _lock: lock,
+            _identity: identity,
+        });
+        Ok(())
     }
 
     pub(crate) fn has_inside_cas(&self) -> bool {
@@ -1303,6 +1492,7 @@ impl LinuxStorageOwner {
                 self.budget.persistent_owner_generation(),
             ),
             bootstrap_budget: self.bootstrap_budget.clone(),
+            outside_control_budget: self.config.outside_control_budget()?,
             native_inspection_authority: false,
             marker_creation_authority: false,
             payload_move_authority: false,
@@ -1409,6 +1599,17 @@ impl LinuxStorageOwner {
                 "actual full-FD SQLite files remain active before any owner FD close",
             ));
         }
+        if self.control_loan_issued.load(Ordering::Acquire)
+            && self
+                .control_closed
+                .lock()
+                .map_err(|_| ReconcileError::Invariant("original control close mutex poisoned"))?
+                .is_none()
+        {
+            return Err(ReconcileError::Invariant(
+                "actual original traffic, storage lock and identity descriptor closes absent",
+            ));
+        }
         let cas = self.inside_cas.as_ref().ok_or(ReconcileError::Invariant(
             "actual inside CAS base originals absent",
         ))?;
@@ -1433,68 +1634,17 @@ impl LinuxStorageOwner {
     /// Call after dropping every StorageNode and its CAS/Journal callbacks.
     /// Never delete persistent files or unfamiliar residue during closure.
     pub fn finish(self) -> Result<LinuxStorageOwnerClosed> {
-        if self.has_inside_cas() {
-            self.verify_finish_constraints()?;
-            let original_layout =
-                self.inside_cas_observation()?
-                    .ok_or(ReconcileError::Invariant(
-                        "actual v2 original inside layout absent at close",
-                    ))?;
-            let Self {
-                owner,
-                budget,
-                process_start_ticks,
-                root,
-                inside_cas,
-                cas_coordination,
-                retirement_inventory,
-                ..
-            } = self;
-            // Outer owner Arc loans must already be gone. Each success below
-            // comes only from the actual kernel/FD operation, never a flag.
-            let inside_cas = inside_cas.ok_or(ReconcileError::Invariant(
-                "original inside CAS close absent",
-            ))?;
-            let inventory = retirement_inventory.into_inner().map_err(|_| {
-                ReconcileError::Invariant("original retirement accounting mutex poisoned")
-            })?;
-            if let Some(inventory) = inventory.as_ref() {
-                inside_cas.close_with_retirement_prefixes(inventory)?;
-            } else {
-                inside_cas.close()?;
-            }
-            cas_coordination
-                .ok_or(ReconcileError::Invariant(
-                    "original CAS sentinel close absent",
-                ))?
-                .close()?;
-            let persistent = budget.persistent_owner_generation();
-            let receipt = budget.checkpoint_closed()?;
-            drop(budget);
-            LinuxStorageCasCoordination::close_outside_root(root)?;
-            let owner = Arc::try_unwrap(owner).map_err(|_| {
-                ReconcileError::Invariant(
-                    "original namespace still has active CAS/Journal/guard dependents",
-                )
-            })?;
-            owner.release_unarmed_mount()?;
-            return Ok(LinuxStorageOwnerClosed {
-                format_version: 2,
-                process_id: std::process::id(),
-                process_start_ticks,
-                metadata: metadata_observation(receipt, persistent),
-                all_sqlite_connections_closed: true,
-                original_mount_released: true,
-                original_loop_released: true,
-                helpers_started: false,
-                pending_resume_authority: false,
-                inside_cas: Some(LinuxStorageInsideCasClosed {
-                    original_layout,
-                    original_realm_file_and_lease_closed: true,
-                    original_inside_directory_fds_closed: true,
-                    original_cooperative_sentinel_fds_closed: true,
-                    retired_native_cleanup_authority: false,
-                }),
+        let inside = self.has_inside_cas();
+        let mut first = if inside {
+            self.verify_finish_constraints()
+        } else {
+            self.verify()
+        }
+        .err();
+        let original_layout = self.inside_cas_observation();
+        if let Err(error) = &original_layout {
+            first.get_or_insert_with(|| {
+                ReconcileError::Io(std::io::Error::other(error.to_string()))
             });
         }
         let Self {
@@ -1502,38 +1652,120 @@ impl LinuxStorageOwner {
             budget,
             process_start_ticks,
             root,
+            inside_cas,
+            cas_coordination,
+            retirement_inventory,
+            control_loan_issued,
+            control_closed,
             ..
         } = self;
-        let persistent = budget.persistent_owner_generation();
-        let checkpoint = budget.checkpoint_closed();
-        drop(budget);
-        let release = Arc::try_unwrap(owner)
-            .map_err(|_| std::io::Error::other("original v1 namespace still has live dependents"))
-            .and_then(LinuxNamespaceCapability::release_unarmed_mount);
-        drop(root);
-        let receipt = match (checkpoint, release) {
-            (Ok(receipt), Ok(())) => receipt,
-            (Err(error), Ok(())) => return Err(error.into()),
-            (Ok(_), Err(error)) => return Err(error.into()),
-            (Err(error), Err(release)) => {
-                return Err(std::io::Error::other(format!(
-                    "{error}; original storage owner release also refused: {release}"
-                ))
-                .into());
+        let inventory = match retirement_inventory.into_inner() {
+            Ok(inventory) => inventory,
+            Err(poisoned) => {
+                first.get_or_insert(ReconcileError::Invariant(
+                    "original retirement accounting mutex poisoned",
+                ));
+                poisoned.into_inner()
             }
         };
-        let metadata = metadata_observation(receipt, persistent);
+        let control_closed = match control_closed.into_inner() {
+            Ok(closed) => closed,
+            Err(poisoned) => {
+                first.get_or_insert(ReconcileError::Invariant(
+                    "original control close mutex poisoned",
+                ));
+                poisoned.into_inner()
+            }
+        };
+        if control_loan_issued.load(Ordering::Acquire) && control_closed.is_none() {
+            first.get_or_insert(ReconcileError::Invariant(
+                "actual original traffic, lock and identity descriptor closes absent",
+            ));
+        }
+        let original_control_close =
+            control_closed
+                .as_ref()
+                .map(|closed| LinuxStorageControlClosedObservation {
+                    traffic_original_file_count: closed._traffic.original().files.len(),
+                    traffic_original_directory_descriptor_count: closed
+                        ._traffic
+                        .original()
+                        .retained_directory_descriptors,
+                    traffic_duplicate_main: closed._traffic.original_duplicate_identity().into(),
+                    storage_lock: closed._lock.identity().into(),
+                    device_secret: closed._identity.identity().into(),
+                    actual_traffic_sqlite_and_vfs_closed: true,
+                    actual_all_control_descriptors_closed: true,
+                });
+        if let Some(cas) = inside_cas {
+            let closed = if let Some(inventory) = inventory.as_ref() {
+                cas.close_with_retirement_prefixes(inventory)
+            } else {
+                cas.close()
+            };
+            if let Err(error) = closed {
+                first.get_or_insert(error.into());
+            }
+        } else if inside {
+            first.get_or_insert(ReconcileError::Invariant(
+                "original inside CAS close absent",
+            ));
+        }
+        if let Some(coordination) = cas_coordination {
+            if let Err(error) = coordination.close() {
+                first.get_or_insert(error.into());
+            }
+        } else if inside {
+            first.get_or_insert(ReconcileError::Invariant(
+                "original CAS sentinel close absent",
+            ));
+        }
+        let persistent = budget.persistent_owner_generation();
+        let receipt = budget.close_original();
+        if let Err(error) = &receipt {
+            first.get_or_insert_with(|| {
+                ReconcileError::Io(std::io::Error::new(error.kind(), error.to_string()))
+            });
+        }
+        if let Err(error) = LinuxStorageCasCoordination::close_outside_root(root) {
+            first.get_or_insert(error.into());
+        }
+        let release = Arc::try_unwrap(owner)
+            .map_err(|_| {
+                std::io::Error::other("original namespace still has active Journal/CAS/guard loans")
+            })
+            .and_then(LinuxNamespaceCapability::release_unarmed_mount);
+        if let Err(error) = release {
+            first.get_or_insert(error.into());
+        }
+        if let Some(error) = first {
+            return Err(error);
+        }
+        let inside_cas = if inside {
+            Some(LinuxStorageInsideCasClosed {
+                original_layout: original_layout?.ok_or(ReconcileError::Invariant(
+                    "actual v2 original inside layout absent at close",
+                ))?,
+                original_realm_file_and_lease_closed: true,
+                original_inside_directory_fds_closed: true,
+                original_cooperative_sentinel_fds_closed: true,
+                retired_native_cleanup_authority: false,
+            })
+        } else {
+            None
+        };
         Ok(LinuxStorageOwnerClosed {
-            format_version: 1,
+            format_version: if inside { 2 } else { 1 },
             process_id: std::process::id(),
             process_start_ticks,
-            metadata,
+            metadata: metadata_observation(receipt?, persistent),
             all_sqlite_connections_closed: true,
             original_mount_released: true,
             original_loop_released: true,
             helpers_started: false,
             pending_resume_authority: false,
-            inside_cas: None,
+            inside_cas,
+            original_control_close,
         })
     }
 }

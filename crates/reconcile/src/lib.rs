@@ -98,11 +98,12 @@ mod storage_node;
 pub use storage_linux_cas::{LinuxStorageCasReadGuard, LinuxStorageCasSessionGuard};
 #[cfg(target_os = "linux")]
 pub use storage_linux_owner::{
-    read_linux_storage_owner_config, LinuxStorageCasRealm, LinuxStorageInsideCasClosed,
-    LinuxStorageInsideCasConfig, LinuxStorageInsideCasExpectation,
+    read_linux_storage_owner_config, LinuxStorageCasRealm, LinuxStorageControlClosedObservation,
+    LinuxStorageInsideCasClosed, LinuxStorageInsideCasConfig, LinuxStorageInsideCasExpectation,
     LinuxStorageInsideCasObservation, LinuxStorageMetadataLimits, LinuxStorageObjectIdentity,
-    LinuxStorageOwner, LinuxStorageOwnerClosed, LinuxStorageOwnerConfig,
-    LinuxStorageOwnerObservation, LinuxStorageOwnerRole,
+    LinuxStorageOutsideControlBudget, LinuxStorageOutsideControlFileBudget, LinuxStorageOwner,
+    LinuxStorageOwnerClosed, LinuxStorageOwnerConfig, LinuxStorageOwnerObservation,
+    LinuxStorageOwnerRole,
 };
 mod storage_retirement;
 mod storage_retirement_disposal;

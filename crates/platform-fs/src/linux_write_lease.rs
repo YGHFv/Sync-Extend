@@ -3,7 +3,7 @@
 use std::{
     fs::File,
     io,
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, IntoRawFd},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc,
@@ -23,10 +23,10 @@ struct Owner {
 }
 
 pub(crate) struct OriginalWriteLease {
-    file: File,
+    file: Option<File>,
     broken: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
-    watcher: Option<JoinHandle<()>>,
+    watcher: Option<JoinHandle<io::Result<()>>>,
 }
 
 impl OriginalWriteLease {
@@ -89,7 +89,12 @@ impl OriginalWriteLease {
                 };
                 let active = setup.is_ok();
                 if ready.send(setup).is_err() || !active {
-                    return;
+                    if active {
+                        // SAFETY: startup failed after acquiring this original
+                        // description; release before its owner thread exits.
+                        unsafe { libc::fcntl(watched.as_raw_fd(), F_SETLEASE, libc::F_UNLCK) };
+                    }
+                    return close_original(watched);
                 }
                 // SAFETY: the set was completely initialized before mask/setup above.
                 let signals = unsafe { signals.assume_init() };
@@ -114,6 +119,7 @@ impl OriginalWriteLease {
                         break;
                     }
                 }
+                close_original(watched)
             })?;
         match startup.recv() {
             Ok(Ok(())) => {}
@@ -127,7 +133,7 @@ impl OriginalWriteLease {
             }
         }
         let lease = Self {
-            file,
+            file: Some(file),
             broken,
             stop,
             watcher: Some(watcher),
@@ -137,8 +143,11 @@ impl OriginalWriteLease {
     }
 
     pub(crate) fn verify(&self) -> io::Result<()> {
+        let file = self.file.as_ref().ok_or_else(|| {
+            io::Error::other("original mandatory write lease description has closed")
+        })?;
         // SAFETY: pointer-free query on this retained original file description.
-        let state = unsafe { libc::fcntl(self.file.as_raw_fd(), F_GETLEASE) };
+        let state = unsafe { libc::fcntl(file.as_raw_fd(), F_GETLEASE) };
         if state < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -149,15 +158,75 @@ impl OriginalWriteLease {
         }
         Ok(())
     }
+
+    /// Release only this original lease, join its actual owner task, and close
+    /// both retained duplicates. A broken lease is never renewed or forgiven.
+    pub(crate) fn close(mut self) -> io::Result<()> {
+        let mut failure = self.verify().err();
+        if let Err(error) = self.close_resources() {
+            failure.get_or_insert(error);
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn close_resources(&mut self) -> io::Result<()> {
+        let mut failure = None;
+        if let Some(file) = &self.file {
+            // SAFETY: release this exact original open description before
+            // stopping its specifically directed SIGIO watcher.
+            if unsafe { libc::fcntl(file.as_raw_fd(), F_SETLEASE, libc::F_UNLCK) } < 0 {
+                failure.get_or_insert_with(io::Error::last_os_error);
+            }
+            // SAFETY: actual kernel lease state through the same live FD.
+            let state = unsafe { libc::fcntl(file.as_raw_fd(), F_GETLEASE) };
+            if state != libc::F_UNLCK {
+                failure.get_or_insert_with(|| {
+                    if state < 0 {
+                        io::Error::last_os_error()
+                    } else {
+                        io::Error::other("original mandatory kernel lease did not release")
+                    }
+                });
+            }
+        }
+        self.stop.store(true, Ordering::Release);
+        if let Some(watcher) = self.watcher.take() {
+            match watcher.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    failure.get_or_insert(error);
+                }
+                Err(_) => {
+                    failure.get_or_insert_with(|| {
+                        io::Error::other(
+                            "original lease watcher task panicked before confirmed close",
+                        )
+                    });
+                }
+            }
+        }
+        if let Some(file) = self.file.take() {
+            if let Err(error) = close_original(file) {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
 }
 
 impl Drop for OriginalWriteLease {
     fn drop(&mut self) {
-        // SAFETY: release precedes terminating the specifically directed watcher task.
-        unsafe { libc::fcntl(self.file.as_raw_fd(), F_SETLEASE, libc::F_UNLCK) };
-        self.stop.store(true, Ordering::Release);
-        if let Some(watcher) = self.watcher.take() {
-            let _ = watcher.join();
-        }
+        // Best-effort abandonment never supplies a successful close receipt.
+        let _ = self.close_resources();
     }
+}
+
+fn close_original(file: File) -> io::Result<()> {
+    let descriptor = file.into_raw_fd();
+    // SAFETY: consume this original descriptor exactly once. Never retry EINTR,
+    // because Linux may already have closed and reused the descriptor number.
+    if unsafe { libc::close(descriptor) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
