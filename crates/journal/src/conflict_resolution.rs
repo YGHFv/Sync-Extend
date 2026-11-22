@@ -389,6 +389,28 @@ fn bind(connection: &Connection, header: &Header, plan: &FileResolutionPlan) -> 
     Ok(())
 }
 
+/// Reuse canonical migration DDL without adding its target stubs to the compared catalog.
+pub(crate) fn compiled_unix_retirement_trigger_sql(name: &str) -> Result<&'static str> {
+    static DEFINITIONS: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
+    if DEFINITIONS.get().is_none() {
+        let reference = Connection::open_in_memory()?;
+        for table in crate::storage_retirement_unix::schema::REFERENCES {
+            reference.execute_batch(&format!("CREATE TABLE {table}(content_id TEXT);"))?;
+        }
+        reference.execute_batch(include_str!("migration-068.sql"))?;
+        let definitions = reference
+            .prepare("SELECT name,sql FROM main.sqlite_schema WHERE type='trigger' ORDER BY name")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<BTreeMap<String, String>>>()?;
+        let _ = DEFINITIONS.set(definitions);
+    }
+    DEFINITIONS
+        .get()
+        .and_then(|definitions| definitions.get(name))
+        .map(String::as_str)
+        .ok_or(invalid("compiled Unix retirement trigger absent"))
+}
+
 pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     fn objects(db: &Connection) -> Result<Vec<(String, String, Option<String>)>> {
         Ok(db.prepare_cached("SELECT type,name,sql FROM main.sqlite_schema WHERE name LIKE 'conflict_resolution_%' OR tbl_name LIKE 'conflict_resolution_%' ORDER BY type,name")?
@@ -437,6 +459,14 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
         expected.execute_batch(include_str!("migration-047.sql"))?;
         expected.execute_batch(include_str!("migration-048.sql"))?;
         expected.execute_batch(include_str!("conflict_resolution_retirement_fences.sql"))?;
+        for name in [
+            "unix_storage_retirement_v1_fence_conflict_resolution_objects_insert",
+            "unix_storage_retirement_v1_fence_conflict_resolution_objects_update",
+            "unix_storage_retirement_v1_fence_conflict_resolution_native_history_objects_insert",
+            "unix_storage_retirement_v1_fence_conflict_resolution_native_history_objects_update",
+        ] {
+            expected.execute_batch(compiled_unix_retirement_trigger_sql(name)?)?;
+        }
         let definitions = objects(&expected)?;
         let _ = EXPECTED.set(definitions);
     }

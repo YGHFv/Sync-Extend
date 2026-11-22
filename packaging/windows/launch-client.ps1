@@ -40,8 +40,11 @@ if (!(Test-Path -LiteralPath (Join-Path $InstallRoot 'state.json') -PathType Lea
     $null = & $manage start -InstallRoot $InstallRoot -Deployment $deploymentPath
 } else {
     $current = & $manage status -InstallRoot $InstallRoot
-    if (!$current.process_active) {
-        $null = & $manage start -InstallRoot $InstallRoot -Deployment $deploymentPath
+    if (!$current.pending_restore -and !$current.process_active -and $current.state -ceq 'stopped' -and
+        $current.process_exit_verified -ceq $true) {
+        # Reopening a pending restore must reach the client Continue controls.
+        # A normal stopped launch retains the already selected installed image.
+        $null = & $manage resume -InstallRoot $InstallRoot -Deployment $deploymentPath
     }
 }
 & (Join-Path $PSScriptRoot 'client.ps1') -Deployment $deploymentPath -Binary $binaryPath -InstallRoot $InstallRoot `

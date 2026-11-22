@@ -346,6 +346,14 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
         }
         expected.execute_batch(include_str!("migration-041.sql"))?;
         expected.execute_batch(include_str!("remote_replace_retirement_fences.sql"))?;
+        for name in [
+            "unix_storage_retirement_v1_fence_remote_replace_objects_insert",
+            "unix_storage_retirement_v1_fence_remote_replace_objects_update",
+        ] {
+            let definition =
+                crate::conflict_resolution::compiled_unix_retirement_trigger_sql(name)?;
+            expected.execute_batch(definition)?;
+        }
         let definitions = objects(&expected)?;
         let _ = EXPECTED.set(definitions);
     }

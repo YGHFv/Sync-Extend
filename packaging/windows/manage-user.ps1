@@ -346,6 +346,8 @@ function Get-PendingRestore {
         (Get-SyncExtendRestoreByteDigest $budgetBytes) -cne $pending.budget_sha256) {
         throw 'Pending restoration raw budget digest changed.'
     }
+    Assert-SyncExtendRestoreBudgets (ConvertFrom-SyncExtendJson (
+        [Text.UTF8Encoding]::new($false, $true).GetString($budgetBytes)))
     return $pending
 }
 
@@ -525,8 +527,8 @@ function Confirm-RestorePreparation($Pending, $Preparation) {
         (Get-SyncExtendRestoreObjectDigest $Preparation.intent.scope) -cne $Pending.scope_sha256) {
         throw 'Native preparation transaction or exact selection scope changed.'
     }
-    $budgets = ConvertFrom-Json -InputObject ([Text.UTF8Encoding]::new($false, $true).GetString(
-        [Convert]::FromHexString($Pending.budget_hex))) -AsHashtable
+    $budgets = ConvertFrom-SyncExtendJson ([Text.UTF8Encoding]::new($false, $true).GetString(
+        [Convert]::FromHexString($Pending.budget_hex)))
     if ((Get-SyncExtendRestoreObjectDigest $Preparation.intent.limits) -cne
             (Get-SyncExtendRestoreObjectDigest $budgets.plan)) { throw 'Native plan budgets changed.' }
     $checks = @(
@@ -794,7 +796,7 @@ function Invoke-ManagedRestore($Record, $Pending, [bool]$Resume) {
                 $read += $received
             }
         } finally { $budgetStream.Dispose() }
-        $budgets = ConvertFrom-Json -InputObject ([Text.UTF8Encoding]::new($false, $true).GetString($budgetBytes)) -AsHashtable
+        $budgets = ConvertFrom-SyncExtendJson ([Text.UTF8Encoding]::new($false, $true).GetString($budgetBytes))
         Assert-SyncExtendRestoreBudgets $budgets
         $profile = Read-SyncExtendJson $Record.deployment
         $dataDir = Get-RestoreDataDirectory $profile $request.request.space_id

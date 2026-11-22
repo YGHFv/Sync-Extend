@@ -302,7 +302,7 @@ function ConvertFrom-SyncExtendRestoreRequestHex([string]$Hex) {
     }
     $bytes = [Convert]::FromHexString($Hex)
     $json = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
-    $request = ConvertFrom-Json -InputObject $json -AsHashtable -ErrorAction Stop
+    $request = ConvertFrom-SyncExtendJson $json
     Assert-SyncExtendRestoreRequest $request
     return $request
 }

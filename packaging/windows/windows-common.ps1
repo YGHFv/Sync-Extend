@@ -26,9 +26,42 @@ function Read-SyncExtendJson {
     try {
         if ($stream.Length -gt $MaxBytes) { throw 'The selected JSON file exceeds its size limit.' }
         $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false, $true), $false)
-        try { return ($reader.ReadToEnd() | ConvertFrom-Json -AsHashtable -ErrorAction Stop) }
+        try { return ConvertFrom-SyncExtendJson ($reader.ReadToEnd()) }
         finally { $reader.Dispose() }
     } finally { $stream.Dispose() }
+}
+
+function ConvertFrom-SyncExtendJson {
+    param([Parameter(Mandatory)][string]$Text)
+
+    # Validate the original text before PowerShell can collapse duplicate keys.
+    # JsonProperty.Name is decoded, so "plan" and "\u0070lan" are the same key.
+    $document = $null
+    try {
+        $options = [Text.Json.JsonDocumentOptions]::new()
+        $options.MaxDepth = 128
+        $document = [Text.Json.JsonDocument]::Parse($Text, $options)
+        $pending = [Collections.Generic.Stack[Text.Json.JsonElement]]::new()
+        $pending.Push($document.RootElement)
+        while ($pending.Count) {
+            $element = $pending.Pop()
+            if ($element.ValueKind -eq [Text.Json.JsonValueKind]::Object) {
+                $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                foreach ($property in $element.EnumerateObject()) {
+                    if (!$names.Add($property.Name)) { throw 'Duplicate decoded JSON object key.' }
+                    $pending.Push($property.Value)
+                }
+            } elseif ($element.ValueKind -eq [Text.Json.JsonValueKind]::Array) {
+                foreach ($item in $element.EnumerateArray()) { $pending.Push($item) }
+            }
+        }
+    } catch {
+        throw 'The JSON contains invalid syntax or duplicate object fields.'
+    } finally {
+        if ($document) { $document.Dispose() }
+    }
+    try { return ConvertFrom-Json -InputObject $Text -AsHashtable -ErrorAction Stop }
+    catch { throw 'The JSON cannot be represented by the supported client format.' }
 }
 
 function New-SyncExtendProcess {
@@ -53,19 +86,67 @@ function Invoke-SyncExtendJson {
     param([string]$Image, [string[]]$Arguments, [int]$TimeoutMs = 12000)
 
     $child = New-SyncExtendProcess $Image $Arguments -Capture
+    $stdout = $null
+    $stderr = $null
+    $exited = $false
+    $capturesClosed = $false
+    $captureDeadline = $null
     try {
+        $null = $child.Handle
         $stdout = $child.StandardOutput.ReadToEndAsync()
         $stderr = $child.StandardError.ReadToEndAsync()
-        if (!$child.WaitForExit($TimeoutMs)) {
-            $child.Kill()
-            [void]$child.WaitForExit(5000)
+        $exited = $child.WaitForExit($TimeoutMs)
+        if (!$exited) {
             throw "The $($Arguments[0]) command timed out."
         }
         if ($child.ExitCode -ne 0) { throw "The $($Arguments[0]) command was refused (exit $($child.ExitCode))." }
+        $captureDeadline = [Diagnostics.Stopwatch]::StartNew()
+        if (![Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stdout, $stderr), 5000)) {
+            throw 'The original client helper capture tasks did not close within the cleanup deadline.'
+        }
         $result = $stdout.GetAwaiter().GetResult()
-        if ($result.Length -gt 1100000) { throw 'The local response exceeds its size limit.' }
-        return ($result | ConvertFrom-Json -AsHashtable -ErrorAction Stop)
-    } finally { $child.Dispose() }
+        $null = $stderr.GetAwaiter().GetResult()
+        $capturesClosed = $true
+        if ([Text.Encoding]::UTF8.GetByteCount($result) -gt 1100000) { throw 'The local response exceeds its size limit.' }
+        return ConvertFrom-SyncExtendJson $result
+    } finally {
+        try {
+            if (!$exited) {
+                # Kill can race the original process's natural exit. This
+                # exact Process is still waited before any exit is reported.
+                try { if (!$child.HasExited) { $child.Kill() } }
+                catch { if (!$child.HasExited) { $exited = $false } }
+                $exited = $child.WaitForExit(5000)
+            }
+            if (!$exited) { throw 'The original client helper exit remains unverified after the cleanup deadline.' }
+            if (!$capturesClosed) {
+                if (!$captureDeadline) { $captureDeadline = [Diagnostics.Stopwatch]::StartNew() }
+                $remaining = [int][Math]::Max(0, 5000 - $captureDeadline.ElapsedMilliseconds)
+                $captures = [Threading.Tasks.Task[]]@(@($stdout, $stderr) | Where-Object { $null -ne $_ })
+                if ($captures.Count -and ![Threading.Tasks.Task]::WaitAll($captures, $remaining)) {
+                    throw 'The original client helper capture tasks did not close within the cleanup deadline.'
+                }
+                if ($stdout) { $null = $stdout.GetAwaiter().GetResult() }
+                if ($stderr) { $null = $stderr.GetAwaiter().GetResult() }
+                $capturesClosed = $true
+            }
+        } finally {
+            if ($exited -and $capturesClosed) {
+                $child.Dispose()
+            } else {
+                # Keep the exact original handles reachable in this invocation;
+                # an unresolved cleanup is an error, never an exit receipt.
+                if (!$script:syncExtendUnclosedHelpers) {
+                    $script:syncExtendUnclosedHelpers = [Collections.Generic.List[object]]::new()
+                }
+                $script:syncExtendUnclosedHelpers.Add(@{
+                    process = $child; stdout = $stdout; stderr = $stderr
+                    process_exit_verified = $exited; capture_tasks_closed = $capturesClosed
+                    command = $Arguments[0]
+                })
+            }
+        }
+    }
 }
 
 function Write-SyncExtendJson {
