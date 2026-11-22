@@ -560,3 +560,57 @@ impl OriginalNodeCompletionObservation<'_, '_> {
             .verify_original_completion_membership(&self.manifest)
     }
 }
+
+/// A sealed borrow of the living completion. It exposes owned identity values
+/// and exact roots, never LocalSpace or recovered native mutation authority.
+pub(crate) struct DeploymentCompletionBinding<'proof, 'local, 'scope> {
+    original: &'proof OriginalNodeCompletionObservation<'local, 'scope>,
+}
+
+impl<'local, 'scope> OriginalNodeCompletionObservation<'local, 'scope> {
+    pub(crate) fn deployment_binding(
+        &self,
+    ) -> Result<DeploymentCompletionBinding<'_, 'local, 'scope>> {
+        self.verify()?;
+        Ok(DeploymentCompletionBinding { original: self })
+    }
+}
+
+impl DeploymentCompletionBinding<'_, '_, '_> {
+    pub(crate) fn verify(&self) -> Result<()> {
+        self.original.verify()
+    }
+    pub(crate) fn archive_digest(&self) -> &ContentId {
+        &self.original.manifest.archive_digest
+    }
+    pub(crate) fn data_dir(&self) -> &std::path::Path {
+        std::path::Path::new(&self.original.manifest.original_data_target)
+    }
+    pub(crate) fn worktree(&self) -> &std::path::Path {
+        std::path::Path::new(&self.original.manifest.original_worktree_target)
+    }
+    pub(crate) fn data_key(&self) -> &str {
+        &self.original.manifest.data_root_key
+    }
+    pub(crate) fn worktree_key(&self) -> &str {
+        &self.original.manifest.worktree_root_key
+    }
+    pub(crate) fn manifest_digest(&self) -> Result<ContentId> {
+        self.verify()?;
+        let digest = ContentId::hash(&self.original.manifest.bytes()?);
+        self.verify()?;
+        Ok(digest)
+    }
+    pub(crate) fn space_id(&self) -> Result<SpaceId> {
+        self.verify()?;
+        let space = self.original.local.status()?.space_id;
+        self.verify()?;
+        Ok(space)
+    }
+    pub(crate) fn device_id(&self) -> Result<sync_extend_core_model::DeviceId> {
+        self.verify()?;
+        let device = self.original.local.status()?.device_id;
+        self.verify()?;
+        Ok(device)
+    }
+}

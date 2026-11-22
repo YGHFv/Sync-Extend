@@ -23,6 +23,13 @@ use windows_sys::Win32::{
 #[path = "directory_create.rs"]
 mod directory_create;
 pub use directory_create::OriginalDirectoryCreation;
+#[path = "protected_artifact_windows.rs"]
+mod protected_artifact;
+pub use protected_artifact::{
+    SealedWindowsProtectedArtifact, WindowsFailedArtifactCreation,
+    WindowsProtectedArtifactCreateFailure, WindowsProtectedArtifactCreator,
+    WindowsProtectedArtifactParent, WindowsProtectedArtifactSealFailure,
+};
 #[path = "owned_file.rs"]
 mod owned_file;
 pub use owned_file::{
@@ -49,6 +56,42 @@ fn key(file: &File) -> io::Result<FileKey> {
         volume: info.VolumeSerialNumber,
         id: u128::from_le_bytes(info.FileId.Identifier),
     })
+}
+
+/// Same-object identity/read handoff shared by original creators. A metadata
+/// witness must stay live while an incompatible exclusive HANDLE is closed.
+/// The fixed choices grant no namespace CREATE or recovered mutation rights.
+fn reopen_same_file_object(source: &File, expected: FileKey, read: bool) -> io::Result<File> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::{Foundation::INVALID_HANDLE_VALUE, Storage::FileSystem::ReOpenFile};
+    regular(source, false)?;
+    if key(source)? != expected {
+        return Err(invalid("same-object handoff source identity differs"));
+    }
+    // SAFETY: source owns the original live object. Fixed read/identity access
+    // and sharing flags create another handle to it without pathname resolution.
+    let handle = unsafe {
+        ReOpenFile(
+            source.as_raw_handle() as HANDLE,
+            if read { GENERIC_READ } else { 0 },
+            if read {
+                FILE_SHARE_READ
+            } else {
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+            },
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful ReOpenFile returned one newly owned HANDLE.
+    let reopened = unsafe { File::from_raw_handle(handle) };
+    regular(&reopened, false)?;
+    if key(&reopened)? != expected {
+        return Err(invalid("same-object handoff retained identity differs"));
+    }
+    Ok(reopened)
 }
 
 impl FileKey {

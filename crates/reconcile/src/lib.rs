@@ -1585,12 +1585,16 @@ mod explicit_credential_mapping;
 #[cfg(windows)]
 mod explicit_management_mapping;
 mod management_dashboard;
+#[cfg(any(windows, target_os = "linux"))]
+mod protected_deployment;
 #[cfg(windows)]
 pub use explicit_credential_mapping::{
     ExplicitWebDavCredentialMapping, InstalledExplicitWebDavCredential,
 };
 #[cfg(windows)]
 pub use explicit_management_mapping::ExplicitManagementCredentialMapping;
+#[cfg(any(windows, target_os = "linux"))]
+pub use protected_deployment::*;
 
 #[cfg(not(windows))]
 fn acquire_lock(data: &Path) -> Result<File> {

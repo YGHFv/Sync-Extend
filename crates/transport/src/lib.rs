@@ -44,6 +44,7 @@ pub use resolution_wire::{
 };
 mod signed;
 mod tls;
+pub use tls::{deployment_server_config, verify_deployment_tls_pair};
 mod wire;
 
 pub use conflict_resolution::{

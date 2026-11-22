@@ -9,57 +9,7 @@ use sync_extend_core_model::{
 use sync_extend_reconcile::WebDavBudgetLimits;
 
 /// Listener-local explicit collection limits; no new product defaults are inferred.
-#[derive(Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct CollectionLimits {
-    max_entries: usize,
-    max_operations: usize,
-    max_handles: usize,
-    max_actions: usize,
-    max_templates: usize,
-    max_binding_json: u64,
-    max_manifest_json: u64,
-    max_receipt_json: u64,
-    max_execution_json: u64,
-    max_metadata_bytes: u64,
-    max_retained_bytes: u64,
-    max_native_bytes: u64,
-    max_failure_body_bytes: usize,
-}
-impl CollectionLimits {
-    fn validate(&self, local: &LocalLimits) -> Result<(), u16> {
-        let ceiling = sync_extend_core_model::tree_restore_history::MAX_TREE_HISTORY_BYTES;
-        if self.max_entries == 0
-            || self.max_entries > local.max_scan_entries
-            || self.max_operations == 0
-            || self.max_operations > local.max_storage_entries
-            || self.max_handles == 0
-            || self.max_handles > local.max_storage_entries
-            || self.max_actions == 0
-            || self.max_actions > local.max_storage_entries
-            || self.max_templates == 0
-            || self.max_templates > local.max_storage_entries
-            || self.max_binding_json == 0
-            || self.max_binding_json > ceiling
-            || self.max_manifest_json == 0
-            || self.max_manifest_json > ceiling
-            || self.max_receipt_json == 0
-            || self.max_receipt_json > ceiling
-            || self.max_execution_json == 0
-            || self.max_execution_json > ceiling
-            || self.max_metadata_bytes == 0
-            || self.max_metadata_bytes > local.max_scan_bytes
-            || self.max_metadata_bytes > ceiling
-            || self.max_retained_bytes > local.max_staging_bytes
-            || self.max_native_bytes > local.max_staging_bytes
-            || self.max_failure_body_bytes == 0
-            || self.max_failure_body_bytes > 4 * 1024 * 1024
-        {
-            return Err(503);
-        }
-        Ok(())
-    }
-}
+pub(super) use sync_extend_core_model::deployment::DeploymentCollectionLimits as CollectionLimits;
 fn inside(path: &PortablePath, root: &PortablePath) -> bool {
     path == root
         || path
@@ -105,7 +55,7 @@ pub(super) fn dispatch(
         return Err(405);
     }
     let policy = runtime.collection_limits.as_ref().ok_or(503u16)?;
-    policy.validate(limits)?;
+    policy.validate(limits).map_err(|_| 503u16)?;
     let source = authorized.path.as_ref().ok_or(405u16)?.clone();
     let original = find(&baseline, Some(&source));
     let export = runtime

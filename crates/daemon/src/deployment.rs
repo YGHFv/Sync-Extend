@@ -1,13 +1,15 @@
 //! Expand deployment configuration to one existing foreground command in the same process.
 use super::{Cli, Command};
 use std::path::{Component, Path};
-use sync_extend_core_model::deployment::{DeploymentConfig, DeploymentRole};
+use sync_extend_core_model::deployment::{
+    decode_deployment_document, DeploymentConfig, DeploymentRole,
+};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub fn load(path: &Path) -> Result<DeploymentConfig> {
     let bytes = super::config_file::read(path, 65_536)?;
-    let config: DeploymentConfig = serde_json::from_slice(&bytes)?;
+    let config: DeploymentConfig = decode_deployment_document(&bytes, 65_536)?;
     config.validate()?;
     Ok(config)
 }

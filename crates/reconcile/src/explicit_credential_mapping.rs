@@ -75,8 +75,8 @@ impl ExplicitWebDavCredentialMapping {
         mapped: &WebDavListener,
         max_aggregate_bytes: usize,
     ) -> Result<Self> {
-        let original_listener = listener_digest(original)?;
-        let mapped_listener = listener_digest(mapped)?;
+        listener_digest(original)?;
+        listener_digest(mapped)?;
         if !normalized(source) || max_aggregate_bytes == 0 || max_aggregate_bytes > 4 * MAX_BYTES {
             return Err(ReconcileError::Invariant(
                 "explicit credential path aggregate bounds",
@@ -120,8 +120,64 @@ impl ExplicitWebDavCredentialMapping {
                 "original credential stable bounded bytes",
             ));
         }
+        file.verify_single_link()?;
+        sync_extend_platform_fs::verify_current_user_private_file(file.reader())?;
+        if !file.matches_path(source)? {
+            return Err(ReconcileError::Unstable);
+        }
+        let result =
+            Self::from_bound_ciphertext(&encrypted, original, mapped, max_aggregate_bytes)?;
+        file.verify_single_link()?;
+        sync_extend_platform_fs::verify_current_user_private_file(file.reader())?;
+        if !file.matches_path(source)? {
+            return Err(ReconcileError::Unstable);
+        }
+        Ok(result)
+    }
+
+    /// Verified v2 protection supplies the original DPAPI ciphertext directly.
+    pub fn from_verified_protected_artifact(
+        source: &crate::VerifiedProtectedArtifact,
+        original: &WebDavListener,
+        mapped: &WebDavListener,
+        max_aggregate_bytes: usize,
+    ) -> Result<Self> {
+        if source.protection_scope().provider
+            != crate::ProtectionProviderKind::WindowsCurrentUserDpapi
+        {
+            return Err(ReconcileError::Invariant(
+                "WebDAV original DPAPI provider scope",
+            ));
+        }
+        let encrypted = source.checked_original_bytes(
+            crate::ProtectedArtifactRole::WebdavCredential,
+            &listener_digest(original)?,
+        )?;
+        Self::from_bound_ciphertext(encrypted, original, mapped, max_aggregate_bytes)
+    }
+
+    fn from_bound_ciphertext(
+        encrypted: &[u8],
+        original: &WebDavListener,
+        mapped: &WebDavListener,
+        max_aggregate_bytes: usize,
+    ) -> Result<Self> {
+        let original_listener = listener_digest(original)?;
+        let mapped_listener = listener_digest(mapped)?;
+        let mut expected = original.clone();
+        expected.listener_id = mapped.listener_id.clone();
+        if expected != *mapped
+            || encrypted.is_empty()
+            || encrypted.len() > MAX_BYTES
+            || max_aggregate_bytes == 0
+            || max_aggregate_bytes > 4 * MAX_BYTES
+        {
+            return Err(ReconcileError::Invariant(
+                "protected WebDAV exact listener and aggregate scope",
+            ));
+        }
         let clear =
-            windows_dpapi::decrypt_data(&encrypted, windows_dpapi::Scope::User, Some(ENTROPY))
+            windows_dpapi::decrypt_data(encrypted, windows_dpapi::Scope::User, Some(ENTROPY))
                 .map_err(|_| {
                     ReconcileError::Invariant("original current user credential protection")
                 })?;
@@ -130,8 +186,9 @@ impl ExplicitWebDavCredentialMapping {
                 "original clear credential bytes",
             ));
         }
-        let mut stored: Stored = serde_json::from_slice(&clear)
-            .map_err(|_| ReconcileError::Invariant("original credential encoding"))?;
+        let mut stored: Stored =
+            sync_extend_core_model::deployment::decode_deployment_document(&clear, MAX_BYTES)
+                .map_err(|_| ReconcileError::Invariant("original credential encoding"))?;
         validate(&stored, original)?;
         stored.listener_id = mapped.listener_id.clone();
         let mapped_clear = serde_json::to_vec(&stored)
@@ -159,7 +216,7 @@ impl ExplicitWebDavCredentialMapping {
             ));
         }
         Ok(Self {
-            original_ciphertext: ContentId::hash(&encrypted),
+            original_ciphertext: ContentId::hash(encrypted),
             mapped_ciphertext: ContentId::hash(&protected),
             protected,
             original_listener,
@@ -177,6 +234,9 @@ impl ExplicitWebDavCredentialMapping {
     }
     pub fn mapped_listener_digest(&self) -> &ContentId {
         &self.mapped_listener
+    }
+    pub(crate) fn protected_bytes_for_deployment(&self) -> &[u8] {
+        &self.protected
     }
 
     /// Exact retained parent and CREATE_NEW establish ownership. Foreign files

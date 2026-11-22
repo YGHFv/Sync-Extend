@@ -20,6 +20,7 @@ use std::{
     time::Duration,
 };
 use sync_extend_core_model::{
+    deployment::{DeploymentGatewayConfig, DeploymentPlatform, LoopbackTlsConfig},
     limits::LocalLimits,
     webdav::{self, AuthorizedWebDavPath, WebDavListener},
     Entry, EntryKind, PortablePath, SpaceId,
@@ -37,7 +38,7 @@ pub use diagnostics::{check, test_connection};
 #[path = "webdav_collections.rs"]
 mod collections;
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Runtime {
     pub listener: WebDavListener,
@@ -45,16 +46,58 @@ pub struct Runtime {
     pub uploads: PathBuf,
     pub spaces: BTreeMap<SpaceId, PathBuf>,
     host_loopback_tls: Option<host_tls::HostLoopbackTls>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    listener_tls: Option<LoopbackTlsConfig>,
     #[cfg(windows)]
     collection_limits: Option<collections::CollectionLimits>,
 }
 
 impl Runtime {
     pub fn scheme(&self) -> &'static str {
-        if self.host_loopback_tls.is_some() {
+        if self.host_loopback_tls.is_some() || self.listener_tls.is_some() {
             "https"
         } else {
             "http"
+        }
+    }
+
+    pub(crate) fn deployment_document(
+        &self,
+    ) -> Result<DeploymentGatewayConfig, Box<dyn std::error::Error>> {
+        let document = DeploymentGatewayConfig {
+            listener: self.listener.clone(),
+            credentials: self.credentials.clone(),
+            uploads: self.uploads.clone(),
+            spaces: self.spaces.clone(),
+            host_loopback_tls: self
+                .host_loopback_tls
+                .as_ref()
+                .map(|policy| policy.0.clone()),
+            listener_tls: self.listener_tls.clone(),
+            #[cfg(windows)]
+            collection_limits: self.collection_limits.clone(),
+            #[cfg(not(windows))]
+            collection_limits: None,
+        };
+        document.validate(if cfg!(windows) {
+            DeploymentPlatform::Windows
+        } else {
+            DeploymentPlatform::Linux
+        })?;
+        Ok(document)
+    }
+
+    fn selected_tls_config(
+        &self,
+    ) -> Result<Option<Arc<rustls::ServerConfig>>, Box<dyn std::error::Error>> {
+        match (&self.host_loopback_tls, &self.listener_tls) {
+            (Some(policy), None) => Ok(Some(policy.server_config()?)),
+            (None, Some(policy)) => Ok(Some(host_tls::loopback_server_config(
+                policy,
+                self.listener.address,
+            )?)),
+            (None, None) => Ok(None),
+            _ => Err("select one exact gateway TLS endpoint".into()),
         }
     }
 
@@ -77,9 +120,33 @@ impl Runtime {
 
 pub fn load(path: &Path) -> Result<Runtime, Box<dyn std::error::Error>> {
     let bytes = super::config_file::read(path, 65_536)?;
-    let runtime: Runtime = serde_json::from_slice(&bytes)?;
+    parse_original_bytes(&bytes)
+}
+
+pub(crate) fn parse_original_bytes(bytes: &[u8]) -> Result<Runtime, Box<dyn std::error::Error>> {
+    let document = DeploymentGatewayConfig::parse_for_platform(
+        bytes,
+        if cfg!(windows) {
+            DeploymentPlatform::Windows
+        } else {
+            DeploymentPlatform::Linux
+        },
+    )?;
+    let runtime = Runtime {
+        listener: document.listener,
+        credentials: document.credentials,
+        uploads: document.uploads,
+        spaces: document.spaces,
+        host_loopback_tls: document.host_loopback_tls.map(host_tls::HostLoopbackTls),
+        listener_tls: document.listener_tls,
+        #[cfg(windows)]
+        collection_limits: document.collection_limits,
+    };
     runtime.listener.validate()?;
     if let Some(policy) = &runtime.host_loopback_tls {
+        policy.validate(runtime.listener.address)?;
+    }
+    if let Some(policy) = &runtime.listener_tls {
         policy.validate(runtime.listener.address)?;
     }
     if !runtime.credentials.is_absolute()
@@ -116,13 +183,7 @@ pub fn serve(
     let tls = runtime
         .listener
         .enabled
-        .then(|| {
-            runtime
-                .host_loopback_tls
-                .as_ref()
-                .map(host_tls::HostLoopbackTls::server_config)
-                .transpose()
-        })
+        .then(|| runtime.selected_tls_config())
         .transpose()?
         .flatten();
     // Bind and authenticate before opening long-lived worktree owners, so a

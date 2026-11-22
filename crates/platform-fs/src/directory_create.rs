@@ -193,10 +193,38 @@ fn create_new_child_lifetime(
 }
 
 pub(super) fn create_new_current_user_file(file: &File, name: &str) -> io::Result<File> {
+    create_new_current_user_file_attempt(file, name).map_err(|failure| failure.error)
+}
+
+pub(super) struct NativeChildCreateFailure {
+    pub(super) error: io::Error,
+    pub(super) original_created: Option<File>,
+}
+
+impl From<io::Error> for NativeChildCreateFailure {
+    fn from(error: io::Error) -> Self {
+        Self {
+            error,
+            original_created: None,
+        }
+    }
+}
+
+/// The exact original HANDLE survives every check failure after native CREATE.
+/// The ordinary API above retains its existing close-on-error behavior.
+pub(super) fn create_new_current_user_file_attempt(
+    file: &File,
+    name: &str,
+) -> Result<File, NativeChildCreateFailure> {
     let security = super::current_user_file::CurrentUserSecurity::new()?;
     let created =
-        create_new_child_security(file, name, NewChildKind::File, false, Some(&security))?;
-    super::current_user_file::verify_current_user_private_file(&created)?;
+        create_new_child_security_attempt(file, name, NewChildKind::File, false, Some(&security))?;
+    if let Err(error) = super::current_user_file::verify_current_user_private_file(&created) {
+        return Err(NativeChildCreateFailure {
+            error,
+            original_created: Some(created),
+        });
+    }
     Ok(created)
 }
 
@@ -207,6 +235,17 @@ fn create_new_child_security(
     delete_on_close: bool,
     security: Option<&super::current_user_file::CurrentUserSecurity>,
 ) -> io::Result<File> {
+    create_new_child_security_attempt(file, name, kind, delete_on_close, security)
+        .map_err(|failure| failure.error)
+}
+
+fn create_new_child_security_attempt(
+    file: &File,
+    name: &str,
+    kind: NewChildKind,
+    delete_on_close: bool,
+    security: Option<&super::current_user_file::CurrentUserSecurity>,
+) -> Result<File, NativeChildCreateFailure> {
     use std::os::windows::io::FromRawHandle;
     use windows_sys::{
         Wdk::{
@@ -227,11 +266,11 @@ fn create_new_child_security(
     };
     if matches!(kind, NewChildKind::StagingDirectory) {
         if name != ".sync-tmp" {
-            return Err(invalid("internal scaffold name differs"));
+            return Err(invalid("internal scaffold name differs").into());
         }
     } else if matches!(kind, NewChildKind::WorktreeMarkerDirectory) {
         if name != ".sync-extend" {
-            return Err(invalid("fixed worktree marker name differs"));
+            return Err(invalid("fixed worktree marker name differs").into());
         }
     } else {
         validate_directory_component(name)?;
@@ -328,15 +367,15 @@ fn create_new_child_security(
     };
     if status < 0 {
         // SAFETY: conversion takes only the NTSTATUS returned by the syscall.
-        return Err(io::Error::from_raw_os_error(
-            unsafe { RtlNtStatusToDosError(status) } as i32,
-        ));
+        return Err(
+            io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32).into(),
+        );
     }
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return Err(invalid("native create returned no owned handle"));
+        return Err(invalid("native create returned no owned handle").into());
     }
     // SAFETY: successful synchronous creation returned one owned native handle.
-    // File assumes ownership once and closes it on every later error path.
+    // File assumes ownership once. The attempt API retains it after errors.
     let created = unsafe { File::from_raw_handle(handle) };
     // SAFETY: synchronous completion initialized the status member of the union.
     let completion = unsafe { status_block.Anonymous.Status };
@@ -344,14 +383,26 @@ fn create_new_child_security(
         || completion != STATUS_SUCCESS
         || status_block.Information != FILE_CREATED as usize
     {
-        return Err(invalid("new native creation ownership unavailable"));
+        return Err(NativeChildCreateFailure {
+            error: invalid("new native creation ownership unavailable"),
+            original_created: Some(created),
+        });
     }
-    regular(&created, directory)?;
-    if directory {
-        require_case_insensitive(&created)?;
-    }
-    if key(&created)?.volume != parent_key.volume {
-        return Err(invalid("created native volume changed"));
+    let checked = (|| -> io::Result<()> {
+        regular(&created, directory)?;
+        if directory {
+            require_case_insensitive(&created)?;
+        }
+        if key(&created)?.volume != parent_key.volume {
+            return Err(invalid("created native volume changed"));
+        }
+        Ok(())
+    })();
+    if let Err(error) = checked {
+        return Err(NativeChildCreateFailure {
+            error,
+            original_created: Some(created),
+        });
     }
     Ok(created)
 }

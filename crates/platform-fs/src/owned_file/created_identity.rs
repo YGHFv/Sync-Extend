@@ -40,27 +40,8 @@ impl OwnedFileCreation {
             let expected_key = proof.key()?;
             let expected_parent = proof.parent_key()?;
             self.verify_single_link()?;
-            // SAFETY: self owns a live native CREATE handle. ReOpenFile opens
-            // the same object independently, never a resolved pathname. Zero
-            // desired access requests only an identity witness; it does not
-            // assert content sharing exclusion or any mutation permission.
-            let handle = unsafe {
-                ReOpenFile(
-                    self.reader().as_raw_handle() as HANDLE,
-                    0,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    FILE_FLAG_OPEN_REPARSE_POINT,
-                )
-            };
-            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: successful ReOpenFile returned one new owned native handle.
-            let witness = unsafe { File::from_raw_handle(handle) };
-            regular(&witness, false)?;
-            if key(&witness)? != expected_key {
-                return Err(invalid("released original identity differs"));
-            }
+            let witness =
+                super::super::reopen_same_file_object(self.reader(), expected_key, false)?;
             // Access to original parent is implemented within owned_file.rs;
             // this fragment is included there, where private fields are visible.
             let parent = self.parent.try_clone()?;
@@ -165,26 +146,7 @@ impl ReleasedOriginalFileIdentity {
     pub fn retain_read_after_creation(self) -> Result<ReleasedOriginalReadFile, (Self, io::Error)> {
         let open = || -> io::Result<File> {
             self.verify()?;
-            // SAFETY: original is a retained live same-object handle. Read access
-            // and FILE_SHARE_READ request actual compatible readonly protection.
-            let handle = unsafe {
-                ReOpenFile(
-                    self.original.as_raw_handle() as HANDLE,
-                    windows_sys::Win32::Foundation::GENERIC_READ,
-                    FILE_SHARE_READ,
-                    FILE_FLAG_OPEN_REPARSE_POINT,
-                )
-            };
-            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: successful ReOpenFile produced exactly one owned new handle.
-            let reader = unsafe { File::from_raw_handle(handle) };
-            regular(&reader, false)?;
-            if key(&reader)? != self.key {
-                return Err(invalid("original read handoff object differs"));
-            }
-            Ok(reader)
+            super::super::reopen_same_file_object(&self.original, self.key, true)
         };
         match open() {
             Ok(reader) => Ok(ReleasedOriginalReadFile {

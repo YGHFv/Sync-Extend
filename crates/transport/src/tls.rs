@@ -2,7 +2,7 @@ use crate::{PeerIdentity, Result, TransportError, TransportIdentity};
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     crypto::{verify_tls13_signature, CryptoProvider},
-    pki_types::{CertificateDer, ServerName, UnixTime},
+    pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName, UnixTime},
     server::danger::{ClientCertVerified, ClientCertVerifier},
     ClientConfig, DigitallySignedStruct, DistinguishedName, Error, ServerConfig, SignatureScheme,
 };
@@ -161,4 +161,56 @@ pub(crate) fn server(
     config.max_early_data_size = 0;
     config.send_tls13_tickets = 0;
     Ok(Arc::new(config))
+}
+
+/// Parse the selected PEM bytes and require an actual matching key pair.
+pub fn deployment_server_config(
+    certificate_pem: &[u8],
+    private_key_pem: &[u8],
+) -> Result<Arc<ServerConfig>> {
+    const MAX_PEM_BYTES: usize = 65_536;
+    if certificate_pem.is_empty()
+        || certificate_pem.len() > MAX_PEM_BYTES
+        || private_key_pem.is_empty()
+        || private_key_pem.len() > MAX_PEM_BYTES
+    {
+        return Err(TransportError::Authorization(
+            "bounded selected deployment TLS artifacts required",
+        ));
+    }
+    let certificates = CertificateDer::pem_slice_iter(certificate_pem)
+        .take(9)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| TransportError::Authorization("deployment certificate PEM encoding"))?;
+    if !(1..=8).contains(&certificates.len()) {
+        return Err(TransportError::Authorization(
+            "one to eight selected deployment certificates required",
+        ));
+    }
+    let mut keys = PrivateKeyDer::pem_slice_iter(private_key_pem);
+    let key = keys
+        .next()
+        .transpose()
+        .map_err(|_| TransportError::Authorization("deployment private key PEM encoding"))?
+        .ok_or(TransportError::Authorization(
+            "deployment private key absent",
+        ))?;
+    if keys.next().is_some() {
+        return Err(TransportError::Authorization(
+            "exactly one selected deployment private key required",
+        ));
+    }
+    let mut config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(certificates, key)?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.max_early_data_size = 0;
+    config.send_tls13_tickets = 0;
+    Ok(Arc::new(config))
+}
+
+pub fn verify_deployment_tls_pair(certificate_pem: &[u8], private_key_pem: &[u8]) -> Result<()> {
+    deployment_server_config(certificate_pem, private_key_pem).map(|_| ())
 }

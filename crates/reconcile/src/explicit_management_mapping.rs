@@ -86,16 +86,74 @@ impl ExplicitManagementCredentialMapping {
                 "original management stable bytes",
             ));
         }
+        file.verify_single_link()?;
+        sync_extend_platform_fs::verify_current_user_private_file(file.reader())?;
+        if !file.matches_path(&original.token_file)? {
+            return Err(ReconcileError::Unstable);
+        }
+        let result =
+            Self::from_bound_ciphertext(&encrypted, original, target, max_aggregate_bytes)?;
+        file.verify_single_link()?;
+        sync_extend_platform_fs::verify_current_user_private_file(file.reader())?;
+        if !file.matches_path(&original.token_file)? {
+            return Err(ReconcileError::Unstable);
+        }
+        Ok(result)
+    }
+
+    pub fn from_verified_protected_artifact(
+        source: &crate::VerifiedProtectedArtifact,
+        original: &ManagementConfig,
+        target: &ManagementConfig,
+        max_aggregate_bytes: usize,
+    ) -> Result<Self> {
+        if source.protection_scope().provider
+            != crate::ProtectionProviderKind::WindowsCurrentUserDpapi
+        {
+            return Err(ReconcileError::Invariant(
+                "management original DPAPI provider scope",
+            ));
+        }
+        let encrypted = source.checked_original_bytes(
+            crate::ProtectedArtifactRole::ManagementCredential,
+            &ContentId::hash(&serde_json::to_vec(original)?),
+        )?;
+        Self::from_bound_ciphertext(encrypted, original, target, max_aggregate_bytes)
+    }
+
+    fn from_bound_ciphertext(
+        encrypted: &[u8],
+        original: &ManagementConfig,
+        target: &ManagementConfig,
+        max_aggregate_bytes: usize,
+    ) -> Result<Self> {
+        original.validate()?;
+        target.validate()?;
+        let mut expected = original.clone();
+        expected.token_file = target.token_file.clone();
+        if expected != *target
+            || original.token_protection != TokenProtection::WindowsUser
+            || encrypted.is_empty()
+            || encrypted.len() > MAX
+            || max_aggregate_bytes == 0
+            || max_aggregate_bytes > 4 * MAX
+        {
+            return Err(ReconcileError::Invariant(
+                "protected management exact path-only aggregate scope",
+            ));
+        }
         let clear =
-            windows_dpapi::decrypt_data(&encrypted, windows_dpapi::Scope::User, Some(ENTROPY))
+            windows_dpapi::decrypt_data(encrypted, windows_dpapi::Scope::User, Some(ENTROPY))
                 .map_err(|_| {
                     ReconcileError::Invariant("original management current user protection")
                 })?;
         if clear.len() > MAX {
             return Err(ReconcileError::ResourceLimit("management clear bound"));
         }
-        let mut token: ProtectedToken = serde_json::from_slice(&clear)
-            .map_err(|_| ReconcileError::Invariant("original management credential encoding"))?;
+        let mut token: ProtectedToken =
+            sync_extend_core_model::deployment::decode_deployment_document(&clear, MAX).map_err(
+                |_| ReconcileError::Invariant("original management credential encoding"),
+            )?;
         if token.format_version != 1
             || token.address != original.address
             || token.token_file != original.token_file
@@ -130,7 +188,7 @@ impl ExplicitManagementCredentialMapping {
             ));
         }
         Ok(Self {
-            source_digest: ContentId::hash(&encrypted),
+            source_digest: ContentId::hash(encrypted),
             target_digest: ContentId::hash(&protected),
             protected,
             target: target.clone(),
@@ -141,6 +199,9 @@ impl ExplicitManagementCredentialMapping {
     }
     pub fn mapped_ciphertext_digest(&self) -> &ContentId {
         &self.target_digest
+    }
+    pub(crate) fn protected_bytes_for_deployment(&self) -> &[u8] {
+        &self.protected
     }
     pub fn install_current_user_file(
         self,

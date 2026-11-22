@@ -73,9 +73,18 @@ pub use publication_epoch::{
 #[allow(unsafe_code)]
 mod linux_write_lease;
 
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+mod protected_artifact_unix;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows;
+#[cfg(target_os = "linux")]
+pub use protected_artifact_unix::{
+    SealedUnixProtectedArtifact, UnixFailedArtifactCreation, UnixProtectedArtifactCreateFailure,
+    UnixProtectedArtifactCreator, UnixProtectedArtifactKey, UnixProtectedArtifactParent,
+    UnixProtectedArtifactSealFailure, UnixProtectedArtifactSource,
+};
 #[cfg(windows)]
 pub use windows::{
     regular_file_link_count, regular_file_matches_path, sqlite_main_file_identity,
@@ -84,6 +93,12 @@ pub use windows::{
     OwnedFileCreation, PublishedOriginalFile, ReacquiredNodeFile, ReacquiredNodeLock,
     ReleasedOriginalCoordinationFile, ReleasedOriginalFileIdentity, ReleasedOriginalReadFile,
     RetainedWriterDirectory, SealedOriginalFile,
+};
+#[cfg(windows)]
+pub use windows::{
+    SealedWindowsProtectedArtifact, WindowsFailedArtifactCreation,
+    WindowsProtectedArtifactCreateFailure, WindowsProtectedArtifactCreator,
+    WindowsProtectedArtifactParent, WindowsProtectedArtifactSealFailure,
 };
 
 #[allow(unsafe_code)]
