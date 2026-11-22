@@ -395,7 +395,7 @@ $restoreWorkerTimer.Add_Tick({
                 if ($Managed) { $restoreNotes.Text += "`r`n执行前会再次核对当前属主和完整范围；预览有效期为10秒。" }
             } catch { $restoreNotes.Text += "`r`n当前选择不满足执行前提；请检查冲突、源保留状态和当前基线。" }
         } catch {
-            Reset-ClientRestorePreview
+            Clear-ClientRestore
             $restoreNotes.Text = '预览被拒绝或当前属主已变化。请刷新状态，检查选择后重试。'
         }
         Set-ClientRestoreBusy $false
