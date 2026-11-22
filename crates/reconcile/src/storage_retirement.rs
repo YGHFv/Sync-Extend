@@ -21,7 +21,7 @@ pub struct StorageRetirementAssessment {
 }
 
 impl StorageNode {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     pub(super) fn retained_retirement_metadata_hash(
         &self,
         storage_id: &ContentId,
