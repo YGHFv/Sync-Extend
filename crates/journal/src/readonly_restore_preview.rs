@@ -511,8 +511,9 @@ impl<'a> PreviewMetadataReader<'a> {
             ));
         }
         let (json, length): (String, i64) = self.connection.query_row(
-            "SELECT CASE WHEN length(CAST(manifest AS BLOB))<=?2 THEN manifest ELSE '' END,
-             length(CAST(manifest AS BLOB)) FROM current_manifests WHERE space_id=?1",
+            "SELECT CASE WHEN length(CAST(s.manifest AS BLOB))<=?2 THEN s.manifest ELSE '' END,
+             length(CAST(s.manifest AS BLOB)) FROM current_manifests c
+             JOIN snapshots s USING(snapshot_id) WHERE c.space_id=?1",
             rusqlite::params![space.as_str(), self.bounds.max_manifest_bytes as i64],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
