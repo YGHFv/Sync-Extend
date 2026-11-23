@@ -1345,7 +1345,7 @@ impl StorageNode {
                 "storage snapshot physical quota changed",
             ));
         }
-        let (guard, ()) = self.journal.with_reserved_chunk::<(), ReconcileError>(
+        let ingested = self.journal.with_reserved_chunk::<(), ReconcileError>(
             &self.config.space_id,
             owner,
             &chunk.content_id,
@@ -1357,9 +1357,24 @@ impl StorageNode {
                 self.cas.read(chunk)?;
                 Ok(())
             },
-        )?;
-        drop(guard);
-        Ok(())
+        );
+        self.finish_reserved_chunk_ingest(ingested)
+    }
+
+    fn finish_reserved_chunk_ingest(
+        &self,
+        ingested: Result<(sync_extend_journal::CasAccessGuard, ())>,
+    ) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.cas.finish_reserved_chunk_ingest(ingested)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let (guard, ()) = ingested?;
+            drop(guard);
+            Ok(())
+        }
     }
 
     /// Authorize and charge the exact announced chunk before its block is read.
@@ -1451,7 +1466,7 @@ impl StorageNode {
                 "storage physical quota changed",
             ));
         }
-        let (guard, ()) = self.journal.with_reserved_chunk::<(), ReconcileError>(
+        let ingested = self.journal.with_reserved_chunk::<(), ReconcileError>(
             &self.config.space_id,
             owner,
             &chunk.content_id,
@@ -1465,9 +1480,8 @@ impl StorageNode {
                 self.cas.read(chunk)?;
                 Ok(())
             },
-        )?;
-        drop(guard);
-        Ok(())
+        );
+        self.finish_reserved_chunk_ingest(ingested)
     }
 
     /// Report stored-only state from the exact retained report, owner and CAS audit.

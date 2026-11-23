@@ -6,6 +6,10 @@ use std::{fs::File, io, os::unix::fs::FileExt, sync::atomic::Ordering};
 pub(super) const RECORD_BYTES: usize = 4096;
 const MAGIC: &[u8] = b"sync-extend.linux-metadata-owner.v2\0";
 const STORAGE_MAGIC: &[u8] = b"sync-extend.linux-metadata-owner.storage-only.v3\0";
+const STORAGE_RECEIVE_MAGIC: &[u8] = b"sync-extend.linux-metadata-owner.storage-only.v4\0";
+pub(super) const CAS_RECEIVE_CLEAN: u8 = 0;
+pub(super) const CAS_RECEIVE_ARMED: u8 = 1;
+pub(super) const CAS_RECEIVE_FAILED: u8 = 2;
 
 #[derive(Clone)]
 pub(super) struct Record {
@@ -18,6 +22,7 @@ pub(super) struct Record {
     pub total_limit: u64,
     pub logical: [u64; 5],
     pub storage_sealed: Option<[u64; 5]>,
+    pub cas_receive_state: u8,
 }
 
 // This is a torn-write detector. Authority comes from the original embedded
@@ -32,7 +37,10 @@ impl Record {
     pub fn encode(&self) -> io::Result<[u8; RECORD_BYTES]> {
         self.validate()?;
         let mut output = [0u8; RECORD_BYTES];
-        let magic = if self.storage_sealed.is_some() {
+        let magic = if self.storage_sealed.is_some() && self.cas_receive_state != CAS_RECEIVE_CLEAN
+        {
+            STORAGE_RECEIVE_MAGIC
+        } else if self.storage_sealed.is_some() {
             STORAGE_MAGIC
         } else {
             MAGIC
@@ -63,6 +71,9 @@ impl Record {
                 offset += 8;
             }
         }
+        if self.cas_receive_state != CAS_RECEIVE_CLEAN {
+            output[offset] = self.cas_receive_state;
+        }
         let digest = checksum(&output[..RECORD_BYTES - 8]);
         output[RECORD_BYTES - 8..].copy_from_slice(&digest.to_le_bytes());
         Ok(output)
@@ -89,6 +100,11 @@ impl Record {
             }
             offset += amount as u64;
         }
+        if record.cas_receive_state != CAS_RECEIVE_CLEAN {
+            return Err(refuse(
+                "storage-only durable inside CAS receive remains incomplete or failed; no reopen or repair",
+            ));
+        }
         Ok(record)
     }
 
@@ -98,7 +114,14 @@ impl Record {
         }
         let mut input = [0u8; RECORD_BYTES];
         file.read_exact_at(&mut input, 0)?;
-        let magic = if storage_only { STORAGE_MAGIC } else { MAGIC };
+        let receive_record = storage_only && input.starts_with(STORAGE_RECEIVE_MAGIC);
+        let magic = if receive_record {
+            STORAGE_RECEIVE_MAGIC
+        } else if storage_only {
+            STORAGE_MAGIC
+        } else {
+            MAGIC
+        };
         if !input.starts_with(magic)
             || checksum(&input[..RECORD_BYTES - 8]).to_le_bytes() != input[RECORD_BYTES - 8..]
         {
@@ -135,6 +158,18 @@ impl Record {
         });
         let logical = std::array::from_fn(|_| next());
         let storage_sealed = storage_only.then(|| std::array::from_fn(|_| next()));
+        let cas_receive_state = if receive_record {
+            let value = input[offset];
+            offset += 1;
+            if !matches!(value, CAS_RECEIVE_ARMED | CAS_RECEIVE_FAILED) {
+                return Err(refuse(
+                    "storage-only durable receive state encoding differs",
+                ));
+            }
+            value
+        } else {
+            CAS_RECEIVE_CLEAN
+        };
         if input[offset..RECORD_BYTES - 8]
             .iter()
             .any(|byte| *byte != 0)
@@ -151,6 +186,7 @@ impl Record {
             total_limit,
             logical,
             storage_sealed,
+            cas_receive_state,
         };
         record.validate()?;
         if storage_only && file.metadata()?.len() != record.capacities[4] {
@@ -160,7 +196,9 @@ impl Record {
     }
 
     fn validate(&self) -> io::Result<()> {
-        if self.generation == [0; 16]
+        if self.cas_receive_state > CAS_RECEIVE_FAILED
+            || (self.storage_sealed.is_none() && self.cas_receive_state != CAS_RECEIVE_CLEAN)
+            || self.generation == [0; 16]
             || self.backing_image.device == 0
             || self.backing_image.inode == 0
             || self.directory.device == 0
@@ -228,6 +266,10 @@ impl State {
             .owner_record_lock
             .lock()
             .map_err(|_| refuse("metadata owner record lock poisoned"))?;
+        self.verify_owner_record_locked()
+    }
+
+    fn verify_owner_record_locked(&self) -> io::Result<()> {
         let record = if self.storage_sealed.is_some() {
             Record::read_impl(&self.files[4].file, true)?
         } else {
@@ -241,6 +283,7 @@ impl State {
             || record.allocated != self.initial_allocated
             || record.total_limit != self.total_limit
             || record.storage_sealed != self.storage_sealed
+            || record.cas_receive_state != self.storage_cas_receive.load(Ordering::Acquire)
         {
             return Err(refuse("original metadata owner record was substituted"));
         }
@@ -252,6 +295,10 @@ impl State {
             .owner_record_lock
             .lock()
             .map_err(|_| refuse("metadata owner record lock poisoned"))?;
+        self.persist_owner_record_locked()
+    }
+
+    fn persist_owner_record_locked(&self) -> io::Result<()> {
         let record = Record {
             generation: self.persistent_generation,
             backing_image: self.backing_image,
@@ -264,8 +311,48 @@ impl State {
                 self.files[index].logical_bytes.load(Ordering::Acquire)
             }),
             storage_sealed: self.storage_sealed,
+            cas_receive_state: self.storage_cas_receive.load(Ordering::Acquire),
         };
         self.files[4].file.write_all_at(&record.encode()?, 0)?;
         self.files[4].file.sync_all()
+    }
+
+    pub(super) fn transition_storage_cas_receive(
+        &self,
+        expected: Option<u8>,
+        next: u8,
+    ) -> io::Result<()> {
+        // Recheck every original lease, namespace and named slot before the
+        // record mutex. It serializes this state with all ordinary VFS syncs.
+        self.verify()?;
+        let _guard = self
+            .owner_record_lock
+            .lock()
+            .map_err(|_| refuse("metadata owner record lock poisoned"))?;
+        self.verify_owner_record_locked()?;
+        let current = self.storage_cas_receive.load(Ordering::Acquire);
+        if expected.is_some_and(|expected| current != expected)
+            || (current == CAS_RECEIVE_FAILED && next != CAS_RECEIVE_FAILED)
+        {
+            return Err(refuse("original durable receive transition refused"));
+        }
+        if current == next {
+            return Ok(());
+        }
+        self.storage_cas_receive.store(next, Ordering::Release);
+        if let Err(error) = self.persist_owner_record_locked() {
+            // Never permit another live clean transition after a failed
+            // checkpoint. The pre-CREATE arm protects actual failed prefixes
+            // even if writing a more specific failed state also fails.
+            self.storage_cas_receive
+                .store(CAS_RECEIVE_FAILED, Ordering::Release);
+            return match self.persist_owner_record_locked() {
+                Ok(()) => Err(error),
+                Err(retained) => Err(io::Error::other(format!(
+                    "{error}; durable receive refusal checkpoint also failed: {retained}"
+                ))),
+            };
+        }
+        Ok(())
     }
 }

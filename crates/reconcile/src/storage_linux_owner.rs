@@ -757,8 +757,38 @@ fn allowed_names(config: &LinuxStorageOwnerConfig) -> BTreeSet<std::ffi::OsStrin
         // An optional outside CAS is inert. Even a matching name, payload or
         // inode never supplies an image CAS key, byte, reference or permission.
         names.insert(std::ffi::OsString::from("cas"));
+    } else {
+        // The ordinary v1 Journal creates this one canonical zero-length
+        // sentinel on its first real CAS access. It remains optional before
+        // that call and never supplies an inside-image coordination loan.
+        names.insert(std::ffi::OsString::from("cas-access.lock"));
     }
     names
+}
+
+fn verify_v1_cas_coordination(root: &File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    // Resolve the fixed component through the acquired original root FD;
+    // symlink_metadata never follows the sentinel itself. No path is created.
+    let path = format!("/proc/self/fd/{}/cas-access.lock", root.as_raw_fd());
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.nlink() != 1
+        || metadata.uid() != root.metadata()?.uid()
+        || metadata.len() != 0
+    {
+        return Err(ReconcileError::Invariant(
+            "ordinary v1 canonical CAS coordination sentinel differs",
+        ));
+    }
+    // The ordinary Journal still acquires and verifies its real sentinel FD
+    // and cooperative guard. This bounded slot check grants no native loan.
+    Ok(())
 }
 
 fn layout(config: &LinuxStorageOwnerConfig, initialize: bool, root: &File) -> Result<()> {
@@ -799,6 +829,7 @@ fn layout(config: &LinuxStorageOwnerConfig, initialize: bool, root: &File) -> Re
     }
     if config.format_version == 1 {
         // The original v1 outside CAS checks and non-native behavior stay intact.
+        verify_v1_cas_coordination(root)?;
         for relative in ["cas", "cas/objects", "cas/tmp"] {
             let path = config.storage.data_dir.join(relative);
             crate::check_ancestors(&path)?;
@@ -1346,8 +1377,48 @@ impl LinuxStorageOwner {
         // A real failed read/verify/close prevents future operations and success
         // receipts; this flag cannot supply a kernel close or native authority.
         if let Ok(mut failure) = self.cas_failure.lock() {
-            failure.get_or_insert_with(|| error.to_string());
+            if failure.is_none() {
+                let mut first = error.to_string();
+                if self.has_inside_cas() {
+                    if let Err(retained) = self.budget.fail_storage_cas_receive() {
+                        first.push_str(&format!(
+                            "; original durable receive refusal checkpoint also failed: {retained}"
+                        ));
+                    }
+                }
+                *failure = Some(first);
+            }
         }
+    }
+
+    pub(crate) fn begin_inside_cas_receive(&self) -> std::io::Result<()> {
+        self.verify()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        if !self.has_inside_cas() {
+            return Err(std::io::Error::other(
+                "explicit original inside CAS required before durable receive arm",
+            ));
+        }
+        self.budget.begin_storage_cas_receive()
+    }
+
+    pub(crate) fn complete_inside_cas_receive(&self) -> std::io::Result<()> {
+        self.verify()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        if !self.has_inside_cas() {
+            return Err(std::io::Error::other(
+                "explicit original inside CAS required at durable receive completion",
+            ));
+        }
+        if self.budget.has_pending_storage_cas_receive() {
+            self.budget.complete_storage_cas_receive()
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn has_pending_inside_cas_receive(&self) -> bool {
+        self.has_inside_cas() && self.budget.has_pending_storage_cas_receive()
     }
 
     pub(crate) fn verify_config(&self, config: &StorageNodeConfig, initialize: bool) -> Result<()> {
@@ -1391,7 +1462,7 @@ impl LinuxStorageOwner {
             &self.cas_coordination,
             self.config.format_version,
         ) {
-            (None, None, 1) => {}
+            (None, None, 1) => verify_v1_cas_coordination(&self.root)?,
             (Some(cas), Some(coordination), 2) => {
                 coordination.verify()?;
                 let fingerprint = realm_fingerprint(

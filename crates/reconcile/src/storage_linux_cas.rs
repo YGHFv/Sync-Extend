@@ -94,6 +94,41 @@ impl StorageCas {
         }
     }
 
+    pub(super) fn finish_reserved_chunk_ingest(
+        &self,
+        ingested: crate::Result<(CasAccessGuard, ())>,
+    ) -> crate::Result<()> {
+        match self {
+            Self::Ordinary(_) => {
+                let (guard, ()) = ingested?;
+                drop(guard);
+                Ok(())
+            }
+            Self::Inside(cas) => {
+                let (guard, ()) = match ingested {
+                    Ok(ingested) => ingested,
+                    Err(error) => {
+                        // A whole-budget refusal before the CREATE callback
+                        // stays clean. Once armed, retain the original receive
+                        // failure through the outer reservation transaction.
+                        if cas.owner.has_pending_inside_cas_receive() {
+                            cas.owner.poison_inside_cas(&error);
+                        }
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = guard.close_linux_storage_original() {
+                    cas.owner.poison_inside_cas(&error);
+                    return Err(error.into());
+                }
+                cas.owner.complete_inside_cas_receive().map_err(|error| {
+                    cas.owner.poison_inside_cas(&error);
+                    error.into()
+                })
+            }
+        }
+    }
+
     pub(super) fn verify(&self, manifest: &FileManifest) -> Result<()> {
         match self {
             Self::Ordinary(cas) => cas.verify(manifest),
@@ -330,7 +365,9 @@ impl LinuxManagedStorageCas {
                     .map_err(|error| self.actual_io(error))?
             } else {
                 let staged = cas
-                    .stage_new(reference.content_id.as_str(), bytes)
+                    .stage_new_with_before_create(reference.content_id.as_str(), bytes, || {
+                        self.owner.begin_inside_cas_receive()
+                    })
                     .map_err(|error| {
                         if error.kind() == io::ErrorKind::StorageFull {
                             // The platform preserves this kind only for whole
@@ -369,6 +406,8 @@ impl LinuxManagedStorageCas {
         let closed = directories.map_or(Ok(()), |original| {
             original.close().map_err(|error| self.actual_io(error))
         });
+        // Keep the durable receive armed until the outer reservation callback,
+        // transaction and its original coordination guard have also ended.
         combine(operation, closed)
     }
 

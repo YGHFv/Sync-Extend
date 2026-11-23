@@ -14,7 +14,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
     },
 };
@@ -188,6 +188,7 @@ struct State {
     total_limit: u64,
     initial_allocated: u64,
     storage_sealed: Option<[u64; 5]>,
+    storage_cas_receive: AtomicU8,
     storage_liabilities: Option<[u64; 5]>,
     storage_profile: Option<StorageExt4Profile>,
     next_connection: AtomicU64,
@@ -635,6 +636,55 @@ impl LinuxMetadataBudget {
         self.storage_only
     }
 
+    /// Diagnostic state only. It cannot supply a lease, close or receive
+    /// completion; those transitions recheck the actual acquired originals.
+    pub fn has_pending_storage_cas_receive(&self) -> bool {
+        self.storage_only
+            && self.state.storage_cas_receive.load(Ordering::Acquire)
+                != owner_record::CAS_RECEIVE_CLEAN
+    }
+
+    /// Persist an incomplete receive in the existing original owner record,
+    /// after the complete CAS budget gate and before its first CREATE. A crash
+    /// or a later failed payload/guard close cannot reopen that prefix as clean.
+    pub fn begin_storage_cas_receive(&self) -> io::Result<()> {
+        if !self.storage_only || self.state.storage_sealed.is_none() {
+            return Err(refuse(
+                "original sealed storage-only receive record required",
+            ));
+        }
+        self.state.transition_storage_cas_receive(
+            Some(owner_record::CAS_RECEIVE_CLEAN),
+            owner_record::CAS_RECEIVE_ARMED,
+        )
+    }
+
+    /// Only the caller that has completed every actual payload, directory and
+    /// coordination close may commit a clean receive. No file is recreated.
+    pub fn complete_storage_cas_receive(&self) -> io::Result<()> {
+        if !self.storage_only || self.state.storage_sealed.is_none() {
+            return Err(refuse(
+                "original sealed storage-only receive record required",
+            ));
+        }
+        self.state.transition_storage_cas_receive(
+            Some(owner_record::CAS_RECEIVE_ARMED),
+            owner_record::CAS_RECEIVE_CLEAN,
+        )
+    }
+
+    /// Keep the first actual failure durable without poisoning the descriptor
+    /// VFS's structural checks needed to attempt its real original closes.
+    pub fn fail_storage_cas_receive(&self) -> io::Result<()> {
+        if !self.storage_only || self.state.storage_sealed.is_none() {
+            return Err(refuse(
+                "original sealed storage-only receive record required",
+            ));
+        }
+        self.state
+            .transition_storage_cas_receive(None, owner_record::CAS_RECEIVE_FAILED)
+    }
+
     /// Read-only structural preflight for the explicit storage-only role.
     /// This returns no original owner, lease, VFS, native attempt or authority.
     /// The caller serializes storage opening before touching these old slots;
@@ -970,6 +1020,7 @@ impl LinuxMetadataBudget {
             total_limit: limits.total_physical,
             logical: initial_logical,
             storage_sealed: storage_liabilities.map(|_| sealed),
+            cas_receive_state: owner_record::CAS_RECEIVE_CLEAN,
         };
         if storage_liabilities.is_some() {
             prepared[4].write_all_at(&owner_record.encode()?, 0)?;
@@ -1044,6 +1095,7 @@ impl LinuxMetadataBudget {
             total_limit: limits.total_physical,
             initial_allocated: physical,
             storage_sealed: storage_liabilities.map(|_| sealed),
+            storage_cas_receive: AtomicU8::new(owner_record::CAS_RECEIVE_CLEAN),
             storage_liabilities,
             storage_profile,
             next_connection: AtomicU64::new(1),
@@ -1276,6 +1328,7 @@ impl LinuxMetadataBudget {
             total_limit: limits.total_physical,
             initial_allocated: physical,
             storage_sealed: record.storage_sealed,
+            storage_cas_receive: AtomicU8::new(record.cas_receive_state),
             storage_liabilities,
             storage_profile,
             next_connection: AtomicU64::new(1),

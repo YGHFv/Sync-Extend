@@ -976,6 +976,18 @@ impl LinuxStorageCas {
     }
 
     pub fn stage_new(&self, content: &str, bytes: &[u8]) -> io::Result<LinuxStorageCasStaged> {
+        self.stage_new_with_before_create(content, bytes, || Ok(()))
+    }
+
+    /// The acquired caller may checkpoint its existing durable receive state
+    /// after every original budget gate and before any shard/prefix CREATE.
+    /// A callback supplies no layout, lease, payload or deletion authority.
+    pub fn stage_new_with_before_create(
+        &self,
+        content: &str,
+        bytes: &[u8],
+        before_create: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<LinuxStorageCasStaged> {
         validate_hex(content, 64)?;
         if bytes.is_empty() || bytes.len() as u64 > CHUNK_BYTES {
             return Err(refuse("inside CAS receive chunk length refused"));
@@ -998,6 +1010,11 @@ impl LinuxStorageCas {
                 "inside CAS whole byte/entry budget refused before receive CREATE",
             ));
         }
+        before_create().map_err(|error| {
+            io::Error::other(format!(
+                "{error}; original durable receive arm refused before any CREATE; target={content}"
+            ))
+        })?;
         self.stage_admitted(content, bytes).map_err(|error| {
             // Only the admission above may retain StorageFull. Once shard/tmp
             // CREATE can have run, every failure preserves the prefix and must
