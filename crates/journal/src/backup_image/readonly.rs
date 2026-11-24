@@ -1,6 +1,6 @@
 //! Read-only image audits borrow the original Journal view, never writer gates.
 use crate::{JournalCapacityLimits, JournalError, JournalReadView, JournalStoredRow, Result};
-use rusqlite::{limits::Limit, Connection, Transaction, TransactionBehavior, MAIN_DB};
+use rusqlite::{Connection, MAIN_DB, Transaction, TransactionBehavior, limits::Limit};
 use std::time::{Duration, Instant};
 use sync_extend_core_model::SpaceId;
 
@@ -15,7 +15,9 @@ pub struct NodeInspectionBounds {
 }
 
 impl NodeInspectionBounds {
-    fn validate(self) -> Result<()> {
+    /// Validate the bounded inspection policy before a protected daemon
+    /// acquires any original Journal/native resources.
+    pub fn validate(self) -> Result<()> {
         crate::tree_storage_inventory::validate_limits(self.max_entries, self.capacity.inventory)?;
         if self.capacity.max_rows == 0
             || self.capacity.max_rows > self.max_entries as u64
@@ -184,8 +186,57 @@ impl super::JournalBackupImage {
     }
 }
 
+pub(super) trait InspectionConnection {
+    fn inspection_connection(&self) -> Result<&Connection>;
+
+    fn inspection_progress_handler<F>(
+        &mut self,
+        num_ops: i32,
+        handler: Option<F>,
+    ) -> rusqlite::Result<()>
+    where
+        F: FnMut() -> bool + Send + 'static;
+}
+
+impl InspectionConnection for Connection {
+    fn inspection_connection(&self) -> Result<&Connection> {
+        Ok(self)
+    }
+
+    fn inspection_progress_handler<F>(
+        &mut self,
+        num_ops: i32,
+        handler: Option<F>,
+    ) -> rusqlite::Result<()>
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
+        self.progress_handler(num_ops, handler)
+    }
+}
+
+#[cfg(windows)]
+impl InspectionConnection for crate::original_readonly_close::JournalConnectionOwner {
+    fn inspection_connection(&self) -> Result<&Connection> {
+        self.original_ref().ok_or(JournalError::Invariant(
+            "original inspection connection has already ended",
+        ))
+    }
+
+    fn inspection_progress_handler<F>(
+        &mut self,
+        num_ops: i32,
+        handler: Option<F>,
+    ) -> rusqlite::Result<()>
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
+        self.progress_handler(num_ops, handler)
+    }
+}
+
 pub(super) fn configure_inspection(
-    connection: &mut Connection,
+    connection: &mut impl InspectionConnection,
     bounds: NodeInspectionBounds,
 ) -> Result<()> {
     bounds.validate()?;
@@ -196,14 +247,15 @@ pub(super) fn configure_inspection(
         (Limit::SQLITE_LIMIT_ATTACHED, 0),
         (Limit::SQLITE_LIMIT_WORKER_THREADS, 0),
     ] {
-        connection.set_limit(category, limit)?;
-        if connection.limit(category)? > limit {
+        let original = connection.inspection_connection()?;
+        original.set_limit(category, limit)?;
+        if original.limit(category)? > limit {
             return Err(JournalError::Invariant("node SQL limit not applied"));
         }
     }
     let started = Instant::now();
     let mut remaining = bounds.max_vm_instructions;
-    connection.progress_handler(
+    connection.inspection_progress_handler(
         1_000,
         Some(move || {
             if remaining < 1_000 || started.elapsed() >= bounds.max_query_time {
@@ -213,16 +265,27 @@ pub(super) fn configure_inspection(
             false
         }),
     )?;
-    connection.pragma_update(None, "query_only", true)?;
-    connection.pragma_update(None, "trusted_schema", false)?;
-    connection.pragma_update(None, "temp_store", "MEMORY")?;
-    connection.pragma_update(None, "cache_size", -8_192i32)?;
+    let original = connection.inspection_connection()?;
+    original.pragma_update(None, "query_only", true)?;
+    original.pragma_update(None, "trusted_schema", false)?;
+    original.pragma_update(None, "temp_store", "MEMORY")?;
+    original.pragma_update(None, "cache_size", -8_192i32)?;
     Ok(())
 }
 
 impl NodeInspectionBounds {
     #[cfg(windows)]
-    pub(crate) fn configure_original_connection(self, connection: &mut Connection) -> Result<()> {
+    pub(crate) fn configure_planning_connection(self, connection: &mut Connection) -> Result<()> {
+        configure_inspection(connection, self)?;
+        connection.busy_timeout(Duration::ZERO)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn configure_original_connection(
+        self,
+        connection: &mut crate::original_readonly_close::JournalConnectionOwner,
+    ) -> Result<()> {
         configure_inspection(connection, self)?;
         connection.busy_timeout(Duration::ZERO)?;
         Ok(())

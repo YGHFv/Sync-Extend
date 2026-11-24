@@ -15,7 +15,9 @@ pub struct LedgerBounds {
 }
 
 impl LedgerBounds {
-    pub(in super::super) fn validate(self) -> Result<()> {
+    /// Validate the bounded restore-ledger policy before protected runtime
+    /// acquisition. The check is pure and has no filesystem side effects.
+    pub fn validate(self) -> Result<()> {
         if !(1..=100_000).contains(&self.max_records)
             || self.max_intents == 0
             || self.max_intents as u64 > self.max_records
