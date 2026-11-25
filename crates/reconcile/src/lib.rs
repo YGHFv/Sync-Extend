@@ -814,7 +814,7 @@ impl LocalSpace {
                     path: intent.target_path.clone(),
                     kind: EntryKind::File,
                     content: Some(intent.content.clone()),
-                    metadata: None,
+                    metadata: observed.metadata.clone(),
                 },
             );
             manifest.tombstones.remove(&intent.entry_id);
@@ -939,7 +939,9 @@ impl LocalSpace {
         if scanned.len() != completion.manifest.entries.len()
             || completion.manifest.entries.values().any(|entry| {
                 scanned.get(&entry.path).is_none_or(|observed| {
-                    observed.kind != entry.kind || observed.content != entry.content
+                    observed.kind != entry.kind
+                        || observed.content != entry.content
+                        || observed.metadata != entry.metadata
                 })
             })
         {
@@ -1004,7 +1006,16 @@ impl LocalSpace {
                 path: intent.target_path.clone(),
                 kind: EntryKind::File,
                 content: Some(intent.content.clone()),
-                metadata: None,
+                metadata: observed
+                    .get(&intent.target_path)
+                    .and_then(|entry| entry.metadata.clone())
+                    .or_else(|| {
+                        prior
+                            .manifest
+                            .entries
+                            .get(&intent.entry_id)
+                            .and_then(|entry| entry.metadata.clone())
+                    }),
             },
             intent.created_at_ms,
         )?;
@@ -1409,7 +1420,7 @@ fn build_manifest(
                 path: path.clone(),
                 kind: scanned.kind,
                 content: scanned.content.clone(),
-                metadata: None,
+                metadata: scanned.metadata.clone(),
             },
         );
     }

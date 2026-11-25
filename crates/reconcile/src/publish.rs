@@ -1,7 +1,9 @@
 use crate::{
     check_ancestors,
     fault::checkpoint,
-    filesystem::{physical_identity, ObservedFile},
+    filesystem::{
+        metadata_matches_observed, physical_identity, platform_metadata_for_apply, ObservedFile,
+    },
     now_ms, LocalSpace, ReconcileError, Result,
 };
 use same_file::Handle;
@@ -32,8 +34,8 @@ impl LocalSpace {
         self.recover()?;
         let (source, observed) = self.observe_source(source)?;
         self.scan_without_recovery()?;
-        let content = self.import_observed_source(&source, observed)?;
-        let id = self.begin_content(path, content, None)?;
+        let (content, metadata) = self.import_observed_source_with_metadata(&source, observed)?;
+        let id = self.begin_content_with_metadata(path, content, metadata, None)?;
         self.recover_transaction(&id)?;
         self.publication_result(&id)
     }
@@ -83,7 +85,18 @@ impl LocalSpace {
         source: &Path,
         observed: ObservedFile,
     ) -> Result<FileManifest> {
+        Ok(self
+            .import_observed_source_with_metadata(source, observed)?
+            .0)
+    }
+
+    pub(crate) fn import_observed_source_with_metadata(
+        &self,
+        source: &Path,
+        observed: ObservedFile,
+    ) -> Result<(FileManifest, Option<PortableEntryMetadata>)> {
         checkpoint("after_publish_source_open");
+        let metadata = observed.portable.clone();
         let content = self.cas.import_bounded(
             &observed.file,
             observed.metadata.len(),
@@ -96,7 +109,7 @@ impl LocalSpace {
         {
             return Err(ReconcileError::Unstable);
         }
-        Ok(content)
+        Ok((content, metadata))
     }
 
     pub fn restore_file(
@@ -108,16 +121,26 @@ impl LocalSpace {
         self.recover()?;
         self.scan_without_recovery()?;
         let source = self.journal.snapshot(&self.space_id, snapshot)?;
-        let content = source
+        let source_entry = source
             .entries
             .values()
             .find(|entry| entry.path == path)
-            .and_then(|entry| entry.content.clone())
+            .ok_or(ReconcileError::Invariant(
+                "source snapshot does not contain this file",
+            ))?;
+        let content = source_entry
+            .content
+            .clone()
             .ok_or(ReconcileError::Invariant(
                 "source snapshot does not contain this file",
             ))?;
         self.cas.verify(&content)?;
-        let id = self.begin_content(path, content, Some(snapshot.clone()))?;
+        let id = self.begin_content_with_metadata(
+            path,
+            content,
+            source_entry.metadata.clone(),
+            Some(snapshot.clone()),
+        )?;
         self.recover_transaction(&id)?;
         self.publication_result(&id)
     }
@@ -128,12 +151,25 @@ impl LocalSpace {
         content: FileManifest,
         source: Option<SnapshotId>,
     ) -> Result<EntryId> {
-        self.begin_content_with_ids(
+        self.begin_content_with_metadata(path, content, None, source)
+    }
+
+    fn begin_content_with_metadata(
+        &mut self,
+        path: PortablePath,
+        content: FileManifest,
+        metadata: Option<PortableEntryMetadata>,
+        source: Option<SnapshotId>,
+    ) -> Result<EntryId> {
+        self.begin_content_selected_slot_with_metadata(
             path,
             content,
+            metadata,
             source,
             EntryId::random()?,
             EntryId::random()?,
+            false,
+            false,
         )
     }
 
@@ -165,6 +201,30 @@ impl LocalSpace {
         &mut self,
         path: PortablePath,
         content: FileManifest,
+        source: Option<SnapshotId>,
+        id: EntryId,
+        entry_id: EntryId,
+        native_only: bool,
+        require_absent: bool,
+    ) -> Result<EntryId> {
+        self.begin_content_selected_slot_with_metadata(
+            path,
+            content,
+            None,
+            source,
+            id,
+            entry_id,
+            native_only,
+            require_absent,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_content_selected_slot_with_metadata(
+        &mut self,
+        path: PortablePath,
+        content: FileManifest,
+        metadata: Option<PortableEntryMetadata>,
         source: Option<SnapshotId>,
         id: EntryId,
         entry_id: EntryId,
@@ -205,7 +265,7 @@ impl LocalSpace {
                 path: target_path.clone(),
                 kind: EntryKind::File,
                 content: Some(content.clone()),
-                metadata: None,
+                metadata,
             },
             timestamp,
         )?;
@@ -422,10 +482,18 @@ impl LocalSpace {
                     self.verify_root()?;
                     verify_directory_identity(&self.worktree, &root_identity)?;
                     verify_directory_identity(&parent, &parent_identity)?;
+                    let admitted_metadata = intent
+                        .completion
+                        .as_ref()
+                        .and_then(|completion| completion.manifest.entries.get(&intent.entry_id))
+                        .map(|entry| entry.metadata.clone());
                     if !same_owned_file(&payload_identity, &payload, &target, &intent.content)?
-                        || scan
-                            .get(&intent.target_path)
-                            .is_none_or(|entry| entry.content.as_ref() != Some(&intent.content))
+                        || scan.get(&intent.target_path).is_none_or(|entry| {
+                            entry.content.as_ref() != Some(&intent.content)
+                                || admitted_metadata
+                                    .as_ref()
+                                    .is_some_and(|metadata| entry.metadata != *metadata)
+                        })
                     {
                         self.retarget(&intent)?;
                         continue;
@@ -611,8 +679,27 @@ fn prepare_payload(
     intent: &PublicationIntent,
     max_staging_bytes: u64,
 ) -> Result<()> {
+    let metadata = intent
+        .completion
+        .as_ref()
+        .and_then(|completion| completion.manifest.entries.get(&intent.entry_id))
+        .and_then(|entry| entry.metadata.as_ref());
     if payload.try_exists()? {
         if file_matches(payload, &intent.content)? {
+            if let Some(metadata) = metadata {
+                let complete = ObservedFile::open(payload).is_ok_and(|observed| {
+                    observed
+                        .portable
+                        .as_ref()
+                        .is_some_and(|observed| metadata_matches_observed(metadata, observed))
+                });
+                if !complete {
+                    let requested = platform_metadata_for_apply(metadata)?;
+                    let file = OpenOptions::new().read(true).write(true).open(payload)?;
+                    sync_extend_platform_fs::apply_portable_file_metadata(&file, &requested)?;
+                    file.sync_all()?;
+                }
+            }
             return Ok(());
         }
         return Err(ReconcileError::Invariant(
@@ -635,7 +722,6 @@ fn prepare_payload(
     checkpoint("after_temp_created");
     local.cas.write_file(&intent.content, &mut file)?;
     file.sync_all()?;
-    drop(file);
     checkpoint("after_temp_flushed");
     if !file_matches(&building, &intent.content)? {
         return Err(ReconcileError::Unstable);
@@ -643,6 +729,12 @@ fn prepare_payload(
     fs::hard_link(&building, payload)?;
     sync_directory(directory)?;
     fs::remove_file(building)?;
+    if let Some(metadata) = metadata {
+        let requested = platform_metadata_for_apply(metadata)?;
+        sync_extend_platform_fs::apply_portable_file_metadata(&file, &requested)?;
+        file.sync_all()?;
+    }
+    drop(file);
     Ok(())
 }
 
