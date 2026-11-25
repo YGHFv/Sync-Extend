@@ -1,5 +1,44 @@
 #Requires -Version 7.0
 
+function Get-SyncExtendUtf8ByteCount {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+
+    # UTF8Encoding without a replacement fallback refuses lone surrogates
+    # instead of silently counting the three-byte U+FFFD replacement.
+    try { return [Text.UTF8Encoding]::new($false, $true).GetByteCount($Value) }
+    catch [Text.EncoderFallbackException] { throw 'Text contains an invalid UTF-16 sequence.' }
+}
+
+function Get-SyncExtendUtf8Bytes {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+
+    try { Write-Output -NoEnumerate ([Text.UTF8Encoding]::new($false, $true).GetBytes($Value)) }
+    catch [Text.EncoderFallbackException] { throw 'Text contains an invalid UTF-16 sequence.' }
+}
+
+function Assert-SyncExtendUtf8Value($Value, [int]$Depth = 0) {
+    if ($Depth -gt 128) { throw 'The local observation exceeds the UTF-8 validation depth.' }
+    if ($Value -is [string]) { $null = Get-SyncExtendUtf8ByteCount $Value; return }
+    if ($Value -is [Collections.IDictionary]) {
+        foreach ($key in $Value.Keys) {
+            if ($key -isnot [string]) { throw 'The local observation has a non-text field name.' }
+            $null = Get-SyncExtendUtf8ByteCount $key
+            Assert-SyncExtendUtf8Value $Value[$key] ($Depth + 1)
+        }
+        return
+    }
+    if ($Value -is [Collections.IEnumerable] -and $Value -isnot [string]) {
+        foreach ($item in $Value) { Assert-SyncExtendUtf8Value $item ($Depth + 1) }
+    }
+}
+
+function Get-SyncExtendCanonicalJsonByteCount {
+    param($Value, [int]$Depth = 12)
+
+    Assert-SyncExtendUtf8Value $Value
+    return Get-SyncExtendUtf8ByteCount (ConvertTo-Json -InputObject $Value -Depth $Depth -Compress)
+}
+
 function Resolve-SyncExtendPath {
     param([string]$Path, [switch]$File, [switch]$Directory)
 
@@ -157,7 +196,7 @@ function Invoke-SyncExtendJson {
         $result = $stdout.GetAwaiter().GetResult()
         $null = $stderr.GetAwaiter().GetResult()
         $capturesClosed = $true
-        if ([Text.Encoding]::UTF8.GetByteCount($result) -gt 1100000) { throw 'The local response exceeds its size limit.' }
+        if ((Get-SyncExtendUtf8ByteCount $result) -gt 1100000) { throw 'The local response exceeds its size limit.' }
         return ConvertFrom-SyncExtendJson $result
     } finally {
         try {
@@ -203,7 +242,7 @@ function Write-SyncExtendJson {
     param([string]$Path, $Value, [switch]$Replace)
 
     $text = ($Value | ConvertTo-Json -Depth 12) + "`n"
-    Write-SyncExtendBytes $Path ([Text.Encoding]::UTF8.GetBytes($text)) -Replace:$Replace
+    Write-SyncExtendBytes $Path (Get-SyncExtendUtf8Bytes $text) -Replace:$Replace
 }
 
 function Write-SyncExtendBytes {
