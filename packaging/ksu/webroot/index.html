@@ -43,7 +43,7 @@
       </div>
       <p id="workspace-detail" class="detail">从持有资源的后台服务读取有界摘要。</p>
       <dl id="workspace-summary" class="summary" hidden></dl>
-      <p id="workspace-files-detail" class="detail">文件修改时间、只读属性和元数据能力未知。</p>
+      <p id="workspace-files-detail" class="detail">文件修改时间、只读属性、创建时间与可执行位能力按后台报告显示；未知不表示支持。</p>
       <div id="workspace-files" class="workspace-table-wrap" tabindex="0" role="region" aria-label="工作区文件元数据" hidden>
         <table class="workspace-table">
           <caption>本机路径样本</caption>
@@ -95,7 +95,7 @@
           </select>
         </label>
       </div>
-      <p class="detail">目标前缀保留完整源相对路径。未选区域始终保留；类型、大小写和祖先文件冲突会报告。</p>
+      <p class="detail">目标前缀保留完整源相对路径。未选区域始终保留；类型、大小写和祖先文件冲突会报告。预览不认证所选历史项已应用元数据。</p>
       <div class="actions"><button id="restore-preview" type="button" class="primary" disabled>生成只读预览</button></div>
       <p id="restore-detail" class="detail" role="status">等待当前部署的已鉴权历史列表。</p>
       <dl id="restore-summary" class="summary" hidden></dl>

@@ -402,7 +402,11 @@ $restoreWorkerTimer.Add_Tick({
             if (!$script:current -or $script:current.owner_generation -cne $request.owner_generation) {
                 throw 'The displayed owner changed while previewing.'
             }
-            $view = New-SyncExtendRestorePreviewView $result $request
+            $capabilities = if ($script:current -and $script:current.observation -and
+                $script:current.observation.local) {
+                $script:current.observation.local.metadata_capabilities
+            }
+            $view = New-SyncExtendRestorePreviewView $result $request $capabilities
             foreach ($row in $view.Rows) { Add-ClientRow 'Selection preview' $row }
             $restoreNotes.Text = $view.Summary
             Reset-ClientRestorePreview

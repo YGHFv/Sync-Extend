@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const PORTABLE_ENTRY_METADATA_VERSION: u32 = 1;
 pub const MAX_PORTABLE_ENTRY_METADATA_BYTES: usize = 4096;
+pub const PORTABLE_METADATA_CAPABILITY_VERSION: u32 = 1;
 
 /// A bounded, signed Unix timestamp. Negative seconds are real pre-epoch
 /// values, not an unknown marker.
@@ -192,6 +193,104 @@ impl PortableEntryMetadata {
             return Err(ModelError::InvalidData(
                 "portable entry metadata byte limit",
             ));
+        }
+        Ok(())
+    }
+
+    /// Projects only values that were actually captured. Unknown or
+    /// unsupported fields stay absent instead of being synthesized.
+    pub fn captured_modified_and_readonly(&self) -> Option<(i64, u32, bool)> {
+        let (seconds, nanos) = self.modified.captured_value()?;
+        let readonly = self.readonly.value()?;
+        Some((seconds, nanos, readonly))
+    }
+}
+
+/// A field's implemented support on the running platform. `Supported` means
+/// the capture/apply/verify routine exists; it does not certify every
+/// filesystem. `Unknown` is used where this release has no actual result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortableMetadataSupport {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableMetadataFieldCapability {
+    pub modified: PortableMetadataSupport,
+    pub creation: PortableMetadataSupport,
+    pub readonly: PortableMetadataSupport,
+    pub unix_executable: PortableMetadataSupport,
+}
+
+/// Reasons are disclosed only for fields this build cannot handle.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableMetadataUnsupportedFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation: Option<PortableMetadataUnsupportedReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unix_executable: Option<PortableMetadataUnsupportedReason>,
+}
+
+impl PortableMetadataUnsupportedFields {
+    pub fn none() -> Self {
+        Self {
+            creation: None,
+            unix_executable: None,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.creation.is_none() && self.unix_executable.is_none()
+    }
+}
+
+/// Names the exact platform evidence that backs the capability matrix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortableMetadataCertification {
+    WindowsNtfsActualGroupedAcceptance,
+    UnixImplementedNotVerifiedInThisRelease,
+    UnsupportedPlatform,
+}
+
+/// Bounded, versioned disclosure for diagnostics and read-only dashboard
+/// clients. It never grants native authority and never claims that a
+/// particular file was applied or verified.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableMetadataCapabilityMatrix {
+    pub format_version: u32,
+    pub capture: PortableMetadataFieldCapability,
+    pub apply: PortableMetadataFieldCapability,
+    pub verify: PortableMetadataFieldCapability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_precision_ns: Option<u32>,
+    #[serde(
+        default,
+        skip_serializing_if = "PortableMetadataUnsupportedFields::is_empty"
+    )]
+    pub unsupported: PortableMetadataUnsupportedFields,
+    pub certification: PortableMetadataCertification,
+}
+
+impl PortableMetadataCapabilityMatrix {
+    pub fn validate(&self) -> Result<()> {
+        if self.format_version != PORTABLE_METADATA_CAPABILITY_VERSION {
+            return Err(ModelError::InvalidData(
+                "unsupported portable metadata capability version",
+            ));
+        }
+        if let Some(precision) = self.timestamp_precision_ns {
+            if precision == 0 || precision > 1_000_000_000 {
+                return Err(ModelError::InvalidData(
+                    "portable metadata timestamp precision out of range",
+                ));
+            }
         }
         Ok(())
     }
