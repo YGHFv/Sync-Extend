@@ -671,11 +671,8 @@ impl Journal {
         writer_id: &EntryId,
     ) -> Result<NativeHistoryFreshWriterInspection> {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
-        let stored = load_writer(&tx, writer_id)?;
-        let source = super::inspect_source(&tx, &stored.source_digest)?;
-        let events = load_events(&tx, writer_id)?;
+        let inspection = inspect_writer_connection(&tx, writer_id)?;
         tx.rollback()?;
-        let inspection = verify_event_chain(writer_id, &stored, &source, &events)?;
         Ok(inspection)
     }
 
@@ -739,6 +736,18 @@ impl Journal {
         tx.rollback()?;
         Ok(snapshot)
     }
+}
+
+/// Read-only inspection over an existing snapshot/transaction. The source and
+/// the complete event chain are validated before any field is returned.
+pub(super) fn inspect_writer_connection(
+    connection: &Connection,
+    writer_id: &EntryId,
+) -> Result<NativeHistoryFreshWriterInspection> {
+    let stored = load_writer(connection, writer_id)?;
+    let source = super::inspect_source(connection, &stored.source_digest)?;
+    let events = load_events(connection, writer_id)?;
+    verify_event_chain(writer_id, &stored, &source, &events)
 }
 
 fn fresh_writer_id(

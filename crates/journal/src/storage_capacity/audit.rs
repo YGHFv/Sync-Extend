@@ -195,8 +195,13 @@ pub(super) fn storage_receive_owners(
     max: usize,
     tables: &[JournalStoredTable],
 ) -> Result<Owners> {
+    let device: DeviceId = view
+        .state("device_id")?
+        .ok_or_else(|| {
+            invalid("storage receive requires exact worktree-free initialized identity")
+        })?
+        .parse()?;
     if view.state("space_id")?.as_deref() != Some(space.as_str())
-        || view.state("device_id")?.is_none()
         || view.state("worktree")?.is_some()
         || view.state("storage_role")?.as_deref() != Some("storage-v1")
     {
@@ -242,11 +247,24 @@ pub(super) fn storage_receive_owners(
         "reference_reservation_objects",
         "cas_leases",
     ];
+    let native_history_owners =
+        crate::backup_image::native_history_persistence::STORAGE_ROLE_OWNER_TABLES;
+    if tables.iter().any(|table| {
+        table.rows != 0
+            && !STORAGE_TABLES.contains(&table.table)
+            && !native_history_owners.contains(&table.table)
+    }) {
+        return Err(invalid("storage receive contains client/native owner"));
+    }
     if tables
         .iter()
-        .any(|table| table.rows != 0 && !STORAGE_TABLES.contains(&table.table))
+        .any(|table| table.rows != 0 && native_history_owners.contains(&table.table))
     {
-        return Err(invalid("storage receive contains client/native owner"));
+        crate::backup_image::native_history_persistence::validate_storage_role_owners(
+            view.connection,
+            space,
+            &device,
+        )?;
     }
     owners(view, space, max)
 }
