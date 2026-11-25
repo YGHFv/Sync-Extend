@@ -199,7 +199,7 @@ impl ReadOnlyRestorePreviewJournal {
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version != crate::SCHEMA_VERSION {
             return Err(JournalError::Invariant(
-                "readonly snapshot preview requires schema 67 without migration",
+                "readonly snapshot preview requires schema 70 without migration",
             ));
         }
         let reader = Self {

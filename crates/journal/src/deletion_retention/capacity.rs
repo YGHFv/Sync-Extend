@@ -28,6 +28,7 @@ fn charge(columns: &[JournalStorageColumn]) -> Result<u64> {
             Value::Null => 0,
             Value::Integer(_) => 8,
             Value::Text(text) => text.len() as u64,
+            Value::Bytes(bytes) => bytes.len() as u64,
         };
         sum.checked_add(bytes)
             .ok_or(JournalError::Invariant("retention metadata byte overflow"))

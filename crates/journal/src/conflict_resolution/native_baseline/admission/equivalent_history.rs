@@ -64,6 +64,7 @@ fn width(rows: &RowMap) -> Result<u64> {
             crate::JournalStorageColumnValue::Text(s) => s.len() as u64,
             crate::JournalStorageColumnValue::Integer(_) => 8,
             crate::JournalStorageColumnValue::Null => 0,
+            crate::JournalStorageColumnValue::Bytes(bytes) => bytes.len() as u64,
         })
         .ok_or(invalid("equivalent history exact logical width overflow"))
     })

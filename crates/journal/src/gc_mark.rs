@@ -430,6 +430,7 @@ impl crate::JournalReadView<'_> {
         // Immutable image preflight and the live writer share every pin family.
         if crate::recovered_retention::active_pins(self.connection)?.contains(id)
             || crate::history_reservation::original_reserved_content(self.connection)?.contains(id)
+            || crate::backup_image::native_history_persistence::holds_content(self.connection, id)?
         {
             return Ok(true);
         }

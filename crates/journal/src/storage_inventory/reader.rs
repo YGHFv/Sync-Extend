@@ -13,6 +13,7 @@ pub(crate) enum ColumnKind {
     Text(usize),
     Utf8 { min: usize, max: usize },
     Integer,
+    Blob { min: usize, max: usize },
 }
 pub(crate) struct ColumnSpec {
     pub name: &'static str,
@@ -32,6 +33,7 @@ pub(crate) enum Namespace {
     All,
     TreeRestore,
     TreeNative,
+    NativeHistory,
 }
 impl Namespace {
     fn predicate(self) -> &'static str {
@@ -39,6 +41,7 @@ impl Namespace {
             Self::All => "lower(substr(name,1,7))!='sqlite_'",
             Self::TreeRestore => "lower(substr(name,1,13))='tree_restore_'",
             Self::TreeNative => "lower(substr(name,1,12))='tree_native_'",
+            Self::NativeHistory => "lower(substr(name,1,15))='native_history_'",
         }
     }
 }
@@ -97,6 +100,7 @@ pub(crate) fn validate_schema(
             let declared = match expected.kind {
                 ColumnKind::Text(_) | ColumnKind::Utf8 { .. } => "TEXT",
                 ColumnKind::Integer => "INTEGER",
+                ColumnKind::Blob { .. } => "BLOB",
             };
             if actual.get::<_, i64>(0)? != index as i64
                 || actual.get::<_, String>(1)? != expected.name
@@ -145,6 +149,9 @@ fn validity(column: &ColumnSpec) -> String {
             "typeof(\"{name}\")='text' AND length(CAST(\"{name}\" AS BLOB)) BETWEEN {min} AND {max}"
         ),
         ColumnKind::Integer => format!("typeof(\"{name}\")='integer' AND \"{name}\">=0"),
+        ColumnKind::Blob { min, max } => format!(
+            "typeof(\"{name}\")='blob' AND length(\"{name}\") BETWEEN {min} AND {max}"
+        ),
     }
 }
 fn nullable(column: &ColumnSpec) -> bool {
@@ -184,6 +191,7 @@ pub(crate) fn preflight(
                         format!("length(CAST(\"{}\" AS BLOB))", c.name)
                     }
                     ColumnKind::Integer => "8".into(),
+                    ColumnKind::Blob { .. } => format!("length(\"{}\")", c.name),
                 };
                 let null = if nullable(c) {
                     format!("WHEN \"{}\" IS NULL THEN 0 ", c.name)
@@ -238,6 +246,7 @@ fn validate_text(raw: &[u8], kind: ColumnKind) -> Result<&str> {
         }
         ColumnKind::Utf8 { min, max } => (min..=max).contains(&raw.len()),
         ColumnKind::Integer => false,
+        ColumnKind::Blob { .. } => false,
     };
     if !valid {
         return Err(invalid("storage inventory text value bounds"));
@@ -265,6 +274,15 @@ fn read_row(table: &TableSpec, row: &rusqlite::Row<'_>) -> Result<JournalStoredR
                 8,
                 (spec.primary_key != 0).then(|| n.to_string()),
             ),
+            (ColumnKind::Blob { min, max }, ValueRef::Blob(bytes))
+                if (min..=max).contains(&bytes.len()) =>
+            {
+                (
+                    JournalStorageColumnValue::Bytes(bytes.to_vec()),
+                    bytes.len() as u64,
+                    None,
+                )
+            }
             (_, ValueRef::Null) if nullable(spec) => (JournalStorageColumnValue::Null, 0, None),
             _ => return Err(invalid("storage inventory value changed")),
         };

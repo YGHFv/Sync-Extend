@@ -125,6 +125,7 @@ fn sql(value: &Value) -> Result<rusqlite::types::Value> {
         Value::Null => rusqlite::types::Value::Null,
         Value::Text(value) => rusqlite::types::Value::Text(value.clone()),
         Value::Integer(value) => rusqlite::types::Value::Integer(crate::sql_integer(*value)?),
+        Value::Bytes(value) => rusqlite::types::Value::Blob(value.clone()),
     })
 }
 #[cfg(windows)]

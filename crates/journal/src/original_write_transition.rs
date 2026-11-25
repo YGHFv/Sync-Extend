@@ -847,6 +847,7 @@ fn original_history_diff(
                     .map_err(|_| JournalError::Invariant("original admitted integer SQL range"))?,
             ),
             Value::Text(s) => OriginalSqliteValue::Text(s.clone()),
+            Value::Bytes(value) => OriginalSqliteValue::Blob(value.clone()),
         })
     }
     fn allowed(table: &str) -> bool {
