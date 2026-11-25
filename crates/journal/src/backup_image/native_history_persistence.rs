@@ -10,14 +10,14 @@ use super::native_history_source_proof::{
     NativeHistoryRowKey, NativeHistorySourceTable,
 };
 use crate::{
-    Journal, JournalCapacityLimits, JournalError, JournalStorageColumn, JournalStoredRow,
-    NodeInspectionBounds, Result, TreeRestoreInventoryLimits,
+    Journal, JournalCapacityLimits, JournalError, JournalStorageColumn, JournalStorageColumnValue,
+    JournalStoredRow, NodeInspectionBounds, Result, TreeRestoreInventoryLimits,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
-use sync_extend_core_model::{ContentId, SpaceId};
+use sync_extend_core_model::{ContentId, DeviceId, EntryId, SpaceId};
 
 mod fresh_writer;
 pub(crate) mod schema;
@@ -29,6 +29,22 @@ pub use fresh_writer::{
 
 const FORMAT_VERSION: u32 = 1;
 const MAX_SOURCE_ROWS: usize = 100_000;
+
+/// The complete native-history persistence inventory. Storage-role capacity
+/// audits may accept these rows only when the exact fresh-writer/source
+/// contract below owns every one of them.
+pub(crate) const STORAGE_ROLE_OWNER_TABLES: &[&str] = &[
+    "native_history_sources",
+    "native_history_source_tables",
+    "native_history_source_rows",
+    "native_history_holds",
+    "native_history_hold_rows",
+    "native_history_hold_objects",
+    "native_history_projection_rows",
+    "native_history_projection_root_columns",
+    "native_history_fresh_writers",
+    "native_history_fresh_writer_events",
+];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct NativeHistorySourceBinding {
@@ -756,6 +772,186 @@ fn parse_key(value: String) -> Result<Vec<String>> {
         ));
     }
     Ok(serde_json::from_str(&value)?)
+}
+
+/// Accept native-history rows into a storage-role capacity audit only when
+/// every row belongs to the exact fresh-writer/source contract for this
+/// worktree-free identity.
+///
+/// Rule:
+/// 1. every fresh writer names this exact space and device;
+/// 2. every fresh writer validates its complete event chain and source binding;
+/// 3. every persisted source is referenced by one of those writers;
+/// 4. every source is the exact storage identity (`space_id`, `device_id`,
+///    `storage_role=storage-v1`, no worktree) and validates its complete image,
+///    table, row, hold, object and projection digests;
+/// 5. every dependency row references a validated source/writer.
+///
+/// A row that cannot be attributed this way is a genuine foreign client/native
+/// owner and must still refuse the storage-only adapter.
+pub(crate) fn validate_storage_role_owners(
+    connection: &Connection,
+    space: &SpaceId,
+    device: &DeviceId,
+) -> Result<()> {
+    let writer_rows = connection
+        .prepare(
+            "SELECT writer_id,source_digest,space_id,device_id
+             FROM native_history_fresh_writers ORDER BY writer_id",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut referenced_sources = BTreeSet::new();
+    for (writer_id, source_digest, writer_space, writer_device) in writer_rows {
+        if writer_space != space.as_str() || writer_device != device.as_str() {
+            return Err(JournalError::Invariant(
+                "storage role foreign native history writer identity",
+            ));
+        }
+        let writer_id: EntryId = writer_id.parse()?;
+        let source_digest: ContentId = source_digest.parse()?;
+        let inspection = fresh_writer::inspect_writer_connection(connection, &writer_id)?;
+        if inspection.source_digest() != &source_digest
+            || inspection.space() != space
+            || inspection.device() != device
+        {
+            return Err(JournalError::Invariant(
+                "storage role native history writer contract differs",
+            ));
+        }
+        referenced_sources.insert(source_digest);
+    }
+
+    let source_rows = connection
+        .prepare("SELECT source_digest FROM native_history_sources ORDER BY source_digest")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut validated_sources = BTreeSet::new();
+    for digest in source_rows {
+        let digest: ContentId = digest.parse()?;
+        if !referenced_sources.contains(&digest) {
+            return Err(JournalError::Invariant(
+                "storage role native history source has no fresh writer",
+            ));
+        }
+        let source = inspect_source(connection, &digest)?;
+        if source.space() != space {
+            return Err(JournalError::Invariant(
+                "storage role foreign native history source space",
+            ));
+        }
+        let keys: BTreeSet<&str> = source
+            .rows()
+            .iter()
+            .filter(|row| row.table() == "local_state")
+            .filter_map(|row| row.primary_key().first().map(String::as_str))
+            .collect();
+        if keys != BTreeSet::from(["device_id", "space_id", "storage_role"]) {
+            return Err(JournalError::Invariant(
+                "storage role native history source identity keys",
+            ));
+        }
+        if source_local_state(&source, "space_id")? != Some(space.as_str())
+            || source_local_state(&source, "device_id")? != Some(device.as_str())
+            || source_local_state(&source, "storage_role")? != Some("storage-v1")
+            || source_local_state(&source, "worktree")?.is_some()
+        {
+            return Err(JournalError::Invariant(
+                "storage role foreign native history source identity",
+            ));
+        }
+        validated_sources.insert(digest);
+    }
+    if validated_sources != referenced_sources {
+        return Err(JournalError::Invariant(
+            "storage role native history source contract differs",
+        ));
+    }
+
+    for table in [
+        "native_history_source_tables",
+        "native_history_source_rows",
+        "native_history_holds",
+        "native_history_hold_rows",
+        "native_history_hold_objects",
+        "native_history_projection_rows",
+        "native_history_projection_root_columns",
+    ] {
+        let foreign: bool = connection.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM main.{table}
+                 WHERE source_digest NOT IN
+                   (SELECT source_digest FROM main.native_history_sources))"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        if foreign {
+            return Err(JournalError::Invariant(
+                "storage role foreign native history dependency row",
+            ));
+        }
+    }
+    for table in ["native_history_hold_rows", "native_history_hold_objects"] {
+        let foreign: bool = connection.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM main.{table}
+                 WHERE (source_digest,hold_ordinal) NOT IN
+                   (SELECT source_digest,ordinal FROM main.native_history_holds))"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        if foreign {
+            return Err(JournalError::Invariant(
+                "storage role foreign native history hold row",
+            ));
+        }
+    }
+    let orphan_events: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.native_history_fresh_writer_events
+         WHERE writer_id NOT IN
+           (SELECT writer_id FROM main.native_history_fresh_writers))",
+        [],
+        |row| row.get(0),
+    )?;
+    if orphan_events {
+        return Err(JournalError::Invariant(
+            "storage role foreign native history writer event",
+        ));
+    }
+    Ok(())
+}
+
+fn source_local_state<'a>(
+    source: &'a PersistedNativeHistorySource,
+    key: &str,
+) -> Result<Option<&'a str>> {
+    let Some(row) = source
+        .rows()
+        .iter()
+        .find(|row| row.table() == "local_state" && row.primary_key() == [key])
+    else {
+        return Ok(None);
+    };
+    let Some(column) = row.columns().iter().find(|column| column.name == "value") else {
+        return Err(JournalError::Invariant(
+            "persisted native history source identity value absent",
+        ));
+    };
+    match &column.value {
+        JournalStorageColumnValue::Text(value) => Ok(Some(value)),
+        _ => Err(JournalError::Invariant(
+            "persisted native history source identity value type",
+        )),
+    }
 }
 
 pub(super) fn inspect_source(

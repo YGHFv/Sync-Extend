@@ -1103,17 +1103,69 @@ fn projection(
             ));
         }
     }
-    let materialized: BTreeSet<_> = rows
-        .iter()
-        .filter(|row| row.table() == "operations")
-        .filter_map(|row| match text(row, "state") {
-            Ok("materialized") => Some(text(row, "op_id").map(str::to_owned)),
-            Ok("received" | "pending") => None,
-            _ => Some(Err(invalid(
-                "native history original operation state differs",
-            ))),
-        })
-        .collect::<Result<_>>()?;
+    // A materialized operation is only portable together with the exact
+    // contiguous receive cursor that a fresh Journal capacity audit requires.
+    // If the original cursor cannot prove the complete 1..=N sequence for one
+    // device, that device's operations stay in the original hold and are not
+    // projected. No cursor is synthesized.
+    let mut sequences: BTreeMap<(String, String), BTreeSet<u64>> = BTreeMap::new();
+    let mut operation_devices: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for row in rows.iter().filter(|row| row.table() == "operations") {
+        match text(row, "state")? {
+            "materialized" => {
+                let key = (
+                    text(row, "space_id")?.to_owned(),
+                    text(row, "origin_device_id")?.to_owned(),
+                );
+                let sequence = integer(row, "origin_seq")?;
+                if !sequences.entry(key.clone()).or_default().insert(sequence) {
+                    return Err(invalid(
+                        "native history duplicate materialized operation sequence",
+                    ));
+                }
+                operation_devices.insert(text(row, "op_id")?.to_owned(), key);
+            }
+            "received" | "pending" => (),
+            _ => {
+                return Err(invalid(
+                    "native history original operation state differs",
+                ))
+            }
+        }
+    }
+    let mut cursors = BTreeMap::new();
+    for row in rows.iter().filter(|row| row.table() == "receive_cursors") {
+        let key = (
+            text(row, "space_id")?.to_owned(),
+            text(row, "device_id")?.to_owned(),
+        );
+        if cursors
+            .insert(key, integer(row, "contiguous_seq")?)
+            .is_some()
+        {
+            return Err(invalid("native history duplicate original receive cursor"));
+        }
+    }
+    let mut projected_cursors = BTreeSet::new();
+    let mut unprojected_devices = BTreeSet::new();
+    for (key, values) in &sequences {
+        let last = values.iter().next_back().copied().unwrap_or(0);
+        let contiguous =
+            last > 0 && values.len() as u64 == last && values.first().copied() == Some(1);
+        match cursors.get(key) {
+            Some(cursor) if contiguous && *cursor == last => {
+                projected_cursors.insert(key.clone());
+            }
+            _ => {
+                unprojected_devices.insert(key.clone());
+            }
+        }
+    }
+    let materialized: BTreeSet<_> = operation_devices
+        .into_iter()
+        .filter(|(_, device)| !unprojected_devices.contains(device))
+        .map(|(operation, _)| operation)
+        .collect();
     let mut portable = Vec::new();
     for row in rows {
         let rule = registry.table(row.table())?;
@@ -1125,9 +1177,15 @@ fn projection(
             "operations" => materialized.contains(text(row, "op_id")?),
             "original_operation_provenance" => materialized.contains(text(row, "op_id")?),
             "deletion_retention_observations" => materialized.contains(text(row, "operation_id")?),
-            // Old inbox acknowledgements and receive cursors are immutable
-            // original source data. A fresh session has independent cursors.
-            "receive_cursors" | "original_page_inbox" | "forwarded_page_inbox" => false,
+            // The exact matching cursor is immutable source evidence and the
+            // required target state for the projected materialized sequence.
+            // A cursor without an exact projected operation set stays held.
+            "receive_cursors" => projected_cursors.contains(&(
+                text(row, "space_id")?.to_owned(),
+                text(row, "device_id")?.to_owned(),
+            )),
+            // Old inbox acknowledgements are immutable original source data.
+            "original_page_inbox" | "forwarded_page_inbox" => false,
             _ => rule.portable_state,
         };
         if safe {

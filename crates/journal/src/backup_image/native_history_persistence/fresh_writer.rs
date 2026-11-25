@@ -456,7 +456,7 @@ impl Journal {
             apply_root_mapping(&key, &mut columns, mapping)?;
             insert_row(&tx, row.table(), &columns)?;
         }
-        let snapshot = target_snapshot(&tx, &tables, &source)?;
+        let snapshot = target_snapshot(&tx, &target_tables(&source), &source)?;
         let at_ms = monotonic_now(stored.updated_at_ms)?;
         let changed = tx.execute(
             "UPDATE native_history_fresh_writers
@@ -488,8 +488,8 @@ impl Journal {
 
     /// Record a replacement after the caller has actually changed the target
     /// through ordinary writer paths. The supplied digest must be the complete
-    /// post-change snapshot of every projected table, and it must differ from
-    /// the created snapshot.
+    /// post-change snapshot of the whole writable schema-69 target state, and it
+    /// must differ from the created snapshot.
     pub fn replace_native_history_fresh_writer(
         &mut self,
         writer: &mut NativeHistoryFreshWriter,
@@ -498,7 +498,7 @@ impl Journal {
         writer.require(NativeHistoryFreshWriterState::Created)?;
         let source = self.inspect_native_history_source(writer.source_digest.clone())?;
         verify_writer_source(writer, &source)?;
-        let tables = projection_tables(&source);
+        let tables = target_tables(&source);
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let stored = load_writer(&tx, &writer.writer_id)?;
         verify_writer_token(writer, &stored, NativeHistoryFreshWriterState::Created)?;
@@ -558,7 +558,7 @@ impl Journal {
         let source = self.inspect_native_history_source(writer.source_digest.clone())?;
         verify_writer_source(writer, &source)?;
         let expected = writer.last_snapshot()?;
-        let tables = projection_tables(&source);
+        let tables = target_tables(&source);
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let stored = load_writer(&tx, &writer.writer_id)?;
         verify_writer_token(writer, &stored, writer.state)?;
@@ -624,7 +624,7 @@ impl Journal {
             ));
         }
         let expected = writer.last_snapshot()?;
-        let tables = projection_tables(&source);
+        let tables = target_tables(&source);
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let stored = load_writer(&tx, &writer.writer_id)?;
         verify_writer_token(writer, &stored, NativeHistoryFreshWriterState::Closed)?;
@@ -671,11 +671,8 @@ impl Journal {
         writer_id: &EntryId,
     ) -> Result<NativeHistoryFreshWriterInspection> {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
-        let stored = load_writer(&tx, writer_id)?;
-        let source = super::inspect_source(&tx, &stored.source_digest)?;
-        let events = load_events(&tx, writer_id)?;
+        let inspection = inspect_writer_connection(&tx, writer_id)?;
         tx.rollback()?;
-        let inspection = verify_event_chain(writer_id, &stored, &source, &events)?;
         Ok(inspection)
     }
 
@@ -735,10 +732,22 @@ impl Journal {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
         let stored = load_writer(&tx, writer_id)?;
         let source = super::inspect_source(&tx, &stored.source_digest)?;
-        let snapshot = target_snapshot(&tx, &projection_tables(&source), &source)?;
+        let snapshot = target_snapshot(&tx, &target_tables(&source), &source)?;
         tx.rollback()?;
         Ok(snapshot)
     }
+}
+
+/// Read-only inspection over an existing snapshot/transaction. The source and
+/// the complete event chain are validated before any field is returned.
+pub(super) fn inspect_writer_connection(
+    connection: &Connection,
+    writer_id: &EntryId,
+) -> Result<NativeHistoryFreshWriterInspection> {
+    let stored = load_writer(connection, writer_id)?;
+    let source = super::inspect_source(connection, &stored.source_digest)?;
+    let events = load_events(connection, writer_id)?;
+    verify_event_chain(writer_id, &stored, &source, &events)
 }
 
 fn fresh_writer_id(
@@ -1159,6 +1168,21 @@ fn projection_tables(source: &PersistedNativeHistorySource) -> Vec<&'static str>
         tables.insert(key.table());
     }
     tables.into_iter().collect()
+}
+
+/// Every writable schema-69 table is part of the target state, including
+/// tables that receive rows through ordinary Journal paths after create.
+/// Snapshotting only the initial projection would miss those later writes and
+/// let a replacement, close or reopen accept a changed target.
+fn target_tables(source: &PersistedNativeHistorySource) -> Vec<&'static str> {
+    let mut tables: Vec<_> = source
+        .registry()
+        .tables()
+        .iter()
+        .map(|table| table.table)
+        .collect();
+    tables.sort_unstable();
+    tables
 }
 
 fn row_key(row: &JournalStoredRow) -> Result<NativeHistoryRowKey> {
