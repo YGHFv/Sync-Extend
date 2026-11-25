@@ -110,7 +110,7 @@ function Get-SyncExtendRestoreRequestHex($Request) {
     return [Convert]::ToHexString($bytes).ToLowerInvariant()
 }
 
-function New-SyncExtendRestorePreviewView($Response, $Request) {
+function New-SyncExtendRestorePreviewView($Response, $Request, $Capabilities = $null) {
     Assert-SyncExtendViewObject $Response
     Assert-SyncExtendViewId $Response.owner_generation 32
     if ($Response.preview_format_version -ne 2 -or $Response.owner_generation -cne $Request.owner_generation -or
@@ -202,6 +202,10 @@ function New-SyncExtendRestorePreviewView($Response, $Request) {
     }
     $details = "只读描述，尚未恢复。选中 $($Response.counts.selected_target_entries) 项；保留当前 $($Response.counts.preserved_current_paths) 项；冲突 $($Response.counts.reported_conflicts) 项。"
     $details += "`r`n逻辑暂存：$staging；原内容估计：$original。CAS 内容、原生路径冲突、可用空间和实际物理分配均未验证。"
+    $capabilityView = New-SyncExtendMetadataCapabilitiesView $Capabilities
+    if ($capabilityView.Declared) {
+        $details += "`r`n预览所用平台的元数据能力：$($capabilityView.Capabilities)；认证：$($capabilityView.Certification)；时间精度：$($capabilityView.Precision)。这是能力披露，不代表所选历史项已应用或已校验。"
+    }
     if ($Response.entries_truncated -or $Response.cas_references_truncated) {
         $details += "`r`n结果表或块引用已按显示预算截断；完整选中数量仍保留。"
     }
@@ -722,32 +726,75 @@ function Get-SyncExtendMetadataPrecisionText($Value) {
 function New-SyncExtendMetadataCapabilitiesView($Capabilities) {
     $view = @{
         Capabilities = '捕获未知 / 应用未知 / 校验未知'
-        Precision = '未知'; Declared = $false
+        Precision = '未知'; Certification = '未知'; Declared = $false
     }
     if ($null -eq $Capabilities) { return $view }
     try {
         Assert-SyncExtendViewObject $Capabilities
-        $fields = @('capture', 'apply', 'verify', 'timestamp_precision_ns')
-        if ($Capabilities.Count -lt 3 -or $Capabilities.Count -gt 4 -or
+        $fields = @('format_version', 'capture', 'apply', 'verify', 'timestamp_precision_ns', 'unsupported', 'certification')
+        if ($Capabilities.Count -lt 3 -or $Capabilities.Count -gt $fields.Count -or
             @($Capabilities.Keys | Where-Object { $_ -cnotin $fields }).Count) {
             throw 'The optional metadata capability shape cannot be verified.'
         }
+        if ($null -ne $Capabilities.format_version -and
+            ((Get-SyncExtendViewInteger $Capabilities.format_version) -ne 1)) {
+            throw 'The optional metadata capability version cannot be verified.'
+        }
         $states = @{ supported = '支持'; unsupported = '不支持'; unknown = '未知' }
+        $reasons = @{ platform = '平台'; filesystem = '文件系统'; permission = '权限'; api = '接口' }
+        $fieldNames = [ordered]@{
+            modified = '时间'; creation = '创建时间'; readonly = '只读'; unix_executable = '可执行位'
+        }
         $labels = [ordered]@{ capture = '捕获'; apply = '应用'; verify = '校验' }
         $segments = [Collections.Generic.List[string]]::new()
         $allUnknown = $true
         foreach ($phase in $labels.Keys) {
             $stage = $Capabilities[$phase]
             Assert-SyncExtendViewObject $stage
-            if ($stage.Count -ne 2 -or
-                @($stage.Keys | Where-Object { $_ -cnotin @('modified', 'readonly') }).Count -or
-                $stage.modified -isnot [string] -or $stage.readonly -isnot [string] -or
-                $stage.modified -cnotin @('supported', 'unsupported', 'unknown') -or
-                $stage.readonly -cnotin @('supported', 'unsupported', 'unknown')) {
+            if ($stage.Count -lt 2 -or $stage.Count -gt $fieldNames.Count -or
+                @($stage.Keys | Where-Object { $_ -cnotin @($fieldNames.Keys) }).Count -or
+                -not (@($stage.Keys) -ccontains 'modified') -or
+                -not (@($stage.Keys) -ccontains 'readonly')) {
                 throw 'The optional metadata capability stage cannot be verified.'
             }
-            if ($stage.modified -cne 'unknown' -or $stage.readonly -cne 'unknown') { $allUnknown = $false }
-            [void]$segments.Add("$($labels[$phase]) 时间$($states[$stage.modified])、只读$($states[$stage.readonly])")
+            $parts = [Collections.Generic.List[string]]::new()
+            foreach ($field in $fieldNames.Keys) {
+                if (!(@($stage.Keys) -ccontains $field)) { continue }
+                $state = $stage[$field]
+                if ($state -isnot [string] -or $state -cnotin $states.Keys) {
+                    throw 'The optional metadata capability stage state cannot be verified.'
+                }
+                if ($state -cne 'unknown') { $allUnknown = $false }
+                [void]$parts.Add("$($fieldNames[$field])$($states[$state])")
+            }
+            [void]$segments.Add("$($labels[$phase]) $($parts -join '、')")
+        }
+        $reasonSegments = [Collections.Generic.List[string]]::new()
+        if ($null -ne $Capabilities.unsupported) {
+            Assert-SyncExtendViewObject $Capabilities.unsupported
+            if (@($Capabilities.unsupported.Keys | Where-Object { $_ -cnotin @('creation', 'unix_executable') }).Count) {
+                throw 'The optional metadata unsupported reasons cannot be verified.'
+            }
+            foreach ($field in @('creation', 'unix_executable')) {
+                if ($null -eq $Capabilities.unsupported[$field]) { continue }
+                $reason = $Capabilities.unsupported[$field]
+                if ($reason -isnot [string] -or !$reasons.ContainsKey($reason)) {
+                    throw 'The optional metadata unsupported reason cannot be verified.'
+                }
+                [void]$reasonSegments.Add("$($fieldNames[$field])=$($reasons[$reason])")
+            }
+        }
+        $certification = '未知'
+        if ($null -ne $Capabilities.certification) {
+            if ($Capabilities.certification -isnot [string]) {
+                throw 'The optional metadata certification cannot be verified.'
+            }
+            $certification = switch -CaseSensitive ($Capabilities.certification) {
+                'windows_ntfs_actual_grouped_acceptance' { 'Windows NTFS 实际分组验收' }
+                'unix_implemented_not_verified_in_this_release' { 'Unix 已实现，本版本未实测' }
+                'unsupported_platform' { '当前平台不支持' }
+                default { throw 'The optional metadata certification cannot be verified.' }
+            }
         }
         $precision = '未知'
         if ($null -ne $Capabilities.timestamp_precision_ns) {
@@ -761,8 +808,13 @@ function New-SyncExtendMetadataCapabilitiesView($Capabilities) {
                 $precision = Get-SyncExtendMetadataPrecisionText $value
             }
         }
-        if (!$allUnknown) { $view.Capabilities = $segments -join ' / ' }
+        if (!$allUnknown) {
+            $text = $segments -join ' / '
+            if ($reasonSegments.Count) { $text += "（未支持原因：$($reasonSegments -join '、')）" }
+            $view.Capabilities = $text
+        }
         $view.Precision = $precision
+        $view.Certification = $certification
         $view.Declared = $true
     } catch {
         # Optional fields from older or malformed observations remain unknown.
@@ -1135,7 +1187,8 @@ function New-SyncExtendClientView($Dashboard) {
         Add-SyncExtendViewRow $view 'Status' @('待处理文件 / 发布', "$($local.outstanding_mutations) / $($local.outstanding_publications)")
         $metadataCapabilities = New-SyncExtendMetadataCapabilitiesView $local.metadata_capabilities
         if ($metadataCapabilities.Declared) {
-            Add-SyncExtendViewRow $view 'Status' @('元数据能力说明', '捕获、应用、校验分别声明支持能力；支持不代表该文件已应用或已校验。')
+            Add-SyncExtendViewRow $view 'Status' @('元数据能力说明',
+                "捕获、应用、校验分别声明支持能力；支持不代表该文件已应用或已校验。认证：$($metadataCapabilities.Certification)；时间精度：$($metadataCapabilities.Precision)。")
         }
         foreach ($entry in $local.entries) {
             Assert-SyncExtendViewObject $entry

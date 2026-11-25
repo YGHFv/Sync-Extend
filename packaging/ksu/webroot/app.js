@@ -436,27 +436,62 @@ function showSummary(category, rows) {
 
 function metadataCapabilitiesView(capabilities) {
   const view = {
-    capabilities: "捕获未知 / 应用未知 / 校验未知", precision: "未知", declared: false,
+    capabilities: "捕获未知 / 应用未知 / 校验未知", precision: "未知",
+    certification: "未知", declared: false,
   };
   if (capabilities === undefined || capabilities === null) return view;
   const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
-  const names = ["capture", "apply", "verify", "timestamp_precision_ns"];
+  const names = ["format_version", "capture", "apply", "verify", "timestamp_precision_ns", "unsupported", "certification"];
   if (!object(capabilities) || Object.keys(capabilities).length < 3 ||
-      Object.keys(capabilities).length > 4 || Object.keys(capabilities).some((key) => !names.includes(key))) {
+      Object.keys(capabilities).length > names.length ||
+      Object.keys(capabilities).some((key) => !names.includes(key))) {
     return view;
   }
+  if (Object.hasOwn(capabilities, "format_version") && capabilities.format_version !== 1) return view;
   const labels = {capture: "捕获", apply: "应用", verify: "校验"};
   const states = {supported: "支持", unsupported: "不支持", unknown: "未知"};
+  const reasons = {platform: "平台", filesystem: "文件系统", permission: "权限", api: "接口"};
+  const fieldNames = {modified: "时间", creation: "创建时间", readonly: "只读", unix_executable: "可执行位"};
+  const fieldOrder = ["modified", "creation", "readonly", "unix_executable"];
   const segments = [];
   let allUnknown = true;
   for (const phase of ["capture", "apply", "verify"]) {
     const stage = capabilities[phase];
-    if (!object(stage) || Object.keys(stage).length !== 2 ||
-        Object.keys(stage).some((key) => !["modified", "readonly"].includes(key)) ||
-        !["supported", "unsupported", "unknown"].includes(stage.modified) ||
-        !["supported", "unsupported", "unknown"].includes(stage.readonly)) return view;
-    if (stage.modified !== "unknown" || stage.readonly !== "unknown") allUnknown = false;
-    segments.push(`${labels[phase]} 时间${states[stage.modified]}、只读${states[stage.readonly]}`);
+    if (!object(stage) || Object.keys(stage).length < 2 || Object.keys(stage).length > fieldOrder.length ||
+        Object.keys(stage).some((key) => !fieldOrder.includes(key)) ||
+        !Object.hasOwn(stage, "modified") || !Object.hasOwn(stage, "readonly")) return view;
+    const parts = [];
+    for (const field of fieldOrder) {
+      if (!Object.hasOwn(stage, field)) continue;
+      if (!["supported", "unsupported", "unknown"].includes(stage[field])) return view;
+      if (stage[field] !== "unknown") allUnknown = false;
+      parts.push(`${fieldNames[field]}${states[stage[field]]}`);
+    }
+    segments.push(`${labels[phase]} ${parts.join("、")}`);
+  }
+  const reasonSegments = [];
+  if (capabilities.unsupported !== undefined && capabilities.unsupported !== null) {
+    if (!object(capabilities.unsupported) || Object.keys(capabilities.unsupported).length > 2 ||
+        Object.keys(capabilities.unsupported).some((key) => !["creation", "unix_executable"].includes(key))) {
+      return view;
+    }
+    for (const field of ["creation", "unix_executable"]) {
+      if (!Object.hasOwn(capabilities.unsupported, field)) continue;
+      const reason = capabilities.unsupported[field];
+      if (typeof reason !== "string" || !Object.hasOwn(reasons, reason)) return view;
+      reasonSegments.push(`${fieldNames[field]}=${reasons[reason]}`);
+    }
+  }
+  let certification = "未知";
+  if (capabilities.certification !== undefined && capabilities.certification !== null) {
+    const certifications = {
+      windows_ntfs_actual_grouped_acceptance: "Windows NTFS 实际分组验收",
+      unix_implemented_not_verified_in_this_release: "Unix 已实现，本版本未实测",
+      unsupported_platform: "当前平台不支持",
+    };
+    if (typeof capabilities.certification !== "string" ||
+        !Object.hasOwn(certifications, capabilities.certification)) return view;
+    certification = certifications[capabilities.certification];
   }
   let precision = "未知";
   const value = capabilities.timestamp_precision_ns;
@@ -466,8 +501,13 @@ function metadataCapabilitiesView(capabilities) {
     }
     precision = Number.isSafeInteger(value) ? `${value} ns（后台声明）` : "未知（整数超出客户端精确范围）";
   }
-  if (!allUnknown) view.capabilities = segments.join(" / ");
+  if (!allUnknown) {
+    let text = segments.join(" / ");
+    if (reasonSegments.length) text += `（未支持原因：${reasonSegments.join("、")}）`;
+    view.capabilities = text;
+  }
   view.precision = precision;
+  view.certification = certification;
   view.declared = true;
   return view;
 }
@@ -514,8 +554,11 @@ function entryMetadataView(metadata, capabilities = undefined) {
 function showWorkspaceEntries(local) {
   fields["workspace-rows"].textContent = "";
   fields["workspace-files"].hidden = true;
+  const capabilityView = metadataCapabilitiesView(local.metadata_capabilities);
   if (local.entries === undefined || local.entries === null) {
-    fields["workspace-files-detail"].textContent = "后台尚未提供文件元数据列表；当前值未知。";
+    fields["workspace-files-detail"].textContent = "后台尚未提供文件元数据列表；当前值未知。" +
+      (capabilityView.declared ?
+        ` 元数据能力：${capabilityView.capabilities}；认证：${capabilityView.certification}；时间精度：${capabilityView.precision}。` : "");
     return;
   }
   if (!Array.isArray(local.entries) || local.entries.length > 128 ||
@@ -543,11 +586,10 @@ function showWorkspaceEntries(local) {
   }
   fields["workspace-rows"].appendChild(fragment);
   fields["workspace-files"].hidden = false;
-  const capabilityView = metadataCapabilitiesView(local.metadata_capabilities);
   fields["workspace-files-detail"].textContent =
     `${local.entries.length} / ${local.total_entries} 个路径${local.entries_truncated ? "（已截取）" : ""}。` +
     (capabilityView.declared ?
-      "修改时间和只读属性来自源元数据；捕获、应用、校验分别声明支持能力，支持不代表已应用或已校验。" :
+      `修改时间和只读属性来自源元数据；捕获、应用、校验分别声明支持能力，支持不代表已应用或已校验。认证：${capabilityView.certification}；时间精度：${capabilityView.precision}。` :
       "修改时间和只读属性来自源元数据；捕获、应用、校验与文件系统时间精度尚未报告。");
 }
 
