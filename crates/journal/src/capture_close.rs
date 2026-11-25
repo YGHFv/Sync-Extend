@@ -277,7 +277,10 @@ impl Journal {
                                 "stopped capture sidecar byte bound",
                             ));
                         }
-                        if suffix == "-wal" {
+                        // A zero-length WAL carries no frames. Treat it like an
+                        // absent WAL so a stopped source can still be opened
+                        // immutably; the empty file itself stays retained.
+                        if suffix == "-wal" && length != 0 {
                             existing_wal = Some((held.key()?, length));
                         }
                         if suffix == "-journal" && length != 0 {

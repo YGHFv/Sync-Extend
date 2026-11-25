@@ -707,7 +707,7 @@ impl OriginalJournalWriteTransition {
             let mut statement = memory.prepare(&query.sql)?;
             after.push(expected_rows(&mut statement, bounds, &mut aggregate)?);
         }
-        let statements = original_history_diff(&before_audit.rows, &after_audit.rows)?;
+        let statements = original_history_diff(&before_audit.rows, &after_audit.rows, false)?;
 
         self.original.execute_admitted_rows(
             &statements,
@@ -833,6 +833,7 @@ fn original_owned_value(value: &OriginalSqliteValue) -> Result<rusqlite::types::
 fn original_history_diff(
     before: &[crate::JournalStoredRow],
     after: &[crate::JournalStoredRow],
+    allow_unchanged: bool,
 ) -> Result<Vec<sync_extend_platform_fs::OriginalSqliteStatement>> {
     use crate::JournalStorageColumnValue as Value;
     use std::collections::BTreeMap;
@@ -974,7 +975,7 @@ fn original_history_diff(
             ));
         }
     }
-    if result.is_empty() || result.len() > 1024 {
+    if (result.is_empty() && !allow_unchanged) || result.len() > 1024 {
         return Err(JournalError::Invariant("original history statement count"));
     }
     Ok(result)
@@ -1242,7 +1243,7 @@ impl JournalBackupImage {
             snapshot.rollback()?;
             audit
         };
-        let statements = original_history_diff(&before_audit.rows, &after_audit.rows)?;
+        let statements = original_history_diff(&before_audit.rows, &after_audit.rows, false)?;
         let mut aggregate = ExpectedAggregate { rows: 0, bytes: 0 };
         let mut after = Vec::new();
         for query in &queries {
@@ -1544,7 +1545,7 @@ impl JournalBackupImage {
         let before_audit = audit(&planner)?;
         let outcome = change(&mut planner)?;
         let after_audit = audit(&planner)?;
-        let statements = original_history_diff(&before_audit.rows, &after_audit.rows)?;
+        let statements = original_history_diff(&before_audit.rows, &after_audit.rows, false)?;
         let mut aggregate = ExpectedAggregate { rows: 0, bytes: 0 };
         let after = queries
             .iter()
@@ -1675,6 +1676,28 @@ impl JournalBackupImage {
         space: &SpaceId,
         bounds: NodeInspectionBounds,
     ) -> Result<()> {
+        self.audit_recovered_history_extension_inner(baseline, space, bounds, false)
+    }
+
+    /// The same complete extension audit, except that a genuinely unchanged
+    /// read-only generation is valid. Chain close/restart paths use this so a
+    /// Run that performs no mutation can still publish its native generation.
+    pub fn audit_recovered_history_extension_allow_unchanged(
+        &self,
+        baseline: &JournalBackupImage,
+        space: &SpaceId,
+        bounds: NodeInspectionBounds,
+    ) -> Result<()> {
+        self.audit_recovered_history_extension_inner(baseline, space, bounds, true)
+    }
+
+    fn audit_recovered_history_extension_inner(
+        &self,
+        baseline: &JournalBackupImage,
+        space: &SpaceId,
+        bounds: NodeInspectionBounds,
+        allow_unchanged: bool,
+    ) -> Result<()> {
         fn rows(
             image: &JournalBackupImage,
             space: &SpaceId,
@@ -1761,7 +1784,7 @@ impl JournalBackupImage {
             snapshot.rollback()?;
             audit
         };
-        let _ = original_history_diff(&old_audit.rows, &new_audit.rows)?;
+        let _ = original_history_diff(&old_audit.rows, &new_audit.rows, allow_unchanged)?;
         Ok(())
     }
 }

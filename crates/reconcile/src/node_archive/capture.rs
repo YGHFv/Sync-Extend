@@ -377,7 +377,10 @@ impl LocalSpace {
                     "node config references require separately captured protected artifacts",
                 ));
             }
-            if config.data_dir != self.data_dir || config.worktree.as_ref() != Some(&self.worktree)
+            if !super::portable_source::path_equal(&config.data_dir, &self.data_dir)
+                || config.worktree.as_deref().is_none_or(|worktree| {
+                    !super::portable_source::path_equal(worktree, &self.worktree)
+                })
             {
                 return Err(ReconcileError::Invariant(
                     "node explicit config scope differs",

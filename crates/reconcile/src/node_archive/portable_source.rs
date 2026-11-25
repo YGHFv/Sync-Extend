@@ -1,6 +1,8 @@
 //! Original owner history preflight before any target or ledger effects.
 use crate::{ReconcileError, Result};
-use std::path::{Component, Path, PathBuf};
+#[cfg(windows)]
+use std::path::Component;
+use std::path::{Path, PathBuf};
 use sync_extend_core_model::{ContentId, DeviceId, SpaceId};
 use sync_extend_journal::{
     ArchivedReadLeaseHold, JournalBackupImage, NodeInspectionBounds,
@@ -9,26 +11,42 @@ use sync_extend_journal::{
 
 // Compare drive and ordinary components the same way for both slash
 // spellings and when the original is an extended-length Windows path.
-pub(super) fn path_within(path: &Path, parent: &Path) -> bool {
-    let parts = |value: &Path| {
-        value
-            .components()
-            .map(|part| match part {
-                Component::Prefix(prefix) => match prefix.kind() {
-                    std::path::Prefix::Disk(letter) | std::path::Prefix::VerbatimDisk(letter) => {
-                        format!("{}:", char::from(letter.to_ascii_uppercase()))
-                    }
-                    _ => prefix.as_os_str().to_string_lossy().to_uppercase(),
-                },
-                Component::Normal(name) => name
-                    .to_string_lossy()
-                    .trim_end_matches([' ', '.'])
-                    .to_uppercase(),
-                _ => part.as_os_str().to_string_lossy().into_owned(),
-            })
-            .collect::<Vec<_>>()
-    };
-    parts(path).starts_with(&parts(parent))
+#[cfg(windows)]
+pub(crate) fn path_components(value: &Path) -> Vec<String> {
+    value
+        .components()
+        .map(|part| match part {
+            Component::Prefix(prefix) => match prefix.kind() {
+                std::path::Prefix::Disk(letter) | std::path::Prefix::VerbatimDisk(letter) => {
+                    format!("{}:", char::from(letter.to_ascii_uppercase()))
+                }
+                _ => prefix.as_os_str().to_string_lossy().to_uppercase(),
+            },
+            Component::Normal(name) => name
+                .to_string_lossy()
+                .trim_end_matches([' ', '.'])
+                .to_uppercase(),
+            _ => part.as_os_str().to_string_lossy().into_owned(),
+        })
+        .collect()
+}
+
+// Unix paths are case- and trailing-character-sensitive, so components are
+// compared exactly rather than folded through Windows rules.
+#[cfg(not(windows))]
+pub(crate) fn path_components(value: &Path) -> Vec<String> {
+    value
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect()
+}
+
+pub(crate) fn path_equal(left: &Path, right: &Path) -> bool {
+    path_components(left) == path_components(right)
+}
+
+pub(crate) fn path_within(path: &Path, parent: &Path) -> bool {
+    path_components(path).starts_with(&path_components(parent))
 }
 
 #[derive(serde::Serialize)]

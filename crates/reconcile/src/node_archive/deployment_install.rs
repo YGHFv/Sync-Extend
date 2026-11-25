@@ -9,7 +9,7 @@ use super::{
     protected_artifact::{DeploymentProtectionProvider, OriginalProtectedArtifact},
     NativeCreator, NativeFailedCreate, NativeParent, NativeSealed,
 };
-use crate::{ReconcileError, Result};
+use crate::{node_archive::portable_source::path_equal, ReconcileError, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -91,8 +91,8 @@ impl ActualDeploymentNodeProof for crate::OriginalNodeCompletionObservation<'_, 
             let binding = self.deployment_binding()?;
             if id != descriptor.id
                 || binding.archive_digest() != &descriptor.archive_digest
-                || binding.data_dir() != target.data_dir
-                || binding.worktree() != target.worktree
+                || !path_equal(binding.data_dir(), &target.data_dir)
+                || !path_equal(binding.worktree(), &target.worktree)
                 || binding.space_id()? != descriptor.space_id
                 || binding.device_id()? != descriptor.device_id
             {
@@ -900,7 +900,7 @@ impl<'proof> PreparedDeploymentInstall<'proof> {
                     actual_digest: artifact.digest.clone(),
                     original_private_create_verified: true,
                     original_file_sync_and_readback_verified: true,
-                    original_parent_sync_verified: cfg!(target_os = "linux"),
+                    original_parent_sync_verified: ORIGINAL_PARENT_SYNC_VERIFIED,
                     original_sealed_read_scope_verified: true,
                     receipt_digest,
                 })
@@ -959,6 +959,13 @@ pub struct OriginalDeploymentInstallAttempt<'proof> {
     complete: bool,
 }
 
+/// The Linux creator fsyncs the retained parent directory as part of the
+/// bounded write. The Windows creator has no native parent-directory sync
+/// operation, so its receipts must not claim one. Pin both the receipt and the
+/// audit to the same platform capability instead of demanding Linux semantics
+/// everywhere.
+const ORIGINAL_PARENT_SYNC_VERIFIED: bool = cfg!(target_os = "linux");
+
 fn verify_original_installed_files(
     mapping: &RestrictedDeploymentMapping,
     parents: &BTreeMap<PathBuf, NativeParent>,
@@ -1010,7 +1017,7 @@ fn verify_original_installed_files(
             || receipt.actual_bytes != artifact.bytes.len() as u64
             || !receipt.original_private_create_verified
             || !receipt.original_file_sync_and_readback_verified
-            || !receipt.original_parent_sync_verified
+            || receipt.original_parent_sync_verified != ORIGINAL_PARENT_SYNC_VERIFIED
             || !receipt.original_sealed_read_scope_verified
             || receipt.original_key != sealed_key(file)
             || !ids.insert(artifact.id)

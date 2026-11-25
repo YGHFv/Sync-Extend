@@ -3837,14 +3837,14 @@ fn recovered_wal_v2_records(bytes: &[u8]) -> Result<Vec<RecoveredWalV2Record>> {
                 ));
             }
         }
-        if index >= 2 {
-            let checkpoint: &RecoveredWalV2Record = &result[1];
+        if index == 3 {
+            let checkpoint: &RecoveredWalV2Record = &result[2];
             if record.rows != checkpoint.rows
                 || record.main != checkpoint.main
                 || record.shm != checkpoint.shm
             {
                 return Err(ReconcileError::Invariant(
-                    "WAL2 checkpoint bytes changed after commit",
+                    "WAL2 close bytes changed after checkpoint",
                 ));
             }
         }
@@ -7714,8 +7714,12 @@ impl FreshRecoveredNodeWalV2Session {
     pub fn close_recovered_mutation_history_with_evidence(&mut self) -> Result<PathBuf> {
         self.verify()?;
         let metadata = self.verified_metadata_close_evidence()?;
+        let empty_chain_continuation = self.history_count == 0
+            && metadata.is_none()
+            && self.history_chain_parent.is_some()
+            && self.retained_receipts.is_empty();
         if self.closed
-            || (self.history_count == 0 && metadata.is_none())
+            || (!empty_chain_continuation && self.history_count == 0 && metadata.is_none())
             || self.history_count >= FRESH_OPERATION_MAXIMUM
         {
             return Err(ReconcileError::Invariant(
@@ -7970,7 +7974,9 @@ impl super::VerifiedNodeStateArchive {
                 || first.phase != "close_intended"
                 || first.archive != *self.digest()
                 || first.wal2_frames.is_some()
-                || (first.history_count == 0 && first.metadata.is_none())
+                || (first.history_count == 0
+                    && first.metadata.is_none()
+                    && !first.receipts.is_empty())
                 || first.history_count >= FRESH_OPERATION_MAXIMUM
                 || terminal.index != 1
                 || terminal.phase != "closed"
@@ -8279,7 +8285,9 @@ impl FreshRecoveredNodeWalV2Session {
     pub fn close_recovered_history_for_chain8(&mut self) -> Result<PathBuf> {
         self.verify()?;
         self.verified_metadata_close_evidence()?;
-        if (self.history_count == 0 && self.metadata_count == 0)
+        if (self.history_count == 0
+            && self.metadata_count == 0
+            && self.history_chain_parent.is_none())
             || self.closed
             || self.history_baseline.is_empty()
             || self.history_baseline.len() > 64 * 1024 * 1024
@@ -8327,7 +8335,25 @@ impl FreshRecoveredNodeWalV2Session {
             &self.space,
             self.bounds,
         )?;
-        final_image.audit_recovered_history_extension(&baseline, &self.space, self.bounds)?;
+        let continuation_without_receipts = self.history_count == 0
+            && self.metadata_count == 0
+            && self.history_chain_parent.is_some()
+            && self.retained_receipts.is_empty();
+        if continuation_without_receipts {
+            if baseline.closed_node_complete_rows_digest(&self.space, self.bounds)?
+                != final_image.closed_node_complete_rows_digest(&self.space, self.bounds)?
+            {
+                return Err(ReconcileError::Invariant(
+                    "read-only continuation changed native rows without history",
+                ));
+            }
+        } else {
+            final_image.audit_recovered_history_extension_allow_unchanged(
+                &baseline,
+                &self.space,
+                self.bounds,
+            )?;
+        }
         let parent = self
             .path
             .parent()
@@ -8347,7 +8373,7 @@ impl FreshRecoveredNodeWalV2Session {
             .map(history_object)
             .collect::<Result<Vec<_>>>()?;
         receipts.sort_by(|a, b| a.name.cmp(&b.name));
-        if receipts.is_empty()
+        if (receipts.is_empty() && self.history_chain_parent.is_none())
             || receipts.len() > FRESH_RECEIPT_COUNT_MAXIMUM
             || receipts
                 .iter()
@@ -8664,7 +8690,7 @@ impl super::VerifiedNodeStateArchive {
             || record.external_key != held.key()?.to_string()
             || record.baseline.name != format!("node-history-baseline-{}.image", record.session)
             || record.predecessor.is_some() != record.epoch.is_some()
-            || record.receipts.is_empty()
+            || (record.receipts.is_empty() && record.predecessor.is_none())
             || record.receipts.len() > FRESH_RECEIPT_COUNT_MAXIMUM
         {
             return Err(ReconcileError::Invariant(
@@ -8712,6 +8738,7 @@ impl super::VerifiedNodeStateArchive {
         let wal = history_restart_wal_records(&wal_bytes)?;
         let first = &wal[1];
         let terminal = &wal[3];
+        let baseline_rows = baseline.closed_node_complete_rows_digest(self.space(), bounds)?;
         if terminal.archive != record.archive
             || terminal.original_frames != record.original_frames
             || terminal.fresh != record.session
@@ -8722,7 +8749,8 @@ impl super::VerifiedNodeStateArchive {
             || terminal.worktree != record.worktree
             || terminal.data != record.data
             || first.main != record.baseline.digest
-            || baseline.closed_node_complete_rows_digest(self.space(), bounds)? != first.rows
+            || baseline_rows != first.rows
+            || (record.receipts.is_empty() && baseline_rows != terminal.rows)
         {
             return Err(ReconcileError::Invariant(
                 "history chain complete WAL and baseline binding",
@@ -9275,7 +9303,11 @@ impl super::VerifiedNodeStateArchive {
                 &older.record.session,
                 &newer.record.session,
             )?;
-            normalized.audit_recovered_history_extension(&older.baseline, self.space(), bounds)?;
+            normalized.audit_recovered_history_extension_allow_unchanged(
+                &older.baseline,
+                self.space(),
+                bounds,
+            )?;
             let epoch = newer
                 .record
                 .epoch
@@ -9467,7 +9499,7 @@ impl super::VerifiedNodeStateArchive {
             self.space(),
             bounds,
         )?;
-        image.audit_recovered_history_extension(baseline, self.space(), bounds)?;
+        image.audit_recovered_history_extension_allow_unchanged(baseline, self.space(), bounds)?;
         live_retention::verify_chain_metadata_sql(self, &generations, &image, &retained, bounds)?;
         read.external.extend(owner_evidence);
         read.locks.extend(owner_locks);
@@ -9779,12 +9811,17 @@ impl FreshRecoveredNodeWalV2Session {
         path: &sync_extend_core_model::PortablePath,
         max_bytes: u64,
     ) -> Result<Vec<u8>> {
+        // This path assembles the whole file in memory, so the caller's policy
+        // ceiling is clamped to the memory bound rather than compared against
+        // it. A larger policy limit must not reject every file.
+        const MAX_RECOVERED_READ_BYTES: u64 = 256 * 1024 * 1024;
         self.deployment_runtime_binding()?.verify()?;
-        if max_bytes == 0 || max_bytes > 256 * 1024 * 1024 {
+        if max_bytes == 0 {
             return Err(ReconcileError::ResourceLimit(
                 "fresh recovered file read bound",
             ));
         }
+        let max_bytes = max_bytes.min(MAX_RECOVERED_READ_BYTES);
         let manifest = self.recovered_local_manifest()?;
         let content = manifest
             .entries
@@ -9845,7 +9882,10 @@ impl FreshRecoveredNodeWalV2Session {
 
     pub(crate) fn close_deployment_runtime(&mut self) -> Result<(bool, PathBuf)> {
         self.deployment_runtime_binding()?.verify()?;
-        if self.history_count == 0 && self.metadata_count == 0 {
+        if self.history_count == 0
+            && self.metadata_count == 0
+            && self.history_chain_parent.is_none()
+        {
             Ok((false, self.close_completed()?))
         } else {
             Ok((true, self.close_recovered_history_for_chain8()?))
