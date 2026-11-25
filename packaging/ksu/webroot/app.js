@@ -15,6 +15,7 @@ const fields = {};
   "workspace-state", "workspace-detail", "workspace-summary",
   "workspace-files-detail", "workspace-files", "workspace-rows",
   "storage-state", "storage-detail", "storage-summary", "network-state", "network-detail", "network-summary",
+  "native-audit-state", "native-audit-detail", "native-audit-summary",
   "easytier-state", "easytier-detail", "easytier-summary",
   "recovery-state", "recovery-detail", "recovery-summary", "recovery-guide",
   "restore-space", "restore-snapshot", "restore-selection", "restore-paths", "restore-prefix", "restore-extra-policy",
@@ -130,11 +131,13 @@ function clearRuntime(detail = "当前没有可验证的运行摘要。") {
   fields["workspace-rows"].textContent = "";
   fields["workspace-files"].hidden = true;
   fields["workspace-files-detail"].textContent = "文件修改时间、只读属性和元数据能力未知。";
-  for (const category of ["workspace", "storage", "network", "easytier", "recovery"]) {
+  for (const category of ["workspace", "storage", "network", "easytier", "recovery", "native-audit"]) {
     fields[`${category}-summary`].textContent = "";
     fields[`${category}-summary`].hidden = true;
     setStatus(category, "暂无观察", detail);
   }
+  setStatus("native-audit", "未知",
+    "没有当前 owner 的显式 schema69 镜像审计；旧结果已清除，未知不等于失败或通过。");
   fields["network-detail"].textContent = "当前没有已鉴权的连接样本；实际路径、外层 wire 和中继费用保持未知。";
   fields["easytier-detail"].textContent = "当前没有本机受管子进程与 RPC 属主绑定的样本。";
   fields["recovery-guide"].textContent = "没有可验证的当前历史来源。恢复须独立核对，不能使用旧观测执行。";
@@ -716,6 +719,87 @@ function showEasyTier(observation) {
     "overlay ID 不是 SyncExtend 设备身份，未关联到同步连接；不授予 P2P 费用豁免。外层 wire 和费用未知。");
 }
 
+const exactFields = (value, names) => value !== null && typeof value === "object" &&
+  !Array.isArray(value) && Object.keys(value).length === names.length &&
+  names.every((name) => Object.hasOwn(value, name));
+const auditDigests = ["image_digest", "catalog_digest", "rows_digest", "source_digest",
+  "registry_digest"];
+
+function showNativeHistoryAudit(value, expectedSpace) {
+  if (value === undefined || value === null) {
+    fields["native-audit-summary"].textContent = "";
+    fields["native-audit-summary"].hidden = true;
+    setStatus("native-audit", "未知",
+      "当前 owner 未提供显式 schema69 镜像审计。KSU 页面不自行读取任意主机路径，也不把未知当作通过。");
+    return;
+  }
+  if (!identifier(expectedSpace, 32) || !exactFields(value, ["audit", "status", "request_sha256",
+      "schema", "space", "image_digest", "catalog_digest", "rows_digest", "source_digest",
+      "registry_digest", "tables", "owners", "projection", "limits", "read_only",
+      "native_authority", "raw_rows_included", "host_paths_included"]) ||
+      value.audit !== "native_history_source" || value.status !== "ok" || value.schema !== 69 ||
+      value.space !== expectedSpace || !identifier(value.request_sha256, 64) ||
+      auditDigests.some((name) => !identifier(value[name], 64)) ||
+      value.read_only !== true || value.native_authority !== false ||
+      value.raw_rows_included !== false || value.host_paths_included !== false) {
+    throw new Error("Invalid native history audit");
+  }
+  const tables = value.tables;
+  if (!exactFields(tables, ["count", "families", "slices", "rows", "logical_bytes",
+      "sample_limit", "truncated", "sample"]) ||
+      tables.count !== 141 || tables.families !== 22 || tables.slices !== 27 ||
+      !count(tables.rows) || !count(tables.logical_bytes) || !count(tables.sample_limit) ||
+      tables.sample_limit > 4 || !Array.isArray(tables.sample) ||
+      tables.sample.length > tables.sample_limit || typeof tables.truncated !== "boolean" ||
+      tables.truncated !== (tables.sample.length < tables.count) ||
+      tables.sample.some((row) => !exactFields(row, ["table", "rows", "logical_bytes"]) ||
+        typeof row.table !== "string" || row.table.length < 1 || row.table.length > 64 ||
+        !count(row.rows) || !count(row.logical_bytes))) {
+    throw new Error("Invalid native history audit table summary");
+  }
+  if (!count(value.owners) || value.owners < 1) throw new Error("Invalid native history owners");
+  const projection = value.projection;
+  if (!exactFields(projection, ["portable_rows", "root_columns", "sample_limit", "truncated", "sample"]) ||
+      !count(projection.portable_rows) || !count(projection.root_columns) ||
+      !count(projection.sample_limit) || projection.sample_limit > 4 ||
+      !Array.isArray(projection.sample) || projection.sample.length > projection.sample_limit ||
+      typeof projection.truncated !== "boolean" ||
+      projection.truncated !== (projection.sample.length < projection.root_columns) ||
+      projection.root_columns > 64 ||
+      projection.sample.some((row) => !exactFields(row, ["table", "column"]) ||
+        typeof row.table !== "string" || row.table.length < 1 || row.table.length > 64 ||
+        typeof row.column !== "string" || row.column.length < 1 || row.column.length > 64)) {
+    throw new Error("Invalid native history audit projection");
+  }
+  const limits = value.limits;
+  const limitFields = ["max_image_bytes", "max_entries", "inventory_max_rows",
+    "inventory_max_logical_bytes", "max_rows", "max_logical_bytes", "max_vm_instructions",
+    "max_query_secs"];
+  if (!exactFields(limits, limitFields) || !limitFields.every((name) => count(limits[name])) ||
+      limits.max_image_bytes < 1 || limits.max_image_bytes > 256 * 1024 * 1024 ||
+      limits.max_vm_instructions < 1000 || limits.max_vm_instructions > 250000000 ||
+      limits.max_query_secs < 1 || limits.max_query_secs > 300) {
+    throw new Error("Invalid native history audit limits");
+  }
+  if (new TextEncoder().encode(JSON.stringify(value)).length > 3072) {
+    throw new Error("Native history audit exceeds the display budget");
+  }
+  showSummary("native-audit", [
+    ["空间 / schema", `${value.space} / ${value.schema}`],
+    ["镜像摘要", value.image_digest],
+    ["catalog / rows", `${value.catalog_digest} / ${value.rows_digest}`],
+    ["source / registry", `${value.source_digest} / ${value.registry_digest}`],
+    ["表摘要", `${tables.count} 表 / ${tables.families} 家族 / ${tables.slices} 切片；` +
+      `${tables.rows} 行；${tables.logical_bytes} B；样本 ${tables.sample.length}/${tables.count}`],
+    ["owner / 投影", `${value.owners} owner；${projection.portable_rows} 可移植行；` +
+      `${projection.root_columns} root 列`],
+    ["显式预算", `镜像 ${limits.max_image_bytes} B；行 ${limits.max_rows}；` +
+      `字节 ${limits.max_logical_bytes} B；VM ${limits.max_vm_instructions}；查询 ${limits.max_query_secs}s`],
+  ]);
+  setStatus("native-audit", "只读审计通过",
+    "仅聚合计数与摘要；不含原始行、secret 或绝对主机路径。不授权恢复、清理或 native 写入。", "ready");
+}
+
 function showDashboard(owner) {
   clearRuntime();
   const value = owner.dashboard;
@@ -818,6 +902,8 @@ function showDashboard(owner) {
   }
   showConnection(value.connection);
   showEasyTier(value.easytier);
+  showNativeHistoryAudit(value.native_history_audit,
+    value.observation ? value.observation.local.space_id : undefined);
   showGatewayAvailability();
 }
 

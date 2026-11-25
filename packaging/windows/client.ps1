@@ -10,21 +10,32 @@ param(
     [string]$RestoreBudgets,
     [switch]$ProtectedDeployment,
     [switch]$Managed,
-    [switch]$Snapshot
+    [switch]$Snapshot,
+    [string]$LayoutProbe
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'windows-common.ps1')
 . (Join-Path $PSScriptRoot 'client-view.ps1')
 . (Join-Path $PSScriptRoot 'protected-deployment-client.ps1')
-$binaryPath = Resolve-SyncExtendPath $Binary -File
+$binaryPath = if ($LayoutProbe) {
+    Join-Path $PSScriptRoot 'layout-probe-syncd.exe'
+} else {
+    Resolve-SyncExtendPath $Binary -File
+}
 if ($ProtectedDeployment) {
     if ($Snapshot) { throw '-ProtectedDeployment opens the interactive deployment control window.' }
     Show-SyncExtendProtectedDeploymentClient $binaryPath
     return
 }
-$deploymentPath = Resolve-SyncExtendPath $Deployment -File
-$deploymentFile = Read-SyncExtendJson $deploymentPath
-$managementPath = Resolve-SyncExtendPath $deploymentFile.management -File
+if ($LayoutProbe) {
+    # The hidden structural probe never opens or verifies a deployment.
+    $deploymentPath = Join-Path $PSScriptRoot 'layout-probe-deployment.json'
+    $managementPath = Join-Path $PSScriptRoot 'layout-probe-management.json'
+} else {
+    $deploymentPath = Resolve-SyncExtendPath $Deployment -File
+    $deploymentFile = Read-SyncExtendJson $deploymentPath
+    $managementPath = Resolve-SyncExtendPath $deploymentFile.management -File
+}
 if ([bool]$StorageConfig -ne [bool]$AttemptPolicy) {
     throw 'Specify both -StorageConfig and -AttemptPolicy for the independent read-only budget view.'
 }
@@ -69,20 +80,6 @@ function Get-ClientBudgetRows {
     }
 }
 
-function Test-ClientVerifiedStopStatus($Status) {
-    # manage-user records stopped only after its original retained process
-    # exits with zero. A ManagementStatus reply or failed health read is not
-    # that record. Also honour an explicit future exit-verification field.
-    if ($null -eq $Status -or $Status.state -cne 'stopped' -or
-        $Status.process_active -isnot [bool] -or $Status.process_active -cne $false) { return $false }
-    $hasExit = if ($Status -is [Collections.IDictionary]) { $Status.Contains('process_exit_verified') } else {
-        $null -ne $Status.PSObject.Properties['process_exit_verified']
-    }
-    if ($hasExit -and ($Status.process_exit_verified -isnot [bool] -or
-            $Status.process_exit_verified -cne $true)) { return $false }
-    return $true
-}
-
 if ($Snapshot) {
     $value = Get-ClientSnapshot
     $null = New-SyncExtendClientView $value
@@ -97,8 +94,8 @@ Add-Type -AssemblyName System.Drawing
 $form = [Windows.Forms.Form]::new()
 $form.Text = 'SyncExtend'
 $form.StartPosition = 'CenterScreen'
-$form.MinimumSize = [Drawing.Size]::new(900, 720)
-$form.Size = [Drawing.Size]::new(1120, 850)
+$form.MinimumSize = [Drawing.Size]::new(900, 780)
+$form.Size = [Drawing.Size]::new(1120, 900)
 $form.Font = [Drawing.Font]::new('Segoe UI', 10)
 $form.BackColor = [Drawing.Color]::White
 
@@ -176,13 +173,20 @@ Add-ColumnsTab 'Storage' @('项目', '状态') @(225, 665) '存储与暂存'
 Add-ColumnsTab 'Storage snapshots' @('来源设备', '快照报告', '报告时间') @(360, 360, 190) '存储报告'
 Add-ColumnsTab 'Network' @('项目', '状态') @(225, 665) '连接与路径'
 Add-ColumnsTab 'Pull budget' @('项目', '状态') @(225, 665) '拉取预算'
+Add-ColumnsTab 'Native audit' @('项目', '只读摘要') @(210, 830) '原生历史审计'
 $lists['WebDAV'].MultiSelect = $false
 $lists['Selection preview'].Name = 'RestorePreviewRows'
 
 $restorePage = $lists['Selection preview'].Parent
+$restoreLayout = [Windows.Forms.TableLayoutPanel]::new()
+$restoreLayout.Dock = 'Fill'
+$restoreLayout.ColumnCount = 1
+$restoreLayout.RowCount = 3
+[void]$restoreLayout.RowStyles.Add([Windows.Forms.RowStyle]::new('Absolute', 292))
+[void]$restoreLayout.RowStyles.Add([Windows.Forms.RowStyle]::new('Percent', 100))
+[void]$restoreLayout.RowStyles.Add([Windows.Forms.RowStyle]::new('Absolute', 153))
 $restorePanel = [Windows.Forms.TableLayoutPanel]::new()
-$restorePanel.Dock = 'Top'
-$restorePanel.Height = 284
+$restorePanel.Dock = 'Fill'
 $restorePanel.Padding = [Windows.Forms.Padding]::new(8)
 $restorePanel.ColumnCount = 4
 $restorePanel.RowCount = 7
@@ -284,15 +288,14 @@ $restorePanel.Controls.Add($restoreBudgetNote, 2, 6)
 $restorePanel.SetColumnSpan($restoreBudgetNote, 2)
 $restoreNotes = [Windows.Forms.Label]::new()
 $restoreNotes.Name = 'RestorePreviewSummary'
-$restoreNotes.Dock = 'Bottom'
-$restoreNotes.Height = 145
+$restoreNotes.Dock = 'Fill'
 $restoreNotes.Padding = [Windows.Forms.Padding]::new(8)
 $restoreNotes.Text = '等待当前 owner 的已鉴权历史列表。'
-$restorePage.Controls.Add($restoreNotes)
-$restorePage.Controls.Add($restorePanel)
-# Dock layout visits the controls from back to front. Reserve the top input
-# panel and bottom summary before assigning the remaining space to the list.
-$lists['Selection preview'].BringToFront()
+$restorePage.Controls.Remove($lists['Selection preview'])
+$restoreLayout.Controls.Add($restorePanel, 0, 0)
+$restoreLayout.Controls.Add($lists['Selection preview'], 0, 1)
+$restoreLayout.Controls.Add($restoreNotes, 0, 2)
+$restorePage.Controls.Add($restoreLayout)
 $script:restoreContext = $null
 
 function Set-ClientRestoreBusy([bool]$Value) {
@@ -619,7 +622,7 @@ function Show-ClientUnavailable {
             if ($status.pending_restore) {
                 $summary.Text = (New-SyncExtendPendingRestoreView $status.pending_restore).Summary
                 $tabs.SelectedTab = $restorePage
-            } elseif (Test-ClientVerifiedStopStatus $status) {
+            } elseif (Test-SyncExtendVerifiedStopStatus $status) {
                 $summary.Text = "本机服务已停止。可启动原来选定的已安装版本。`r`n工作树、历史与配置继续保留。"
                 Add-ClientRow 'Status' @('本机服务', '已停止')
                 Add-ClientRow 'Status' @('已选版本', $status.version)
@@ -804,6 +807,39 @@ $null = Add-ClientButton '查看拉取预算' {
 $null = Add-ClientButton '恢复与预览说明' {
     $tabs.SelectedTab = $lists['Recovery'].Parent
 }
+$null = Add-ClientButton '原生历史只读审计…' {
+    if ($script:busy) { return }
+    $picker = [Windows.Forms.OpenFileDialog]::new()
+    $picker.Filter = 'JSON files (*.json)|*.json'
+    $picker.Title = '选择显式 schema69 原生历史审计请求'
+    try {
+        if ($picker.ShowDialog($form) -ne 'OK') { return }
+        $requestPath = Resolve-SyncExtendPath $picker.FileName -File
+        $request = Read-SyncExtendJson $requestPath 65536
+        Assert-SyncExtendNativeHistoryAuditRequest $request
+        $null = Resolve-SyncExtendPath ([string]$request.image) -File
+        $lists['Native audit'].Items.Clear()
+        Add-ClientRow 'Native audit' @('读取状态', '正在执行有界只读审计…')
+        $audit = Invoke-SyncExtendJson $binaryPath @('native-history-audit', '--request', $requestPath)
+        $requestDigest = (Get-FileHash -LiteralPath $requestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($audit.request_sha256 -cne $requestDigest) {
+            throw 'Native history audit response is not bound to this request file.'
+        }
+        $view = New-SyncExtendNativeHistoryAuditView $audit $request
+        $lists['Native audit'].Items.Clear()
+        foreach ($row in $view.Rows) { Add-ClientRow 'Native audit' $row }
+        $summary.Text = $view.Summary
+        $tabs.SelectedTab = $lists['Native audit'].Parent
+    } catch {
+        $lists['Native audit'].Items.Clear()
+        Add-ClientRow 'Native audit' @('读取状态', '拒绝或无法验证；旧审计结果未保留')
+        Add-ClientRow 'Native audit' @('限制', '本页不授权恢复、清理、native 写入或原始行显示')
+        $summary.Text = '原生历史只读审计被拒绝。请检查显式 image、摘要、space、root 映射和预算。'
+        $tabs.SelectedTab = $lists['Native audit'].Parent
+    } finally {
+        $picker.Dispose()
+    }
+}
 $null = Add-ClientButton '打开配置目录' {
     Invoke-Item -LiteralPath ([IO.Path]::GetDirectoryName($deploymentPath))
 }
@@ -821,8 +857,73 @@ function Set-ClientProtectedFence([bool]$Active) {
     }
     Set-ClientRestoreBusy $script:busy
 }
-$script:protectedClient = New-SyncExtendProtectedClient -Form $form -Tabs $tabs -Image $binaryPath `
-    -IsBlocked { Test-ClientProtectedBlocked } -OnActivity { param($Active) Set-ClientProtectedFence $Active }
+if (!$LayoutProbe) {
+    $script:protectedClient = New-SyncExtendProtectedClient -Form $form -Tabs $tabs -Image $binaryPath `
+        -IsBlocked { Test-ClientProtectedBlocked } -OnActivity { param($Active) Set-ClientProtectedFence $Active }
+}
+if ($LayoutProbe) {
+    $outputPath = Resolve-SyncExtendPath $LayoutProbe
+    $form.ShowInTaskbar = $false
+    $form.StartPosition = 'Manual'
+    $form.Location = [Drawing.Point]::new(-32000, -32000)
+    $form.Size = [Drawing.Size]::new(1120, 900)
+    $form.CreateControl()
+    $tabs.SelectedTab = $restorePage
+    $form.PerformLayout()
+    $form.Show()
+    [Windows.Forms.Application]::DoEvents()
+    $bitmap = [Drawing.Bitmap]::new($form.Width, $form.Height)
+    try {
+        $form.DrawToBitmap($bitmap, [Drawing.Rectangle]::new(0, 0, $bitmap.Width, $bitmap.Height))
+        $bitmap.Save($outputPath, [Drawing.Imaging.ImageFormat]::Png)
+    } finally {
+        $bitmap.Dispose()
+    }
+    $restoreList = $lists['Selection preview']
+    $controls = @($restorePanel, $restoreList, $restoreNotes)
+    $bounds = foreach ($control in $controls) {
+        [ordered]@{
+            name = $control.Name
+            type = $control.GetType().FullName
+            x = $control.Left; y = $control.Top; width = $control.Width; height = $control.Height
+            parent_width = $control.Parent.ClientSize.Width
+            parent_height = $control.Parent.ClientSize.Height
+            visible = $control.Visible
+        }
+    }
+    $overlap = {
+        param($left, $right)
+        $left.Right -gt $right.Left -and $right.Right -gt $left.Left -and
+            $left.Bottom -gt $right.Top -and $right.Bottom -gt $left.Top
+    }
+    $panelListOverlap = & $overlap $restorePanel.Bounds $restoreList.Bounds
+    $listNotesOverlap = & $overlap $restoreList.Bounds $restoreNotes.Bounds
+    $columns = foreach ($column in $restoreList.Columns) {
+        [ordered]@{
+            text = $column.Text
+            width = $column.Width
+            measured_header_plus_24 = [Windows.Forms.TextRenderer]::MeasureText($column.Text, $form.Font).Width + 24
+        }
+    }
+    $probe = [ordered]@{
+        probe = 'sync_extend_windows_hidden_form_layout'
+        screenshot = $outputPath
+        screenshot_bytes = (Get-Item -LiteralPath $outputPath).Length
+        form = [ordered]@{ width = $form.Width; height = $form.Height; minimum_width = $form.MinimumSize.Width; minimum_height = $form.MinimumSize.Height }
+        tabs = [ordered]@{ width = $tabs.Width; height = $tabs.Height; page_count = $tabs.TabPages.Count }
+        restore_page = [ordered]@{ width = $restorePage.ClientSize.Width; height = $restorePage.ClientSize.Height }
+        restore_controls = @($bounds)
+        panel_list_overlap = $panelListOverlap
+        list_notes_overlap = $listNotesOverlap
+        list_scrollable = $restoreList.Scrollable
+        columns = @($columns)
+        passed = (!$panelListOverlap -and !$listNotesOverlap -and $restoreList.Scrollable -and
+            @($columns | Where-Object { $_.width -lt $_.measured_header_plus_24 }).Count -eq 0)
+    }
+    $form.Dispose()
+    $probe | ConvertTo-Json -Depth 8 -Compress
+    return
+}
 $form.Add_Shown({ Update-Client })
 $form.Add_FormClosing({
     param($sender, $event)

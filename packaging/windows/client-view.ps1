@@ -471,6 +471,183 @@ function New-SyncExtendPendingRestoreView($Pending) {
     }
 }
 
+function Test-SyncExtendVerifiedStopStatus($Status) {
+    # manage-user records stopped only after its original retained process
+    # exits with zero. A ManagementStatus reply or failed health read is not
+    # that record. Also honour an explicit future exit-verification field.
+    if ($null -eq $Status -or $Status.state -cne 'stopped' -or
+        $Status.process_active -isnot [bool] -or $Status.process_active -cne $false) { return $false }
+    $hasExit = if ($Status -is [Collections.IDictionary]) { $Status.Contains('process_exit_verified') } else {
+        $null -ne $Status.PSObject.Properties['process_exit_verified']
+    }
+    # A stopped state without an explicit verified-exit receipt is not enough
+    # to open a new window or restore from that owner. Older observations are
+    # unknown, not an implicit success.
+    return [bool]($hasExit -and $Status.process_exit_verified -is [bool] -and
+        $Status.process_exit_verified -ceq $true)
+}
+
+function Assert-SyncExtendNativeHistoryAuditRequest($Request) {
+    Assert-SyncExtendRestoreKeys $Request @('image', 'image_digest', 'space', 'roots',
+        'max_image_bytes', 'bounds')
+    Assert-SyncExtendViewText $Request.image 4096
+    if ([IO.Path]::IsPathRooted($Request.image) -eq $false -or
+        $Request.image.IndexOf([char]0) -ge 0) {
+        throw 'Native history audit image must be an absolute local path.'
+    }
+    Assert-SyncExtendViewId $Request.image_digest
+    Assert-SyncExtendViewId $Request.space 32
+    Assert-SyncExtendViewList $Request.roots 64
+    if (!$Request.roots.Count) { throw 'Native history audit requires a root mapping.' }
+    foreach ($root in $Request.roots) {
+        Assert-SyncExtendRestoreKeys $root @('original_worktree', 'projected_worktree')
+        foreach ($name in @('original_worktree', 'projected_worktree')) {
+            Assert-SyncExtendViewText $root[$name] 4096
+            if ([IO.Path]::IsPathRooted($root[$name]) -eq $false -or
+                $root[$name].IndexOf([char]0) -ge 0) {
+                throw 'Native history audit root mappings must be absolute.'
+            }
+        }
+    }
+    $imageLimit = Get-SyncExtendViewInteger $Request.max_image_bytes
+    if ($imageLimit -lt 1 -or $imageLimit -gt 256MB) {
+        throw 'Native history audit image bound is outside the client limit.'
+    }
+    Assert-SyncExtendRestoreKeys $Request.bounds @('max_entries', 'inventory_max_rows',
+        'inventory_max_logical_bytes', 'max_rows', 'max_logical_bytes',
+        'max_vm_instructions', 'max_query_secs')
+    foreach ($name in @('max_entries', 'inventory_max_rows', 'inventory_max_logical_bytes',
+            'max_rows', 'max_logical_bytes', 'max_vm_instructions', 'max_query_secs')) {
+        $null = Get-SyncExtendViewInteger $Request.bounds[$name]
+    }
+    if ($Request.bounds.max_entries -lt 1 -or $Request.bounds.max_entries -gt 1000000 -or
+        $Request.bounds.inventory_max_rows -lt 1 -or $Request.bounds.inventory_max_rows -gt 1000000 -or
+        $Request.bounds.max_rows -lt 1 -or $Request.bounds.max_rows -gt 1000000 -or
+        $Request.bounds.inventory_max_logical_bytes -lt 1 -or
+        $Request.bounds.max_logical_bytes -lt 1 -or
+        $Request.bounds.max_vm_instructions -lt 1000 -or
+        $Request.bounds.max_vm_instructions -gt 250000000 -or
+        $Request.bounds.max_query_secs -lt 1 -or $Request.bounds.max_query_secs -gt 300) {
+        throw 'Native history audit bounds are outside the client limit.'
+    }
+}
+
+function New-SyncExtendNativeHistoryAuditView($Audit, $Request) {
+    Assert-SyncExtendNativeHistoryAuditRequest $Request
+    Assert-SyncExtendRestoreKeys $Audit @('audit', 'status', 'request_sha256', 'schema', 'space',
+        'image_digest', 'catalog_digest', 'rows_digest', 'source_digest', 'registry_digest',
+        'tables', 'owners', 'projection', 'limits', 'read_only', 'native_authority',
+        'raw_rows_included', 'host_paths_included')
+    if ($Audit.audit -cne 'native_history_source' -or $Audit.status -cne 'ok' -or
+        (Get-SyncExtendViewInteger $Audit.schema) -ne 69) {
+        throw 'Native history audit identity is not the schema-69 source audit.'
+    }
+    Assert-SyncExtendViewId $Audit.request_sha256
+    Assert-SyncExtendViewId $Audit.space 32
+    foreach ($name in @('image_digest', 'catalog_digest', 'rows_digest', 'source_digest',
+            'registry_digest')) {
+        Assert-SyncExtendViewId $Audit[$name]
+    }
+    if ($Audit.space -cne $Request.space -or $Audit.image_digest -cne $Request.image_digest) {
+        throw 'Native history audit response does not match the explicit request.'
+    }
+    foreach ($name in @('read_only', 'native_authority', 'raw_rows_included', 'host_paths_included')) {
+        Assert-SyncExtendViewFlag $Audit[$name]
+    }
+    if (!$Audit.read_only -or $Audit.native_authority -or
+        $Audit.raw_rows_included -or $Audit.host_paths_included) {
+        throw 'Native history audit cannot grant write, native, row or host-path output authority.'
+    }
+    Assert-SyncExtendRestoreKeys $Audit.tables @('count', 'families', 'slices', 'rows',
+        'logical_bytes', 'sample_limit', 'truncated', 'sample')
+    foreach ($name in @('count', 'families', 'slices', 'rows', 'logical_bytes', 'sample_limit')) {
+        $null = Get-SyncExtendViewInteger $Audit.tables[$name]
+    }
+    Assert-SyncExtendViewFlag $Audit.tables.truncated
+    Assert-SyncExtendViewList $Audit.tables.sample 4
+    if ($Audit.tables.count -ne 141 -or $Audit.tables.families -ne 22 -or
+        $Audit.tables.slices -ne 27 -or $Audit.tables.sample_limit -gt 4 -or
+        $Audit.tables.sample.Count -gt $Audit.tables.sample_limit -or
+        $Audit.tables.truncated -ne ($Audit.tables.sample.Count -lt $Audit.tables.count)) {
+        throw 'Native history audit table summary is inconsistent.'
+    }
+    foreach ($table in $Audit.tables.sample) {
+        Assert-SyncExtendRestoreKeys $table @('table', 'rows', 'logical_bytes')
+        Assert-SyncExtendViewText $table.table 64
+        $null = Get-SyncExtendViewInteger $table.rows
+        $null = Get-SyncExtendViewInteger $table.logical_bytes
+    }
+    $owners = Get-SyncExtendViewInteger $Audit.owners
+    if ($owners -lt 1) { throw 'Native history audit owner summary is empty.' }
+    Assert-SyncExtendRestoreKeys $Audit.projection @('portable_rows', 'root_columns',
+        'sample_limit', 'truncated', 'sample')
+    foreach ($name in @('portable_rows', 'root_columns', 'sample_limit')) {
+        $null = Get-SyncExtendViewInteger $Audit.projection[$name]
+    }
+    Assert-SyncExtendViewFlag $Audit.projection.truncated
+    Assert-SyncExtendViewList $Audit.projection.sample 4
+    if ($Audit.projection.root_columns -gt $Request.roots.Count -or
+        $Audit.projection.sample_limit -gt 4 -or
+        $Audit.projection.sample.Count -gt $Audit.projection.sample_limit -or
+        $Audit.projection.truncated -ne
+        ($Audit.projection.sample.Count -lt $Audit.projection.root_columns)) {
+        throw 'Native history audit projection summary is inconsistent.'
+    }
+    foreach ($mapping in $Audit.projection.sample) {
+        Assert-SyncExtendRestoreKeys $mapping @('table', 'column')
+        Assert-SyncExtendViewText $mapping.table 64
+        Assert-SyncExtendViewText $mapping.column 64
+    }
+    Assert-SyncExtendRestoreKeys $Audit.limits @('max_image_bytes', 'max_entries',
+        'inventory_max_rows', 'inventory_max_logical_bytes', 'max_rows', 'max_logical_bytes',
+        'max_vm_instructions', 'max_query_secs')
+    foreach ($name in @('max_image_bytes', 'max_entries', 'inventory_max_rows',
+            'inventory_max_logical_bytes', 'max_rows', 'max_logical_bytes',
+            'max_vm_instructions', 'max_query_secs')) {
+        $null = Get-SyncExtendViewInteger $Audit.limits[$name]
+    }
+    if ($Audit.limits.max_image_bytes -ne $Request.max_image_bytes -or
+        $Audit.limits.max_entries -ne $Request.bounds.max_entries -or
+        $Audit.limits.inventory_max_rows -ne $Request.bounds.inventory_max_rows -or
+        $Audit.limits.inventory_max_logical_bytes -ne $Request.bounds.inventory_max_logical_bytes -or
+        $Audit.limits.max_rows -ne $Request.bounds.max_rows -or
+        $Audit.limits.max_logical_bytes -ne $Request.bounds.max_logical_bytes -or
+        $Audit.limits.max_vm_instructions -ne $Request.bounds.max_vm_instructions -or
+        $Audit.limits.max_query_secs -ne $Request.bounds.max_query_secs) {
+        throw 'Native history audit limits do not match the explicit request.'
+    }
+    $canonical = [Text.Encoding]::UTF8.GetBytes(($Audit | ConvertTo-Json -Depth 12 -Compress))
+    if ($canonical.Length -gt 3072) { throw 'Native history audit exceeds the client display budget.' }
+    $tableText = $Audit.tables.sample | ForEach-Object {
+        "$($_.table): $($_.rows) 行 / $(Format-SyncExtendViewBytes $_.logical_bytes)"
+    }
+    $rootText = $Audit.projection.sample | ForEach-Object { "$($_.table).$($_.column)" }
+    return @{
+        Summary = "原生 schema-69 历史源只读审计通过。`r`n" +
+            "摘要仅含聚合计数与摘要值；不含原始行、secret 或主机绝对路径。"
+        Rows = @(
+            ,@('审计状态', '只读 SELECT 通过；未执行恢复、写入或 native 授权')
+            ,@('空间 / schema', "$($Audit.space) / $($Audit.schema)")
+            ,@('镜像摘要', $Audit.image_digest)
+            ,@('catalog / rows 摘要', "$($Audit.catalog_digest) / $($Audit.rows_digest)")
+            ,@('source / registry 摘要', "$($Audit.source_digest) / $($Audit.registry_digest)")
+            ,@('表摘要', "$($Audit.tables.count) 表 / $($Audit.tables.families) 家族 / " +
+                "$($Audit.tables.slices) 切片；$($Audit.tables.rows) 行；" +
+                "$(Format-SyncExtendViewBytes $Audit.tables.logical_bytes)")
+            ,@('表样本', $(if ($tableText) { $tableText -join '；' } else { '无' }) +
+                $(if ($Audit.tables.truncated) { '（仅显示前 4 项）' } else { '' }))
+            ,@('owner / 投影', "$($Audit.owners) owner；$($Audit.projection.portable_rows) 可移植行；" +
+                "$($Audit.projection.root_columns) root 列")
+            ,@('root 列样本', $(if ($rootText) { $rootText -join '；' } else { '无' }) +
+                $(if ($Audit.projection.truncated) { '（仅显示前 4 项）' } else { '' }))
+            ,@('显式预算', "镜像 $(Format-SyncExtendViewBytes $Audit.limits.max_image_bytes)；" +
+                "行/字节 $($Audit.limits.max_rows) / $(Format-SyncExtendViewBytes $Audit.limits.max_logical_bytes)；" +
+                "VM $($Audit.limits.max_vm_instructions)；查询 $($Audit.limits.max_query_secs)s")
+            ,@('输出边界', '无原始行内容、secret 或绝对 host 路径；未知或超限时清除旧结果')
+        )
+    }
+}
+
 function Assert-SyncExtendViewObject($Value) {
     if ($Value -isnot [Collections.IDictionary]) { throw 'The local observation has an invalid object.' }
 }
@@ -906,12 +1083,15 @@ function New-SyncExtendClientView($Dashboard) {
         Summary = if ($Dashboard.resources_ready) { '本机资源已就绪。' } else { '本机资源尚未就绪。' }
     }
     foreach ($tab in @('Status', 'Files', 'History', 'Conflicts', 'Unavailable chunks', 'WebDAV',
-            'Storage', 'Storage snapshots', 'Network', 'Pull budget', 'Recovery', 'Pruned history')) {
+            'Storage', 'Storage snapshots', 'Network', 'Pull budget', 'Recovery', 'Pruned history',
+            'Native audit')) {
         $view.Rows[$tab] = [Collections.Generic.List[object]]::new()
     }
     $view.Summary += "`r`n远端备份状态尚未确认。"
     Add-SyncExtendViewRow $view 'Status' @('本机资源', $(if ($Dashboard.resources_ready) { '已就绪' } else { '尚未就绪' }))
     Add-SyncExtendViewRow $view 'Status' @('远端备份', '尚未确认')
+    Add-SyncExtendViewRow $view 'Native audit' @('原生历史只读审计', '未读取；需要显式 schema69 image、摘要、space 与 root 映射请求')
+    Add-SyncExtendViewRow $view 'Native audit' @('限制', '仅只读 SELECT；不授权恢复或清理；成功结果也不包含原始行、secret 或主机绝对路径')
 
     if ($null -ne $Dashboard.observation) {
         $observation = $Dashboard.observation
