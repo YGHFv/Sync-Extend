@@ -120,7 +120,10 @@ impl PublicationCompletion {
                             path: observed.path.clone(),
                         });
                     }
-                    if old.kind != observed.kind || old.content != observed.content {
+                    if old.kind != observed.kind
+                        || old.content != observed.content
+                        || old.metadata != observed.metadata
+                    {
                         changes.push(Change::Put {
                             entry: observed.clone(),
                         });
@@ -216,6 +219,7 @@ impl PublicationCompletion {
                         path: intent.target_path.clone(),
                         kind: EntryKind::File,
                         content: Some(intent.content.clone()),
+                        metadata: self.manifest.entries[&intent.entry_id].metadata.clone(),
                     },
                 })
         {

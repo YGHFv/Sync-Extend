@@ -205,6 +205,7 @@ impl LocalSpace {
                 path: target_path.clone(),
                 kind: EntryKind::File,
                 content: Some(content.clone()),
+                metadata: None,
             },
             timestamp,
         )?;

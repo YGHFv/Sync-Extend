@@ -739,7 +739,10 @@ impl LocalSpace {
                             path: entry.path.clone(),
                         });
                     }
-                    if old.kind != entry.kind || old.content != entry.content {
+                    if old.kind != entry.kind
+                        || old.content != entry.content
+                        || old.metadata != entry.metadata
+                    {
                         changes.push(Change::Put {
                             entry: entry.clone(),
                         });
@@ -811,6 +814,7 @@ impl LocalSpace {
                     path: intent.target_path.clone(),
                     kind: EntryKind::File,
                     content: Some(intent.content.clone()),
+                    metadata: None,
                 },
             );
             manifest.tombstones.remove(&intent.entry_id);
@@ -829,7 +833,10 @@ impl LocalSpace {
                             path: entry.path.clone(),
                         });
                     }
-                    if old.kind != entry.kind || old.content != entry.content {
+                    if old.kind != entry.kind
+                        || old.content != entry.content
+                        || old.metadata != entry.metadata
+                    {
                         changes.push(Change::Put {
                             entry: entry.clone(),
                         });
@@ -997,6 +1004,7 @@ impl LocalSpace {
                 path: intent.target_path.clone(),
                 kind: EntryKind::File,
                 content: Some(intent.content.clone()),
+                metadata: None,
             },
             intent.created_at_ms,
         )?;
@@ -1401,6 +1409,7 @@ fn build_manifest(
                 path: path.clone(),
                 kind: scanned.kind,
                 content: scanned.content.clone(),
+                metadata: None,
             },
         );
     }

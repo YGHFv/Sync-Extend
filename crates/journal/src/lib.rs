@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 70;
+const SCHEMA_VERSION: u32 = 71;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -395,7 +395,7 @@ impl ReadOnlyJournal {
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version != SCHEMA_VERSION {
             return Err(JournalError::Invariant(
-                "read-only Journal requires schema 70; an explicit writer open upgrades older schemas",
+                "read-only Journal requires the current schema; an explicit writer open upgrades older schemas",
             ));
         }
         let journal = Self {
@@ -1378,6 +1378,11 @@ impl Journal {
         if version < 70 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-070.sql"))?;
+            tx.commit()?;
+        }
+        if version < 71 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-071.sql"))?;
             tx.commit()?;
         }
         backup_image::native_history_persistence::schema::validate(&connection)?;
