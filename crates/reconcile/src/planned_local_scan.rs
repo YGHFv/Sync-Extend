@@ -283,6 +283,7 @@ impl LocalSpace {
             crate::scan::ScannedEntry {
                 kind: EntryKind::File,
                 content: Some(content.clone()),
+                metadata: None,
                 // The planner does not mint native identity for a future file.
                 // Actual physical identity is acquired from the held CREATE later.
                 physical_identity: ContentId::hash(b"planned-entry-no-native-identity"),

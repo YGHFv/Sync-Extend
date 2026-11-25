@@ -5,7 +5,186 @@ use std::{
     path::Path,
 };
 use sync_extend_cas::is_reparse;
-use sync_extend_core_model::ContentId;
+use sync_extend_core_model::{
+    ContentId, PortableEntryMetadata, PortableMetadataUnsupportedReason, PortableReadonly,
+    PortableTimestamp, PortableUnixExecutable,
+};
+
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+fn portable_unsupported_reason(
+    reason: sync_extend_platform_fs::UnsupportedReason,
+) -> PortableMetadataUnsupportedReason {
+    match reason {
+        sync_extend_platform_fs::UnsupportedReason::Platform => {
+            PortableMetadataUnsupportedReason::Platform
+        }
+        sync_extend_platform_fs::UnsupportedReason::Filesystem => {
+            PortableMetadataUnsupportedReason::Filesystem
+        }
+        sync_extend_platform_fs::UnsupportedReason::Permission => {
+            PortableMetadataUnsupportedReason::Permission
+        }
+        sync_extend_platform_fs::UnsupportedReason::Api => PortableMetadataUnsupportedReason::Api,
+    }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+fn portable_time(value: sync_extend_platform_fs::PortableTime) -> Result<PortableTimestamp> {
+    PortableTimestamp::captured(value.seconds, value.nanos).map_err(Into::into)
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+fn portable_captured_time(
+    value: sync_extend_platform_fs::CapturedTime,
+) -> Result<PortableTimestamp> {
+    match value {
+        sync_extend_platform_fs::CapturedTime::Unsupported(reason) => {
+            Ok(PortableTimestamp::Unsupported {
+                reason: portable_unsupported_reason(reason),
+            })
+        }
+        sync_extend_platform_fs::CapturedTime::Value(value) => portable_time(value),
+    }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+fn portable_captured_flag(value: sync_extend_platform_fs::CapturedFlag) -> PortableUnixExecutable {
+    match value {
+        sync_extend_platform_fs::CapturedFlag::Unsupported(reason) => {
+            PortableUnixExecutable::Unsupported {
+                reason: portable_unsupported_reason(reason),
+            }
+        }
+        sync_extend_platform_fs::CapturedFlag::Value(value) => {
+            PortableUnixExecutable::captured(value)
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+pub(crate) fn portable_metadata(file: &File) -> Result<Option<PortableEntryMetadata>> {
+    let capture = sync_extend_platform_fs::capture_portable_file_metadata(file)?;
+    let mut metadata = PortableEntryMetadata::new(
+        portable_time(capture.metadata.modified)?,
+        PortableReadonly::captured(capture.metadata.readonly),
+    );
+    metadata.creation = Some(portable_captured_time(capture.metadata.creation)?);
+    metadata.unix_executable = Some(portable_captured_flag(capture.metadata.unix_executable));
+    metadata.validate()?;
+    Ok(Some(metadata))
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+fn platform_time(value: PortableTimestamp) -> Result<sync_extend_platform_fs::PortableTime> {
+    let (seconds, nanos) = value.captured_value().ok_or(ReconcileError::Invariant(
+        "portable metadata time is not captured",
+    ))?;
+    Ok(sync_extend_platform_fs::PortableTime { seconds, nanos })
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+fn platform_unsupported(
+    reason: PortableMetadataUnsupportedReason,
+) -> sync_extend_platform_fs::UnsupportedReason {
+    match reason {
+        PortableMetadataUnsupportedReason::Platform => {
+            sync_extend_platform_fs::UnsupportedReason::Platform
+        }
+        PortableMetadataUnsupportedReason::Filesystem => {
+            sync_extend_platform_fs::UnsupportedReason::Filesystem
+        }
+        PortableMetadataUnsupportedReason::Permission => {
+            sync_extend_platform_fs::UnsupportedReason::Permission
+        }
+        PortableMetadataUnsupportedReason::Api => sync_extend_platform_fs::UnsupportedReason::Api,
+    }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+fn platform_captured_time(
+    value: PortableTimestamp,
+) -> Result<sync_extend_platform_fs::CapturedTime> {
+    match value {
+        PortableTimestamp::Captured { .. } => Ok(sync_extend_platform_fs::CapturedTime::Value(
+            platform_time(value)?,
+        )),
+        PortableTimestamp::Unsupported { reason } => Ok(
+            sync_extend_platform_fs::CapturedTime::Unsupported(platform_unsupported(reason)),
+        ),
+        PortableTimestamp::Unknown => Err(ReconcileError::Invariant(
+            "portable metadata time is unknown",
+        )),
+    }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+fn platform_captured_flag(value: PortableUnixExecutable) -> sync_extend_platform_fs::CapturedFlag {
+    match value {
+        PortableUnixExecutable::Captured { executable } => {
+            sync_extend_platform_fs::CapturedFlag::Value(executable)
+        }
+        PortableUnixExecutable::Unsupported { reason } => {
+            sync_extend_platform_fs::CapturedFlag::Unsupported(platform_unsupported(reason))
+        }
+        PortableUnixExecutable::Unknown => sync_extend_platform_fs::CapturedFlag::Unsupported(
+            sync_extend_platform_fs::UnsupportedReason::Api,
+        ),
+    }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+pub(crate) fn platform_metadata_for_apply(
+    metadata: &PortableEntryMetadata,
+) -> Result<sync_extend_platform_fs::CapturedFileMetadata> {
+    metadata.validate()?;
+    Ok(sync_extend_platform_fs::CapturedFileMetadata {
+        modified: platform_time(metadata.modified)?,
+        readonly: metadata.readonly.value().ok_or(ReconcileError::Invariant(
+            "portable readonly metadata is unknown",
+        ))?,
+        creation: metadata
+            .creation
+            .map(platform_captured_time)
+            .transpose()?
+            .unwrap_or(sync_extend_platform_fs::CapturedTime::Unsupported(
+                sync_extend_platform_fs::UnsupportedReason::Api,
+            )),
+        unix_executable: metadata
+            .unix_executable
+            .map(platform_captured_flag)
+            .unwrap_or(sync_extend_platform_fs::CapturedFlag::Unsupported(
+                sync_extend_platform_fs::UnsupportedReason::Api,
+            )),
+    })
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+pub(crate) fn portable_metadata(_file: &File) -> Result<Option<PortableEntryMetadata>> {
+    Ok(None)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+pub(crate) fn platform_metadata_for_apply(
+    _metadata: &PortableEntryMetadata,
+) -> Result<sync_extend_platform_fs::CapturedFileMetadata> {
+    Err(ReconcileError::Invariant(
+        "portable metadata apply is unsupported on this platform",
+    ))
+}
+
+pub(crate) fn metadata_matches_observed(
+    expected: &PortableEntryMetadata,
+    observed: &PortableEntryMetadata,
+) -> bool {
+    expected.modified == observed.modified
+        && expected.readonly == observed.readonly
+        && expected.creation.is_none_or(|value| {
+            value.captured_value().is_none() || Some(value) == observed.creation
+        })
+        && expected
+            .unix_executable
+            .is_none_or(|value| value.value().is_none() || Some(value) == observed.unix_executable)
+}
 
 pub(crate) struct PathIdentity {
     handle: Handle,
@@ -106,6 +285,7 @@ pub(crate) struct ObservedFile {
     pub(crate) file: File,
     pub(crate) identity: PathIdentity,
     pub(crate) metadata: Metadata,
+    pub(crate) portable: Option<PortableEntryMetadata>,
 }
 
 impl ObservedFile {
@@ -120,10 +300,12 @@ impl ObservedFile {
         let physical = physical_identity(path)?;
         let file = File::open(path)?;
         let handle = Handle::from_file(file.try_clone()?)?;
+        let portable = portable_metadata(&file)?;
         let observed = Self {
             file,
             identity: PathIdentity { handle, physical },
             metadata,
+            portable,
         };
         observed.verify(path)?;
         Ok(observed)
@@ -133,6 +315,7 @@ impl ObservedFile {
         self.identity.verify(path)?;
         if !same_metadata(&self.metadata, &self.file.metadata()?)
             || !same_metadata(&self.metadata, &fs::symlink_metadata(path)?)
+            || portable_metadata(&self.file)? != self.portable
         {
             return Err(ReconcileError::Unstable);
         }

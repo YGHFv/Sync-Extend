@@ -480,7 +480,9 @@ impl Journal {
             .protected_objects
             .clone();
         let mut observed = intent.completion.as_ref().unwrap().manifest.entries.clone();
-        observed.remove(&intent.entry_id);
+        let metadata = observed
+            .remove(&intent.entry_id)
+            .and_then(|entry| entry.metadata);
         intent.completion = Some(crate::publication::PublicationCompletion::from_observed(
             &baseline,
             &device,
@@ -490,6 +492,7 @@ impl Journal {
                 path: intent.target_path.clone(),
                 kind: EntryKind::File,
                 content: Some(intent.content.clone()),
+                metadata,
             },
             intent.created_at_ms,
         )?);

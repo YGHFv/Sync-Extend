@@ -1,8 +1,8 @@
 //! Pure bounded flat-file projection. No signatures, pins or native authority.
 use crate::{
     causal::{reduce_operations, ContentAlternative, MAX_CAUSAL_OPERATIONS},
-    ContentId, DeviceId, Entry, EntryId, EntryKind, FileManifest, Manifest, ModelError, Operation,
-    OperationId, PortablePath, Result, SpaceId, VersionVector,
+    Change, ContentId, DeviceId, Entry, EntryId, EntryKind, FileManifest, Manifest, ModelError,
+    Operation, OperationId, PortableEntryMetadata, PortablePath, Result, SpaceId, VersionVector,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -172,6 +172,10 @@ pub fn verify_file_resolution_projection(
     let mut combined = originals.to_vec();
     combined.extend_from_slice(resolving);
     let reduced = reduce_operations(&plan.space_id, &combined, limits.max_operations)?;
+    let by_id: BTreeMap<&OperationId, &Operation> = combined
+        .iter()
+        .map(|operation| (&operation.op_id, operation))
+        .collect();
     if !reduced.path_collisions.is_empty()
         || reduced.entries.len() != plan.projected.entries.len() + plan.projected.tombstones.len()
     {
@@ -179,6 +183,12 @@ pub fn verify_file_resolution_projection(
     }
     for (id, frontier) in &reduced.entries {
         if let Some(entry) = plan.projected.entries.get(id) {
+            let actual_metadata = frontier
+                .contents
+                .first()
+                .and_then(|alternative| alternative.operations.first())
+                .and_then(|operation| by_id.get(operation))
+                .and_then(|operation| operation_metadata(operation));
             if frontier.deleted
                 || frontier.delete_conflict
                 || frontier.paths.len() != 1
@@ -186,6 +196,7 @@ pub fn verify_file_resolution_projection(
                 || frontier.contents.len() != 1
                 || frontier.contents[0].kind != entry.kind
                 || frontier.contents[0].content != entry.content
+                || actual_metadata != entry.metadata
             {
                 return Err(invalid("resolution actual causal result differs"));
             }
@@ -223,6 +234,13 @@ fn content(alternative: &ContentAlternative) -> Result<&FileManifest> {
         .content
         .as_ref()
         .ok_or(invalid("resolution missing file content"))
+}
+
+fn operation_metadata(operation: &Operation) -> Option<PortableEntryMetadata> {
+    match &operation.payload.change {
+        Change::Put { entry } => entry.metadata.clone(),
+        _ => None,
+    }
 }
 
 // Reserve every requested name, including alternate Renames and future primaries.
@@ -384,6 +402,7 @@ pub fn plan_file_resolution(
         } else {
             primary_names.insert(primary_path.collision_key(), source.clone());
         }
+        let primary = provenance(selected)?;
         push_file(
             &mut files,
             ResolutionFile {
@@ -392,6 +411,7 @@ pub fn plan_file_resolution(
                     path: primary_path.clone(),
                     kind: EntryKind::File,
                     content: Some(content(selected)?.clone()),
+                    metadata: operation_metadata(primary),
                 },
                 source_entry_id: source.clone(),
                 content_operations: selected.operations.clone(),
@@ -423,6 +443,7 @@ pub fn plan_file_resolution(
                         path,
                         kind: EntryKind::File,
                         content: Some(file.clone()),
+                        metadata: operation_metadata(original),
                     },
                     source_entry_id: source.clone(),
                     content_operations: alternative.operations.clone(),

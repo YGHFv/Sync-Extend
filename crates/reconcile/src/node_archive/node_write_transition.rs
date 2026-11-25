@@ -10247,6 +10247,7 @@ impl FreshRecoveredNodeWalV2Session {
                     path: path.clone(),
                     kind: sync_extend_core_model::EntryKind::Directory,
                     content: None,
+                    metadata: None,
                 },
             );
             let root = self.commit_recovered_namespace_scan(&previous, &expected, timestamp)?;
