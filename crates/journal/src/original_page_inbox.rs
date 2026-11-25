@@ -1,15 +1,15 @@
 //! Immutable signed page restart provenance, never received or native authority.
 use crate::{
-    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
     Journal, JournalError, RemotePublicationProof, Result,
+    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
 };
 use rusqlite::{
-    params, types::Value, Connection, OptionalExtension, Transaction, TransactionBehavior,
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Value,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use sync_extend_core_model::{ContentId, SpaceId};
-use sync_extend_transport::{PeerIdentity, SignedOriginalOperationPage, MAX_ORIGINAL_PAGE_BYTES};
+use sync_extend_transport::{MAX_ORIGINAL_PAGE_BYTES, PeerIdentity, SignedOriginalOperationPage};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

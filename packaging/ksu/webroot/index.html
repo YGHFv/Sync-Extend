@@ -43,6 +43,14 @@
       </div>
       <p id="workspace-detail" class="detail">从持有资源的后台服务读取有界摘要。</p>
       <dl id="workspace-summary" class="summary" hidden></dl>
+      <p id="workspace-files-detail" class="detail">文件修改时间、只读属性和元数据能力未知。</p>
+      <div id="workspace-files" class="workspace-table-wrap" tabindex="0" role="region" aria-label="工作区文件元数据" hidden>
+        <table class="workspace-table">
+          <caption>本机路径样本</caption>
+          <thead><tr><th scope="col">相对路径</th><th scope="col">类型</th><th scope="col">逻辑大小</th><th scope="col">源修改时间（UTC）</th><th scope="col">只读属性</th><th scope="col">元数据能力</th><th scope="col">时间精度</th></tr></thead>
+          <tbody id="workspace-rows"></tbody>
+        </table>
+      </div>
     </section>
 
     <section class="panel" aria-labelledby="recovery-title">

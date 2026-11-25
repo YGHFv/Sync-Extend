@@ -1,5 +1,5 @@
 //! Restart inspection is descriptive and never adopts a persisted invocation.
-use super::{cancel, liability, phase_chain, Stored, KEY};
+use super::{KEY, Stored, cancel, liability, phase_chain};
 use crate::{Journal, JournalError, JournalStoredRow, Result};
 use rusqlite::{Transaction, TransactionBehavior};
 use serde::Serialize;

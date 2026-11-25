@@ -29,6 +29,27 @@ pub(super) struct CreatedFile {
     pub(super) digest: ContentId,
 }
 impl CreatedNodeFileSet<'_> {
+    pub fn close_into_attempt<'scope>(
+        self,
+        attempt: &mut super::OriginalNodeResourceCloseAttempt<'scope>,
+    ) where
+        Self: 'scope,
+    {
+        let Self {
+            directories, files, archive_digest, read_lease_hold,
+            source_journal_digest, mapped_journal_digest,
+        } = self;
+        attempt.keep_context((
+            directories, archive_digest, read_lease_hold,
+            source_journal_digest, mapped_journal_digest,
+        ));
+        for (slot, original) in files {
+            let CreatedFile { creator, path, key, parent, bytes, digest } = original;
+            attempt.keep_context((slot, path, key, parent, bytes, digest));
+            creator.close_into_attempt(&mut attempt.native);
+        }
+    }
+
     pub fn archive_digest(&self) -> &ContentId {
         &self.archive_digest
     }

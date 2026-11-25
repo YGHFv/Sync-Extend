@@ -2,9 +2,9 @@
 //! The owned memory connection has no pathname, migration or writer authority.
 #[cfg(target_os = "linux")]
 use crate::ReadOnlyJournal;
-use crate::{JournalError, Result, RetainedSnapshot, SnapshotPruning, MAX_OPERATION_BYTES};
+use crate::{JournalError, MAX_OPERATION_BYTES, Result, RetainedSnapshot, SnapshotPruning};
 use serde::{Deserialize, Serialize};
-use sync_extend_core_model::{limits, ContentId, Manifest, SnapshotId, SpaceId};
+use sync_extend_core_model::{ContentId, Manifest, SnapshotId, SpaceId, limits};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -138,7 +138,7 @@ impl ReadOnlyRestorePreviewJournal {
         files: sync_extend_platform_fs::ReadOnlyJournalFiles,
         bounds: ReadOnlySnapshotPreviewLimits,
     ) -> Result<Self> {
-        use rusqlite::{limits::Limit, Connection, MAIN_DB};
+        use rusqlite::{Connection, MAIN_DB, limits::Limit};
         use std::{io::Cursor, time::Duration};
         bounds.validate()?;
         files.check_main_bound(bounds.max_journal_bytes)?;
@@ -417,7 +417,7 @@ impl<'a> PreviewMetadataReader<'a> {
     }
 
     fn snapshot(&self, space: &SpaceId, id: &SnapshotId) -> Result<ReadOnlySnapshotPreviewSource> {
-        use rusqlite::{params, OptionalExtension};
+        use rusqlite::{OptionalExtension, params};
         let stored_space: Option<String> = self
             .connection
             .query_row(
@@ -668,8 +668,13 @@ impl crate::Journal {
 
 /// One owner connection, one Deferred transaction, and a temporary bounded VM
 /// guard shared by preview and pure context observations.
+#[cfg(windows)]
+type PreviewOwnerConnection = crate::original_readonly_close::JournalConnectionOwner;
+#[cfg(not(windows))]
+type PreviewOwnerConnection = rusqlite::Connection;
+
 fn with_live_preview_reader<T>(
-    connection: &mut rusqlite::Connection,
+    connection: &mut PreviewOwnerConnection,
     expected_space: &SpaceId,
     bounds: ReadOnlySnapshotPreviewLimits,
     deadline: std::time::Instant,
@@ -691,7 +696,7 @@ fn with_live_preview_reader<T>(
     // General owner Journal connections have no persistent progress hook.
     // Restore every temporary connection limit and timeout on all exits.
     struct QueryGuard<'a> {
-        connection: &'a mut rusqlite::Connection,
+        connection: &'a mut PreviewOwnerConnection,
         limits: Vec<(Limit, i32)>,
         busy_ms: u64,
         restored: bool,

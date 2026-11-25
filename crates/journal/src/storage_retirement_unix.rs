@@ -1,22 +1,22 @@
 //! Independent Unix immutable fences. Serialized history never reacquires an FD.
 use crate::{
+    Journal, JournalError, Result,
     storage_capacity::CapacitySnapshot,
     storage_inventory::reader::{add, preflight},
-    storage_retirement::{retained_scope, RetainedScope},
-    Journal, JournalError, Result,
+    storage_retirement::{RetainedScope, retained_scope},
 };
 use rusqlite::{
-    params, types::Value, Connection, OptionalExtension, Transaction, TransactionBehavior,
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Value,
 };
 use serde::Serialize;
 use sync_extend_core_model::{
+    ContentId, DeviceId, EntryId,
     storage_node::StorageNodeConfig,
     storage_retirement_unix::{
         UnixStorageRetirementBinding, UnixStorageRetirementExpectation,
         UnixStorageRetirementIntent, UnixStorageRetirementRequest,
     },
     tree_storage_capacity::TreeStorageCharge,
-    ContentId, DeviceId, EntryId,
 };
 
 pub(crate) mod native;

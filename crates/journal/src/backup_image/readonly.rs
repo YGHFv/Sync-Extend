@@ -1,6 +1,6 @@
 //! Read-only image audits borrow the original Journal view, never writer gates.
 use crate::{JournalCapacityLimits, JournalError, JournalReadView, JournalStoredRow, Result};
-use rusqlite::{Connection, MAIN_DB, Transaction, TransactionBehavior, limits::Limit};
+use rusqlite::{limits::Limit, Connection, Transaction, TransactionBehavior, MAIN_DB};
 use std::time::{Duration, Instant};
 use sync_extend_core_model::SpaceId;
 

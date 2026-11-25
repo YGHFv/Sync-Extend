@@ -1,7 +1,7 @@
 //! Original signed Delete receipts; never local reauthoring or legacy owner adoption.
 use crate::{
-    storage_inventory::reader::{hash, invalid},
     Journal, JournalCapacityObligation, JournalStoredRow, RemotePublicationProof, Result,
+    storage_inventory::reader::{hash, invalid},
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};

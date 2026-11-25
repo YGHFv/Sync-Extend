@@ -1,16 +1,16 @@
 //! Worktree-free durable content fences, never quarantine or deletion authority.
 use crate::{
+    CasAccessGuard, Journal, JournalError, Result,
     storage_capacity::CapacitySnapshot,
     storage_inventory::reader::{add, preflight},
-    CasAccessGuard, Journal, JournalError, Result,
 };
 use rusqlite::{
-    params, types::Value, Connection, OptionalExtension, Transaction, TransactionBehavior,
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Value,
 };
 use serde::Serialize;
 use sync_extend_core_model::{
-    storage_node::StorageNodeConfig, storage_retirement::StorageRetirementRequest,
-    tree_storage_capacity::TreeStorageCharge, Change, ContentId, DeviceId, EntryId,
+    Change, ContentId, DeviceId, EntryId, storage_node::StorageNodeConfig,
+    storage_retirement::StorageRetirementRequest, tree_storage_capacity::TreeStorageCharge,
 };
 
 pub(crate) mod disposal;

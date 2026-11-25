@@ -2,9 +2,9 @@
 use super::receipt_protocol::{ReceiptDescription, ReceiptEvidence, ReceiptStage, VerifiedPrefix};
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
+    ContentId, Entry, Manifest, ModelError, PortablePath, Result,
     tree_restore_identity::TreeNativeIdentity,
     webdav_native::{WebDavNativeAction, WebDavNativePlan},
-    ContentId, Entry, Manifest, ModelError, PortablePath, Result,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]

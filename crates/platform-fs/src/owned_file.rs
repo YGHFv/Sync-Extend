@@ -102,6 +102,13 @@ impl LockedDirectoryMutation {
 }
 
 impl OwnedFileCreation {
+    /// Consume the actual CREATE file and its actual retained parent. This
+    /// terminal grants no creator, replacement object, or pathname authority.
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        attempt.close_file(self.file);
+        attempt.close_file(self.parent);
+    }
+
     /// Retains both original handles for the entire lifetime of the proof.
     /// The creator remains writable; callers must separately close content and
     /// durably bind the proof to their exact transaction before native effects.
@@ -153,19 +160,119 @@ pub struct SealedOriginalFile {
     original_parent_key: FileKey,
     created_component: String,
     current_parent: Option<File>,
+    original_creator_terminal: Option<crate::ClosedWindowsOriginalResources>,
+}
+
+impl SealedOriginalFile {
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        if let Some(closed) = self.original_creator_terminal {
+            attempt.append_result(Ok(closed));
+        }
+        attempt.close_file(self.file);
+        attempt.close_file(self.parent);
+        if let Some(parent) = self.current_parent {
+            attempt.close_file(parent);
+        }
+    }
+}
+
+/// A refused reduction retains the same creator, or the same reduced handle
+/// together with every still-owned original writable handle. This failure has
+/// only terminal operations and cannot issue a new creator or sealed result.
+pub struct OriginalFileSealFailure {
+    pub error: io::Error,
+    original: OriginalFileSealFailureState,
+}
+
+enum OriginalFileSealFailureState {
+    Creator(OwnedFileCreation),
+    Sealed {
+        sealed: SealedOriginalFile,
+        original_writable: Option<File>,
+        original_resources: Option<crate::WindowsOriginalResourceCloseFailure>,
+    },
+}
+
+impl std::fmt::Debug for OriginalFileSealFailure {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("OriginalFileSealFailure")
+            .field("error", &self.error)
+            .field("originals_retained", &self.has_retained_originals())
+            .finish()
+    }
+}
+
+impl OriginalFileSealFailure {
+    pub fn has_retained_originals(&self) -> bool {
+        true
+    }
+
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        attempt.note_error(self.error);
+        match self.original {
+            OriginalFileSealFailureState::Creator(creator) => creator.close_into_attempt(attempt),
+            OriginalFileSealFailureState::Sealed {
+                sealed,
+                original_writable,
+                original_resources,
+            } => {
+                if let Some(original) = original_writable {
+                    attempt.close_file(original);
+                }
+                if let Some(original) = original_resources {
+                    attempt.append_failure(original.close_remaining());
+                }
+                sealed.close_into_attempt(attempt);
+            }
+        }
+    }
+
+    pub fn retain_until_process_exit(self) {
+        let _ = Box::leak(Box::new(self));
+    }
+
+    pub fn retain_and_report(self) -> io::Error {
+        let error = match self.error.raw_os_error() {
+            Some(code) => io::Error::from_raw_os_error(code),
+            None => io::Error::new(self.error.kind(), self.error.to_string()),
+        };
+        let mut terminal = crate::WindowsOriginalCloseAttempt::new();
+        self.close_into_attempt(&mut terminal);
+        if let Err(original) = terminal.finish() {
+            original.retain_until_process_exit();
+        }
+        error
+    }
 }
 
 impl OwnedFileCreation {
     /// Keep the same original file object continuously held while closing our
     /// writable handle. No path lookup or reopen is used to obtain read rights.
     pub fn seal_original(self) -> io::Result<SealedOriginalFile> {
+        self.seal_original_retaining()
+            .map_err(OriginalFileSealFailure::retain_and_report)
+    }
+
+    /// Reduce the same original CREATE with DuplicateHandle, then end the
+    /// actual writable HANDLE before returning a sealed result. Every failed
+    /// native prefix retains its original objects for terminal close.
+    pub fn seal_original_retaining(self) -> Result<SealedOriginalFile, OriginalFileSealFailure> {
         use std::os::windows::io::{AsRawHandle, FromRawHandle};
         use windows_sys::Win32::{
-            Foundation::{DuplicateHandle, GENERIC_READ, HANDLE},
+            Foundation::{DuplicateHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE},
             System::Threading::GetCurrentProcess,
         };
-        self.verify_single_link()?;
-        self.file.sync_all()?;
+        if let Err(error) = self
+            .original_creation()
+            .and_then(|original| original.verify())
+            .and_then(|_| self.verify_single_link())
+            .and_then(|_| self.file.sync_all())
+        {
+            return Err(OriginalFileSealFailure {
+                error,
+                original: OriginalFileSealFailureState::Creator(self),
+            });
+        }
         let mut duplicate: HANDLE = std::ptr::null_mut();
         // SAFETY: the pseudo-process handle is valid in this process; source
         // owns a live File; duplicate is writable HANDLE output. Desired access
@@ -183,10 +290,16 @@ impl OwnedFileCreation {
             )
         };
         if success == 0 {
-            return Err(io::Error::last_os_error());
+            return Err(OriginalFileSealFailure {
+                error: io::Error::last_os_error(),
+                original: OriginalFileSealFailureState::Creator(self),
+            });
         }
-        if duplicate.is_null() {
-            return Err(super::invalid("no sealed original handle"));
+        if duplicate.is_null() || duplicate == INVALID_HANDLE_VALUE {
+            return Err(OriginalFileSealFailure {
+                error: super::invalid("no sealed original handle"),
+                original: OriginalFileSealFailureState::Creator(self),
+            });
         }
         // SAFETY: successful DuplicateHandle transferred one new owned handle.
         let file = unsafe { File::from_raw_handle(duplicate) };
@@ -197,17 +310,57 @@ impl OwnedFileCreation {
             original_parent_key,
             created_component,
         } = self;
-        let sealed = SealedOriginalFile {
+        let mut sealed = SealedOriginalFile {
             file,
             parent,
             original_key,
             original_parent_key,
             created_component,
             current_parent: None,
+            original_creator_terminal: None,
         };
-        sealed.verify_original()?;
-        drop(writable);
-        sealed.verify_original()?;
+        if let Err(error) = sealed.verify_original() {
+            return Err(OriginalFileSealFailure {
+                error,
+                original: OriginalFileSealFailureState::Sealed {
+                    sealed,
+                    original_writable: Some(writable),
+                    original_resources: None,
+                },
+            });
+        }
+        let mut terminal = crate::WindowsOriginalCloseAttempt::new();
+        terminal.close_file(writable);
+        match terminal.finish() {
+            Ok(closed) => sealed.original_creator_terminal = Some(closed),
+            Err(original_resources) => {
+                let error = match original_resources.error.raw_os_error() {
+                    Some(code) => io::Error::from_raw_os_error(code),
+                    None => io::Error::new(
+                        original_resources.error.kind(),
+                        original_resources.error.to_string(),
+                    ),
+                };
+                return Err(OriginalFileSealFailure {
+                    error,
+                    original: OriginalFileSealFailureState::Sealed {
+                        sealed,
+                        original_writable: None,
+                        original_resources: Some(original_resources),
+                    },
+                });
+            }
+        }
+        if let Err(error) = sealed.verify_original() {
+            return Err(OriginalFileSealFailure {
+                error,
+                original: OriginalFileSealFailureState::Sealed {
+                    sealed,
+                    original_writable: None,
+                    original_resources: None,
+                },
+            });
+        }
         Ok(sealed)
     }
 }
@@ -260,6 +413,7 @@ pub struct PublishedOriginalFile {
     original_key: FileKey,
     original_parent_key: FileKey,
     created_component: String,
+    original_creator_terminal: Option<crate::ClosedWindowsOriginalResources>,
 }
 impl SealedOriginalFile {
     pub fn release_creation_parent(self) -> io::Result<PublishedOriginalFile> {
@@ -271,6 +425,7 @@ impl SealedOriginalFile {
             original_parent_key,
             created_component,
             current_parent,
+            original_creator_terminal,
         } = self;
         if current_parent.is_some() {
             return Err(super::invalid(
@@ -282,6 +437,7 @@ impl SealedOriginalFile {
             original_key,
             original_parent_key,
             created_component,
+            original_creator_terminal,
         };
         drop(parent);
         result.verify_original()?;
@@ -289,6 +445,13 @@ impl SealedOriginalFile {
     }
 }
 impl PublishedOriginalFile {
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        if let Some(closed) = self.original_creator_terminal {
+            attempt.append_result(Ok(closed));
+        }
+        attempt.close_file(self.file);
+    }
+
     pub fn reader(&self) -> &File {
         &self.file
     }
@@ -323,7 +486,10 @@ pub use created_identity::{
 impl OriginalFileCreation<'_> {
     /// Observe the original empty writer sentinel through a reduced-right
     /// duplicate. The CREATE remains held by its original restore coordinator.
-    pub(crate) fn retain_writer_sentinel(&self) -> io::Result<File> {
+    pub(crate) fn retain_writer_sentinel_into_attempt(
+        &self,
+        terminal: &mut crate::WindowsOriginalCloseAttempt,
+    ) -> io::Result<File> {
         use std::os::windows::io::{AsRawHandle, FromRawHandle};
         use windows_sys::Win32::{
             Foundation::{DuplicateHandle, GENERIC_READ, HANDLE},
@@ -354,9 +520,16 @@ impl OriginalFileCreation<'_> {
         }
         // SAFETY: successful duplication transferred exactly one owned handle.
         let file = unsafe { File::from_raw_handle(handle) };
-        regular(&file, false)?;
-        if key(&file)? != self.key()? || file.metadata()?.len() != 0 {
-            return Err(super::invalid("original writer sentinel duplicate differs"));
+        let checked = (|| -> io::Result<()> {
+            regular(&file, false)?;
+            if key(&file)? != self.key()? || file.metadata()?.len() != 0 {
+                return Err(super::invalid("original writer sentinel duplicate differs"));
+            }
+            Ok(())
+        })();
+        if let Err(error) = checked {
+            terminal.close_file(file);
+            return Err(error);
         }
         Ok(file)
     }
@@ -584,6 +757,11 @@ impl LockedDirectory {
     }
 }
 impl ReacquiredNodeFile {
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        attempt.close_file(self.file);
+        attempt.close_file(self.parent);
+    }
+
     pub fn key(&self) -> io::Result<FileKey> {
         self.verify()?;
         Ok(self.key)
@@ -666,6 +844,13 @@ impl ReacquiredNodeFile {
     }
 }
 impl ReacquiredNodeLock {
+    /// Closing this same owning lock description releases its actual native
+    /// byte lock; its retained original parent is ended independently.
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        attempt.close_file(self.file);
+        attempt.close_file(self.parent);
+    }
+
     pub fn verify(&self) -> io::Result<()> {
         regular(&self.file, false)?;
         regular(&self.parent, true)?;
@@ -683,6 +868,10 @@ pub struct FreshExclusiveSqliteFile {
     pub(in super::super) acquired: ReacquiredNodeFile,
 }
 impl FreshExclusiveSqliteFile {
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        self.acquired.close_into_attempt(attempt);
+    }
+
     pub fn verify(&self) -> io::Result<()> {
         self.acquired.verify()
     }
@@ -827,6 +1016,11 @@ impl OwnedFileCreation {
 /// Fresh explicit READ|DELETE native acquisition. No historical CREATE rights.
 pub struct FreshRecoveredMutationFile {
     acquired: ReacquiredNodeFile,
+}
+impl FreshRecoveredMutationFile {
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        self.acquired.close_into_attempt(attempt);
+    }
 }
 impl LockedDirectory {
     pub fn reacquire_existing_node_mutation_file(

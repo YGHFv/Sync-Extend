@@ -1,10 +1,10 @@
 //! Persisted exact history admission before native effects; no creator authority.
 use crate::{
-    storage_capacity::CapacitySnapshot, storage_policy, Completion, Journal, JournalError,
-    JournalStorageColumn, JournalStorageColumnValue as Value, PublicationIntent, PublicationState,
-    Result,
+    Completion, Journal, JournalError, JournalStorageColumn, JournalStorageColumnValue as Value,
+    PublicationIntent, PublicationState, Result, storage_capacity::CapacitySnapshot,
+    storage_policy,
 };
-use rusqlite::{params, Transaction, TransactionBehavior};
+use rusqlite::{Transaction, TransactionBehavior, params};
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::*;
 

@@ -13,6 +13,7 @@ pub(super) struct OriginalIo {
     limit: u64,
     poisoned: *const AtomicBool,
     retained_close: bool,
+    original_logical_terminal: *const AtomicBool,
 }
 
 unsafe fn owner<'a>(file: *mut ffi::sqlite3_file) -> &'a OriginalIo {
@@ -34,6 +35,7 @@ pub(super) unsafe fn install(
     limit: u64,
     poisoned: *const AtomicBool,
     retained_close: bool,
+    original_logical_terminal: *const AtomicBool,
 ) {
     // SAFETY: caller allocated aligned outer storage sized OriginalIo and base
     // SQLite file and successfully initialized base's original method table.
@@ -47,6 +49,7 @@ pub(super) unsafe fn install(
                 limit,
                 poisoned,
                 retained_close,
+                original_logical_terminal,
             },
         );
     }
@@ -57,6 +60,13 @@ unsafe extern "C" fn close(file: *mut ffi::sqlite3_file) -> i32 {
     if state.retained_close {
         // The exact builtin object is owned by Policy; logical SQLite close
         // cannot create a native sharing gap or free the owned filename.
+        if !state.original_logical_terminal.is_null() {
+            // SAFETY: the stable original owning IO retains this boxed atomic
+            // until every SQLite wrapper has ended its original native loan.
+            unsafe {
+                (*state.original_logical_terminal).store(true, Ordering::SeqCst);
+            }
+        }
         return ffi::SQLITE_OK;
     }
     // SAFETY: retained base method table and original file initialized in xOpen.

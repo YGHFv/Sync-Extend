@@ -1,6 +1,6 @@
 //! Private descriptive audits for one unchanged connection read phase.
 //! These values never issue an effect, receipt, SQL write, or native identity.
-use super::{invalid, WebDavNativeAdmission};
+use super::{WebDavNativeAdmission, invalid};
 use crate::Result;
 use rusqlite::Connection;
 use std::{

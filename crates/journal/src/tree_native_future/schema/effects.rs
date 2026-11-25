@@ -1,6 +1,6 @@
 use crate::{
-    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
     MAX_OPERATION_BYTES,
+    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
 };
 const fn c(name: &'static str, kind: ColumnKind, primary_key: usize) -> ColumnSpec {
     ColumnSpec {

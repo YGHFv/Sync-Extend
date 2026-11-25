@@ -349,7 +349,7 @@ pub(super) fn native_partition(
     scope_digest: &ContentId,
 ) -> Result<NativePartition> {
     use sync_extend_core_model::conflict_native_layout::{
-        plan_conflict_native_layout, ConflictNativeLayoutLimits,
+        ConflictNativeLayoutLimits, plan_conflict_native_layout,
     };
     binding.validate(parent)?;
     let layout = plan_conflict_native_layout(
@@ -449,7 +449,7 @@ pub(super) fn cleanup_partition(
     branch_owners: &[super::native_history_templates::BranchOwner],
 ) -> Result<Ledger> {
     use sync_extend_core_model::conflict_native_layout::{
-        plan_conflict_native_layout, ConflictNativeActionKind, ConflictNativeLayoutLimits,
+        ConflictNativeActionKind, ConflictNativeLayoutLimits, plan_conflict_native_layout,
     };
     let layout = plan_conflict_native_layout(
         &parent.intent.baseline,

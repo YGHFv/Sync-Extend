@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::{path::Path, time::Duration};
 use sync_extend_core_model::*;
 
@@ -22,7 +22,9 @@ pub enum JournalError {
     RetentionAdmissionDeferred(&'static str),
     #[error("retention clock uncertain; age remains protected: {0}")]
     RetentionClockUncertain(&'static str),
-    #[error("current snapshot {snapshot_id} is already committed; retention observation failed: {error}")]
+    #[error(
+        "current snapshot {snapshot_id} is already committed; retention observation failed: {error}"
+    )]
     RetentionObservationAfterCommit {
         snapshot_id: SnapshotId,
         #[source]
@@ -152,6 +154,12 @@ fn immutable_readonly_uri(path: &Path) -> Result<String> {
     Ok(output)
 }
 
+mod capture_close;
+pub use capture_close::ClosedJournalCaptureConnection;
+#[cfg(windows)]
+pub use capture_close::{
+    CasCaptureCloseFailure, OriginalStoppedCaptureConnection, StoppedCaptureJournalOpenFailure,
+};
 mod causal_log;
 mod deletion_retention;
 pub use deletion_retention::{DeletionRetentionPolicy, RetentionPreviewInputs};
@@ -198,24 +206,25 @@ pub use remote_publication::RemotePublicationProof;
 mod remote_replay;
 pub use remote_replay::{RemoteReplayDisposition, RemoteReplayReport};
 mod remote_rename;
-pub use remote_rename::{remote_rename_transaction, RemoteRenameReceipt, RemoteRenameStage};
 #[cfg(windows)]
 pub use remote_rename::{RemoteRenameObservation, RemoteRenameSource};
+pub use remote_rename::{RemoteRenameReceipt, RemoteRenameStage, remote_rename_transaction};
 mod remote_replace;
-pub use remote_replace::{remote_replace_transaction, RemoteReplaceReceipt, RemoteReplaceStage};
 #[cfg(windows)]
 pub use remote_replace::{
     RemoteReplaceCreation, RemoteReplaceFileView, RemoteReplaceObservation, RemoteReplaceReadiness,
     RemoteReplaceSource,
 };
+pub use remote_replace::{RemoteReplaceReceipt, RemoteReplaceStage, remote_replace_transaction};
 mod remote_delete;
-pub use remote_delete::{remote_delete_transaction, RemoteDeleteReceipt, RemoteDeleteStage};
 #[cfg(windows)]
 pub use remote_delete::{RemoteDeleteObservation, RemoteDeleteSource};
+pub use remote_delete::{RemoteDeleteReceipt, RemoteDeleteStage, remote_delete_transaction};
 mod storage_page_handoff;
 mod storage_policy;
 mod storage_retirement;
 mod storage_retirement_unix;
+pub use storage_retirement_unix::UnixStorageRetirementAdmission;
 #[cfg(target_os = "linux")]
 pub use storage_retirement_unix::native::UnixStorageRetirementNativeTerminal;
 pub use storage_retirement_unix::native::{
@@ -224,15 +233,14 @@ pub use storage_retirement_unix::native::{
     UnixStorageRetirementNativeKind, UnixStorageRetirementNativePayloadSlot,
     UnixStorageRetirementNativeRelease, UnixStorageRetirementNativeState,
 };
-pub use storage_retirement_unix::UnixStorageRetirementAdmission;
 mod storage_snapshot_handoff;
+pub use storage_retirement::StorageRetirementAdmission;
 pub use storage_retirement::disposal::StorageRetirementDisposalReport;
 #[cfg(windows)]
 pub use storage_retirement::owner::StorageRetirementOwnerCreation;
 pub use storage_retirement::owner::StorageRetirementOwnerReceipt;
 pub use storage_retirement::payload::StorageRetirementPayloadReport;
 pub use storage_retirement::terminal::StorageRetirementTerminalReport;
-pub use storage_retirement::StorageRetirementAdmission;
 mod storage_traffic;
 pub use storage_traffic::StorageTrafficLedger;
 #[cfg(target_os = "linux")]
@@ -258,6 +266,9 @@ pub enum ReceiveOutcome {
 }
 
 pub struct Journal {
+    #[cfg(windows)]
+    connection: original_readonly_close::JournalConnectionOwner,
+    #[cfg(not(windows))]
     connection: Connection,
     webdav_native_read_charges: webdav_native::DavReadChargeCache,
     #[cfg(target_os = "linux")]
@@ -271,11 +282,18 @@ pub struct Journal {
     #[cfg(windows)]
     original_read_protection: Option<sync_extend_platform_fs::ReleasedOriginalReadFile>,
     #[cfg(windows)]
+    original_stopped_capture_files:
+        Vec<(std::path::PathBuf, sync_extend_platform_fs::GuardedReadFile)>,
+    #[cfg(windows)]
+    original_stopped_capture_absent: Vec<std::path::PathBuf>,
+    #[cfg(windows)]
     original_coordination_observer: bool,
     #[cfg(windows)]
     original_main_handoff: Option<sync_extend_platform_fs::OriginalSqliteMainHandoff>,
     #[cfg(windows)]
     original_cas_coordination: Option<sync_extend_platform_fs::ReleasedOriginalCoordinationFile>,
+    #[cfg(windows)]
+    stopped_capture_existing_only: bool,
     database_path: std::path::PathBuf,
     max_storage_entries: usize,
     conflict_resolution_issuance: conflict_resolution::issuance::Gate,
@@ -801,8 +819,8 @@ impl Journal {
         max_storage_entries: usize,
     ) -> Result<StorageJournalBootstrapBudget> {
         use std::sync::{
-            atomic::{AtomicU64, Ordering},
             Arc,
+            atomic::{AtomicU64, Ordering},
         };
         storage_policy::validate(max_storage_entries)?;
         if max_storage_entries < 3 {
@@ -1504,7 +1522,7 @@ impl Journal {
             std::fs::canonicalize(path)?
         };
         Ok(Self {
-            connection,
+            connection: connection.into(),
             webdav_native_read_charges: webdav_native::DavReadChargeCache::default(),
             #[cfg(target_os = "linux")]
             linux_metadata_vfs,
@@ -1516,7 +1534,13 @@ impl Journal {
             #[cfg(windows)]
             original_cas_coordination: None,
             #[cfg(windows)]
+            stopped_capture_existing_only: false,
+            #[cfg(windows)]
             original_read_protection: None,
+            #[cfg(windows)]
+            original_stopped_capture_files: Vec::new(),
+            #[cfg(windows)]
+            original_stopped_capture_absent: Vec::new(),
             #[cfg(windows)]
             original_coordination_observer: false,
             #[cfg(windows)]
@@ -3184,24 +3208,24 @@ pub use mutation::{
 mod cleanup;
 pub use cleanup::{CleanupIntent, CleanupPlan, CleanupState};
 mod read_lease;
-pub use read_lease::{read_lease_expiry, ReadLease, ReadLeaseIntent, ReadLeaseState};
+pub use read_lease::{ReadLease, ReadLeaseIntent, ReadLeaseState, read_lease_expiry};
 mod snapshot_retention;
 pub use snapshot_retention::RetainedSnapshot;
 mod readonly_restore_preview;
 #[cfg(target_os = "linux")]
 pub use readonly_restore_preview::ReadOnlyRestorePreviewJournal;
 pub use readonly_restore_preview::{
-    validate_preview_manifest, ReadOnlyRestorePreviewSource, ReadOnlySnapshotPreviewLimits,
-    ReadOnlySnapshotPreviewSource,
+    ReadOnlyRestorePreviewSource, ReadOnlySnapshotPreviewLimits, ReadOnlySnapshotPreviewSource,
+    validate_preview_manifest,
 };
 mod snapshot_pruning;
 pub use snapshot_pruning::{SnapshotAudit, SnapshotPruning};
 mod gc_mark;
-pub use gc_mark::{gc_grace_until, GcCheck, GcMark, GcMarkAudit, GcObservation, GcState};
+pub use gc_mark::{GcCheck, GcMark, GcMarkAudit, GcObservation, GcState, gc_grace_until};
 mod gc_authorization;
 pub use gc_authorization::{
-    gc_authorization_expiry, GcAuthorization, GcAuthorizationAudit, GcAuthorizationState,
-    GcBoundary,
+    GcAuthorization, GcAuthorizationAudit, GcAuthorizationState, GcBoundary,
+    gc_authorization_expiry,
 };
 mod gc_execution;
 pub use gc_execution::{GcExecutionAudit, GcExecutionIntent, GcExecutionState};
@@ -3444,7 +3468,7 @@ impl crate::JournalReadView<'_> {
             _ => {
                 return Err(JournalError::Invariant(
                     "mutation execution integrity mismatch",
-                ))
+                ));
             }
         };
         if let Some(execution) = &execution {
@@ -3566,7 +3590,12 @@ mod recovered_history_tables;
 #[cfg(windows)]
 pub use backup_image::CreatedJournalRestore;
 pub use backup_image::{
-    ArchivedReadLeaseHold, JournalBackupImage, NodeInspectionBounds, PortableNodeImageScope,
+    ArchivedReadLeaseHold, ImmutableNativeHistorySourceProof, JournalBackupImage,
+    NativeHistoryCasReference, NativeHistoryCatalogDefinition, NativeHistoryColumnKind,
+    NativeHistoryColumnSpec, NativeHistoryFamilyRegistry, NativeHistoryHoldSpec,
+    NativeHistoryProjectionPlan, NativeHistoryReferenceKind, NativeHistoryRootColumnMapping,
+    NativeHistoryRootMapping, NativeHistoryRowKey, NativeHistorySliceSpec,
+    NativeHistorySourceTable, NativeHistoryTableRule, NodeInspectionBounds, PortableNodeImageScope,
 };
 pub use recovered_history_tables::{
     RecoveredArchiveTableSummaries, RecoveredHistoryTable, RecoveredHistoryTables,
@@ -3584,6 +3613,14 @@ mod original_cas_coordination;
 
 #[cfg(windows)]
 mod original_readonly;
+#[cfg(windows)]
+pub use original_readonly::OriginalReadonlyJournalOpenFailure;
+#[cfg(windows)]
+mod original_readonly_close;
+#[cfg(windows)]
+pub use original_readonly_close::{
+    OriginalReadonlyJournalCloseFailure, OriginalReadonlyJournalWriteHandoff,
+};
 
 #[cfg(windows)]
 mod original_completion;
@@ -3594,7 +3631,8 @@ mod original_handoff;
 mod original_write_transition;
 #[cfg(windows)]
 pub use original_write_transition::{
-    OriginalJournalTransitionFailure, OriginalJournalWriteTransition,
+    OriginalJournalTransitionFailure, OriginalJournalTransitionResourceCloseFailure,
+    OriginalJournalWriteResourceCloseFailure, OriginalJournalWriteTransition,
 };
 
 pub use backup_image::{
@@ -3609,203 +3647,274 @@ impl Journal {
         path: &std::path::Path,
         max_storage_entries: usize,
     ) -> Result<Self> {
-        connection.set_prepared_statement_cache_capacity(256);
-        storage_policy::validate(max_storage_entries)?;
-        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != SCHEMA_VERSION {
-            return Err(JournalError::Invariant("original planning current schema"));
-        }
-        deletion_retention::validate_schema(&connection)?;
-        let deletion_retention_issuance =
-            storage_retirement::gate::Gate::register(&connection, "sync_deletion_retention_issue")?;
-        webdav_native::schema::validate(&connection)?;
-        let webdav_native_execution_admission_issue = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_webdav_native_execution_admission_issue",
-        )?;
-        let webdav_native_execution_record_issue = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_webdav_native_execution_record_issue",
-        )?;
-        let webdav_native_execution_template_issue = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_webdav_native_execution_template_issue",
-        )?;
-        let webdav_native_execution_binding_issue = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_webdav_native_execution_binding_issue",
-        )?;
-        let webdav_native_execution_receipt_issue = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_webdav_native_execution_receipt_issue",
-        )?;
-        let webdav_native_execution_manifest_issue = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_webdav_native_execution_manifest_issue",
-        )?;
-        let webdav_original_final_row_issue =
-            webdav_native::final_row_gate::Gate::register(&connection)?;
-        // Non-Windows retains registration's callback-owned rejecting gate.
-        // There is no Windows native issuer on these targets.
-        #[cfg(not(windows))]
-        let _ = (
-            webdav_native_execution_template_issue,
-            webdav_native_execution_binding_issue,
-            webdav_native_execution_receipt_issue,
-            webdav_native_execution_manifest_issue,
-            webdav_original_final_row_issue,
-        );
-        let webdav_native_description_issue = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_webdav_native_description_issue",
-        )?;
-        let webdav_native_object_issue = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_webdav_native_object_issue",
-        )?;
-        let webdav_native_cancel_issue = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_webdav_native_cancel_issue",
-        )?;
-        storage_retirement::terminal_schema::validate(&connection)?;
-        #[cfg(windows)]
-        let storage_retirement_terminal_issue = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_storage_retirement_terminal_issue",
-        )?;
-        storage_retirement::disposal_schema::validate(&connection)?;
-        #[cfg(windows)]
-        let storage_retirement_disposal_issue = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_storage_retirement_disposal_issue",
-        )?;
-        storage_retirement::payload_schema::validate(&connection)?;
-        #[cfg(windows)]
-        let storage_retirement_payload_issue = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_storage_retirement_payload_issue",
-        )?;
-        storage_retirement::schema::validate(&connection)?;
-        storage_retirement::owner_schema::validate(&connection)?;
-        #[cfg(windows)]
-        let storage_retirement_owner_activation = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_storage_retirement_owner_issue",
-        )?;
-        #[cfg(windows)]
-        let storage_retirement_owner_receipt = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_storage_retirement_owner_receipt",
-        )?;
-        let storage_retirement_issuance =
-            storage_retirement::gate::Gate::register(&connection, "sync_storage_retirement_issue")?;
-        let storage_retirement_cancellation = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_storage_retirement_cancel",
-        )?;
-        storage_retirement_unix::schema::validate(&connection)?;
-        let unix_storage_retirement_issuance = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_unix_storage_retirement_issue",
-        )?;
-        let unix_storage_retirement_cancellation = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_unix_storage_retirement_cancel",
-        )?;
-        let unix_storage_retirement_clock_issue = storage_retirement::gate::Gate::register(
-            &connection,
-            "sync_unix_storage_retirement_clock",
-        )?;
-        let unix_storage_retirement_native_gates =
-            storage_retirement_unix::native::Gates::register(&connection)?;
-        storage_page_handoff::validate_schema(&connection)?;
-        storage_snapshot_handoff::validate_schema(&connection)?;
-        tree_native_effects::validate_schema(&connection)?;
-        let tree_native_issuance = tree_native_effects::issuance::Gate::register(&connection)?;
-        #[cfg(not(windows))]
-        let _ = tree_native_issuance;
-        original_provenance::validate_schema(&connection)?;
-        original_page_inbox::validate_schema(&connection)?;
-        forwarded_page_inbox::validate_schema(&connection)?;
-        let original_operation_issuance = original_provenance::Gate::register(&connection)?;
-        conflict_resolution::validate_schema(&connection)?;
-        let conflict_resolution_issuance =
-            conflict_resolution::issuance::Gate::register(&connection)?;
-        remote_replace::validate_schema(&connection)?;
-        let remote_replace_issuance = remote_replace::issuance::Gate::register(&connection)?;
-        #[cfg(not(windows))]
-        let _ = remote_replace_issuance;
-        remote_delete::validate_schema(&connection)?;
-        let remote_delete_issuance = remote_delete::issuance::Gate::register(&connection)?;
-        #[cfg(not(windows))]
-        let _ = remote_delete_issuance;
-        remote_rename::validate_schema(&connection)?;
-        let remote_rename_issuance = remote_rename::issuance::Gate::register(&connection)?;
-        #[cfg(not(windows))]
-        let _ = remote_rename_issuance;
-        native_publication::validate_schema(&connection)?;
-        #[cfg(windows)]
-        let native_issuance = native_publication::issuance::register(&connection)?;
-        Ok(Self {
-            connection,
-            webdav_native_read_charges: webdav_native::DavReadChargeCache::default(),
-            original_local_history_issuer: std::sync::Arc::new(()),
-            #[cfg(windows)]
-            original_restored_image: None,
-            #[cfg(windows)]
-            original_cas_coordination: None,
-            #[cfg(windows)]
-            original_read_protection: None,
-            #[cfg(windows)]
-            original_coordination_observer: false,
-            #[cfg(windows)]
-            original_main_handoff: None,
-            database_path: path.to_path_buf(),
+        Self::from_original_planning_memory_retaining(connection, path, max_storage_entries)
+            .map_err(|(connection, error)| {
+                // Ordinary planning callers retain their existing error API.
+                // Close the same failed preparation explicitly; if SQLite
+                // refuses, retain its exact callback scope until process exit.
+                if let Err((original, _close_error)) = connection.close() {
+                    std::mem::forget(original);
+                }
+                error
+            })
+    }
+
+    pub(crate) fn from_original_planning_memory_retaining(
+        connection: rusqlite::Connection,
+        path: &std::path::Path,
+        max_storage_entries: usize,
+    ) -> std::result::Result<
+        Self,
+        (
+            original_readonly_close::JournalConnectionOwner,
+            JournalError,
+        ),
+    > {
+        Self::from_original_planning_connection_owner_retaining(
+            connection.into(),
+            path,
             max_storage_entries,
-            conflict_resolution_issuance,
-            original_operation_issuance,
-            storage_retirement_issuance,
-            storage_retirement_cancellation,
-            unix_storage_retirement_issuance,
-            unix_storage_retirement_cancellation,
-            unix_storage_retirement_clock_issue,
-            unix_storage_retirement_native_gates,
-            deletion_retention_issuance,
-            webdav_native_description_issue,
-            webdav_native_object_issue,
-            webdav_native_cancel_issue,
-            webdav_native_execution_admission_issue,
-            webdav_native_execution_record_issue,
+        )
+    }
+
+    /// Complete schema and callback preparation borrows the same owning slot.
+    /// An original readonly connection never separates from its native IO.
+    pub(crate) fn from_original_planning_connection_owner_retaining(
+        connection: original_readonly_close::JournalConnectionOwner,
+        path: &std::path::Path,
+        max_storage_entries: usize,
+    ) -> std::result::Result<
+        Self,
+        (
+            original_readonly_close::JournalConnectionOwner,
+            JournalError,
+        ),
+    > {
+        let mut original_connection = Some(connection);
+        let prepared = (|| -> Result<Self> {
+            let connection = original_connection
+                .as_ref()
+                .expect("original planning connection retained during preparation");
+            connection.set_prepared_statement_cache_capacity(256);
+            storage_policy::validate(max_storage_entries)?;
+            let version: u32 =
+                connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            if version != SCHEMA_VERSION {
+                return Err(JournalError::Invariant("original planning current schema"));
+            }
+            deletion_retention::validate_schema(&connection)?;
+            let deletion_retention_issuance = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_deletion_retention_issue",
+            )?;
+            webdav_native::schema::validate(&connection)?;
+            let webdav_native_execution_admission_issue = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_webdav_native_execution_admission_issue",
+            )?;
+            let webdav_native_execution_record_issue = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_webdav_native_execution_record_issue",
+            )?;
+            let webdav_native_execution_template_issue = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_webdav_native_execution_template_issue",
+            )?;
+            let webdav_native_execution_binding_issue = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_webdav_native_execution_binding_issue",
+            )?;
+            let webdav_native_execution_receipt_issue = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_webdav_native_execution_receipt_issue",
+            )?;
+            let webdav_native_execution_manifest_issue = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_webdav_native_execution_manifest_issue",
+            )?;
+            let webdav_original_final_row_issue =
+                webdav_native::final_row_gate::Gate::register(&connection)?;
+            // Non-Windows retains registration's callback-owned rejecting gate.
+            // There is no Windows native issuer on these targets.
+            #[cfg(not(windows))]
+            let _ = (
+                webdav_native_execution_template_issue,
+                webdav_native_execution_binding_issue,
+                webdav_native_execution_receipt_issue,
+                webdav_native_execution_manifest_issue,
+                webdav_original_final_row_issue,
+            );
+            let webdav_native_description_issue = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_webdav_native_description_issue",
+            )?;
+            let webdav_native_object_issue = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_webdav_native_object_issue",
+            )?;
+            let webdav_native_cancel_issue = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_webdav_native_cancel_issue",
+            )?;
+            storage_retirement::terminal_schema::validate(&connection)?;
             #[cfg(windows)]
-            webdav_native_execution_template_issue,
+            let storage_retirement_terminal_issue = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_storage_retirement_terminal_issue",
+            )?;
+            storage_retirement::disposal_schema::validate(&connection)?;
             #[cfg(windows)]
-            webdav_native_execution_binding_issue,
+            let storage_retirement_disposal_issue = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_storage_retirement_disposal_issue",
+            )?;
+            storage_retirement::payload_schema::validate(&connection)?;
             #[cfg(windows)]
-            webdav_native_execution_receipt_issue,
+            let storage_retirement_payload_issue = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_storage_retirement_payload_issue",
+            )?;
+            storage_retirement::schema::validate(&connection)?;
+            storage_retirement::owner_schema::validate(&connection)?;
             #[cfg(windows)]
-            webdav_native_execution_manifest_issue,
+            let storage_retirement_owner_activation = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_storage_retirement_owner_issue",
+            )?;
             #[cfg(windows)]
-            webdav_original_final_row_issue,
+            let storage_retirement_owner_receipt = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_storage_retirement_owner_receipt",
+            )?;
+            let storage_retirement_issuance = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_storage_retirement_issue",
+            )?;
+            let storage_retirement_cancellation = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_storage_retirement_cancel",
+            )?;
+            storage_retirement_unix::schema::validate(&connection)?;
+            let unix_storage_retirement_issuance = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_unix_storage_retirement_issue",
+            )?;
+            let unix_storage_retirement_cancellation = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_unix_storage_retirement_cancel",
+            )?;
+            let unix_storage_retirement_clock_issue = storage_retirement::gate::Gate::register(
+                &connection,
+                "sync_unix_storage_retirement_clock",
+            )?;
+            let unix_storage_retirement_native_gates =
+                storage_retirement_unix::native::Gates::register(&connection)?;
+            storage_page_handoff::validate_schema(&connection)?;
+            storage_snapshot_handoff::validate_schema(&connection)?;
+            tree_native_effects::validate_schema(&connection)?;
+            let tree_native_issuance = tree_native_effects::issuance::Gate::register(&connection)?;
+            #[cfg(not(windows))]
+            let _ = tree_native_issuance;
+            original_provenance::validate_schema(&connection)?;
+            original_page_inbox::validate_schema(&connection)?;
+            forwarded_page_inbox::validate_schema(&connection)?;
+            let original_operation_issuance = original_provenance::Gate::register(&connection)?;
+            conflict_resolution::validate_schema(&connection)?;
+            let conflict_resolution_issuance =
+                conflict_resolution::issuance::Gate::register(&connection)?;
+            remote_replace::validate_schema(&connection)?;
+            let remote_replace_issuance = remote_replace::issuance::Gate::register(&connection)?;
+            #[cfg(not(windows))]
+            let _ = remote_replace_issuance;
+            remote_delete::validate_schema(&connection)?;
+            let remote_delete_issuance = remote_delete::issuance::Gate::register(&connection)?;
+            #[cfg(not(windows))]
+            let _ = remote_delete_issuance;
+            remote_rename::validate_schema(&connection)?;
+            let remote_rename_issuance = remote_rename::issuance::Gate::register(&connection)?;
+            #[cfg(not(windows))]
+            let _ = remote_rename_issuance;
+            native_publication::validate_schema(&connection)?;
             #[cfg(windows)]
-            storage_retirement_owner_activation,
-            #[cfg(windows)]
-            storage_retirement_owner_receipt,
-            #[cfg(windows)]
-            storage_retirement_payload_issue,
-            #[cfg(windows)]
-            storage_retirement_disposal_issue,
-            #[cfg(windows)]
-            storage_retirement_terminal_issue,
-            #[cfg(windows)]
-            tree_native_issuance,
-            #[cfg(windows)]
-            native_issuance,
-            #[cfg(windows)]
-            remote_rename_issuance,
-            #[cfg(windows)]
-            remote_delete_issuance,
-            #[cfg(windows)]
-            remote_replace_issuance,
+            let native_issuance = native_publication::issuance::register(&connection)?;
+            Ok(Self {
+                // No fallible operation follows this original-object transfer.
+                connection: original_connection
+                    .take()
+                    .expect("prepared original planning connection"),
+                webdav_native_read_charges: webdav_native::DavReadChargeCache::default(),
+                original_local_history_issuer: std::sync::Arc::new(()),
+                #[cfg(windows)]
+                original_restored_image: None,
+                #[cfg(windows)]
+                original_cas_coordination: None,
+                #[cfg(windows)]
+                stopped_capture_existing_only: false,
+                #[cfg(windows)]
+                original_read_protection: None,
+                #[cfg(windows)]
+                original_stopped_capture_files: Vec::new(),
+                #[cfg(windows)]
+                original_stopped_capture_absent: Vec::new(),
+                #[cfg(windows)]
+                original_coordination_observer: false,
+                #[cfg(windows)]
+                original_main_handoff: None,
+                database_path: path.to_path_buf(),
+                max_storage_entries,
+                conflict_resolution_issuance,
+                original_operation_issuance,
+                storage_retirement_issuance,
+                storage_retirement_cancellation,
+                unix_storage_retirement_issuance,
+                unix_storage_retirement_cancellation,
+                unix_storage_retirement_clock_issue,
+                unix_storage_retirement_native_gates,
+                deletion_retention_issuance,
+                webdav_native_description_issue,
+                webdav_native_object_issue,
+                webdav_native_cancel_issue,
+                webdav_native_execution_admission_issue,
+                webdav_native_execution_record_issue,
+                #[cfg(windows)]
+                webdav_native_execution_template_issue,
+                #[cfg(windows)]
+                webdav_native_execution_binding_issue,
+                #[cfg(windows)]
+                webdav_native_execution_receipt_issue,
+                #[cfg(windows)]
+                webdav_native_execution_manifest_issue,
+                #[cfg(windows)]
+                webdav_original_final_row_issue,
+                #[cfg(windows)]
+                storage_retirement_owner_activation,
+                #[cfg(windows)]
+                storage_retirement_owner_receipt,
+                #[cfg(windows)]
+                storage_retirement_payload_issue,
+                #[cfg(windows)]
+                storage_retirement_disposal_issue,
+                #[cfg(windows)]
+                storage_retirement_terminal_issue,
+                #[cfg(windows)]
+                tree_native_issuance,
+                #[cfg(windows)]
+                native_issuance,
+                #[cfg(windows)]
+                remote_rename_issuance,
+                #[cfg(windows)]
+                remote_delete_issuance,
+                #[cfg(windows)]
+                remote_replace_issuance,
+            })
+        })();
+        prepared.map_err(|error| {
+            (
+                original_connection
+                    .take()
+                    .expect("failed original planning connection retained"),
+                error,
+            )
         })
     }
 }
@@ -3838,6 +3947,6 @@ mod recovered_retention;
 #[cfg(windows)]
 pub use original_write_transition::{RecoveredMetadataOutcome, RecoveredRetentionPlan};
 pub use recovered_retention::{
-    RecoveredRetentionAudit, RecoveredRetentionMapping, RecoveredRetentionRelease,
-    MAX_RECOVERED_PINS,
+    MAX_RECOVERED_PINS, RecoveredRetentionAudit, RecoveredRetentionMapping,
+    RecoveredRetentionRelease,
 };

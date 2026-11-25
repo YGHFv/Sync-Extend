@@ -1,9 +1,9 @@
 //! Durable intent before exact handle no-replace rename; no final history yet.
 use super::NativePublicationReadiness;
 use crate::{
-    native_publication::{physical, Header},
-    storage_inventory::reader::{hash, invalid},
     Journal, Result,
+    native_publication::{Header, physical},
+    storage_inventory::reader::{hash, invalid},
 };
 use std::{fs, path::PathBuf};
 use sync_extend_core_model::EntryId;

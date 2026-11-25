@@ -1,5 +1,6 @@
 //! Linear SQLite handoff issued only by an actual still-owned original CREATE.
 //! Metadata identities and completed manifests cannot construct this capability.
+use super::created_identity::OriginalSqliteIdentityReleaseFailure;
 use super::{OwnedFileCreation, ReleasedOriginalFileIdentity, ReleasedOriginalReadFile};
 use crate::FileKey;
 use std::{
@@ -27,6 +28,12 @@ pub enum OriginalSqliteMainHandoffFailure {
     },
     Released {
         identity: ReleasedOriginalFileIdentity,
+        error: io::Error,
+    },
+    Terminating {
+        creator: Option<OwnedFileCreation>,
+        identity: Option<ReleasedOriginalFileIdentity>,
+        original_resources: crate::WindowsOriginalResourceCloseFailure,
         error: io::Error,
     },
 }
@@ -60,19 +67,58 @@ impl OwnedFileCreation {
         let path = path.to_owned();
         // The exclusive actual CREATE is the only issuing edge. The current
         // metadata API has no constructor for this linear capability.
-        let identity = match self.release_for_identity_checked_reopen() {
+        let identity = match self.release_original_sqlite_identity() {
             Ok(value) => value,
-            Err((creator, error)) => {
+            Err(OriginalSqliteIdentityReleaseFailure::Creator {
+                creator,
+                original_resources: None,
+                error,
+            }) => {
                 return Err(OriginalSqliteMainHandoffFailure::Creator {
                     creator: *creator,
                     error,
                 })
             }
+            Err(OriginalSqliteIdentityReleaseFailure::Creator {
+                creator,
+                original_resources: Some(original_resources),
+                error,
+            }) => {
+                return Err(OriginalSqliteMainHandoffFailure::Terminating {
+                    creator: Some(*creator),
+                    identity: None,
+                    original_resources,
+                    error,
+                })
+            }
+            Err(OriginalSqliteIdentityReleaseFailure::Released {
+                identity,
+                original_resources,
+                error,
+            }) => {
+                return Err(OriginalSqliteMainHandoffFailure::Terminating {
+                    creator: None,
+                    identity: Some(identity),
+                    original_resources,
+                    error,
+                })
+            }
         };
-        let protected = match identity.retain_read_after_creation() {
+        let protected = match identity.retain_original_sqlite_read() {
             Ok(value) => value,
-            Err((identity, error)) => {
-                return Err(OriginalSqliteMainHandoffFailure::Released { identity, error })
+            Err(failure) => {
+                return Err(match failure.original_resources {
+                    Some(original_resources) => OriginalSqliteMainHandoffFailure::Terminating {
+                        creator: None,
+                        identity: Some(failure.identity),
+                        original_resources,
+                        error: failure.error,
+                    },
+                    None => OriginalSqliteMainHandoffFailure::Released {
+                        identity: failure.identity,
+                        error: failure.error,
+                    },
+                });
             }
         };
         Ok(OriginalSqliteMainHandoff {
@@ -86,6 +132,15 @@ impl OwnedFileCreation {
     }
 }
 impl OriginalSqliteMainHandoff {
+    pub fn close_into_attempt(mut self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        if let Some(original) = self.protected.take() {
+            original.close_into_attempt(attempt);
+        }
+        if let Some(original) = self.released.take() {
+            original.close_into_attempt(attempt);
+        }
+    }
+
     pub fn key(&self) -> io::Result<FileKey> {
         self.verify()?;
         Ok(self.key)
@@ -214,6 +269,12 @@ pub enum OriginalSqliteSidecarHandoffFailure {
         identity: ReleasedOriginalFileIdentity,
         error: io::Error,
     },
+    Terminating {
+        creator: Option<OwnedFileCreation>,
+        identity: Option<ReleasedOriginalFileIdentity>,
+        original_resources: crate::WindowsOriginalResourceCloseFailure,
+        error: io::Error,
+    },
 }
 impl OwnedFileCreation {
     pub fn handoff_original_sqlite_sidecar(
@@ -245,11 +306,39 @@ impl OwnedFileCreation {
                 error,
             });
         }
-        let original = match self.release_for_identity_checked_reopen() {
+        let original = match self.release_original_sqlite_identity() {
             Ok(value) => value,
-            Err((creator, error)) => {
+            Err(OriginalSqliteIdentityReleaseFailure::Creator {
+                creator,
+                original_resources: None,
+                error,
+            }) => {
                 return Err(OriginalSqliteSidecarHandoffFailure::Creator {
                     creator: *creator,
+                    error,
+                })
+            }
+            Err(OriginalSqliteIdentityReleaseFailure::Creator {
+                creator,
+                original_resources: Some(original_resources),
+                error,
+            }) => {
+                return Err(OriginalSqliteSidecarHandoffFailure::Terminating {
+                    creator: Some(*creator),
+                    identity: None,
+                    original_resources,
+                    error,
+                })
+            }
+            Err(OriginalSqliteIdentityReleaseFailure::Released {
+                identity,
+                original_resources,
+                error,
+            }) => {
+                return Err(OriginalSqliteSidecarHandoffFailure::Terminating {
+                    creator: None,
+                    identity: Some(identity),
+                    original_resources,
                     error,
                 })
             }
@@ -269,6 +358,10 @@ impl OwnedFileCreation {
     }
 }
 impl OriginalSqliteSidecarHandoff {
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        self.original.close_into_attempt(attempt);
+    }
+
     pub fn verify(&self) -> io::Result<()> {
         self.original.verify()?;
         if !self.original.matches_path(&self.path)? {
@@ -324,6 +417,66 @@ impl OriginalSqliteSidecarHandoff {
             return Err((Box::new(self), error));
         }
         Ok(self.original)
+    }
+}
+
+impl OriginalSqliteMainHandoffFailure {
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        match self {
+            Self::Creator { creator, error } => {
+                attempt.note_error(error);
+                creator.close_into_attempt(attempt);
+            }
+            Self::Released { identity, error } => {
+                attempt.note_error(error);
+                identity.close_into_attempt(attempt);
+            }
+            Self::Terminating {
+                creator,
+                identity,
+                original_resources,
+                error,
+            } => {
+                attempt.note_error(error);
+                attempt.append_failure(original_resources.close_remaining());
+                if let Some(creator) = creator {
+                    creator.close_into_attempt(attempt);
+                }
+                if let Some(identity) = identity {
+                    identity.close_into_attempt(attempt);
+                }
+            }
+        }
+    }
+}
+
+impl OriginalSqliteSidecarHandoffFailure {
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        match self {
+            Self::Creator { creator, error } => {
+                attempt.note_error(error);
+                creator.close_into_attempt(attempt);
+            }
+            Self::Released { identity, error } => {
+                attempt.note_error(error);
+                identity.close_into_attempt(attempt);
+            }
+            Self::Terminating {
+                creator,
+                identity,
+                original_resources,
+                error,
+            } => {
+                attempt.note_error(error);
+                attempt.append_failure(original_resources.close_remaining());
+                if let Some(creator) = creator {
+                    creator.close_into_attempt(attempt);
+                }
+                if let Some(identity) = identity {
+                    identity.close_into_attempt(attempt);
+                }
+            }
+        }
     }
 }
 

@@ -1,5 +1,5 @@
-use crate::{JournalError, Result, MAX_OPERATION_BYTES, SCHEMA_VERSION};
-use rusqlite::{types::ValueRef, Connection};
+use crate::{JournalError, MAX_OPERATION_BYTES, Result, SCHEMA_VERSION};
+use rusqlite::{Connection, types::ValueRef};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::ContentId;

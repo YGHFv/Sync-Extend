@@ -2,7 +2,7 @@ use super::{LedgerConnection, StorageTrafficLedger};
 use crate::{JournalError, Result};
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use rusqlite::OpenFlags;
-use rusqlite::{limits::Limit, Connection};
+use rusqlite::{Connection, limits::Limit};
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use std::fs::OpenOptions;
 use std::{
@@ -11,7 +11,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use sync_extend_core_model::{storage_node::StorageNodeConfig, DeviceId};
+use sync_extend_core_model::{DeviceId, storage_node::StorageNodeConfig};
 
 #[cfg(windows)]
 use std::path::PathBuf;
@@ -342,7 +342,7 @@ impl StorageTrafficLedger {
                     Ok(_) => {
                         return Err(JournalError::Invariant(
                             "storage traffic readonly absent sidecar appeared",
-                        ))
+                        ));
                     }
                 }
             }

@@ -1,11 +1,11 @@
 //! Exact original staging disposition, never published-target or recursive delete.
-use super::{creation::key, field, issuance, physical, Header, Key};
+use super::{Header, Key, creation::key, field, issuance, physical};
 use crate::{
+    Journal, JournalStorageColumn, JournalStorageColumnValue, PublicationState, Result,
     storage_inventory::reader::{hash, invalid},
-    storage_policy, Journal, JournalStorageColumn, JournalStorageColumnValue, PublicationState,
-    Result,
+    storage_policy,
 };
-use rusqlite::{params_from_iter, types::Value, Transaction, TransactionBehavior};
+use rusqlite::{Transaction, TransactionBehavior, params_from_iter, types::Value};
 use std::{collections::BTreeMap, fs, io::Read, path::PathBuf};
 use sync_extend_core_model::EntryId;
 use sync_extend_platform_fs::{LockedDirectory, LockedDirectoryMutation, LockedFile};

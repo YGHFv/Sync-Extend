@@ -1,23 +1,23 @@
 //! Immutable final candidate descriptions, never native evidence or final commit.
 use crate::{
-    check_storage_metadata_limit, snapshot_retention::audit_snapshot, sql_integer, CasAccessGuard,
-    Journal, JournalError, Result, TreeRestorePreparation, MAX_OPERATION_BYTES,
+    CasAccessGuard, Journal, JournalError, MAX_OPERATION_BYTES, Result, TreeRestorePreparation,
+    check_storage_metadata_limit, snapshot_retention::audit_snapshot, sql_integer,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::{
-    tree_execution_records::{audit_tree_execution_records, TreeExecutionRecordLimits},
+    ContentId,
+    tree_execution_records::{TreeExecutionRecordLimits, audit_tree_execution_records},
     tree_final_description::{
-        plan_tree_final_description, TreeFinalInput, TreeFinalIntent, TreeFinalLimits,
-        TreeFinalPlan,
+        TreeFinalInput, TreeFinalIntent, TreeFinalLimits, TreeFinalPlan,
+        plan_tree_final_description,
     },
     tree_original_reference::plan_tree_original_references,
     tree_owner_marker::{
-        audit_tree_owner_records, plan_tree_owner, TreeOwnerLimits, TreeOwnerRecordLimits,
+        TreeOwnerLimits, TreeOwnerRecordLimits, audit_tree_owner_records, plan_tree_owner,
     },
     tree_restore::plan_tree_restore,
     tree_restore_history::{encode_history_record, plan_tree_restore_history},
-    ContentId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

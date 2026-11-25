@@ -1,6 +1,6 @@
 use crate::{
-    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
     MAX_OPERATION_BYTES,
+    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
 };
 mod effects;
 pub(crate) use effects::EFFECT_TABLES;

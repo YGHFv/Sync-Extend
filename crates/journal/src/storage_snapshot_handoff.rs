@@ -1,12 +1,12 @@
 //! Storage-only atomic exact owner handoff; never CAS disposition or a native claim.
 use crate::{
-    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
     Journal, JournalError, ReferenceReservationIntent, Result,
+    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
 };
 use rusqlite::{
-    params, types::Value, Connection, OptionalExtension, Transaction, TransactionBehavior,
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Value,
 };
-use sync_extend_core_model::{reference_owner::ReferenceOwnerKind, ContentId, EntryId};
+use sync_extend_core_model::{ContentId, EntryId, reference_owner::ReferenceOwnerKind};
 use sync_extend_transport::{SnapshotStorageHandoffRecord, VerifiedSnapshotStorageHandoff};
 
 const fn c(name: &'static str, kind: ColumnKind, pk: usize) -> ColumnSpec {

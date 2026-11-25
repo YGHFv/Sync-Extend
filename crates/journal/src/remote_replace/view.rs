@@ -4,7 +4,7 @@ use super::windows::*;
 use super::*;
 use crate::NativePublicationFileObservation;
 use std::{fs::File, path::Path};
-use sync_extend_platform_fs::{regular_file_matches_path, FileKey};
+use sync_extend_platform_fs::{FileKey, regular_file_matches_path};
 
 fn matches(file: &File, path: &Path) -> Result<bool> {
     Ok(present(path)? && regular_file_matches_path(file, path)?)

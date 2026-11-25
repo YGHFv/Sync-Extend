@@ -1,9 +1,9 @@
 //! Connection-local exact-value issuance; not protection from hostile SQL/unsafe.
 use crate::{JournalError, Result};
 use rusqlite::{
+    Connection,
     functions::FunctionFlags,
     types::{Value, ValueRef},
-    Connection,
 };
 use std::sync::{Arc, Mutex};
 

@@ -8,12 +8,17 @@ impl Journal {
     /// never a fresh CREATE or content-immutable authority.
     #[cfg(windows)]
     pub fn open_original_coordination_connection(&self) -> Result<Self> {
-        self.verify_original_created_image()?;
-        let original = self
-            .original_restored_image
-            .as_ref()
-            .ok_or(JournalError::Invariant("original Journal witness absent"))?
-            .retain_identity_observer()?;
+        self.open_original_coordination_connection_retaining()
+            .map_err(|original| original.retain_and_report())
+    }
+
+    #[cfg(windows)]
+    pub fn open_original_coordination_connection_retaining(
+        &self,
+    ) -> std::result::Result<Self, crate::OriginalReadonlyJournalOpenFailure> {
+        use crate::OriginalReadonlyJournalOpenFailure;
+        self.verify_original_created_image()
+            .map_err(OriginalReadonlyJournalOpenFailure::before_native)?;
         let inspection = crate::NodeInspectionBounds {
             max_entries: self.max_storage_entries,
             capacity: crate::JournalCapacityLimits {
@@ -32,14 +37,35 @@ impl Journal {
             .as_ref()
             .ok_or(JournalError::Invariant(
                 "original coordination sentinel absent",
-            ))?
-            .retain_observer()?;
+            ))
+            .and_then(|sentinel| sentinel.retain_observer().map_err(JournalError::from))
+            .map_err(OriginalReadonlyJournalOpenFailure::before_native)?;
+        let original = match self
+            .original_restored_image
+            .as_ref()
+            .ok_or(JournalError::Invariant("original Journal witness absent"))
+            .and_then(|original| {
+                original
+                    .retain_identity_observer()
+                    .map_err(JournalError::from)
+            }) {
+            Ok(original) => original,
+            Err(error) => {
+                return Err(OriginalReadonlyJournalOpenFailure::before_native(error)
+                    .retain_sentinel(sentinel));
+            }
+        };
         let mut connection =
-            Self::reopen_original_readonly_image(&self.database_path, inspection, original)
-                .map_err(|(_original, error)| error)?;
-        connection
-            .bind_original_cas_coordination(sentinel)
-            .map_err(|(_original, error)| error)?;
+            match Self::reopen_original_readonly_image(&self.database_path, inspection, original) {
+                Ok(connection) => connection,
+                Err(original) => return Err(original.retain_sentinel(sentinel)),
+            };
+        if let Err((sentinel, error)) = connection.bind_original_cas_coordination(sentinel) {
+            return Err(
+                OriginalReadonlyJournalOpenFailure::from_failed_journal(connection, error)
+                    .retain_sentinel(*sentinel),
+            );
+        }
         connection.original_coordination_observer = true;
         Ok(connection)
     }
@@ -50,25 +76,34 @@ impl Journal {
     /// original identity/sentinel witnesses or creating any new main authority.
     /// Failed actual closes restore the same connection and read protection.
     #[cfg(windows)]
-    pub fn close_original_coordination_connection(&mut self) -> Result<()> {
-        self.verify_original_created_image()?;
-        if !self.original_coordination_observer
-            || self.original_read_protection.is_none()
-            || !self.connection.is_autocommit()
-        {
-            return Err(JournalError::Invariant(
-                "coordination close requires an idle observer without main handoff",
-            ));
+    pub fn close_original_coordination_connection(
+        self,
+    ) -> std::result::Result<
+        sync_extend_platform_fs::ClosedWindowsOriginalResources,
+        crate::OriginalReadonlyJournalCloseFailure,
+    > {
+        self.close_original_readonly_resources_retaining()
+    }
+
+    pub(crate) fn finish_original_coordination_observation<T>(
+        self,
+        result: Result<T>,
+    ) -> Result<T> {
+        match self.close_original_readonly_resources_retaining() {
+            Ok(_) => result,
+            Err(failure) => {
+                let reported = JournalError::Io(std::io::Error::other(failure.error.to_string()));
+                match result {
+                    Ok(_) => {
+                        failure.retain_until_process_exit();
+                        Err(reported)
+                    }
+                    Err(first) => {
+                        let _ = Box::leak(Box::new((failure, first.to_string())));
+                        Err(first)
+                    }
+                }
+            }
         }
-        let inert = rusqlite::Connection::open_in_memory()?;
-        let actual = std::mem::replace(&mut self.connection, inert);
-        if let Err((connection, error)) = actual.close() {
-            self.connection = connection;
-            return Err(error.into());
-        }
-        // Original metadata identities and parent witnesses remain retained.
-        // Only the already closed observer's content read protection ends.
-        drop(self.original_read_protection.take());
-        Ok(())
     }
 }

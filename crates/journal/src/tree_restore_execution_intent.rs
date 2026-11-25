@@ -1,22 +1,21 @@
 //! Immutable descriptions, not native admission or complete execution capacity.
 use crate::{
-    check_storage_metadata_limit, sql_integer, CasAccessGuard, Journal, JournalError, Result,
+    CasAccessGuard, Journal, JournalError, MAX_OPERATION_BYTES, Result,
     TreeRestoreHistoryReservation, TreeRestoreNativeReservation, TreeRestorePreparationIntent,
-    MAX_OPERATION_BYTES,
+    check_storage_metadata_limit, sql_integer,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use sync_extend_core_model::{
-    limits,
+    Change, ContentId, EntryId, Manifest, limits,
     tree_restore::plan_tree_restore,
     tree_restore_execution_intent::{
-        plan_tree_execution_intent, TreeExecutionIntent, TreeExecutionIntentInput,
-        TreeExecutionIntentPlan,
+        TreeExecutionIntent, TreeExecutionIntentInput, TreeExecutionIntentPlan,
+        plan_tree_execution_intent,
     },
     tree_restore_history::{encode_history_record, plan_tree_restore_history},
     tree_restore_identity::plan_tree_restore_identities,
-    Change, ContentId, EntryId, Manifest,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

@@ -1,9 +1,9 @@
 use super::*;
 use crate::{
-    storage_capacity::CapacitySnapshot, storage_policy, CasAccessGuard, JournalStorageColumn,
-    JournalStorageColumnValue as ColumnValue,
+    CasAccessGuard, JournalStorageColumn, JournalStorageColumnValue as ColumnValue,
+    storage_capacity::CapacitySnapshot, storage_policy,
 };
-use rusqlite::{params, params_from_iter, types::Value, Transaction, TransactionBehavior};
+use rusqlite::{Transaction, TransactionBehavior, params, params_from_iter, types::Value};
 use std::{
     collections::BTreeMap,
     fs,

@@ -3,7 +3,7 @@
 use crate::{JournalError, Result};
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use rusqlite::OpenFlags;
-use rusqlite::{limits::Limit, params, Connection, TransactionBehavior};
+use rusqlite::{Connection, TransactionBehavior, limits::Limit, params};
 use serde::{Deserialize, Serialize};
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use std::fs::OpenOptions;
@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 use sync_extend_core_model::{
-    storage_node::StorageNodeConfig, Change, ChunkRef, ContentId, DeviceId, EntryId, SpaceId,
+    Change, ChunkRef, ContentId, DeviceId, EntryId, SpaceId, storage_node::StorageNodeConfig,
 };
 use sync_extend_transport::{ForwardedSnapshotEnvelope, PeerIdentity, VerifiedForwardedPage};
 
@@ -487,7 +487,7 @@ impl StoragePullAttemptLedger {
             let sidecar = PathBuf::from(sidecar);
             match std::fs::symlink_metadata(&sidecar) {
                 Ok(_) if fresh => {
-                    return Err(JournalError::Invariant("fresh attempt sidecar exists"))
+                    return Err(JournalError::Invariant("fresh attempt sidecar exists"));
                 }
                 Ok(_) => {
                     let mut options = OpenOptions::new();
@@ -545,7 +545,7 @@ impl StoragePullAttemptLedger {
                     Ok(_) => {
                         return Err(JournalError::Invariant(
                             "attempt readonly absent sidecar appeared",
-                        ))
+                        ));
                     }
                 }
             }

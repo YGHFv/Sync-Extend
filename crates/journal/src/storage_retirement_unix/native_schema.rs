@@ -1,7 +1,7 @@
 //! Exact independent native catalog, including the v1 cancellation guard.
 use crate::{
-    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
     JournalError, Result,
+    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
 };
 use rusqlite::Connection;
 

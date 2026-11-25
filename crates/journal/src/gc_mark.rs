@@ -1,5 +1,5 @@
-use crate::{check_storage_metadata_limit, sql_integer, Journal, JournalError, Result};
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use crate::{Journal, JournalError, Result, check_storage_metadata_limit, sql_integer};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::*;
 

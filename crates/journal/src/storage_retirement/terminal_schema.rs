@@ -1,6 +1,6 @@
 use crate::{
-    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
     JournalError, Result,
+    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
 };
 use rusqlite::Connection;
 const fn c(name: &'static str, kind: ColumnKind, pk: usize) -> ColumnSpec {

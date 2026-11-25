@@ -1,16 +1,16 @@
 //! D01/D04 draft: exact future history values projected from the original DAV plan.
 //! Bound to real inventory inside the owned admission transaction before enabling effects.
 use crate::{
-    storage_inventory::reader::add, JournalError, JournalStorageColumnValue as Value, Result,
+    JournalError, JournalStorageColumnValue as Value, Result, storage_inventory::reader::add,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
+    Change, ContentId, EntryId, Manifest, Operation, SpaceId, VersionVector,
     tree_restore_history::encode_history_record,
     tree_storage_capacity::TreeStorageCharge,
     webdav_mutation::{WebDavMutation, WebDavMutationRequest},
     webdav_native::WebDavNativePlan,
-    Change, ContentId, EntryId, Manifest, Operation, SpaceId, VersionVector,
 };
 
 use super::budget_manifest::OriginalMainRow;

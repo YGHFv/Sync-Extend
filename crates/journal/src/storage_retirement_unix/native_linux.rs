@@ -2,28 +2,28 @@
 //! Every issuing entry point acquires its own fresh admission. Durable facts
 //! cannot construct the original boundary or the sealed terminal below.
 use super::{
-    audit, invalid, UnixStorageRetirementNativeActivation as Activation,
+    EVENT_PEAK_BYTES, MAX_EVENTS, RELEASE_PEAK_BYTES,
+    UnixStorageRetirementNativeActivation as Activation,
     UnixStorageRetirementNativeDisposition as Disposition,
     UnixStorageRetirementNativeEvent as Event, UnixStorageRetirementNativeEvidence as Evidence,
     UnixStorageRetirementNativeKind as Kind, UnixStorageRetirementNativePayloadSlot as Slot,
     UnixStorageRetirementNativeRelease as Release, UnixStorageRetirementNativeState as State,
-    EVENT_PEAK_BYTES, MAX_EVENTS, RELEASE_PEAK_BYTES,
+    audit, invalid,
 };
 use crate::{
-    storage_capacity::CapacitySnapshot, storage_inventory::reader::add,
-    storage_retirement_unix::UnixStorageRetirementAdmission, CasAccessGuard, Journal, JournalError,
-    Result,
+    CasAccessGuard, Journal, JournalError, Result, storage_capacity::CapacitySnapshot,
+    storage_inventory::reader::add, storage_retirement_unix::UnixStorageRetirementAdmission,
 };
 use rusqlite::{
-    params, params_from_iter, types::Value, OptionalExtension, Transaction, TransactionBehavior,
+    OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter, types::Value,
 };
 use sync_extend_core_model::{
+    ContentId, DeviceId, EntryId,
     storage_node::StorageNodeConfig,
     storage_retirement_unix::{
         UnixStorageRetirementBinding, UnixStorageRetirementIntent, UnixStorageRetirementKey,
     },
     tree_storage_capacity::TreeStorageCharge,
-    ContentId, DeviceId, EntryId,
 };
 use sync_extend_platform_fs::{
     LinuxStorageCasDirectoryGuard, LinuxStorageCasExclusiveCoordination,
@@ -332,19 +332,19 @@ fn phase(state: &State) -> Result<Phase> {
             return branched(
                 Phase::MarkerUnlinkRequestedDeleted,
                 Phase::MarkerUnlinkRequestedRestored,
-            )
+            );
         }
         Some(Kind::MarkerUnlinked) => {
-            return branched(Phase::MarkerUnlinkedDeleted, Phase::MarkerUnlinkedRestored)
+            return branched(Phase::MarkerUnlinkedDeleted, Phase::MarkerUnlinkedRestored);
         }
         Some(Kind::OwnerCloseRequested) => {
             return branched(
                 Phase::OwnerCloseRequestedDeleted,
                 Phase::OwnerCloseRequestedRestored,
-            )
+            );
         }
         Some(Kind::OwnerClosed) => {
-            return branched(Phase::OwnerClosedDeleted, Phase::OwnerClosedRestored)
+            return branched(Phase::OwnerClosedDeleted, Phase::OwnerClosedRestored);
         }
         Some(Kind::TerminalDeleted) => Phase::TerminalDeleted,
         Some(Kind::TerminalRestoredClosed) => Phase::TerminalRestored,
@@ -705,7 +705,7 @@ impl Journal {
                 return combine(
                     Err(error.into()),
                     coordination.close_linux_storage_original(),
-                )
+                );
             }
         };
         let mut boundary = Some(boundary);

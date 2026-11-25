@@ -1,6 +1,6 @@
 use crate::{
-    storage_capacity::CapacitySnapshot, JournalError, JournalStorageCapacity, JournalStorageColumn,
-    JournalStorageColumnValue, ReadLease, Result,
+    JournalError, JournalStorageCapacity, JournalStorageColumn, JournalStorageColumnValue,
+    ReadLease, Result, storage_capacity::CapacitySnapshot,
 };
 use std::collections::BTreeMap;
 use sync_extend_core_model::EntryId;

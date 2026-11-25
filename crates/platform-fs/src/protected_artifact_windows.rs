@@ -30,33 +30,59 @@ struct Parent {
     ancestors: Vec<(PathBuf, LockedDirectory, FileKey)>,
 }
 impl Parent {
-    fn open(path: &Path) -> io::Result<Self> {
-        if !path.is_absolute()
-            || path.parent().is_none()
-            || path.as_os_str().len() > 32_768
-            || path
-                .components()
-                .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
-        {
-            return Err(invalid("bounded exact private deployment parent required"));
-        }
-        let mut ancestors = Vec::new();
-        for path in path.ancestors().filter(|path| path.is_absolute()) {
-            let original = LockedDirectory::open(path)?;
-            original.require_local_ntfs(path)?;
-            original.require_case_insensitive()?;
-            if !original.matches_path(path)? {
-                return Err(invalid("original deployment parent changed during open"));
+    fn open_retaining(
+        path: &Path,
+    ) -> Result<Self, crate::WindowsOriginalResourceOpenFailure> {
+        let mut ancestors = Vec::<(PathBuf, LockedDirectory, Option<FileKey>)>::new();
+        let mut failed_opens = Vec::new();
+        let observed = (|| -> io::Result<()> {
+            if !path.is_absolute()
+                || path.parent().is_none()
+                || path.as_os_str().len() > 32_768
+                || path.components()
+                    .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+            {
+                return Err(invalid("bounded exact private deployment parent required"));
             }
-            let native_key = original.key()?;
-            ancestors.push((path.to_path_buf(), original, native_key));
+            for parent in path.ancestors().filter(|parent| parent.is_absolute()) {
+                let original = LockedDirectory::open_retaining(parent).map_err(|failure| {
+                    if let Some(resources) = failure.original_resources {
+                        failed_opens.push(resources);
+                    }
+                    failure.error
+                })?;
+                ancestors.push((parent.to_path_buf(), original, None));
+                let (_, directory, native_key) = ancestors.last_mut()
+                    .ok_or_else(|| invalid("actual deployment parent prefix absent"))?;
+                directory.require_local_ntfs(parent)?;
+                directory.require_case_insensitive()?;
+                if !directory.matches_path(parent)? {
+                    return Err(invalid("original deployment parent changed during open"));
+                }
+                *native_key = Some(directory.key()?);
+            }
+            ancestors.first().ok_or_else(|| invalid("actual deployment parent absent"))?
+                .1.require_current_user_private()
+        })();
+        if let Err(error) = observed {
+            let mut close = crate::WindowsOriginalCloseAttempt::new();
+            for (_, directory, _) in ancestors {
+                close.close_directory(directory);
+            }
+            for resources in failed_opens {
+                close.append_failure(resources);
+            }
+            return Err(crate::WindowsOriginalResourceOpenFailure {
+                error,
+                original_resources: close.finish().err(),
+            });
         }
-        let result = Self {
+        Ok(Self {
             path: path.to_path_buf(),
-            ancestors,
-        };
-        result.verify()?;
-        Ok(result)
+            ancestors: ancestors.into_iter().map(|(path, directory, key)| {
+                (path, directory, key.expect("successful actual deployment parent key"))
+            }).collect(),
+        })
     }
     fn directory(&self) -> io::Result<&LockedDirectory> {
         self.ancestors
@@ -79,8 +105,15 @@ pub struct WindowsProtectedArtifactParent {
 }
 impl WindowsProtectedArtifactParent {
     pub fn open_private(path: &Path) -> io::Result<Self> {
+        Self::open_private_retaining(path)
+            .map_err(crate::WindowsOriginalResourceOpenFailure::retain_and_report)
+    }
+
+    pub fn open_private_retaining(
+        path: &Path,
+    ) -> Result<Self, crate::WindowsOriginalResourceOpenFailure> {
         Ok(Self {
-            original: Arc::new(Parent::open(path)?),
+            original: Arc::new(Parent::open_retaining(path)?),
         })
     }
     pub fn path(&self) -> &Path {
@@ -187,9 +220,28 @@ impl WindowsProtectedArtifactParent {
         })
     }
     pub fn close(self) -> io::Result<()> {
-        Arc::try_unwrap(self.original)
-            .map_err(|_| invalid("deployment parent still has original creator loans"))?;
-        Ok(())
+        self.close_retaining()
+            .map(|_| ())
+            .map_err(crate::WindowsOriginalResourceCloseFailure::retain_and_report)
+    }
+    pub fn close_retaining(
+        self,
+    ) -> Result<crate::ClosedWindowsOriginalResources, crate::WindowsOriginalResourceCloseFailure> {
+        let mut attempt = crate::WindowsOriginalCloseAttempt::new();
+        let original = match Arc::try_unwrap(self.original) {
+            Ok(parent) => parent,
+            Err(original) => {
+                attempt.retain_shared_artifact_parent(
+                    Self { original },
+                    invalid("deployment parent still has actual original creator loans"),
+                );
+                return attempt.finish();
+            }
+        };
+        for (_, directory, _) in original.ancestors {
+            attempt.close_directory(directory);
+        }
+        attempt.finish()
     }
 }
 
@@ -215,8 +267,23 @@ impl WindowsFailedArtifactCreation {
         self.parent.verify()
     }
     pub fn close(self) -> io::Result<()> {
-        drop(self);
-        Ok(())
+        self.close_retaining()
+            .map(|_| ())
+            .map_err(crate::WindowsOriginalResourceCloseFailure::retain_and_report)
+    }
+    pub fn close_retaining(
+        self,
+    ) -> Result<crate::ClosedWindowsOriginalResources, crate::WindowsOriginalResourceCloseFailure> {
+        let mut attempt = crate::WindowsOriginalCloseAttempt::new();
+        attempt.close_file(self.file);
+        // If this is the last actual parent borrow, end its retained ancestors
+        // here. Other living creators retain their same shared parent object.
+        if Arc::strong_count(&self.parent) == 1 {
+            attempt.close_artifact_parent(WindowsProtectedArtifactParent { original: self.parent });
+        } else {
+            drop(self.parent);
+        }
+        attempt.finish()
     }
 }
 
@@ -386,8 +453,21 @@ impl WindowsProtectedArtifactCreator {
         Ok(result)
     }
     pub fn close(self) -> io::Result<()> {
-        drop(self);
-        Ok(())
+        self.close_retaining()
+            .map(|_| ())
+            .map_err(crate::WindowsOriginalResourceCloseFailure::retain_and_report)
+    }
+    pub fn close_retaining(
+        self,
+    ) -> Result<crate::ClosedWindowsOriginalResources, crate::WindowsOriginalResourceCloseFailure> {
+        let mut attempt = crate::WindowsOriginalCloseAttempt::new();
+        attempt.close_file(self.file);
+        if Arc::strong_count(&self.parent) == 1 {
+            attempt.close_artifact_parent(WindowsProtectedArtifactParent { original: self.parent });
+        } else {
+            drop(self.parent);
+        }
+        attempt.finish()
     }
 }
 
@@ -449,7 +529,20 @@ impl SealedWindowsProtectedArtifact {
         self.parent.verify()
     }
     pub fn close(self) -> io::Result<()> {
-        drop(self);
-        Ok(())
+        self.close_retaining()
+            .map(|_| ())
+            .map_err(crate::WindowsOriginalResourceCloseFailure::retain_and_report)
+    }
+    pub fn close_retaining(
+        self,
+    ) -> Result<crate::ClosedWindowsOriginalResources, crate::WindowsOriginalResourceCloseFailure> {
+        let mut attempt = crate::WindowsOriginalCloseAttempt::new();
+        attempt.close_file(self.file);
+        if Arc::strong_count(&self.parent) == 1 {
+            attempt.close_artifact_parent(WindowsProtectedArtifactParent { original: self.parent });
+        } else {
+            drop(self.parent);
+        }
+        attempt.finish()
     }
 }

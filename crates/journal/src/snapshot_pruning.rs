@@ -1,8 +1,8 @@
 use crate::{
-    snapshot_retention::audit_snapshot, sql_integer, storage_policy, Journal, JournalError, Result,
-    MAX_OPERATION_BYTES,
+    Journal, JournalError, MAX_OPERATION_BYTES, Result, snapshot_retention::audit_snapshot,
+    sql_integer, storage_policy,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::*;
 
@@ -215,15 +215,23 @@ impl Journal {
         // caller's audit timestamp cannot age a sender-controlled Delete.
         let now = crate::deletion_retention::local_now_ms().unwrap_or(0);
         let protections = crate::deletion_retention::protections(
-            &tx, &intent.space_id, &snapshots, policy.deleted_min_retention_days,
-            now, bounds.max_rows as usize,
+            &tx,
+            &intent.space_id,
+            &snapshots,
+            policy.deleted_min_retention_days,
+            now,
+            bounds.max_rows as usize,
         )?;
-        if protections.get(&intent.snapshot_id).is_some_and(|reasons| !reasons.is_empty()) {
-            return Err(JournalError::Invariant("snapshot protected by local deletion retention"));
+        if protections
+            .get(&intent.snapshot_id)
+            .is_some_and(|reasons| !reasons.is_empty())
+        {
+            return Err(JournalError::Invariant(
+                "snapshot protected by local deletion retention",
+            ));
         }
-        let retention_clock = self.pruning_retention_clock(
-            &intent.space_id, policy.deleted_min_retention_days, now,
-        )?;
+        let retention_clock =
+            self.pruning_retention_clock(&intent.space_id, policy.deleted_min_retention_days, now)?;
         let target = snapshots
             .iter()
             .find(|s| s.snapshot_id == intent.snapshot_id)
@@ -308,14 +316,23 @@ impl Journal {
             [intent.snapshot_id.as_str()],
         )?;
         let after = view.audit_history_capacity(&intent.space_id, bounds)?;
-        storage_policy::history::snapshot_pruned(&before, &after, intent, &json, retention_clock.as_ref())?;
+        storage_policy::history::snapshot_pruned(
+            &before,
+            &after,
+            intent,
+            &json,
+            retention_clock.as_ref(),
+        )?;
         storage_policy::history::within(&after.report)?;
         physical.verify(self)?;
         tx.commit()?;
-        physical.verify(self).map_err(|error| JournalError::RetentionMetadataAfterCommit {
-            action: "snapshot pruning", identity: intent.snapshot_id.to_string(),
-            error: Box::new(error),
-        })?;
+        physical
+            .verify(self)
+            .map_err(|error| JournalError::RetentionMetadataAfterCommit {
+                action: "snapshot pruning",
+                identity: intent.snapshot_id.to_string(),
+                error: Box::new(error),
+            })?;
         Ok(intent.clone())
     }
 }

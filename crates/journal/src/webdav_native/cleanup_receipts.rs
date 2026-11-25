@@ -2,7 +2,7 @@
 use super::receipt_protocol::{
     ReceiptDescription, ReceiptEvidence as E, ReceiptStage as S, VerifiedPrefix,
 };
-use sync_extend_core_model::{webdav_native::WebDavNativeAction as A, ModelError, Result};
+use sync_extend_core_model::{ModelError, Result, webdav_native::WebDavNativeAction as A};
 fn invalid() -> ModelError {
     ModelError::InvalidData("original DAV cleanup receipt lineage")
 }
@@ -63,13 +63,13 @@ pub(super) fn audit(record: &ReceiptDescription, prior: &VerifiedPrefix<'_>) -> 
                     if previous.stage != S::DisposalRequested(*action)
                         || previous.evidence != record.evidence =>
                 {
-                    return Err(invalid())
+                    return Err(invalid());
                 }
                 S::OwnerSlotCleared(_)
                     if previous.stage != S::OriginalAbsent(*action)
                         || previous.evidence != record.evidence =>
                 {
-                    return Err(invalid())
+                    return Err(invalid());
                 }
                 _ => {}
             }
@@ -169,13 +169,13 @@ pub(super) fn audit(record: &ReceiptDescription, prior: &VerifiedPrefix<'_>) -> 
                     if previous.stage != S::ReferenceHandoffRequested
                         || previous.evidence != record.evidence =>
                 {
-                    return Err(invalid())
+                    return Err(invalid());
                 }
                 S::Terminal
                     if previous.stage != S::StagingAbsent
                         || !prior.any_evidence(S::ReferencesHandedOff, &record.evidence) =>
                 {
-                    return Err(invalid())
+                    return Err(invalid());
                 }
                 _ => {}
             }

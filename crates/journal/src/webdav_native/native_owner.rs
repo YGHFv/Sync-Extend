@@ -6,7 +6,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
-use sync_extend_core_model::{tree_restore_identity::TreeNativeIdentity, ContentId};
+use sync_extend_core_model::{ContentId, tree_restore_identity::TreeNativeIdentity};
 use sync_extend_platform_fs::{
     FileKey, LockedDirectory, LockedDirectoryMutation, OwnedFileCreation, SealedOriginalFile,
 };

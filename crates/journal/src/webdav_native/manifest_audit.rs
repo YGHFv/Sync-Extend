@@ -1,21 +1,22 @@
 //! Exact immutable complete budget audit for pre-native D01 prefixes only.
 //! No serialized receipt can extend this prefix into native or Final authority.
 use super::{
+    WebDavNativeAdmission,
     budget_manifest::{self, BudgetManifest, OriginalMainRow},
     execution::WebDavDurableExecution,
     future_history,
     initial_binding::InitialHeldBinding,
-    receipt_protocol, WebDavNativeAdmission,
+    receipt_protocol,
 };
 use crate::{
-    storage_inventory::reader::{add, hash, preflight, read_table},
     JournalError, JournalStorageColumnValue as Value, Result,
+    storage_inventory::reader::{add, hash, preflight, read_table},
 };
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
-    tree_restore_history::encode_history_record, tree_storage_capacity::TreeStorageCharge,
-    ContentId,
+    ContentId, tree_restore_history::encode_history_record,
+    tree_storage_capacity::TreeStorageCharge,
 };
 
 type RowKey = (String, Vec<String>);

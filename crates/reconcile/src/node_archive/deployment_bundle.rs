@@ -179,6 +179,42 @@ impl CapturedDeploymentNode {
         inspection: sync_extend_journal::NodeInspectionBounds,
         max_content_hash_bytes: u64,
     ) -> Result<Self> {
+        let captured_configs = Self::capture_scope(id, artifact_id, archive_path, local, configs)?;
+        let archive = local.capture_node_archive(configs, archive_bounds)?;
+        Self::from_actual_capture(
+            id, artifact_id, archive_path, local, captured_configs, archive,
+            archive_bounds, inspection, max_content_hash_bytes,
+        )
+    }
+
+    #[cfg(windows)]
+    pub fn capture_stopped(
+        id: u32,
+        artifact_id: u32,
+        archive_path: &Path,
+        source: &mut super::deployment_capture::StoppedDeploymentCaptureSource,
+        configs: &[(String, PathBuf)],
+        archive_bounds: crate::ArchiveBounds,
+        inspection: sync_extend_journal::NodeInspectionBounds,
+        max_content_hash_bytes: u64,
+    ) -> Result<Self> {
+        let captured_configs =
+            Self::capture_scope(id, artifact_id, archive_path, source.original_local()?, configs)?;
+        let archive = source.capture_node_archive(configs, archive_bounds)?;
+        Self::from_actual_capture(
+            id, artifact_id, archive_path, source.original_local()?, captured_configs,
+            archive, archive_bounds, inspection, max_content_hash_bytes,
+        )
+    }
+
+    #[cfg(windows)]
+    fn capture_scope(
+        id: u32,
+        artifact_id: u32,
+        archive_path: &Path,
+        local: &crate::LocalSpace,
+        configs: &[(String, PathBuf)],
+    ) -> Result<BTreeMap<String, PathBuf>> {
         if id == 0
             || artifact_id == 0
             || !normalized(archive_path)
@@ -195,7 +231,21 @@ impl CapturedDeploymentNode {
                 "duplicate actual node config name",
             ));
         }
-        let archive = local.capture_node_archive(configs, archive_bounds)?;
+        Ok(captured_configs)
+    }
+
+    #[cfg(windows)]
+    fn from_actual_capture(
+        id: u32,
+        artifact_id: u32,
+        archive_path: &Path,
+        local: &crate::LocalSpace,
+        captured_configs: BTreeMap<String, PathBuf>,
+        archive: crate::CapturedNodeArchive,
+        archive_bounds: crate::ArchiveBounds,
+        inspection: sync_extend_journal::NodeInspectionBounds,
+        max_content_hash_bytes: u64,
+    ) -> Result<Self> {
         let verified = crate::FramedNodeArchive::verify_framing(
             archive.bytes().to_vec(),
             archive.digest(),
@@ -1062,12 +1112,144 @@ pub struct FramedDeploymentBundle {
     actual_node_capture: bool,
 }
 
+#[cfg(windows)]
+pub struct DeploymentBundleVerificationFailure {
+    pub error: ReconcileError,
+    pub original_framing: FramedDeploymentBundle,
+}
+
+#[cfg(windows)]
+pub struct DeploymentBundleCaptureFailure {
+    pub error: ReconcileError,
+    pub original_artifacts: Vec<OriginalProtectedArtifact>,
+    pub original_open_failures: Vec<sync_extend_platform_fs::WindowsOriginalResourceCloseFailure>,
+}
+
+#[cfg(windows)]
+impl DeploymentBundleCaptureFailure {
+    pub fn close_preserving_error(self) -> (
+        ReconcileError,
+        std::result::Result<
+            sync_extend_platform_fs::ClosedWindowsOriginalResources,
+            sync_extend_platform_fs::WindowsOriginalResourceCloseFailure,
+        >,
+    ) {
+        let mut close = sync_extend_platform_fs::WindowsOriginalCloseAttempt::new();
+        for original in self.original_artifacts {
+            close.append_result(original.close_retaining());
+        }
+        for original in self.original_open_failures {
+            close.append_failure(original);
+        }
+        (self.error, close.finish())
+    }
+}
+
+struct VerifiedDeploymentContents {
+    graph: SelectedDeploymentGraph,
+    documents: BTreeMap<u32, DeploymentDocument>,
+    plaintext: BTreeMap<u32, Vec<u8>>,
+    protected: BTreeMap<u32, VerifiedProtectedArtifact>,
+    #[cfg(windows)]
+    node_archives: BTreeMap<u32, crate::VerifiedNodeStateArchive>,
+}
+
 impl FramedDeploymentBundle {
+    fn verify_original_sources(&self) -> Result<()> {
+        if let Some(source) = &self.original_bundle {
+            source.verify_original()?;
+            if source.source_digest() != self.digest() {
+                return Err(ReconcileError::Unstable);
+            }
+        }
+        for source in &self.original_artifacts {
+            source.verify_original()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn close_original_sources_into(
+        &mut self,
+        close: &mut sync_extend_platform_fs::WindowsOriginalCloseAttempt,
+    ) {
+        if let Some(original) = self.original_bundle.take() {
+            close.append_result(original.close_retaining());
+        }
+        for original in self.original_artifacts.drain(..) {
+            close.append_result(original.close_retaining());
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn close_retaining(
+        mut self,
+    ) -> std::result::Result<
+        sync_extend_platform_fs::ClosedWindowsOriginalResources,
+        sync_extend_platform_fs::WindowsOriginalResourceCloseFailure,
+    > {
+        let mut close = sync_extend_platform_fs::WindowsOriginalCloseAttempt::new();
+        self.close_original_sources_into(&mut close);
+        close.finish()
+    }
+
     pub fn capture(
         selection: DeploymentSelection,
         nodes: Vec<CapturedDeploymentNode>,
         provider: &DeploymentProtectionProvider,
         bounds: DeploymentBundleBounds,
+    ) -> Result<Self> {
+        #[cfg(windows)]
+        {
+            return Self::capture_retaining(selection, nodes, provider, bounds).map_err(|failure| {
+                let (error, closed) = failure.close_preserving_error();
+                if let Err(original) = closed {
+                    original.retain_until_process_exit();
+                }
+                error
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let mut originals = Vec::new();
+            let mut result = Self::capture_held(
+                selection, nodes, provider, bounds, &mut originals,
+            )?;
+            result.original_artifacts = originals;
+            Ok(result)
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn capture_retaining(
+        selection: DeploymentSelection,
+        nodes: Vec<CapturedDeploymentNode>,
+        provider: &DeploymentProtectionProvider,
+        bounds: DeploymentBundleBounds,
+    ) -> std::result::Result<Self, DeploymentBundleCaptureFailure> {
+        let mut original_artifacts = Vec::new();
+        let mut original_open_failures = Vec::new();
+        let mut result = match Self::capture_held(
+            selection, nodes, provider, bounds, &mut original_artifacts,
+            &mut original_open_failures,
+        ) {
+            Ok(result) => result,
+            Err(error) => return Err(DeploymentBundleCaptureFailure {
+                error, original_artifacts, original_open_failures,
+            }),
+        };
+        result.original_artifacts = original_artifacts;
+        Ok(result)
+    }
+
+    fn capture_held(
+        selection: DeploymentSelection,
+        nodes: Vec<CapturedDeploymentNode>,
+        provider: &DeploymentProtectionProvider,
+        bounds: DeploymentBundleBounds,
+        originals: &mut Vec<OriginalProtectedArtifact>,
+        #[cfg(windows)] original_open_failures:
+            &mut Vec<sync_extend_platform_fs::WindowsOriginalResourceCloseFailure>,
     ) -> Result<Self> {
         bounds.validate()?;
         provider.verify_original()?;
@@ -1077,7 +1259,6 @@ impl FramedDeploymentBundle {
             ));
         }
         let platform = actual_platform()?;
-        let mut originals = Vec::new();
         let mut payloads = BTreeMap::new();
         let mut descriptors = Vec::new();
         let mut native_keys = BTreeSet::new();
@@ -1107,18 +1288,30 @@ impl FramedDeploymentBundle {
                 }
                 node.original_bytes()?.to_vec()
             } else {
+                #[cfg(windows)]
+                let original = OriginalProtectedArtifact::capture_retaining(
+                    &selected.source_path, selected.max_bytes as usize,
+                    selected.role.protected().is_some(),
+                ).map_err(|failure| {
+                    if let Some(resources) = failure.original_resources {
+                        original_open_failures.push(resources);
+                    }
+                    failure.error
+                })?;
+                #[cfg(not(windows))]
                 let original = OriginalProtectedArtifact::capture(
                     &selected.source_path,
                     selected.max_bytes as usize,
                     selected.role.protected().is_some(),
                 )?;
+                originals.push(original);
+                let original = originals.last().ok_or(ReconcileError::Unstable)?;
                 if !native_keys.insert(original.native_identity()?) {
                     return Err(ReconcileError::Invariant(
                         "original deployment hardlink/native alias",
                     ));
                 }
                 let bytes = original.original_bytes().to_vec();
-                originals.push(original);
                 bytes
             };
             if bytes.len() as u64 > selected.max_bytes {
@@ -1195,7 +1388,7 @@ impl FramedDeploymentBundle {
             });
             framed_payloads.insert(row.id, bytes);
         }
-        for original in &originals {
+        for original in originals.iter() {
             original.verify_original()?;
         }
         provider.verify_original()?;
@@ -1207,7 +1400,6 @@ impl FramedDeploymentBundle {
             artifacts: framed_artifacts,
         };
         let mut result = Self::assemble(header, framed_payloads, bounds)?;
-        result.original_artifacts = originals;
         result.actual_node_capture = true;
         Ok(result)
     }
@@ -1255,12 +1447,49 @@ impl FramedDeploymentBundle {
         expected: &ContentId,
         bounds: DeploymentBundleBounds,
     ) -> Result<Self> {
+        #[cfg(windows)]
+        {
+            return Self::from_original_file_retaining(path, expected, bounds)
+                .map_err(super::protected_artifact::OriginalProtectedArtifactOpenFailure::retain_and_report);
+        }
+        #[cfg(not(windows))]
+        {
         bounds.validate()?;
         let source = OriginalProtectedArtifact::capture(path, bounds.bundle_bytes as usize, true)?;
         let mut framed = Self::verify_framing(source.original_bytes().to_vec(), expected, bounds)?;
         source.verify_original()?;
         framed.original_bundle = Some(source);
         Ok(framed)
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn from_original_file_retaining(
+        path: &Path,
+        expected: &ContentId,
+        bounds: DeploymentBundleBounds,
+    ) -> std::result::Result<Self, super::protected_artifact::OriginalProtectedArtifactOpenFailure> {
+        use super::protected_artifact::OriginalProtectedArtifactOpenFailure;
+        bounds.validate().map_err(|error| OriginalProtectedArtifactOpenFailure {
+            error, original_resources: None,
+        })?;
+        let source = OriginalProtectedArtifact::capture_retaining(
+            path, bounds.bundle_bytes as usize, true,
+        )?;
+        let verified = Self::verify_framing(source.original_bytes().to_vec(), expected, bounds)
+            .and_then(|framed| {
+                source.verify_original()?;
+                Ok(framed)
+            });
+        match verified {
+            Ok(mut framed) => {
+                framed.original_bundle = Some(source);
+                Ok(framed)
+            }
+            Err(error) => Err(OriginalProtectedArtifactOpenFailure {
+                error, original_resources: source.close_retaining().err(),
+            }),
+        }
     }
 
     pub fn verify_framing(
@@ -1380,8 +1609,73 @@ impl FramedDeploymentBundle {
         #[cfg(windows)] inspection: sync_extend_journal::NodeInspectionBounds,
         #[cfg(windows)] max_content_hash_bytes: u64,
     ) -> Result<VerifiedDeploymentBundle> {
+        #[cfg(windows)]
+        {
+            return self.verify_retaining(
+                provider, bounds, archive_bounds, inspection, max_content_hash_bytes,
+            ).map_err(|failure| {
+                if let Err(original) = failure.original_framing.close_retaining() {
+                    original.retain_until_process_exit();
+                }
+                failure.error
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let contents = self.verify_contents(provider, bounds)?;
+            Ok(VerifiedDeploymentBundle {
+                framing: self,
+                graph: contents.graph,
+                documents: contents.documents,
+                plaintext: contents.plaintext,
+                protected: contents.protected,
+                bounds,
+            })
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn verify_retaining(
+        self,
+        provider: &DeploymentProtectionProvider,
+        bounds: DeploymentBundleBounds,
+        archive_bounds: crate::ArchiveBounds,
+        inspection: sync_extend_journal::NodeInspectionBounds,
+        max_content_hash_bytes: u64,
+    ) -> std::result::Result<VerifiedDeploymentBundle, DeploymentBundleVerificationFailure> {
+        let contents = match self.verify_contents(
+            provider, bounds, archive_bounds, inspection, max_content_hash_bytes,
+        ) {
+            Ok(contents) => contents,
+            Err(error) => return Err(DeploymentBundleVerificationFailure {
+                error, original_framing: self,
+            }),
+        };
+        Ok(VerifiedDeploymentBundle {
+            framing: self,
+            graph: contents.graph,
+            documents: contents.documents,
+            plaintext: contents.plaintext,
+            protected: contents.protected,
+            bounds,
+            node_archives: contents.node_archives,
+            archive_bounds,
+            inspection,
+            max_content_hash_bytes,
+        })
+    }
+
+    fn verify_contents(
+        &self,
+        provider: &DeploymentProtectionProvider,
+        bounds: DeploymentBundleBounds,
+        #[cfg(windows)] archive_bounds: crate::ArchiveBounds,
+        #[cfg(windows)] inspection: sync_extend_journal::NodeInspectionBounds,
+        #[cfg(windows)] max_content_hash_bytes: u64,
+    ) -> Result<VerifiedDeploymentContents> {
         bounds.validate()?;
         provider.verify_original()?;
+        self.verify_original_sources()?;
         if &self.header.protection_scope != provider.scope()
             || self.header.graph.platform != actual_platform()?
         {
@@ -1504,20 +1798,15 @@ impl FramedDeploymentBundle {
             }
         }
         provider.verify_original()?;
-        let result = VerifiedDeploymentBundle {
-            framing: self,
+        self.verify_original_sources()?;
+        Ok(VerifiedDeploymentContents {
             graph: derived,
             documents,
             plaintext,
             protected,
-            bounds,
             #[cfg(windows)]
             node_archives,
-            #[cfg(windows)]
-            archive_bounds,
-        };
-        result.verify_original_source()?;
-        Ok(result)
+        })
     }
 }
 
@@ -1532,9 +1821,25 @@ pub struct VerifiedDeploymentBundle {
     pub(crate) node_archives: BTreeMap<u32, crate::VerifiedNodeStateArchive>,
     #[cfg(windows)]
     archive_bounds: crate::ArchiveBounds,
+    #[cfg(windows)]
+    inspection: sync_extend_journal::NodeInspectionBounds,
+    #[cfg(windows)]
+    max_content_hash_bytes: u64,
 }
 
 impl VerifiedDeploymentBundle {
+    #[cfg(windows)]
+    pub fn close_retaining(
+        mut self,
+    ) -> std::result::Result<
+        sync_extend_platform_fs::ClosedWindowsOriginalResources,
+        sync_extend_platform_fs::WindowsOriginalResourceCloseFailure,
+    > {
+        let mut close = sync_extend_platform_fs::WindowsOriginalCloseAttempt::new();
+        self.framing.close_original_sources_into(&mut close);
+        close.finish()
+    }
+
     pub fn graph(&self) -> &SelectedDeploymentGraph {
         &self.graph
     }
@@ -1543,16 +1848,7 @@ impl VerifiedDeploymentBundle {
     }
 
     pub fn verify_original_source(&self) -> Result<()> {
-        if let Some(source) = &self.framing.original_bundle {
-            source.verify_original()?;
-            if source.source_digest() != self.digest() {
-                return Err(ReconcileError::Unstable);
-            }
-        }
-        for source in &self.framing.original_artifacts {
-            source.verify_original()?;
-        }
-        Ok(())
+        self.framing.verify_original_sources()
     }
 
     pub(crate) fn require_original_provenance(&self) -> Result<()> {
@@ -1612,6 +1908,179 @@ pub struct DeploymentNodeTarget {
     pub worktree: PathBuf,
 }
 
+#[cfg(windows)]
+pub struct DeploymentNodeRestoreInput {
+    node: DeploymentNodeDescriptor,
+    target: DeploymentNodeTarget,
+    archive: crate::VerifiedNodeStateArchive,
+    separated_configs: SeparatedDeploymentNodeConfigs,
+}
+
+#[cfg(windows)]
+impl DeploymentNodeRestoreInput {
+    pub fn node(&self) -> &DeploymentNodeDescriptor { &self.node }
+    pub fn target(&self) -> &DeploymentNodeTarget { &self.target }
+    pub fn archive(&self) -> &crate::VerifiedNodeStateArchive { &self.archive }
+    pub(crate) fn separated_configs(&self) -> &SeparatedDeploymentNodeConfigs {
+        &self.separated_configs
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_deployment_runtime(
+        self,
+        original_frames: &Path,
+        restore_ledger: &Path,
+        previous: Option<&crate::DeploymentClosedNodeRuntime>,
+        inspection: sync_extend_journal::NodeInspectionBounds,
+        ledger_bounds: crate::LedgerBounds,
+    ) -> std::result::Result<crate::RecoveredLocalSpace, crate::DeploymentNodeRuntimeOpenFailure> {
+        let Self { archive, target, separated_configs, .. } = self;
+        archive.open_deployment_runtime_with_configs(
+            &target.worktree, &target.data_dir, original_frames, restore_ledger,
+            previous, inspection, ledger_bounds, separated_configs,
+        )
+    }
+
+    pub fn prepare_original_node_restore(
+        self,
+        inspection: sync_extend_journal::NodeInspectionBounds,
+        ledger_bounds: crate::LedgerBounds,
+        expected_hold: Option<&ContentId>,
+    ) -> Result<PreparedDeploymentNodeRestore> {
+        let Self { node, target, archive, separated_configs } = self;
+        let prepared = archive.prepare_original_node_restore_for_deployment(
+            &target.worktree, &target.data_dir, inspection, ledger_bounds.max_intents,
+            ledger_bounds.max_content_bytes, ledger_bounds, separated_configs, expected_hold,
+        )?;
+        Ok(PreparedDeploymentNodeRestore { node, target, archive, prepared })
+    }
+}
+
+#[cfg(windows)]
+pub struct PreparedDeploymentNodeRestore {
+    node: DeploymentNodeDescriptor,
+    target: DeploymentNodeTarget,
+    archive: crate::VerifiedNodeStateArchive,
+    prepared: crate::PreparedOriginalNodeRestore,
+}
+
+#[cfg(windows)]
+impl PreparedDeploymentNodeRestore {
+    pub fn node(&self) -> &DeploymentNodeDescriptor { &self.node }
+    pub fn target(&self) -> &DeploymentNodeTarget { &self.target }
+    pub fn archive(&self) -> &crate::VerifiedNodeStateArchive { &self.archive }
+    pub fn prepared(&self) -> &crate::PreparedOriginalNodeRestore { &self.prepared }
+}
+
+/// Issued only by the actual verified full deployment mapping. The original
+/// archive, config payloads, source digest and mapped file responsibilities
+/// remain complete. It grants no standalone layout bypass or file CREATE.
+#[cfg(windows)]
+pub struct SeparatedDeploymentNodeConfigs {
+    archive_digest: ContentId,
+    bundle_digest: ContentId,
+    mapping_digest: ContentId,
+    original_data: PathBuf,
+    target_data: PathBuf,
+    target_worktree: PathBuf,
+    mappings: BTreeMap<String, crate::ExplicitOriginalConfigMapping>,
+}
+
+#[cfg(windows)]
+impl SeparatedDeploymentNodeConfigs {
+    /// Checks the still-owned proof after the source archive has become a
+    /// native session. No serialized digest can construct this value.
+    pub(crate) fn verify_acquired_scope(
+        &self,
+        archive: &ContentId,
+        worktree: &Path,
+        data: &Path,
+    ) -> Result<()> {
+        if archive != &self.archive_digest
+            || worktree != self.target_worktree
+            || data != self.target_data
+            || !normalized(&self.original_data)
+            || !normalized(&self.target_data)
+            || !normalized(&self.target_worktree)
+            || self.target_data.starts_with(&self.target_worktree)
+            || self.target_worktree.starts_with(&self.target_data)
+            || self.mappings.is_empty()
+            || self.bundle_digest.as_str().bytes().all(|byte| byte == b'0')
+            || self.mapping_digest.as_str().bytes().all(|byte| byte == b'0')
+        {
+            return Err(ReconcileError::Invariant(
+                "acquired original deployment config proof scope differs",
+            ));
+        }
+        for expected in self.mappings.values() {
+            if expected.archive_digest() != archive
+                || expected.original_bytes().is_empty()
+                || expected.mapped_bytes().is_empty()
+                || expected.original_digest() != &ContentId::hash(expected.original_bytes())
+                || expected.mapped_digest() != &ContentId::hash(expected.mapped_bytes())
+            {
+                return Err(ReconcileError::Invariant(
+                    "acquired original deployment config proof payload differs",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_for_archive(
+        &self,
+        archive: &crate::VerifiedNodeStateArchive,
+        worktree: &Path,
+        data: &Path,
+    ) -> Result<()> {
+        self.verify_acquired_scope(archive.digest(), worktree, data)?;
+        if archive.original_config_data() != Some(self.original_data.as_path()) {
+            return Err(ReconcileError::Invariant("original separated deployment config scope"));
+        }
+        for (name, expected) in &self.mappings {
+            let actual = archive.map_explicit_original_config(
+                name, &self.original_data, data, worktree, 2 * 1024 * 1024,
+            )?;
+            if actual.archive_digest() != &self.archive_digest
+                || actual.original_bytes() != expected.original_bytes()
+                || actual.mapped_bytes() != expected.mapped_bytes()
+                || actual.original_digest() != expected.original_digest()
+                || actual.mapped_digest() != expected.mapped_digest()
+            {
+                return Err(ReconcileError::Invariant("original separated deployment config bytes changed"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_excluded_original_config(
+        &self,
+        archive: &crate::VerifiedNodeStateArchive,
+        name: &str,
+        original_bytes: &[u8],
+    ) -> Result<()> {
+        self.verify_for_archive(archive, &self.target_worktree, &self.target_data)?;
+        let expected = self.mappings.get(name).ok_or(ReconcileError::Invariant(
+            "uncatalogued original config cannot be separated",
+        ))?;
+        if expected.archive_digest() != archive.digest()
+            || expected.original_bytes() != original_bytes
+            || expected.original_digest() != &ContentId::hash(original_bytes)
+        {
+            return Err(ReconcileError::Invariant("excluded original deployment config differs"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn config_names(&self) -> impl Iterator<Item = &str> {
+        self.mappings.keys().map(String::as_str)
+    }
+
+    pub(crate) fn full_source_and_mapping(&self) -> (&ContentId, &ContentId) {
+        (&self.bundle_digest, &self.mapping_digest)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentMapping {
@@ -1649,8 +2118,82 @@ pub struct RestrictedDeploymentMapping {
     pub(crate) mapping_digest: ContentId,
 }
 
+#[cfg(windows)]
+pub struct DeploymentMappingFailure {
+    pub error: ReconcileError,
+    pub original_bundle: VerifiedDeploymentBundle,
+}
+
+struct RestrictedMappingContents {
+    mapping: DeploymentMapping,
+    artifacts: Vec<MappedDeploymentArtifact>,
+    mapped_documents: BTreeMap<u32, DeploymentDocument>,
+    mapped_graph: SelectedDeploymentGraph,
+    mapping_digest: ContentId,
+}
+
+#[cfg(windows)]
+impl RestrictedDeploymentMapping {
+    pub fn close_retaining(
+        self,
+    ) -> std::result::Result<
+        sync_extend_platform_fs::ClosedWindowsOriginalResources,
+        sync_extend_platform_fs::WindowsOriginalResourceCloseFailure,
+    > {
+        self.original.close_retaining()
+    }
+}
+
 impl VerifiedDeploymentBundle {
     pub fn map_restricted(self, mapping: DeploymentMapping) -> Result<RestrictedDeploymentMapping> {
+        #[cfg(windows)]
+        {
+            return self.map_restricted_retaining(mapping).map_err(|failure| {
+                if let Err(original) = failure.original_bundle.close_retaining() {
+                    original.retain_until_process_exit();
+                }
+                failure.error
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let contents = self.map_restricted_contents(mapping)?;
+            Ok(RestrictedDeploymentMapping {
+                original: self,
+                mapping: contents.mapping,
+                artifacts: contents.artifacts,
+                mapped_documents: contents.mapped_documents,
+                mapped_graph: contents.mapped_graph,
+                mapping_digest: contents.mapping_digest,
+            })
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn map_restricted_retaining(
+        self,
+        mapping: DeploymentMapping,
+    ) -> std::result::Result<RestrictedDeploymentMapping, DeploymentMappingFailure> {
+        let contents = match self.map_restricted_contents(mapping) {
+            Ok(contents) => contents,
+            Err(error) => return Err(DeploymentMappingFailure {
+                error, original_bundle: self,
+            }),
+        };
+        Ok(RestrictedDeploymentMapping {
+            original: self,
+            mapping: contents.mapping,
+            artifacts: contents.artifacts,
+            mapped_documents: contents.mapped_documents,
+            mapped_graph: contents.mapped_graph,
+            mapping_digest: contents.mapping_digest,
+        })
+    }
+
+    fn map_restricted_contents(
+        &self,
+        mapping: DeploymentMapping,
+    ) -> Result<RestrictedMappingContents> {
         self.require_original_provenance()?;
         let original_graph = &self.graph;
         let file_ids: BTreeSet<_> = original_graph
@@ -2107,8 +2650,7 @@ impl VerifiedDeploymentBundle {
             total,
         ])?;
         self.verify_original_source()?;
-        Ok(RestrictedDeploymentMapping {
-            original: self,
+        Ok(RestrictedMappingContents {
             mapping,
             artifacts,
             mapped_documents,
@@ -2174,6 +2716,89 @@ impl RestrictedPathMapper<'_> {
 }
 
 impl RestrictedDeploymentMapping {
+    /// A fresh semantic verifier is backed by the original authenticated bundle.
+    /// These inputs grant no completed-node, CREATE, descriptor-restart or start
+    /// authority; the original restore driver must still execute every stage.
+    #[cfg(windows)]
+    pub fn node_restore_inputs(
+        &self,
+        provider: &DeploymentProtectionProvider,
+    ) -> Result<Vec<DeploymentNodeRestoreInput>> {
+        self.original.reverify_provider(provider)?;
+        let node_bytes = self.original.graph.nodes.iter().try_fold(0u64, |sum, node| {
+            sum.checked_add(node.archive_bytes)
+        }).ok_or(ReconcileError::ResourceLimit("deployment node verifier allocation"))?;
+        let plaintext_bytes = self.original.plaintext.values().try_fold(0u64, |sum, bytes| {
+            sum.checked_add(bytes.len() as u64)
+        }).ok_or(ReconcileError::ResourceLimit("deployment node plaintext allocation"))?;
+        let mapped_bytes = self.artifacts.iter().try_fold(0u64, |sum, artifact| {
+            sum.checked_add(artifact.bytes.len() as u64)
+        }).ok_or(ReconcileError::ResourceLimit("deployment node mapped allocation"))?;
+        self.original.bounds.memory([
+            self.original.framing.bytes().len() as u64,
+            plaintext_bytes, mapped_bytes, node_bytes, node_bytes,
+        ])?;
+        let mut result = Vec::new();
+        for node in &self.original.graph.nodes {
+            let bytes = self.original.plaintext.get(&node.artifact_id)
+                .ok_or(ReconcileError::Invariant("authenticated actual node payload absent"))?;
+            let archive = crate::FramedNodeArchive::verify_framing(
+                bytes.clone(), &node.archive_digest, self.original.archive_bounds,
+            )?.verify_node_state(
+                self.original.archive_bounds, self.original.inspection,
+                self.original.max_content_hash_bytes,
+            )?;
+            if archive.space() != &node.space_id || archive.device() != &node.device_id {
+                return Err(ReconcileError::Invariant("selected actual node restore source differs"));
+            }
+            let target = self.mapping.node_roots[&node.id].clone();
+            let mut config_artifacts = BTreeSet::new();
+            let mut config_mappings = BTreeMap::new();
+            for (name, path) in &node.captured_configs {
+                let original = self.original.graph.artifacts.iter().find(|artifact| {
+                    artifact.role == DeploymentArtifactRole::NodeConfig && &artifact.path == path
+                }).ok_or(ReconcileError::Invariant(
+                    "every original node config must be selected in the full deployment",
+                ))?;
+                if !config_artifacts.insert(original.id) {
+                    return Err(ReconcileError::Invariant(
+                        "original node config roles require one-to-one selected artifacts",
+                    ));
+                }
+                let mapped = self.artifacts.iter().find(|artifact| artifact.id == original.id)
+                    .ok_or(ReconcileError::Invariant("separated config actual mapped artifact absent"))?;
+                let config = archive.map_explicit_original_config(
+                    name, &node.data_dir, &target.data_dir, &target.worktree, 2 * 1024 * 1024,
+                )?;
+                if config.archive_digest() != &node.archive_digest
+                    || config.original_bytes() != self.original.plaintext[&original.id]
+                    || config.mapped_bytes() != mapped.bytes
+                    || config.mapped_digest() != &mapped.digest
+                {
+                    return Err(ReconcileError::Invariant(
+                        "separated original and mapped node config exact byte binding",
+                    ));
+                }
+                config_mappings.insert(name.clone(), config);
+            }
+            let separated_configs = SeparatedDeploymentNodeConfigs {
+                archive_digest: node.archive_digest.clone(),
+                bundle_digest: self.original.digest().clone(),
+                mapping_digest: self.mapping_digest.clone(),
+                original_data: node.data_dir.clone(),
+                target_data: target.data_dir.clone(),
+                target_worktree: target.worktree.clone(),
+                mappings: config_mappings,
+            };
+            separated_configs.verify_for_archive(&archive, &target.worktree, &target.data_dir)?;
+            result.push(DeploymentNodeRestoreInput {
+                node: node.clone(), target, archive, separated_configs,
+            });
+        }
+        self.original.reverify_provider(provider)?;
+        Ok(result)
+    }
+
     pub fn original_graph(&self) -> &SelectedDeploymentGraph {
         &self.original.graph
     }

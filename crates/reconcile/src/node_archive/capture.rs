@@ -1,6 +1,6 @@
 //! Bounded consistent stopped-writer node archive capture; Windows original handles.
 use super::{
-    captured_file::CapturedFile,
+    captured_file::{CapturedFile, CapturedFileOpenFailure},
     layout::{ArchiveBounds, ArchiveRole, FramedNodeArchive, SourceSection},
 };
 use crate::{check_ancestors, identity, LocalSpace, ReconcileError, Result};
@@ -10,12 +10,45 @@ use std::{
     path::{Path, PathBuf},
 };
 use sync_extend_core_model::{config::Config, ContentId, DeviceId};
-use sync_extend_platform_fs::{FileKey, LockedDirectory};
+use sync_extend_platform_fs::{
+    ClosedWindowsOriginalResources, FileKey, LockedDirectory, WindowsOriginalCloseAttempt,
+    WindowsOriginalResourceCloseFailure,
+};
 use sync_extend_transport::PeerIdentity;
 
 /// No source paths or protected payloads are serialized into a receipt.
 pub struct CapturedNodeArchive {
     archive: FramedNodeArchive,
+    _closed_source_files: ClosedWindowsOriginalResources,
+    _closed_cas_session: ClosedWindowsOriginalResources,
+}
+
+/// A failed capture retains only its actual failed original resource closes.
+/// It cannot grant a source writer, target creator or restart permission.
+pub struct NodeArchiveCaptureFailure {
+    pub error: ReconcileError,
+    pub original_resources: Option<WindowsOriginalResourceCloseFailure>,
+    pub original_cas_session: Option<sync_extend_journal::CasCaptureCloseFailure>,
+}
+
+impl std::fmt::Debug for NodeArchiveCaptureFailure {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("NodeArchiveCaptureFailure")
+            .field("error", &self.error)
+            .field("original_resources", &self.original_resources)
+            .field("original_cas_session", &self.original_cas_session)
+            .finish()
+    }
+}
+
+impl NodeArchiveCaptureFailure {
+    pub(crate) fn retain_and_report(self) -> ReconcileError {
+        let Self { error, original_resources, original_cas_session } = self;
+        if original_resources.is_some() || original_cas_session.is_some() {
+            let _ = Box::leak(Box::new((original_resources, original_cas_session)));
+        }
+        error
+    }
 }
 
 impl CapturedNodeArchive {
@@ -34,12 +67,15 @@ struct CaptureSet {
     bytes: u64,
     worktree_files: Vec<CapturedFile>,
     bounds: ArchiveBounds,
+    unverified_directories: Vec<LockedDirectory>,
+    failed_file_closes: Vec<WindowsOriginalResourceCloseFailure>,
 }
 
 impl CaptureSet {
     fn directory(&mut self, path: &Path) -> Result<Vec<String>> {
         check_ancestors(path)?;
-        let held = LockedDirectory::open(path)?;
+        self.unverified_directories.push(LockedDirectory::open(path)?);
+        let held = self.unverified_directories.last().ok_or(ReconcileError::Unstable)?;
         held.require_local_ntfs(path)?;
         held.require_case_insensitive()?;
         if !held.matches_path(path)? {
@@ -47,6 +83,7 @@ impl CaptureSet {
         }
         let key = held.key()?;
         let names = enumerate(path, self.bounds.sections)?;
+        let held = self.unverified_directories.pop().ok_or(ReconcileError::Unstable)?;
         self.directories
             .push((path.to_owned(), held, key, names.clone()));
         Ok(names)
@@ -60,19 +97,64 @@ impl CaptureSet {
             ReconcileError::ResourceLimit("node capture remaining bytes"),
         )?;
         let maximum = max_bytes.min(usize::try_from(remaining).unwrap_or(usize::MAX));
-        let captured = CapturedFile::open(path, maximum)?;
+        let captured = self.open_file(path, maximum)?;
+        self.files.push((role, captured));
+        let (role, captured) = self.files.last().ok_or(ReconcileError::Unstable)?;
         self.bytes = self
             .bytes
             .checked_add(captured.bytes().len() as u64)
             .filter(|total| *total <= self.bounds.archive_bytes)
             .ok_or(ReconcileError::ResourceLimit("node capture total bytes"))?;
-        if let ArchiveRole::CasObject { content_id } = &role {
+        if let ArchiveRole::CasObject { content_id } = role {
             if captured.digest() != content_id {
                 return Err(ReconcileError::Invariant("node captured CAS hash differs"));
             }
         }
-        self.files.push((role, captured));
         Ok(())
+    }
+
+    fn retain_file_failure(&mut self, failure: CapturedFileOpenFailure) -> ReconcileError {
+        if let Some(original) = failure.original_resources {
+            self.failed_file_closes.push(original);
+        }
+        failure.error
+    }
+
+    fn open_file(&mut self, path: &Path, maximum: usize) -> Result<CapturedFile> {
+        CapturedFile::open(path, maximum).map_err(|failure| self.retain_file_failure(failure))
+    }
+
+    fn hold_file(
+        &mut self,
+        path: &Path,
+        length: u64,
+        digest: &ContentId,
+    ) -> Result<CapturedFile> {
+        CapturedFile::hold_matching(path, length, digest)
+            .map_err(|failure| self.retain_file_failure(failure))
+    }
+
+    fn close_resources(self) -> std::result::Result<
+        ClosedWindowsOriginalResources,
+        WindowsOriginalResourceCloseFailure,
+    > {
+        let mut close = WindowsOriginalCloseAttempt::new();
+        for (_, original) in self.files {
+            original.close_into_attempt(&mut close);
+        }
+        for original in self.worktree_files {
+            original.close_into_attempt(&mut close);
+        }
+        for (_, original, _, _) in self.directories {
+            close.close_directory(original);
+        }
+        for original in self.unverified_directories {
+            close.close_directory(original);
+        }
+        for original in self.failed_file_closes {
+            close.append_failure(original);
+        }
+        close.finish()
     }
 
     fn verify(&self) -> Result<()> {
@@ -126,10 +208,30 @@ impl LocalSpace {
         configs: &[(String, PathBuf)],
         bounds: ArchiveBounds,
     ) -> Result<CapturedNodeArchive> {
+        self.capture_node_archive_retaining(configs, bounds)
+            .map_err(NodeArchiveCaptureFailure::retain_and_report)
+    }
+
+    pub(crate) fn capture_node_archive_retaining(
+        &self,
+        configs: &[(String, PathBuf)],
+        bounds: ArchiveBounds,
+    ) -> std::result::Result<CapturedNodeArchive, NodeArchiveCaptureFailure> {
+        let mut session = None;
+        let mut set = CaptureSet {
+            files: Vec::new(),
+            worktree_files: Vec::new(),
+            directories: Vec::new(),
+            bytes: 0,
+            bounds,
+            unverified_directories: Vec::new(),
+            failed_file_closes: Vec::new(),
+        };
+        let captured = (|| -> Result<FramedNodeArchive> {
         bounds.validate()?;
         self.verify_root()?;
         self.journal.integrity_check()?;
-        let _session = self.journal.acquire_cas_session()?;
+        session = Some(self.journal.acquire_cas_session()?);
         let status = self.status()?;
         let report = self.storage_report()?;
         if status.outstanding_publications != 0
@@ -155,13 +257,7 @@ impl LocalSpace {
             .map(|manifest| manifest.root())
             .transpose()?;
         let protected = self.journal.protected_objects()?;
-        let mut set = CaptureSet {
-            files: Vec::new(),
-            worktree_files: Vec::new(),
-            directories: Vec::new(),
-            bytes: before.bytes().len() as u64,
-            bounds,
-        };
+        set.bytes = before.bytes().len() as u64;
         let manifest = self.manifest()?.ok_or(ReconcileError::Invariant(
             "node capture requires actual current manifest",
         ))?;
@@ -323,7 +419,35 @@ impl LocalSpace {
         )?;
         set.verify()?;
         self.verify_root()?;
-        Ok(CapturedNodeArchive { archive })
+        Ok(archive)
+        })();
+        let source_close = set.close_resources();
+        let session_close = session.map(|original| original.close_stopped_capture());
+        let (closed_source, source_failure) = match source_close {
+            Ok(closed) => (Some(closed), None),
+            Err(original) => (None, Some(original)),
+        };
+        let (closed_session, session_failure) = match session_close {
+            Some(Ok(closed)) => (Some(closed), None),
+            Some(Err(original)) => (None, Some(original)),
+            None => (None, None),
+        };
+        let error = match captured {
+            Ok(archive) if source_failure.is_none() && session_failure.is_none() => {
+                return Ok(CapturedNodeArchive {
+                    archive,
+                    _closed_source_files: closed_source.expect("successful actual source close"),
+                    _closed_cas_session: closed_session.expect("successful capture acquired session"),
+                });
+            }
+            Ok(_) => ReconcileError::Invariant("actual original capture resource close failed"),
+            Err(error) => error,
+        };
+        Err(NodeArchiveCaptureFailure {
+            error,
+            original_resources: source_failure,
+            original_cas_session: session_failure,
+        })
     }
 }
 
@@ -353,13 +477,15 @@ fn capture_worktree(
                         "node worktree marker directory differs",
                     ));
                 }
-                let marker = CapturedFile::open(&path.join("space-id"), 32)?;
-                if marker.bytes() != space.as_str().as_bytes() {
+                let marker = set.open_file(&path.join("space-id"), 32)?;
+                set.worktree_files.push(marker);
+                if set.worktree_files.last().ok_or(ReconcileError::Unstable)?.bytes()
+                    != space.as_str().as_bytes()
+                {
                     return Err(ReconcileError::Invariant(
                         "node worktree original space marker differs",
                     ));
                 }
-                set.worktree_files.push(marker);
                 continue;
             }
             observed = observed
@@ -389,8 +515,7 @@ fn capture_worktree(
                         .ok_or(ReconcileError::ResourceLimit(
                             "node current worktree hash byte work",
                         ))?;
-                    let held =
-                        CapturedFile::hold_matching(&path, content.length, &content.content_id)?;
+                    let held = set.hold_file(&path, content.length, &content.content_id)?;
                     set.worktree_files.push(held);
                 }
                 _ => {

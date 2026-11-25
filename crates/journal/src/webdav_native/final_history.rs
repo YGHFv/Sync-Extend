@@ -10,10 +10,10 @@ use crate::JournalStorageColumnValue as Value;
 use crate::{JournalError, Result};
 use rusqlite::Connection;
 #[cfg(windows)]
-use rusqlite::{params_from_iter, Transaction};
+use rusqlite::{Transaction, params_from_iter};
 #[cfg(windows)]
 use sync_extend_core_model::tree_restore_history::encode_history_record;
-use sync_extend_core_model::{webdav_native::WebDavNativeAction, ContentId, ModelError};
+use sync_extend_core_model::{ContentId, ModelError, webdav_native::WebDavNativeAction};
 fn invalid() -> JournalError {
     JournalError::Invariant("original complete DAV causal Final values")
 }

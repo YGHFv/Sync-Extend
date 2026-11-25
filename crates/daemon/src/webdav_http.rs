@@ -18,6 +18,7 @@ pub struct Connection {
 enum Transport {
     Plain(DeadlineSocket),
     Tls(Box<StreamOwned<ServerConnection, DeadlineSocket>>),
+    Closed,
 }
 
 impl Transport {
@@ -25,6 +26,7 @@ impl Transport {
         match self {
             Self::Plain(socket) => socket,
             Self::Tls(stream) => &mut stream.sock,
+            Self::Closed => unreachable!("a consumed HTTP connection cannot be read"),
         }
     }
 }
@@ -66,15 +68,38 @@ impl Connection {
         seconds: u64,
         tls: Option<&Arc<ServerConfig>>,
     ) -> io::Result<Self> {
+        Self::new_retaining(stream, seconds, tls).map_err(|failure| {
+            #[cfg(windows)]
+            if let Err((original, _)) =
+                sync_extend_platform_fs::close_original_tcp_stream(failure.original_stream)
+            {
+                let _ = Box::leak(Box::new(original));
+            }
+            failure.error
+        })
+    }
+
+    pub(crate) fn new_retaining(
+        stream: TcpStream,
+        seconds: u64,
+        tls: Option<&Arc<ServerConfig>>,
+    ) -> Result<Self, ConnectionOpenFailure> {
         let timeout = Duration::from_secs(seconds);
         let mut socket = DeadlineSocket {
             stream,
             deadline: Instant::now() + timeout,
         };
         let stream = if let Some(config) = tls {
-            let mut conn = ServerConnection::new(Arc::clone(config)).map_err(io::Error::other)?;
+            let mut conn = match ServerConnection::new(Arc::clone(config)) {
+                Ok(conn) => conn,
+                Err(error) => return Err(ConnectionOpenFailure {
+                    error: io::Error::other(error), original_stream: socket.stream,
+                }),
+            };
             while conn.is_handshaking() {
-                conn.complete_io(&mut socket)?;
+                if let Err(error) = conn.complete_io(&mut socket) {
+                    return Err(ConnectionOpenFailure { error, original_stream: socket.stream });
+                }
             }
             Transport::Tls(Box::new(StreamOwned::new(conn, socket)))
         } else {
@@ -86,6 +111,20 @@ impl Connection {
             body_started: false,
             response_started: false,
         })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn close_retaining(mut self) -> Result<
+        sync_extend_platform_fs::ClosedWindowsOriginalSocket,
+        (TcpStream, io::Error),
+    > {
+        self.finish_response_and_drain();
+        let original = match std::mem::replace(&mut self.stream, Transport::Closed) {
+            Transport::Plain(socket) => socket.stream,
+            Transport::Tls(stream) => stream.sock.stream,
+            Transport::Closed => unreachable!("original connection close is consuming"),
+        };
+        sync_extend_platform_fs::close_original_tcp_stream(original)
     }
     pub fn begin_body(&mut self) -> io::Result<()> {
         if self.body_started || self.response_started {
@@ -106,9 +145,10 @@ impl Connection {
             self.response_started = true;
         }
     }
-}
-impl Drop for Connection {
-    fn drop(&mut self) {
+    fn finish_response_and_drain(&mut self) {
+        if matches!(self.stream, Transport::Closed) {
+            return;
+        }
         // Send FIN only after the complete response. An early refusal can leave
         // request bytes unread; bounded draining avoids discarding the response
         // with a reset while preserving the one-request byte/time limits.
@@ -133,12 +173,24 @@ impl Drop for Connection {
         }
     }
 }
+
+pub(crate) struct ConnectionOpenFailure {
+    pub(crate) error: io::Error,
+    pub(crate) original_stream: TcpStream,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.finish_response_and_drain();
+    }
+}
 impl Read for Connection {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.stream.socket().remaining()?;
         match &mut self.stream {
             Transport::Plain(stream) => stream.read(bytes),
             Transport::Tls(stream) => stream.read(bytes),
+            Transport::Closed => Err(io::Error::new(io::ErrorKind::BrokenPipe, "HTTP connection closed")),
         }
     }
 }
@@ -148,12 +200,14 @@ impl Write for Connection {
         match &mut self.stream {
             Transport::Plain(stream) => stream.write(bytes),
             Transport::Tls(stream) => stream.write(bytes),
+            Transport::Closed => Err(io::Error::new(io::ErrorKind::BrokenPipe, "HTTP connection closed")),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
         match &mut self.stream {
             Transport::Plain(stream) => stream.flush(),
             Transport::Tls(stream) => stream.flush(),
+            Transport::Closed => Err(io::Error::new(io::ErrorKind::BrokenPipe, "HTTP connection closed")),
         }
     }
 }

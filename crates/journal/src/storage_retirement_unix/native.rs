@@ -1,16 +1,16 @@
 //! Immutable native history is an audited prefix, never reconstructed authority.
 use crate::{
-    storage_inventory::reader::{add, preflight},
     Journal, JournalError, Result,
+    storage_inventory::reader::{add, preflight},
 };
-use rusqlite::{types::Value, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, types::Value};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::{
+    ContentId, EntryId,
     storage_retirement_unix::{
         UnixStorageRetirementBinding, UnixStorageRetirementExpectation, UnixStorageRetirementKey,
     },
     tree_storage_capacity::TreeStorageCharge,
-    ContentId, EntryId,
 };
 
 #[cfg(target_os = "linux")]

@@ -9,9 +9,9 @@ use std::{
     path::{Path, PathBuf},
 };
 use sync_extend_core_model::{
+    ContentId, Entry, EntryKind, PortablePath,
     tree_restore_identity::TreeNativeIdentity,
     webdav_native::{WebDavNativeAction, WebDavNativePlan},
-    ContentId, Entry, EntryKind, PortablePath,
 };
 use sync_extend_platform_fs::{
     FileKey, GuardedReadFile, LockedDirectory, LockedDirectoryMutation, LockedFile,

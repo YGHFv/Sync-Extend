@@ -2,9 +2,9 @@
 use crate::JournalError;
 use crate::Result;
 use rusqlite::{
+    Connection,
     functions::FunctionFlags,
     types::{Value, ValueRef},
-    Connection,
 };
 use std::sync::{Arc, Mutex};
 
@@ -19,7 +19,7 @@ pub(crate) struct Gate(Arc<Mutex<State>>);
 pub(super) struct Permit(Gate);
 impl Drop for Permit {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.0 .0.lock() {
+        if let Ok(mut state) = self.0.0.lock() {
             *state = State::default();
         }
     }

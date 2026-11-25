@@ -8,12 +8,12 @@ use super::{
 use crate::{JournalError, Result};
 use rusqlite::Connection;
 use sync_extend_core_model::{
+    ContentId,
     tree_restore_history::encode_history_record,
     webdav_native::{WebDavNativeAction, WebDavNativePlan},
     webdav_native_execution::{
         WebDavExecutionObservation, WebDavExecutionPhase, WebDavExecutionRecord,
     },
-    ContentId,
 };
 fn invalid() -> JournalError {
     JournalError::Invariant("original native DAV result receipt and ordered action observation")
@@ -179,7 +179,7 @@ pub(super) fn audit(
                 ReceiptEvidence::History { action, .. } => *action,
                 ReceiptEvidence::Disposal { action, .. } => *action,
                 ReceiptEvidence::InternalRemoval { .. } | ReceiptEvidence::References { .. } => {
-                    continue
+                    continue;
                 }
                 _ => return Err(invalid()),
             };

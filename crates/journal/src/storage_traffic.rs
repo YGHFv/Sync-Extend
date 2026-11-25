@@ -4,13 +4,13 @@ mod guard;
 use crate::{JournalError, Result};
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use rusqlite::Connection;
-use rusqlite::{params, OptionalExtension, TransactionBehavior};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use std::{
     fs::File,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use sync_extend_core_model::{storage_node::StorageNodeConfig, ContentId, DeviceId};
+use sync_extend_core_model::{ContentId, DeviceId, storage_node::StorageNodeConfig};
 use sync_extend_transport::{ForwardedPageEnvelope, ForwardedSnapshotEnvelope};
 
 type TrafficPermit = (String, String, String, u64, u64);

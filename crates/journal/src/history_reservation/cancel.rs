@@ -1,7 +1,7 @@
 //! Descriptive terminal history only; bytes never issue native or restart rights.
-use super::{OriginalLocalHistoryReservation, Stored, KEY};
+use super::{KEY, OriginalLocalHistoryReservation, Stored};
 use crate::{Journal, JournalError, Result};
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::{ContentId, DeviceId, EntryId, Manifest, SnapshotId, SpaceId};
 

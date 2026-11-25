@@ -2,9 +2,9 @@
 //! History commit/cancel and restart diagnostics cannot release this liability.
 use super::{OriginalLocalHistoryReservation, Stored};
 use crate::{JournalError, JournalStoredRow, Result};
-use rusqlite::{params, Transaction};
+use rusqlite::{Transaction, params};
 use serde::{Deserialize, Serialize};
-use sync_extend_core_model::{tree_storage_capacity::TreeStorageCharge, ContentId, EntryId};
+use sync_extend_core_model::{ContentId, EntryId, tree_storage_capacity::TreeStorageCharge};
 
 const NAMESPACE: &str = "original.native-create.liability.";
 pub(super) const PREFIX: &str = "original.native-create.liability.v1.";

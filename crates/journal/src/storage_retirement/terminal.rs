@@ -1,12 +1,12 @@
 //! Exact restored-owner cleanup and audited native terminal fence release.
 use super::{invalid, terminal_schema};
 use crate::{
-    storage_inventory::reader::{add, preflight},
     Journal, Result,
+    storage_inventory::reader::{add, preflight},
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
-use sync_extend_core_model::{tree_storage_capacity::TreeStorageCharge, ContentId, EntryId};
+use sync_extend_core_model::{ContentId, EntryId, tree_storage_capacity::TreeStorageCharge};
 const PEAK: u64 = 144;
 type SqlEvent = (u64, String, String, u64);
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -245,7 +245,7 @@ pub(super) fn checkpoint(phase: &str) {
 #[cfg(windows)]
 mod windows {
     use super::*;
-    use rusqlite::{params, Transaction, TransactionBehavior};
+    use rusqlite::{Transaction, TransactionBehavior, params};
     use std::io::Read;
     use sync_extend_platform_fs::LockedFile;
     impl Journal {

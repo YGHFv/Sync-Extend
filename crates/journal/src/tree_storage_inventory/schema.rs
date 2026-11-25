@@ -1,7 +1,7 @@
 // Pinned physical schema21-31, independently checked against the migrations.
 use crate::{
-    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
     MAX_OPERATION_BYTES,
+    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
 };
 
 const fn text(name: &'static str, width: usize, primary_key: usize) -> ColumnSpec {

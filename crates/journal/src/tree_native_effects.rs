@@ -1,21 +1,21 @@
 //! Original owner progress only. File/directory steps and final history stay closed.
 use crate::{
+    JournalStorageColumnValue, JournalStoredRow, MAX_OPERATION_BYTES, Result,
+    TreeRestorePreparation,
     storage_inventory::reader::{hash, invalid},
-    JournalStorageColumnValue, JournalStoredRow, Result, TreeRestorePreparation,
-    MAX_OPERATION_BYTES,
 };
-use rusqlite::{types::Value, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, types::Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
+    ContentId, EntryId,
     tree_native_action_layout::{
-        plan_tree_native_action_layout, TreeNativeActionLayoutPlan, TreeNativeActionLayoutRecord,
-        TreeNativeActionPayload, TreeNativeActionScope,
+        TreeNativeActionLayoutPlan, TreeNativeActionLayoutRecord, TreeNativeActionPayload,
+        TreeNativeActionScope, plan_tree_native_action_layout,
     },
     tree_restore_history::encode_history_record,
     tree_storage_capacity::TreeStorageCharge,
-    tree_storage_footprint::{tree_native_action_row_values, TreeStorageColumnValue},
-    ContentId, EntryId,
+    tree_storage_footprint::{TreeStorageColumnValue, tree_native_action_row_values},
 };
 
 #[cfg(windows)]

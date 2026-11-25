@@ -113,7 +113,7 @@ impl Journal {
                 _ => {
                     return Err(invalid(
                         "conflict Final original exact DML precondition differs",
-                    ))
+                    ));
                 }
             }
             let old = template

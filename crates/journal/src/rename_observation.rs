@@ -1,7 +1,7 @@
 use crate::{Journal, JournalError, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::io::{self, Write};
-use sync_extend_core_model::{persisted_rename::RenameObservationMap, Manifest, SpaceId};
+use sync_extend_core_model::{Manifest, SpaceId, persisted_rename::RenameObservationMap};
 
 pub(crate) const MAX_OBSERVATION_BYTES: usize = 16 * 1024 * 1024;
 

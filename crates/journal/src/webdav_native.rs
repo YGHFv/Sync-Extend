@@ -1,20 +1,20 @@
 //! Durable DAV descriptions and content pins. Native effects require a later
 //! adapter with independent, private receipts for real retained handles.
 use crate::{
+    CasAccessGuard, Journal, JournalError, Result,
     snapshot_retention::audit_snapshot,
     storage_capacity::CapacitySnapshot,
     storage_inventory::reader::{add, preflight},
-    CasAccessGuard, Journal, JournalError, Result,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use sync_extend_core_model::{
+    ContentId, DeviceId, SpaceId,
     webdav_mutation::WebDavMutationRequest,
     webdav_native::{
-        plan_webdav_native, WebDavNativeInventory, WebDavNativeLimits, WebDavNativePlan,
+        WebDavNativeInventory, WebDavNativeLimits, WebDavNativePlan, plan_webdav_native,
     },
-    ContentId, DeviceId, SpaceId,
 };
 
 mod budget_manifest;

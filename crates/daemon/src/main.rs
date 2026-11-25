@@ -16,6 +16,8 @@ mod management;
 mod management_credentials;
 #[cfg(windows)]
 mod recovery;
+#[cfg(windows)]
+mod protected_deployment;
 mod restore_preview_cli;
 mod shutdown;
 mod storage;
@@ -928,6 +930,14 @@ enum Command {
         descriptor: PathBuf,
         #[command(subcommand)]
         action: recovery::Action,
+    },
+    /// Capture, inspect, map or install one explicit protected deployment.
+    #[cfg(windows)]
+    ProtectedDeployment {
+        #[arg(long)]
+        descriptor: PathBuf,
+        #[command(subcommand)]
+        action: protected_deployment::Action,
     },
     /// Audit local storage and references without importing, recovering or deleting.
     StorageReport {
@@ -3080,6 +3090,10 @@ async fn execute(
         #[cfg(windows)]
         Command::RecoveredLocal { descriptor, action } => {
             recovery::run(&descriptor, action)?;
+        }
+        #[cfg(windows)]
+        Command::ProtectedDeployment { descriptor, action } => {
+            protected_deployment::run(&descriptor, action, limits.clone())?;
         }
         Command::StorageReport { data_dir } => {
             print(&open(&data_dir)?.storage_report()?)?;

@@ -1,11 +1,13 @@
 //! Close original writers before receipt-backed, mutation-excluding reads.
 use super::{
-    creation::{key, Base},
-    physical, Header, Key,
+    Header, Key,
+    creation::{Base, key},
+    physical,
 };
 use crate::{
+    CasAccessGuard, Journal, NativePublicationCreation, Result,
     storage_inventory::reader::{hash, invalid},
-    storage_policy, CasAccessGuard, Journal, NativePublicationCreation, Result,
+    storage_policy,
 };
 use rusqlite::{Transaction, TransactionBehavior};
 use std::{

@@ -1,18 +1,17 @@
 //! Bounded actual legacy values. This report is not an execution admission.
-use crate::{storage_metadata_budget_usage, Journal, JournalError, Result};
+use crate::{Journal, JournalError, Result, storage_metadata_budget_usage};
 use rusqlite::{Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use sync_extend_core_model::{
-    limits,
+    ContentId, EntryId, SpaceId, limits,
     tree_storage_footprint::{TreeStorageColumn, TreeStorageColumnValue},
-    ContentId, EntryId, SpaceId,
 };
 
 pub(crate) mod schema;
 use crate::storage_inventory::{
-    reader::{add, hash, invalid, preflight, read_table, validate_schema, Namespace},
     JournalStorageColumnValue, JournalStoredRow,
+    reader::{Namespace, add, hash, invalid, preflight, read_table, validate_schema},
 };
 use schema::TABLES;
 
@@ -150,7 +149,7 @@ fn tree_row(row: JournalStoredRow) -> Result<TreeRestoreStoredRow> {
                 JournalStorageColumnValue::Text(text) => TreeStorageColumnValue::Text(text.clone()),
                 JournalStorageColumnValue::Integer(n) => TreeStorageColumnValue::Integer(*n),
                 JournalStorageColumnValue::Null => {
-                    return Err(invalid("tree inventory null value"))
+                    return Err(invalid("tree inventory null value"));
                 }
             };
             Ok(TreeStorageColumn {
@@ -306,8 +305,7 @@ impl Journal {
             &legacy_budget,
         ))?;
         Ok(TreeRestoreStorageInventory {
-            accounting:
-                "all_schema31_tree_restore_values_not_complete_capacity_or_native_authority",
+            accounting: "all_schema31_tree_restore_values_not_complete_capacity_or_native_authority",
             space_id: space.clone(),
             rows: values,
             tables,

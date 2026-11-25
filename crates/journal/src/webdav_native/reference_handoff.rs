@@ -3,7 +3,7 @@ use super::receipt_protocol::{ReceiptDescription, ReceiptEvidence, ReceiptStage}
 use crate::{JournalError, Result};
 use rusqlite::Connection;
 use sync_extend_core_model::{
-    tree_restore_history::encode_history_record, ContentId, EntryId, SnapshotId,
+    ContentId, EntryId, SnapshotId, tree_restore_history::encode_history_record,
 };
 fn invalid() -> JournalError {
     JournalError::Invariant("original DAV exact retained CAS handoff")

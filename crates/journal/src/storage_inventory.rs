@@ -1,7 +1,7 @@
 //! Exact persisted values, not future capacity or native execution authority.
 use crate::{
-    storage_metadata_budget_usage, Journal, Result, TreeRestoreInventoryLimits,
-    TreeRestoreLegacyBudget, TreeRestorePreparation, SCHEMA_VERSION,
+    Journal, Result, SCHEMA_VERSION, TreeRestoreInventoryLimits, TreeRestoreLegacyBudget,
+    TreeRestorePreparation, storage_metadata_budget_usage,
 };
 use rusqlite::{Transaction, TransactionBehavior};
 use serde::Serialize;
@@ -9,7 +9,7 @@ use sync_extend_core_model::{ContentId, SpaceId};
 
 pub(crate) mod reader;
 mod schema;
-use reader::{add, hash, invalid, preflight, read_table, validate_schema, Namespace, TableSpec};
+use reader::{Namespace, TableSpec, add, hash, invalid, preflight, read_table, validate_schema};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]

@@ -3,9 +3,9 @@
 use crate::JournalError;
 use crate::Result;
 use rusqlite::{
+    Connection,
     functions::FunctionFlags,
     types::{Value, ValueRef},
-    Connection,
 };
 use std::sync::{Arc, Mutex};
 
@@ -18,7 +18,7 @@ pub(super) struct Permit(Gate);
 #[cfg(windows)]
 impl Drop for Permit {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.0 .0.lock() {
+        if let Ok(mut state) = self.0.0.lock() {
             *state = None;
         }
     }
@@ -85,7 +85,7 @@ impl Permit {
     pub(super) fn require_consumed(&self) -> Result<()> {
         let state = self
             .0
-             .0
+            .0
             .lock()
             .map_err(|_| JournalError::Invariant("tree native issuer poisoned"))?;
         if state.as_ref().is_none_or(|values| !values.is_empty()) {

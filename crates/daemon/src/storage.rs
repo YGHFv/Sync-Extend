@@ -70,6 +70,38 @@ pub fn load_retention_evidence(
     Ok(evidence)
 }
 
+/// Produce one complete target-applied evidence object from the existing
+/// forwarded inbox.  The reconcile layer performs the fresh native
+/// observation and signs the receipt; this adapter never accepts a caller
+/// supplied cursor, page, manifest or target set.
+#[cfg(windows)]
+pub fn client_applied_evidence(
+    data_dir: &Path,
+    request: &str,
+) -> Result<sync_extend_transport::ForwardedAppliedEvidence> {
+    let request: ContentId = request.parse()?;
+    let local = sync_extend_reconcile::LocalSpace::open(data_dir)?;
+    let envelope = local
+        .forwarded_content_inbox(1024)?
+        .into_iter()
+        .find(|item| {
+            item.signed_page
+                .page
+                .request_id()
+                .ok()
+                .as_ref()
+                == Some(&request)
+        })
+        .ok_or("exact forwarded page inbox required")?;
+    let receipt = local.forwarded_applied_receipt(&request)?;
+    let identity = local.transport_identity()?;
+    receipt.verify_forwarded(identity.peer_identity(), &envelope.signed_page.page)?;
+    Ok(sync_extend_transport::ForwardedAppliedEvidence {
+        envelope,
+        signed_receipt: receipt,
+    })
+}
+
 pub fn load_snapshot_handoff_evidence(
     path: &Path,
 ) -> Result<Vec<sync_extend_transport::SnapshotStorageHandoffEvidence>> {

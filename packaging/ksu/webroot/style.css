@@ -123,11 +123,18 @@ code { display: block; margin-top: 4px; white-space: normal; overflow-wrap: anyw
   outline: 2px solid var(--accent); outline-offset: 2px;
 }
 .restore-field :disabled { opacity: 0.6; }
-.restore-table-wrap { margin-top: 14px; overflow-x: auto; }
-.restore-table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; text-align: left; }
-.restore-table caption { text-align: left; color: var(--muted); padding-bottom: 8px; }
-.restore-table th, .restore-table td { min-width: 120px; padding: 9px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
-.restore-table th { color: var(--muted); font-weight: 600; }
+.restore-table-wrap, .workspace-table-wrap { margin-top: 14px; overflow-x: auto; }
+.workspace-table-wrap { max-height: 360px; overflow-y: auto; }
+.workspace-table-wrap:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.restore-table, .workspace-table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; text-align: left; }
+.restore-table caption, .workspace-table caption { text-align: left; color: var(--muted); padding-bottom: 8px; }
+.restore-table th, .restore-table td, .workspace-table th, .workspace-table td {
+  min-width: 120px; padding: 9px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere;
+}
+.restore-table th, .workspace-table th { color: var(--muted); font-weight: 600; }
+.workspace-table th:nth-child(1), .workspace-table td:nth-child(1) { min-width: 180px; }
+.workspace-table th:nth-child(4), .workspace-table td:nth-child(4) { min-width: 265px; }
+.workspace-table th:nth-child(6), .workspace-table td:nth-child(6) { min-width: 230px; }
 footer { padding: 15px 6px 0; font-size: 0.8125rem; }
 
 @media (max-width: 360px) {

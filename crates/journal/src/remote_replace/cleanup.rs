@@ -1,7 +1,7 @@
 use super::windows::*;
 use super::*;
 use crate::storage_policy;
-use rusqlite::{params_from_iter, Transaction, TransactionBehavior};
+use rusqlite::{Transaction, TransactionBehavior, params_from_iter};
 use sync_extend_platform_fs::{LockedDirectory, LockedDirectoryMutation, LockedFile};
 
 impl Journal {

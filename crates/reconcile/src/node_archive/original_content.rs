@@ -16,6 +16,16 @@ pub(super) enum OriginalContent {
     Sealed(sync_extend_platform_fs::SealedOriginalFile),
 }
 impl OriginalContent {
+    pub(super) fn close_into_attempt(
+        self,
+        attempt: &mut sync_extend_platform_fs::WindowsOriginalCloseAttempt,
+    ) {
+        match self {
+            Self::Read(original) => original.close_into_attempt(attempt),
+            Self::Sealed(original) => original.close_into_attempt(attempt),
+        }
+    }
+
     pub(super) fn reader(&self) -> &std::fs::File {
         match self {
             Self::Read(file) => file.reader(),

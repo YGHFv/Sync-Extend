@@ -1,17 +1,18 @@
 //! Complete private D01 admission from original held capture; no native effect issued.
 use super::{
+    WebDavNativeAdmission,
     budget_manifest::{self, BudgetLimits},
     execution::{self, WebDavDurableExecution, WebDavDurableExecutionLimits},
     future_history, invalid, manifest_audit, receipt_protocol,
     retained::RetainedDavBaseline,
-    scope, WebDavNativeAdmission,
+    scope,
 };
-use crate::{storage_inventory::reader::add, CasAccessGuard, Journal, Result};
-use rusqlite::{params, Transaction, TransactionBehavior};
+use crate::{CasAccessGuard, Journal, Result, storage_inventory::reader::add};
+use rusqlite::{Transaction, TransactionBehavior, params};
 use std::{cell::RefCell, path::Path, sync::Arc};
 use sync_extend_core_model::{
-    tree_restore_history::encode_history_record, webdav_mutation::WebDavMutationRequest,
-    webdav_native::WebDavNativeLimits, ContentId, SpaceId,
+    ContentId, SpaceId, tree_restore_history::encode_history_record,
+    webdav_mutation::WebDavMutationRequest, webdav_native::WebDavNativeLimits,
 };
 
 /// Original guards live in this non-deserializable private object.
@@ -1992,7 +1993,8 @@ impl LiveDavAdmission<'_> {
             .cloned()
             .ok_or_else(invalid)?;
         self.collection_policy(&inspect)?;
-        self.journal.observe_after_current(&retention_space, &retention_snapshot)
+        self.journal
+            .observe_after_current(&retention_space, &retention_snapshot)
     }
 }
 

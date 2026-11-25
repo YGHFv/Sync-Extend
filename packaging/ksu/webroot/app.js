@@ -13,6 +13,7 @@ const fields = {};
   "service-state", "service-detail", "gateway-state", "gateway-detail", "exports", "refresh",
   "verify-stop", "ask-stop", "stop-confirmation", "stop", "cancel-stop", "probe-result",
   "workspace-state", "workspace-detail", "workspace-summary",
+  "workspace-files-detail", "workspace-files", "workspace-rows",
   "storage-state", "storage-detail", "storage-summary", "network-state", "network-detail", "network-summary",
   "easytier-state", "easytier-detail", "easytier-summary",
   "recovery-state", "recovery-detail", "recovery-summary", "recovery-guide",
@@ -126,6 +127,9 @@ function hideConfirmation() {
 
 function clearRuntime(detail = "当前没有可验证的运行摘要。") {
   liveGateway = null;
+  fields["workspace-rows"].textContent = "";
+  fields["workspace-files"].hidden = true;
+  fields["workspace-files-detail"].textContent = "文件修改时间、只读属性和元数据能力未知。";
   for (const category of ["workspace", "storage", "network", "easytier", "recovery"]) {
     fields[`${category}-summary`].textContent = "";
     fields[`${category}-summary`].hidden = true;
@@ -373,6 +377,123 @@ function showSummary(category, rows) {
     target.append(label, detail);
   }
   target.hidden = false;
+}
+
+function metadataCapabilitiesView(capabilities) {
+  const view = {
+    capabilities: "捕获未知 / 应用未知 / 校验未知", precision: "未知", declared: false,
+  };
+  if (capabilities === undefined || capabilities === null) return view;
+  const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+  const names = ["capture", "apply", "verify", "timestamp_precision_ns"];
+  if (!object(capabilities) || Object.keys(capabilities).length < 3 ||
+      Object.keys(capabilities).length > 4 || Object.keys(capabilities).some((key) => !names.includes(key))) {
+    return view;
+  }
+  const labels = {capture: "捕获", apply: "应用", verify: "校验"};
+  const states = {supported: "支持", unsupported: "不支持", unknown: "未知"};
+  const segments = [];
+  let allUnknown = true;
+  for (const phase of ["capture", "apply", "verify"]) {
+    const stage = capabilities[phase];
+    if (!object(stage) || Object.keys(stage).length !== 2 ||
+        Object.keys(stage).some((key) => !["modified", "readonly"].includes(key)) ||
+        !["supported", "unsupported", "unknown"].includes(stage.modified) ||
+        !["supported", "unsupported", "unknown"].includes(stage.readonly)) return view;
+    if (stage.modified !== "unknown" || stage.readonly !== "unknown") allUnknown = false;
+    segments.push(`${labels[phase]} 时间${states[stage.modified]}、只读${states[stage.readonly]}`);
+  }
+  let precision = "未知";
+  const value = capabilities.timestamp_precision_ns;
+  if (value !== undefined && value !== null) {
+    if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+      return view;
+    }
+    precision = Number.isSafeInteger(value) ? `${value} ns（后台声明）` : "未知（整数超出客户端精确范围）";
+  }
+  if (!allUnknown) view.capabilities = segments.join(" / ");
+  view.precision = precision;
+  view.declared = true;
+  return view;
+}
+
+function entryMetadataView(metadata, capabilities = undefined) {
+  const capabilityView = metadataCapabilitiesView(capabilities);
+  const view = {
+    modified: "未知", readonly: "未知",
+    capabilities: capabilityView.capabilities, precision: capabilityView.precision,
+  };
+  if (metadata === undefined || metadata === null) return view;
+  const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+  if (!object(metadata) || Object.keys(metadata).length !== 3 ||
+      Object.keys(metadata).some((key) => !["format_version", "modified", "readonly"].includes(key)) ||
+      metadata.format_version !== 1 || typeof metadata.readonly !== "boolean") {
+    throw new Error("Invalid source entry metadata format");
+  }
+  const modified = metadata.modified;
+  if (!object(modified) || Object.keys(modified).length !== 2 ||
+      Object.keys(modified).some((key) => !["seconds", "nanoseconds"].includes(key)) ||
+      typeof modified.seconds !== "number" || !Number.isFinite(modified.seconds) ||
+      !Number.isInteger(modified.seconds) || !Number.isSafeInteger(modified.nanoseconds) ||
+      modified.nanoseconds < 0 || modified.nanoseconds >= 1000000000) {
+    throw new Error("Invalid source modification timestamp");
+  }
+  view.readonly = metadata.readonly ? "是" : "否";
+  if (!Number.isSafeInteger(modified.seconds)) {
+    view.modified = "未知（整数超出客户端精确范围）";
+    return view;
+  }
+  const fraction = String(modified.nanoseconds).padStart(9, "0");
+  const milliseconds = modified.seconds * 1000;
+  const time = Number.isSafeInteger(milliseconds) ? new Date(milliseconds) : null;
+  if (time && Number.isFinite(time.valueOf()) && time.getUTCFullYear() >= 1 && time.getUTCFullYear() <= 9999) {
+    const whole = time.toISOString().slice(0, 19).replace("T", " ");
+    view.modified = `${whole}.${fraction} UTC`;
+  } else {
+    view.modified = `Unix 秒 ${modified.seconds}；纳秒 ${fraction}`;
+  }
+  // Source values and supported capabilities do not certify an execution result.
+  return view;
+}
+
+function showWorkspaceEntries(local) {
+  fields["workspace-rows"].textContent = "";
+  fields["workspace-files"].hidden = true;
+  if (local.entries === undefined || local.entries === null) {
+    fields["workspace-files-detail"].textContent = "后台尚未提供文件元数据列表；当前值未知。";
+    return;
+  }
+  if (!Array.isArray(local.entries) || local.entries.length > 128 ||
+      local.entries.length > local.total_entries ||
+      (!local.entries_truncated && local.entries.length !== local.total_entries)) {
+    throw new Error("Invalid bounded workspace entry sample");
+  }
+  const fragment = document.createDocumentFragment();
+  for (const entry of local.entries) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry) ||
+        typeof entry.path !== "string" || !entry.path.length || entry.path.length > 4096 ||
+        entry.path.includes("\u0000") || !["file", "directory"].includes(entry.kind)) {
+      throw new Error("Invalid workspace entry");
+    }
+    const metadata = entryMetadataView(entry.metadata, local.metadata_capabilities);
+    const values = [entry.path, entry.kind === "file" ? "文件" : "目录", restoreBytes(entry.logical_bytes),
+      metadata.modified, metadata.readonly, metadata.capabilities, metadata.precision];
+    const row = document.createElement("tr");
+    for (const value of values) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.appendChild(cell);
+    }
+    fragment.appendChild(row);
+  }
+  fields["workspace-rows"].appendChild(fragment);
+  fields["workspace-files"].hidden = false;
+  const capabilityView = metadataCapabilitiesView(local.metadata_capabilities);
+  fields["workspace-files-detail"].textContent =
+    `${local.entries.length} / ${local.total_entries} 个路径${local.entries_truncated ? "（已截取）" : ""}。` +
+    (capabilityView.declared ?
+      "修改时间和只读属性来自源元数据；捕获、应用、校验分别声明支持能力，支持不代表已应用或已校验。" :
+      "修改时间和只读属性来自源元数据；捕获、应用、校验与文件系统时间精度尚未报告。");
 }
 
 function showRecovery(local, age) {
@@ -650,7 +771,8 @@ function showDashboard(owner) {
     setStatus("workspace", "已有样本",
       `${chunks.all_current_chunks_checked ? "已检查当前块。" : "块检查仅为部分抽样。"} ` +
       `${leases.explicit_recovery_required ? "到期租约仍受保护，需要显式回收。" : "没有到期待回收租约。"} ` +
-      `${local.entries_truncated || local.snapshots_truncated ? "后台列表已有截取。 " : ""}本页展示摘要；远端备份尚未确认。`);
+      `${local.entries_truncated || local.snapshots_truncated ? "后台列表已有截取。 " : ""}远端备份尚未确认。`);
+    showWorkspaceEntries(local);
     showRecovery(local, observation.age_ms);
   }
   if (value.storage) {
@@ -721,7 +843,7 @@ function exportRow(item) {
   heading.className = "export-summary";
   access.className = "export-access";
   name.textContent = item.name;
-  access.textContent = item.writable ? "配置允许写入（此模块仅支持读取）" : "只读";
+  access.textContent = item.writable ? "配置允许写入（连接测试仅验证读取）" : "只读";
   url.textContent = address.href;
   probe.type = "button";
   probe.className = "export-probe";

@@ -1,21 +1,20 @@
 //! Immutable owner creator/marker descriptions, not native ownership or admission.
 use crate::{
-    check_storage_metadata_limit, snapshot_retention::audit_snapshot, sql_integer, CasAccessGuard,
-    Journal, JournalError, Result, TreeExecutionDescriptionAudit, TreeOriginalPinsAudit,
-    TreeRestoreHistoryReservation, TreeRestoreNativeReservation, TreeRestorePreparation,
-    TreeRestorePreparationIntent, MAX_OPERATION_BYTES,
+    CasAccessGuard, Journal, JournalError, MAX_OPERATION_BYTES, Result,
+    TreeExecutionDescriptionAudit, TreeOriginalPinsAudit, TreeRestoreHistoryReservation,
+    TreeRestoreNativeReservation, TreeRestorePreparation, TreeRestorePreparationIntent,
+    check_storage_metadata_limit, snapshot_retention::audit_snapshot, sql_integer,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use sync_extend_core_model::{
+    ContentId, Manifest,
     tree_original_reference::plan_tree_original_references,
     tree_owner_marker::{
-        audit_tree_owner_records, plan_tree_owner, TreeOwnerInput, TreeOwnerIntent,
-        TreeOwnerLimits, TreeOwnerPlan, TreeOwnerRecord, TreeOwnerRecordAudit,
-        TreeOwnerRecordLimits,
+        TreeOwnerInput, TreeOwnerIntent, TreeOwnerLimits, TreeOwnerPlan, TreeOwnerRecord,
+        TreeOwnerRecordAudit, TreeOwnerRecordLimits, audit_tree_owner_records, plan_tree_owner,
     },
     tree_restore_history::encode_history_record,
-    ContentId, Manifest,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

@@ -1,7 +1,7 @@
 //! Independent compiled Unix family catalog. Historical JSON has no FD authority.
 use crate::{
-    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
     JournalError, Result,
+    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
 };
 use rusqlite::Connection;
 

@@ -1,6 +1,6 @@
 use crate::{
-    storage_capacity::CapacitySnapshot, JournalError, JournalStorageCapacity, JournalStorageColumn,
-    JournalStorageColumnValue, Result, SnapshotPruning,
+    JournalError, JournalStorageCapacity, JournalStorageColumn, JournalStorageColumnValue, Result,
+    SnapshotPruning, storage_capacity::CapacitySnapshot,
 };
 use std::collections::BTreeMap;
 use sync_extend_core_model::{ContentId, SnapshotId};
@@ -112,8 +112,13 @@ pub(crate) fn admit_pruning(
     let prior = before.report.accounted_total();
     let limits = before.report.limits();
     let clock_growth = if let Some(clock) = retention_clock {
-        let old = before.rows.iter().find(|row| row.table() == "deletion_retention_clock"
-            && row.primary_key() == [clock.space_id.to_string()])
+        let old = before
+            .rows
+            .iter()
+            .find(|row| {
+                row.table() == "deletion_retention_clock"
+                    && row.primary_key() == [clock.space_id.to_string()]
+            })
             .ok_or(JournalError::Invariant("pruning retention clock missing"))?;
         let columns = crate::deletion_retention::clock_columns(clock)?;
         let next = columns.iter().try_fold(0u64, |sum, column| {
@@ -122,10 +127,13 @@ pub(crate) fn admit_pruning(
                 JournalStorageColumnValue::Integer(_) => 8,
                 JournalStorageColumnValue::Text(value) => value.len() as u64,
             };
-            sum.checked_add(length).ok_or(JournalError::Invariant("pruning clock charge overflow"))
+            sum.checked_add(length)
+                .ok_or(JournalError::Invariant("pruning clock charge overflow"))
         })?;
         next.saturating_sub(old.logical_bytes())
-    } else { 0 };
+    } else {
+        0
+    };
     // The immutable receipt is inserted while every old snapshot pin still exists.
     if prior
         .rows
@@ -164,8 +172,10 @@ pub(crate) fn snapshot_pruned(
             continue;
         }
         let clock_columns = retention_clock
-            .filter(|clock| row.table() == "deletion_retention_clock"
-                && row.primary_key() == [clock.space_id.to_string()])
+            .filter(|clock| {
+                row.table() == "deletion_retention_clock"
+                    && row.primary_key() == [clock.space_id.to_string()]
+            })
             .map(crate::deletion_retention::clock_columns)
             .transpose()?;
         let expected = clock_columns.as_deref().unwrap_or(row.columns());

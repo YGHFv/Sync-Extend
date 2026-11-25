@@ -1,14 +1,14 @@
-use super::{physical, Header};
+use super::{Header, physical};
 use crate::{
-    storage_inventory::reader::invalid, NativePublicationCreation, NativePublicationObservation,
-    NativePublicationReadiness, Result,
+    NativePublicationCreation, NativePublicationObservation, NativePublicationReadiness, Result,
+    storage_inventory::reader::invalid,
 };
 use std::{
     fs::{File, Metadata},
     path::{Path, PathBuf},
 };
 use sync_extend_core_model::{ContentId, FileManifest};
-use sync_extend_platform_fs::{regular_file_matches_path, FileKey};
+use sync_extend_platform_fs::{FileKey, regular_file_matches_path};
 
 enum Held<'a> {
     Creation(&'a NativePublicationCreation),

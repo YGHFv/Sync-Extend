@@ -9,6 +9,10 @@ use std::{
     rc::Rc,
 };
 
+/// The actual fixed SHM capacity admitted and mapped by this native engine.
+/// Runtime allocation envelopes derive from this same gate.
+pub const FRESH_NATIVE_WAL_SHM_CAPACITY: u64 = 1024 * 1024;
+
 struct Policy {
     files: [FreshExclusiveSqliteFile; 4],
     names: [CString; 4],
@@ -383,13 +387,142 @@ unsafe extern "C" fn full_path(
     }
     ffi::SQLITE_OK
 }
-pub struct FreshNativeWalConnection {
-    connection: Option<rusqlite::Connection>,
+struct FreshNativeWalContext {
     registration: Box<ffi::sqlite3_vfs>,
     name: CString,
     policy: Rc<Policy>,
+    registered: bool,
+}
+
+pub struct FreshNativeWalConnection {
+    connection: Option<rusqlite::Connection>,
+    /// An error while opening still owns this same original SQLite database.
+    /// It is never exchanged for a newly opened connection.
+    opening_connection: Option<*mut ffi::sqlite3>,
+    context: Option<FreshNativeWalContext>,
     path: std::path::PathBuf,
     attempted: bool,
+    actual_closed_handle_prefix: usize,
+    original_terminal_error: Option<io::Error>,
+}
+
+/// An open rejection has attempted the terminal of the original four files
+/// and any actual partial database/registration/mapping acquired on the way.
+pub struct FreshNativeWalOpenFailure {
+    pub error: io::Error,
+    pub original_resources: Option<FreshNativeWalCloseFailure>,
+}
+
+impl FreshNativeWalOpenFailure {
+    pub fn retain_and_report(self) -> io::Error {
+        if let Some(original) = self.original_resources {
+            original.retain_until_process_exit();
+        }
+        self.error
+    }
+}
+
+/// Owns every original native resource that failed to end. No decoder, clone,
+/// restart, registration, or path-to-owner operation is available here.
+pub struct FreshNativeWalCloseFailure {
+    pub error: io::Error,
+    pub actual_closed_handles: usize,
+    original_owner: Option<FreshNativeWalConnection>,
+    original_resources: Option<crate::WindowsOriginalResourceCloseFailure>,
+}
+
+impl std::fmt::Debug for FreshNativeWalCloseFailure {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("FreshNativeWalCloseFailure")
+            .field("error", &self.error)
+            .field("actual_closed_handles", &self.actual_closed_handles)
+            .field(
+                "original_native_context_retained",
+                &self.original_owner.is_some(),
+            )
+            .field(
+                "original_handle_groups_retained",
+                &self.original_resources.as_ref().map_or(
+                    0,
+                    crate::WindowsOriginalResourceCloseFailure::retained_resource_groups,
+                ),
+            )
+            .finish()
+    }
+}
+
+fn copy_original_error(error: &io::Error) -> io::Error {
+    match error.raw_os_error() {
+        Some(code) => io::Error::from_raw_os_error(code),
+        None => io::Error::new(error.kind(), error.to_string()),
+    }
+}
+
+fn reject_original_open_files(
+    error: io::Error,
+    files: [FreshExclusiveSqliteFile; 4],
+) -> FreshNativeWalOpenFailure {
+    let mut attempt = crate::WindowsOriginalCloseAttempt::new();
+    for file in files {
+        file.close_into_attempt(&mut attempt);
+    }
+    let original_resources = attempt
+        .finish()
+        .err()
+        .map(|original| FreshNativeWalCloseFailure {
+            error: copy_original_error(&original.error),
+            actual_closed_handles: original.actual_closed_handles,
+            original_owner: None,
+            original_resources: Some(original),
+        });
+    FreshNativeWalOpenFailure {
+        error,
+        original_resources,
+    }
+}
+
+impl FreshNativeWalCloseFailure {
+    /// Pure inspection of resources retained by this terminal failure. It
+    /// cannot confer a lease, original owner, native effect, or clean closure.
+    pub fn has_retained_originals(&self) -> bool {
+        self.original_owner
+            .as_ref()
+            .is_some_and(FreshNativeWalConnection::original_resources_remain)
+            || self
+                .original_resources
+                .as_ref()
+                .is_some_and(|original| original.retained_resource_groups() != 0)
+    }
+
+    /// Retry only the terminal of these same originals. The first observed
+    /// terminal error remains recorded even if every retry later succeeds.
+    pub fn close_remaining(mut self) -> Self {
+        let mut attempt = crate::WindowsOriginalCloseAttempt::new();
+        if let Some(original) = self.original_resources.take() {
+            let original = original.close_remaining();
+            attempt.append_failure(original);
+        } else {
+            attempt.note_error(copy_original_error(&self.error));
+            attempt.append_original_handle_prefix(self.actual_closed_handles);
+        }
+        if let Some(mut original) = self.original_owner.take() {
+            original.close_original_into_attempt(&mut attempt);
+            if original.original_resources_remain() {
+                self.original_owner = Some(original);
+            }
+        }
+        let original_resources = match attempt.finish() {
+            Err(original) => original,
+            Ok(_) => unreachable!("the first original native terminal error cannot disappear"),
+        };
+        self.actual_closed_handles = original_resources.actual_closed_handles;
+        self.original_resources = Some(original_resources);
+        self
+    }
+
+    pub fn retain_until_process_exit(self) {
+        let _ = Box::leak(Box::new(self));
+    }
 }
 
 /// A live, non-serializable issuer retains the original four native handles.
@@ -407,68 +540,97 @@ impl FreshNativeRetentionLease {
     pub fn generation(&self) -> u32 {
         self.generation
     }
+
+    /// Consume only the loan from the same native owner. This has no resource
+    /// close witness and cannot issue another live lease or session.
+    pub fn end_original_loan(self) {
+        drop(self);
+    }
 }
 impl FreshNativeWalConnection {
+    fn context_ref(&self) -> &FreshNativeWalContext {
+        self.context
+            .as_ref()
+            .expect("a usable fresh native owner retains its original context")
+    }
+
     pub fn open(
         path: &std::path::Path,
         files: [FreshExclusiveSqliteFile; 4],
         limits: [u64; 4],
     ) -> io::Result<Self> {
-        if !path.is_absolute()
-            || path.file_name().and_then(|v| v.to_str()) != Some("journal.sqlite")
-            || limits
-                .iter()
-                .any(|n| !(512..=256 * 1024 * 1024).contains(n))
-            || limits.iter().sum::<u64>() > 512 * 1024 * 1024
-            || limits[3] != 1024 * 1024
-        {
-            return Err(io::Error::other(
-                "fresh native WAL SQLite exact path/bounds",
-            ));
-        }
-        let text = path
-            .to_str()
-            .ok_or_else(|| io::Error::other("fresh native WAL SQLite path encoding"))?;
-        let names = [
-            CString::new(text),
-            CString::new(format!("{text}-wal")),
-            CString::new(format!("{text}-journal")),
-            CString::new(format!("{text}-shm")),
-        ]
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(io::Error::other)?;
-        let names: [CString; 4] = names
-            .try_into()
-            .map_err(|_| io::Error::other("fresh native WAL SQLite names"))?;
-        for (index, file) in files.iter().enumerate() {
-            file.verify()?;
-            if !file.matches_path(std::path::Path::new(
-                names[index].to_str().map_err(io::Error::other)?,
-            ))? || file.parent_key()? != files[0].parent_key()?
-                || file.exact_bytes(limits[index])?.len() as u64 > limits[index]
+        Self::open_retaining(path, files, limits)
+            .map_err(FreshNativeWalOpenFailure::retain_and_report)
+    }
+
+    pub fn open_retaining(
+        path: &std::path::Path,
+        files: [FreshExclusiveSqliteFile; 4],
+        limits: [u64; 4],
+    ) -> Result<Self, FreshNativeWalOpenFailure> {
+        let prepared = (|| -> io::Result<([CString; 4], CString, Box<ffi::sqlite3_vfs>)> {
+            if !path.is_absolute()
+                || path.file_name().and_then(|v| v.to_str()) != Some("journal.sqlite")
+                || limits
+                    .iter()
+                    .any(|n| !(512..=256 * 1024 * 1024).contains(n))
+                || limits.iter().sum::<u64>() > 512 * 1024 * 1024
+                || limits[3] != FRESH_NATIVE_WAL_SHM_CAPACITY
             {
                 return Err(io::Error::other(
-                    "fresh native WAL SQLite current file differs",
+                    "fresh native WAL SQLite exact path/bounds",
                 ));
             }
-        }
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if id == u64::MAX {
-            return Err(io::Error::other(
-                "fresh native WAL SQLite registration exhausted",
-            ));
-        }
-        let name = CString::new(format!("sync-fresh-native-{}-{id}", std::process::id()))
+            let text = path
+                .to_str()
+                .ok_or_else(|| io::Error::other("fresh native WAL SQLite path encoding"))?;
+            let names = [
+                CString::new(text),
+                CString::new(format!("{text}-wal")),
+                CString::new(format!("{text}-journal")),
+                CString::new(format!("{text}-shm")),
+            ]
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
             .map_err(io::Error::other)?;
-        // SAFETY: builtin VFS is process-lifetime; copying leaves time/randomness callbacks intact.
-        let base = unsafe { ffi::sqlite3_vfs_find(ptr::null()) };
-        if base.is_null() {
-            return Err(io::Error::other("builtin VFS absent"));
-        }
-        // SAFETY: base points to SQLite's initialized process-lifetime VFS table.
-        let mut registration = Box::new(unsafe { *base });
+            let names: [CString; 4] = names
+                .try_into()
+                .map_err(|_| io::Error::other("fresh native WAL SQLite names"))?;
+            for (index, file) in files.iter().enumerate() {
+                file.verify()?;
+                if !file.matches_path(std::path::Path::new(
+                    names[index].to_str().map_err(io::Error::other)?,
+                ))? || file.parent_key()? != files[0].parent_key()?
+                    || file.exact_bytes(limits[index])?.len() as u64 > limits[index]
+                {
+                    return Err(io::Error::other(
+                        "fresh native WAL SQLite current file differs",
+                    ));
+                }
+            }
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let id = NEXT
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |next| next.checked_add(1),
+                )
+                .map_err(|_| io::Error::other("fresh native WAL SQLite registration exhausted"))?;
+            let name = CString::new(format!("sync-fresh-native-{}-{id}", std::process::id()))
+                .map_err(io::Error::other)?;
+            // SAFETY: the builtin VFS lives for the process. Its copied table
+            // supplies only time/randomness while our actual IO stays private.
+            let base = unsafe { ffi::sqlite3_vfs_find(ptr::null()) };
+            if base.is_null() {
+                return Err(io::Error::other("builtin VFS absent"));
+            }
+            // SAFETY: base points to SQLite's initialized original VFS table.
+            Ok((names, name, Box::new(unsafe { *base })))
+        })();
+        let (names, name, mut registration) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return Err(reject_original_open_files(error, files)),
+        };
         let policy = Rc::new(Policy {
             files,
             names,
@@ -492,38 +654,93 @@ impl FreshNativeWalConnection {
         registration.xSetSystemCall = None;
         registration.xGetSystemCall = None;
         registration.xNextSystemCall = None;
-        // SAFETY: owner below retains table/name/policy and does not change default VFS.
-        if unsafe { ffi::sqlite3_vfs_register(&mut *registration, 0) } != ffi::SQLITE_OK {
-            return Err(io::Error::other(
-                "fresh native WAL SQLite registration failed",
-            ));
-        }
         let mut owner = Self {
             connection: None,
-            registration,
-            name,
-            policy,
+            opening_connection: None,
+            context: Some(FreshNativeWalContext {
+                registration,
+                name,
+                policy,
+                registered: false,
+            }),
             path: path.to_owned(),
             attempted: false,
+            actual_closed_handle_prefix: 0,
+            original_terminal_error: None,
         };
-        let connection = rusqlite::Connection::open_with_flags_and_vfs(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            owner.name.to_str().map_err(io::Error::other)?,
-        )
-        .map_err(io::Error::other)?;
+        let context = owner
+            .context
+            .as_mut()
+            .expect("original context just prepared");
+        // SAFETY: this owner retains the actual table/name/policy. The existing
+        // registration is private and the default VFS is unchanged.
+        let registered = unsafe { ffi::sqlite3_vfs_register(&mut *context.registration, 0) };
+        if registered != ffi::SQLITE_OK {
+            return Err(owner.reject_open(io::Error::other(format!(
+                "fresh native WAL SQLite original registration returned {registered}",
+            ))));
+        }
+        context.registered = true;
+        let mut database = ptr::null_mut();
+        // SAFETY: exact names and original registered callbacks stay owned.
+        // The returned actual database pointer is retained even on an error.
+        // Our custom xOpen uses only the already acquired four native files.
+        let opened = unsafe {
+            ffi::sqlite3_open_v2(
+                owner.context_ref().policy.names[0].as_ptr(),
+                &mut database,
+                ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_NOMUTEX,
+                owner.context_ref().name.as_ptr(),
+            )
+        };
+        if !database.is_null() {
+            owner.opening_connection = Some(database);
+        }
+        if opened != ffi::SQLITE_OK || database.is_null() {
+            let error = if database.is_null() {
+                io::Error::other(format!(
+                    "fresh native WAL SQLite original open returned {opened} without a database",
+                ))
+            } else {
+                // SAFETY: the same actual failed-open database remains owned.
+                let message = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(database)) }
+                    .to_string_lossy()
+                    .into_owned();
+                io::Error::other(rusqlite::Error::SqliteFailure(
+                    ffi::Error::new(opened),
+                    Some(message),
+                ))
+            };
+            return Err(owner.reject_open(error));
+        }
+        // SAFETY: this is the one actual successful database from open_v2.
+        // Ownership moves once to rusqlite, not to a new VFS or database.
+        let connection = match unsafe { rusqlite::Connection::from_handle_owned(database) } {
+            Ok(connection) => connection,
+            Err(error) => return Err(owner.reject_open(io::Error::other(error))),
+        };
+        owner.opening_connection = None;
         owner.connection = Some(connection);
-        owner.verify()?;
+        let checked = owner
+            .connection
+            .as_ref()
+            .expect("original opened connection retained")
+            .busy_timeout(std::time::Duration::ZERO)
+            .map_err(io::Error::other)
+            .and_then(|()| owner.verify());
+        if let Err(error) = checked {
+            return Err(owner.reject_open(error));
+        }
         Ok(owner)
     }
     pub fn verify(&self) -> io::Result<()> {
-        if self.policy.poisoned.get() || self.connection.is_none() {
+        if self.context_ref().policy.poisoned.get() || self.connection.is_none() {
             return Err(io::Error::other("fresh native WAL SQLite uncertain"));
         }
-        for file in &self.policy.files {
+        for file in &self.context_ref().policy.files {
             file.verify()?;
         }
-        if !self.policy.files[0].matches_path(&self.path)? {
+        if !self.context_ref().policy.files[0].matches_path(&self.path)? {
             return Err(io::Error::other("fresh WAL SQLite target slot differs"));
         }
         Ok(())
@@ -531,14 +748,14 @@ impl FreshNativeWalConnection {
     pub fn keys(&self) -> io::Result<[FileKey; 3]> {
         self.verify()?;
         Ok([
-            self.policy.files[0].key()?,
-            self.policy.files[1].key()?,
-            self.policy.files[2].key()?,
+            self.context_ref().policy.files[0].key()?,
+            self.context_ref().policy.files[1].key()?,
+            self.context_ref().policy.files[2].key()?,
         ])
     }
     pub fn exact_main_bytes(&self) -> io::Result<Vec<u8>> {
         self.verify()?;
-        self.policy.files[0].exact_bytes(self.policy.limits[0])
+        self.context_ref().policy.files[0].exact_bytes(self.context_ref().policy.limits[0])
     }
     pub fn commit_fresh_session(&mut self, expected: &str, fresh: &str) -> io::Result<()> {
         self.verify()?;
@@ -614,7 +831,7 @@ impl FreshNativeWalConnection {
                 .map_err(|error| io::Error::other(format!("first session commit: {error}")))?,
             result => {
                 let _ = connection.execute_batch("ROLLBACK");
-                self.policy.poisoned.set(true);
+                self.context_ref().policy.poisoned.set(true);
                 return Err(io::Error::other(format!(
                     "fresh session exact CAS failed: {result:?}"
                 )));
@@ -625,53 +842,244 @@ impl FreshNativeWalConnection {
 }
 impl Drop for FreshNativeWalConnection {
     fn drop(&mut self) {
-        self.connection.take();
-        // SAFETY: connection closed before unregistering this owned private table.
-        unsafe {
-            ffi::sqlite3_vfs_unregister(&mut *self.registration);
+        if !self.original_resources_remain() {
+            return;
+        }
+        // Move the same original context, table, DB, mapping, and native files
+        // into a terminal-only owner. No acquisition or registration occurs.
+        let original = Self {
+            connection: self.connection.take(),
+            opening_connection: self.opening_connection.take(),
+            context: self.context.take(),
+            path: std::mem::take(&mut self.path),
+            attempted: self.attempted,
+            actual_closed_handle_prefix: std::mem::take(&mut self.actual_closed_handle_prefix),
+            original_terminal_error: self.original_terminal_error.take(),
+        };
+        if let Err(original) = original.close_original_resources_retaining() {
+            original.retain_until_process_exit();
         }
     }
 }
 
 // Confirm actual SQLite close while all native file objects remain held.
 impl FreshNativeWalConnection {
-    pub fn close_connection_retaining_native_objects(&mut self) -> io::Result<()> {
-        self.verify()?;
-        let connection = self
-            .connection
-            .take()
-            .ok_or_else(|| io::Error::other("fresh native WAL connection already closed"))?;
-        match connection.close() {
-            Ok(()) => {
-                self.policy.shm.borrow_mut().take();
-                self.verify_closed_native_objects()
-            }
-            Err((connection, error)) => {
+    fn original_resources_remain(&self) -> bool {
+        self.connection.is_some() || self.opening_connection.is_some() || self.context.is_some()
+    }
+
+    fn reject_open(self, error: io::Error) -> FreshNativeWalOpenFailure {
+        FreshNativeWalOpenFailure {
+            error,
+            original_resources: self.close_original_resources_retaining().err(),
+        }
+    }
+
+    fn close_original_sqlite_connection(&mut self) -> io::Result<()> {
+        if let Some(connection) = self.connection.take() {
+            if let Err((connection, error)) = connection.close() {
                 self.connection = Some(connection);
-                self.policy.poisoned.set(true);
-                Err(io::Error::other(error))
+                let error = io::Error::other(error);
+                self.original_terminal_error
+                    .get_or_insert_with(|| copy_original_error(&error));
+                return Err(error);
+            }
+        }
+        if let Some(database) = self.opening_connection {
+            // SAFETY: this is the same original partial database from open_v2.
+            // It has never been transferred to another connection or caller.
+            let closed = unsafe { ffi::sqlite3_close(database) };
+            if closed != ffi::SQLITE_OK {
+                // SAFETY: failed close leaves that original database live.
+                let message = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(database)) }
+                    .to_string_lossy()
+                    .into_owned();
+                let error = io::Error::other(rusqlite::Error::SqliteFailure(
+                    ffi::Error::new(closed),
+                    Some(message),
+                ));
+                self.original_terminal_error
+                    .get_or_insert_with(|| copy_original_error(&error));
+                return Err(error);
+            }
+            self.opening_connection = None;
+        }
+        Ok(())
+    }
+
+    fn close_original_shm_retaining(&mut self) -> io::Result<()> {
+        let mut attempt = crate::WindowsOriginalCloseAttempt::new();
+        let context = self.context_ref();
+        {
+            let mut retained = context.policy.shm.borrow_mut();
+            if let Some(mapping) = retained.as_mut() {
+                mapping.close_original_into_attempt(&mut attempt);
+                if !mapping.original_resources_remain() {
+                    retained.take();
+                }
+            }
+        }
+        match attempt.finish() {
+            Ok(closed) => {
+                self.actual_closed_handle_prefix += closed.actual_closed_handles();
+                Ok(())
+            }
+            Err(original) => {
+                self.actual_closed_handle_prefix += original.actual_closed_handles;
+                let error = original.error;
+                self.original_terminal_error
+                    .get_or_insert_with(|| copy_original_error(&error));
+                self.context_ref().policy.poisoned.set(true);
+                Err(error)
             }
         }
     }
+
+    fn close_original_into_attempt(&mut self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        attempt
+            .append_original_handle_prefix(std::mem::take(&mut self.actual_closed_handle_prefix));
+        if let Some(error) = self.original_terminal_error.take() {
+            attempt.note_error(error);
+        }
+        // A failed actual database close must keep every callback dependency.
+        if let Err(error) = self.close_original_sqlite_connection() {
+            attempt.note_error(error);
+            return;
+        }
+        let Some(mut context) = self.context.take() else {
+            return;
+        };
+        {
+            let mut retained = context.policy.shm.borrow_mut();
+            if let Some(mapping) = retained.as_mut() {
+                mapping.close_original_into_attempt(attempt);
+                if !mapping.original_resources_remain() {
+                    retained.take();
+                }
+            }
+        }
+        if context.registered {
+            // SAFETY: the actual DB is closed. Unregister this same retained
+            // registration once; a failed call keeps its table/name/policy.
+            let closed = unsafe { ffi::sqlite3_vfs_unregister(&mut *context.registration) };
+            if closed != ffi::SQLITE_OK {
+                attempt.note_error(io::Error::other(format!(
+                    "fresh native WAL original VFS unregister returned {closed}",
+                )));
+                self.context = Some(context);
+                return;
+            }
+            context.registered = false;
+        }
+        if context.policy.shm.borrow().is_some() {
+            attempt.note_error(io::Error::other(
+                "fresh native WAL original shared-memory view/section remains retained",
+            ));
+            self.context = Some(context);
+            return;
+        }
+        if Rc::strong_count(&context.policy) != 1 {
+            attempt.note_error(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "fresh native WAL terminal retains an outstanding original native loan",
+            ));
+            self.context = Some(context);
+            return;
+        }
+        let FreshNativeWalContext {
+            registration,
+            name,
+            policy,
+            registered,
+        } = context;
+        let policy = match Rc::try_unwrap(policy) {
+            Ok(policy) => policy,
+            Err(policy) => {
+                attempt.note_error(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "fresh native WAL original policy loan remains held",
+                ));
+                self.context = Some(FreshNativeWalContext {
+                    registration,
+                    name,
+                    policy,
+                    registered,
+                });
+                return;
+            }
+        };
+        for file in policy.files {
+            file.close_into_attempt(attempt);
+        }
+        // Box/CString and non-owning policy scalars now contain no callback,
+        // live mapping, or original HANDLE. Their destruction is bookkeeping.
+        drop(registration);
+        drop(name);
+    }
+
+    pub fn close_original_resources_retaining(
+        mut self,
+    ) -> Result<crate::ClosedWindowsOriginalResources, FreshNativeWalCloseFailure> {
+        let mut attempt = crate::WindowsOriginalCloseAttempt::new();
+        self.close_original_into_attempt(&mut attempt);
+        match attempt.finish() {
+            Ok(closed) if !self.original_resources_remain() => Ok(closed),
+            Ok(_) => unreachable!("a retained original native resource records a terminal error"),
+            Err(original) => Err(FreshNativeWalCloseFailure {
+                error: copy_original_error(&original.error),
+                actual_closed_handles: original.actual_closed_handles,
+                original_owner: if self.original_resources_remain() {
+                    Some(self)
+                } else {
+                    None
+                },
+                original_resources: Some(original),
+            }),
+        }
+    }
+
+    /// End only this actual connection after a failed higher-level operation.
+    /// This is a resource terminal, not a clean checkpoint/closure proof:
+    /// poison remains set and all native files remain retained and untouched.
+    pub fn close_actual_connection_after_failure(&mut self) -> io::Result<()> {
+        self.context_ref().policy.poisoned.set(true);
+        self.close_original_sqlite_connection()?;
+        self.close_original_shm_retaining()
+    }
+
+    pub fn close_connection_retaining_native_objects(&mut self) -> io::Result<()> {
+        self.verify()?;
+        if let Err(error) = self.close_original_sqlite_connection() {
+            self.context_ref().policy.poisoned.set(true);
+            return Err(error);
+        }
+        self.close_original_shm_retaining()?;
+        self.verify_closed_native_objects()
+    }
     pub fn verify_closed_native_objects(&self) -> io::Result<()> {
-        if self.connection.is_some() || self.policy.poisoned.get() {
+        if self.connection.is_some()
+            || self.opening_connection.is_some()
+            || self.context_ref().policy.shm.borrow().is_some()
+            || self.context_ref().policy.poisoned.get()
+        {
             return Err(io::Error::other(
                 "fresh native WAL actual close not confirmed",
             ));
         }
-        for (index, file) in self.policy.files.iter().enumerate() {
+        for (index, file) in self.context_ref().policy.files.iter().enumerate() {
             file.verify()?;
             if !file.matches_path(std::path::Path::new(
-                self.policy.names[index]
+                self.context_ref().policy.names[index]
                     .to_str()
                     .map_err(io::Error::other)?,
             ))? {
                 return Err(io::Error::other("fresh closed native file slot changed"));
             }
         }
-        let rollback = self.policy.files[2].exact_bytes(self.policy.limits[2])?;
-        if !self.policy.files[1]
-            .exact_bytes(self.policy.limits[1])?
+        let rollback =
+            self.context_ref().policy.files[2].exact_bytes(self.context_ref().policy.limits[2])?;
+        if !self.context_ref().policy.files[1]
+            .exact_bytes(self.context_ref().policy.limits[1])?
             .is_empty()
             || (!rollback.is_empty() && rollback.get(..8) != Some(&[0; 8]))
         {
@@ -683,7 +1091,7 @@ impl FreshNativeWalConnection {
     }
     pub fn exact_closed_main_bytes(&self) -> io::Result<Vec<u8>> {
         self.verify_closed_native_objects()?;
-        self.policy.files[0].exact_bytes(self.policy.limits[0])
+        self.context_ref().policy.files[0].exact_bytes(self.context_ref().policy.limits[0])
     }
 }
 
@@ -702,17 +1110,53 @@ use windows_sys::Win32::{
     },
 };
 struct ShmMapping {
-    section: HANDLE,
-    view: MEMORY_MAPPED_VIEW_ADDRESS,
+    section: Option<HANDLE>,
+    view: Option<MEMORY_MAPPED_VIEW_ADDRESS>,
+}
+impl ShmMapping {
+    fn original_resources_remain(&self) -> bool {
+        self.section.is_some() || self.view.is_some()
+    }
+
+    fn close_original_into_attempt(&mut self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        if let Some(view) = self.view {
+            // SAFETY: this is the exact original mapped view, retained after
+            // its SQLite connection has closed. No replacement view is made.
+            if unsafe { UnmapViewOfFile(view) } == 0 {
+                attempt.note_error(io::Error::last_os_error());
+            } else {
+                self.view = None;
+            }
+        }
+        if let Some(section) = self.section {
+            // SAFETY: successful CreateFileMapping transferred this actual
+            // original section. A failed close keeps that same owned HANDLE.
+            if unsafe { CloseHandle(section) } == 0 {
+                attempt.note_error(io::Error::last_os_error());
+            } else {
+                self.section = None;
+                attempt.note_actual_handle_closed();
+            }
+        }
+    }
 }
 impl Drop for ShmMapping {
     fn drop(&mut self) {
-        // SAFETY: successful mapping owns exactly this view and section; SQLite
-        // connection closes before Policy drops, so no callback retains pointers.
-        unsafe {
-            UnmapViewOfFile(self.view);
-            CloseHandle(self.section);
+        if !self.original_resources_remain() {
+            return;
         }
+        let mut original = Self {
+            section: self.section.take(),
+            view: self.view.take(),
+        };
+        let mut attempt = crate::WindowsOriginalCloseAttempt::new();
+        original.close_original_into_attempt(&mut attempt);
+        if original.original_resources_remain() {
+            let _ = Box::leak(Box::new(original));
+        }
+        // A fallback drop has no successful-close evidence. Any failed view or
+        // section remains in the exact original terminal-only leaked owner.
+        let _ = attempt.finish();
     }
 }
 unsafe extern "C" fn shm_map(
@@ -779,30 +1223,31 @@ unsafe extern "C" fn shm_map(
             owner.poisoned.set(true);
             return ffi::SQLITE_IOERR_SHMMAP;
         }
+        // Retain the successful actual section before a subsequent mapping
+        // attempt can fail. Terminal close is performed by its original owner.
+        *mapping = Some(ShmMapping {
+            section: Some(section),
+            view: None,
+        });
         // SAFETY: live bounded section; full view starts at aligned offset zero.
         let view =
             unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, owner.limits[3] as usize) };
         if view.Value.is_null() {
-            // SAFETY: only successful CreateFileMapping transferred this handle.
-            unsafe {
-                CloseHandle(section);
-            }
             owner.poisoned.set(true);
             return ffi::SQLITE_IOERR_SHMMAP;
         }
-        *mapping = Some(ShmMapping { section, view });
+        mapping.as_mut().expect("original section retained").view = Some(view);
     }
     let Some(value) = mapping.as_ref() else {
         return ffi::SQLITE_IOERR_SHMMAP;
     };
+    let Some(view) = value.view else {
+        owner.poisoned.set(true);
+        return ffi::SQLITE_IOERR_SHMMAP;
+    };
     // SAFETY: page is in 0..32, size fixed32768; pointer remains inside retained view.
     unsafe {
-        *out = value
-            .view
-            .Value
-            .cast::<u8>()
-            .add(page as usize * 32768)
-            .cast();
+        *out = view.Value.cast::<u8>().add(page as usize * 32768).cast();
     }
     ffi::SQLITE_OK
 }
@@ -874,8 +1319,11 @@ unsafe extern "C" fn shm_unmap(file: *mut ffi::sqlite3_file, _delete: i32) -> i3
         return ffi::SQLITE_IOERR_SHMOPEN;
     }
     if let Some(mapping) = owner.shm.borrow().as_ref() {
+        let Some(view) = mapping.view else {
+            return ffi::SQLITE_IOERR_SHMOPEN;
+        };
         // SAFETY: retained view covers exactly the bounded mapped file.
-        if unsafe { FlushViewOfFile(mapping.view.Value, owner.limits[3] as usize) } == 0 {
+        if unsafe { FlushViewOfFile(view.Value, owner.limits[3] as usize) } == 0 {
             owner.poisoned.set(true);
             return ffi::SQLITE_IOERR_FSYNC;
         }
@@ -918,11 +1366,11 @@ impl FreshNativeWalConnection {
             .map_err(|error| io::Error::other(format!("native WAL checkpoint: {error}")))?;
         if row.0 != 0
             || row.1 != row.2
-            || !self.policy.files[1]
-                .exact_bytes(self.policy.limits[1])?
+            || !self.context_ref().policy.files[1]
+                .exact_bytes(self.context_ref().policy.limits[1])?
                 .is_empty()
         {
-            self.policy.poisoned.set(true);
+            self.context_ref().policy.poisoned.set(true);
             return Err(io::Error::other("actual WAL checkpoint incomplete"));
         }
         self.verify()
@@ -936,11 +1384,11 @@ impl FreshNativeWalConnection {
         } else {
             self.verify_closed_native_objects()?;
         }
-        self.policy.files[index].exact_bytes(self.policy.limits[index])
+        self.context_ref().policy.files[index].exact_bytes(self.context_ref().policy.limits[index])
     }
     pub fn shm_mapping_active(&self) -> io::Result<bool> {
         self.verify()?;
-        Ok(self.policy.shm.borrow().is_some())
+        Ok(self.context_ref().policy.shm.borrow().is_some())
     }
 }
 
@@ -956,15 +1404,15 @@ impl FreshNativeWalConnection {
             .query_row("PRAGMA main.journal_mode=PERSIST", [], |row| row.get(0))
             .map_err(|error| io::Error::other(format!("native standalone mode: {error}")))?;
         if !mode.eq_ignore_ascii_case("persist")
-            || self.policy.files[0]
-                .exact_bytes(self.policy.limits[0])?
+            || self.context_ref().policy.files[0]
+                .exact_bytes(self.context_ref().policy.limits[0])?
                 .get(18..20)
                 != Some(&[1, 1])
-            || !self.policy.files[1]
-                .exact_bytes(self.policy.limits[1])?
+            || !self.context_ref().policy.files[1]
+                .exact_bytes(self.context_ref().policy.limits[1])?
                 .is_empty()
         {
-            self.policy.poisoned.set(true);
+            self.context_ref().policy.poisoned.set(true);
             return Err(io::Error::other(
                 "actual SQLite standalone checkpoint not confirmed",
             ));
@@ -992,81 +1440,102 @@ impl FreshNativeWalConnection {
         limits: [u64; 4],
         expected_shm: (&str, &[u8]),
     ) -> io::Result<Self> {
-        if !path.is_absolute()
-            || path.file_name().and_then(|n| n.to_str()) != Some("journal.sqlite")
-            || limits
-                .iter()
-                .any(|n| !(512..=256 * 1024 * 1024).contains(n))
-            || limits.iter().sum::<u64>() > 512 * 1024 * 1024
-            || limits[3] != 1024 * 1024
-        {
-            return Err(io::Error::other("new SHM epoch exact bounded path"));
-        }
-        for (index, file) in files.iter().enumerate() {
-            file.verify()?;
-            let expected = path.with_file_name(
-                [
-                    "journal.sqlite",
-                    "journal.sqlite-wal",
-                    "journal.sqlite-journal",
-                    "journal.sqlite-shm",
-                ][index],
-            );
-            if !file.matches_path(&expected)? || file.parent_key()? != files[0].parent_key()? {
-                return Err(io::Error::other("new SHM epoch exact four native slots"));
+        Self::open_after_explicit_shm_epoch_retaining(path, files, limits, expected_shm)
+            .map_err(FreshNativeWalOpenFailure::retain_and_report)
+    }
+
+    pub fn open_after_explicit_shm_epoch_retaining(
+        path: &std::path::Path,
+        files: [FreshExclusiveSqliteFile; 4],
+        limits: [u64; 4],
+        expected_shm: (&str, &[u8]),
+    ) -> Result<Self, FreshNativeWalOpenFailure> {
+        let checked = (|| -> io::Result<()> {
+            if !path.is_absolute()
+                || path.file_name().and_then(|n| n.to_str()) != Some("journal.sqlite")
+                || limits
+                    .iter()
+                    .any(|n| !(512..=256 * 1024 * 1024).contains(n))
+                || limits.iter().sum::<u64>() > 512 * 1024 * 1024
+                || limits[3] != FRESH_NATIVE_WAL_SHM_CAPACITY
+            {
+                return Err(io::Error::other("new SHM epoch exact bounded path"));
             }
-            file.exact_bytes(limits[index])?;
-        }
-        if files[0].exact_bytes(limits[0])?.get(18..20) != Some(&[1, 1])
-            || !files[1].exact_bytes(limits[1])?.is_empty()
-        {
-            return Err(io::Error::other(
-                "new SHM epoch requires independently standalone checkpoint",
-            ));
-        }
-        let shm = &files[3];
-        if shm.key()?.to_string() != expected_shm.0
-            || shm.exact_bytes(1024 * 1024)? != expected_shm.1
-            || shm.native_file().metadata()?.len() != 1024 * 1024
-            || !shm.matches_path(&path.with_file_name("journal.sqlite-shm"))?
-            || shm.parent_key()? != files[0].parent_key()?
-            || limits[3] != 1024 * 1024
-        {
-            return Err(io::Error::other(
-                "new SHM epoch exact exclusive previous object required",
-            ));
-        }
-        let zero = [0u8; 65536];
-        for index in 0..16 {
-            let mut offset = 0;
-            while offset < zero.len() {
-                let count = shm
-                    .native_file()
-                    .seek_write(&zero[offset..], index * 65536 + offset as u64)?;
-                if count == 0 {
-                    return Err(io::Error::other("new SHM epoch short native write"));
+            for (index, file) in files.iter().enumerate() {
+                file.verify()?;
+                let expected = path.with_file_name(
+                    [
+                        "journal.sqlite",
+                        "journal.sqlite-wal",
+                        "journal.sqlite-journal",
+                        "journal.sqlite-shm",
+                    ][index],
+                );
+                if !file.matches_path(&expected)? || file.parent_key()? != files[0].parent_key()? {
+                    return Err(io::Error::other("new SHM epoch exact four native slots"));
                 }
-                offset += count;
+                file.exact_bytes(limits[index])?;
             }
+            if files[0].exact_bytes(limits[0])?.get(18..20) != Some(&[1, 1])
+                || !files[1].exact_bytes(limits[1])?.is_empty()
+            {
+                return Err(io::Error::other(
+                    "new SHM epoch requires independently standalone checkpoint",
+                ));
+            }
+            let shm = &files[3];
+            if shm.key()?.to_string() != expected_shm.0
+                || shm.exact_bytes(FRESH_NATIVE_WAL_SHM_CAPACITY)? != expected_shm.1
+                || shm.native_file().metadata()?.len() != FRESH_NATIVE_WAL_SHM_CAPACITY
+                || !shm.matches_path(&path.with_file_name("journal.sqlite-shm"))?
+                || shm.parent_key()? != files[0].parent_key()?
+                || limits[3] != FRESH_NATIVE_WAL_SHM_CAPACITY
+            {
+                return Err(io::Error::other(
+                    "new SHM epoch exact exclusive previous object required",
+                ));
+            }
+            let zero = [0u8; 65536];
+            for index in 0..16 {
+                let mut offset = 0;
+                while offset < zero.len() {
+                    let count = shm
+                        .native_file()
+                        .seek_write(&zero[offset..], index * 65536 + offset as u64)?;
+                    if count == 0 {
+                        return Err(io::Error::other("new SHM epoch short native write"));
+                    }
+                    offset += count;
+                }
+            }
+            shm.native_file().sync_all()?;
+            shm.verify()?;
+            if shm
+                .exact_bytes(FRESH_NATIVE_WAL_SHM_CAPACITY)?
+                .iter()
+                .any(|byte| *byte != 0)
+            {
+                return Err(io::Error::other(
+                    "new SHM epoch exact zero index confirmation",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = checked {
+            return Err(reject_original_open_files(error, files));
         }
-        shm.native_file().sync_all()?;
-        shm.verify()?;
-        if shm.exact_bytes(1024 * 1024)?.iter().any(|byte| *byte != 0) {
-            return Err(io::Error::other(
-                "new SHM epoch exact zero index confirmation",
-            ));
-        }
-        Self::open(path, files, limits)
+        Self::open_retaining(path, files, limits)
     }
 }
 
 impl FreshNativeWalConnection {
     pub fn held_shm_bytes(&self) -> io::Result<Vec<u8>> {
-        self.policy.files[3].verify()?;
-        self.policy.files[3].exact_bytes(1024 * 1024)
+        self.context_ref().policy.files[3].verify()?;
+        self.context_ref().policy.files[3].exact_bytes(FRESH_NATIVE_WAL_SHM_CAPACITY)
     }
     pub fn all_native_keys(&self) -> io::Result<[FileKey; 4]> {
-        self.policy
+        self.context_ref()
+            .policy
             .files
             .each_ref()
             .map(|file| file.key())
@@ -1086,7 +1555,7 @@ impl FreshNativeWalConnection {
             ));
         }
         Ok(FreshNativeRetentionLease {
-            policy: Rc::clone(&self.policy),
+            policy: Rc::clone(&self.context_ref().policy),
             keys: self.all_native_keys()?,
             generation,
         })
@@ -1096,7 +1565,7 @@ impl FreshNativeWalConnection {
         self.verify()?;
         if !self.attempted
             || self.connection.is_none()
-            || !Rc::ptr_eq(&self.policy, &lease.policy)
+            || !Rc::ptr_eq(&self.context_ref().policy, &lease.policy)
             || self.all_native_keys()? != lease.keys
         {
             return Err(io::Error::other(
@@ -1149,7 +1618,7 @@ impl FreshNativeWalConnection {
             connection, statements, queries, before, after, budget, gc_mark,
         );
         if result.is_err() {
-            self.policy.poisoned.set(true);
+            self.context_ref().policy.poisoned.set(true);
         }
         result?;
         self.checkpoint_to_standalone()?;
@@ -1204,7 +1673,7 @@ impl FreshNativeWalConnection {
             connection, statements, queries, before, after, budget,
         );
         if result.is_err() {
-            self.policy.poisoned.set(true);
+            self.context_ref().policy.poisoned.set(true);
         }
         result?;
         self.checkpoint_to_standalone()?;

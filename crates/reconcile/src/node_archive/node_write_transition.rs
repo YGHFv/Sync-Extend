@@ -9,12 +9,30 @@ use std::{
 use sync_extend_core_model::{ContentId, SpaceId};
 use sync_extend_platform_fs::{FileKey, OriginalFileCreation, OwnedFileCreation};
 
-pub(super) const ORIGINAL_WRITE_SIDECAR_LIMIT: u64 = 8 * 1024 * 1024;
+mod deployment_close;
+pub use deployment_close::DeploymentFreshNodeResourceCloseFailure;
+mod runtime_budget;
+pub use runtime_budget::DeploymentNativeRuntimeLiability;
+use runtime_budget::{
+    FRESH_CAS_OBJECT_MAXIMUM, FRESH_HELD_HISTORY_AGGREGATE_MAXIMUM,
+    FRESH_HELD_HISTORY_OBJECT_MAXIMUM, FRESH_HISTORY_GENERATION_MAXIMUM, FRESH_OPERATION_MAXIMUM,
+    FRESH_RECEIPT_COUNT_MAXIMUM, FRESH_WORK_DIRECTORY_MAXIMUM, ORIGINAL_WRITE_CAS_RECEIPT_MAXIMUM,
+    ORIGINAL_WRITE_FRAMES_MAXIMUM, ORIGINAL_WRITE_MAIN_GROWTH, ORIGINAL_WRITE_MAIN_MAXIMUM,
+    ORIGINAL_WRITE_OWNER_MAXIMUM, ORIGINAL_WRITE_RECEIPT_MAXIMUM,
+};
+pub(super) use runtime_budget::{
+    ORIGINAL_WRITE_CAS_EVIDENCE_MAXIMUM, ORIGINAL_WRITE_FILE_MAXIMUM,
+    ORIGINAL_WRITE_OPERATION_MAXIMUM, ORIGINAL_WRITE_SIDECAR_LIMIT,
+};
+
+pub(super) fn original_native_shm_capacity() -> u64 {
+    sync_extend_platform_fs::FRESH_NATIVE_WAL_SHM_CAPACITY
+}
 
 pub(super) fn original_write_main_limit(main_bytes: u64) -> Result<u64> {
     main_bytes
-        .checked_add(8 * 1024 * 1024)
-        .filter(|limit| main_bytes >= 512 && *limit <= 256 * 1024 * 1024)
+        .checked_add(ORIGINAL_WRITE_MAIN_GROWTH)
+        .filter(|limit| main_bytes >= 512 && *limit <= ORIGINAL_WRITE_MAIN_MAXIMUM)
         .ok_or(ReconcileError::ResourceLimit(
             "original write Journal byte bound",
         ))
@@ -111,6 +129,38 @@ impl OriginalNodeWriteLedgerCreationFailure {
             + usize::from(self.state.file.is_some())
             + 2 * usize::from(self.state.complete.is_some())
     }
+
+    pub(super) fn close_into_attempt<'scope>(
+        self,
+        attempt: &mut super::OriginalNodeResourceCloseAttempt<'scope>,
+    ) {
+        let Self { state, error } = self;
+        let OriginalNodeWriteLedgerCreating {
+            ancestors,
+            owner_lock,
+            file,
+            complete,
+        } = *state;
+        attempt
+            .native
+            .note_error(std::io::Error::other(error.to_string()));
+        attempt.keep_context(error);
+        if let Some(original) = complete {
+            original.close_into_attempt(attempt);
+        }
+        if let Some(original) = file {
+            original.close_into_attempt(&mut attempt.native);
+        }
+        if let Some(original) = owner_lock {
+            original.close_into_attempt(&mut attempt.native);
+        }
+        if let Some(ancestors) = ancestors {
+            for (path, original, key) in ancestors.into_iter().rev() {
+                attempt.keep_context((path, key));
+                attempt.native.close_directory(original);
+            }
+        }
+    }
 }
 struct OriginalNodeWriteLedgerCreating {
     ancestors: Option<Vec<(PathBuf, sync_extend_platform_fs::LockedDirectory, FileKey)>>,
@@ -169,6 +219,40 @@ impl OriginalWriteScope {
 }
 
 impl OriginalNodeWriteLedger {
+    pub(super) fn close_into_attempt<'scope>(
+        self,
+        attempt: &mut super::OriginalNodeResourceCloseAttempt<'scope>,
+    ) {
+        let Self {
+            file,
+            path,
+            scope,
+            scope_bytes,
+            owner,
+            instance,
+            next,
+            previous,
+            wal,
+            rollback,
+            length,
+            poisoned,
+        } = self;
+        attempt.keep_context((
+            path,
+            scope,
+            scope_bytes,
+            instance,
+            next,
+            previous,
+            wal,
+            rollback,
+            length,
+            poisoned,
+        ));
+        file.close_into_attempt(&mut attempt.native);
+        owner.close_into_attempt(attempt);
+    }
+
     pub(super) fn path(&self) -> &std::path::Path {
         &self.path
     }
@@ -368,7 +452,7 @@ impl OriginalNodeWriteLedger {
         self.file.verify_single_link()?;
         if !sync_extend_platform_fs::regular_file_matches_path(self.file.reader(), &self.path)?
             || self.file.reader().metadata()?.len() != self.length
-            || self.length > 1024 * 1024
+            || self.length > ORIGINAL_WRITE_FRAMES_MAXIMUM
         {
             return Err(ReconcileError::Invariant(
                 "new framed write original object/slot/length differs",
@@ -541,7 +625,7 @@ impl OriginalNodeWriteLedger {
         let length = self
             .length
             .checked_add(frame.len() as u64)
-            .filter(|value| *value <= 1024 * 1024)
+            .filter(|value| *value <= ORIGINAL_WRITE_FRAMES_MAXIMUM)
             .ok_or(ReconcileError::Invariant(
                 "new framed write aggregate before-append bound",
             ))?;
@@ -1066,7 +1150,7 @@ impl OriginalNodeWriteLedger {
         receipt.file.verify_single_link()?;
         if !Arc::ptr_eq(&self.instance, &receipt.instance)
             || receipt.next > 3
-            || receipt.length > 256 * 1024
+            || receipt.length > ORIGINAL_WRITE_RECEIPT_MAXIMUM
             || receipt.length as usize != receipt.expected_bytes.len()
             || receipt.file.reader().metadata()?.len() != receipt.length
         {
@@ -1239,10 +1323,12 @@ impl OriginalNodeWriteLedger {
         self.verify()?;
         receipt.file.original_creation()?.verify()?;
         receipt.file.verify_single_link()?;
+        let expected_length = u64::try_from(receipt.expected.len())
+            .map_err(|_| ReconcileError::Invariant("new CAS original evidence length overflow"))?;
         if !Arc::ptr_eq(&self.instance, &receipt.instance)
             || receipt.next > 3
-            || receipt.expected.len() > 64 * 1024
-            || receipt.file.reader().metadata()?.len() != receipt.expected.len() as u64
+            || expected_length > ORIGINAL_WRITE_CAS_RECEIPT_MAXIMUM
+            || receipt.file.reader().metadata()?.len() != expected_length
         {
             return Err(ReconcileError::Invariant(
                 "new CAS original evidence bounds/identity",
@@ -1408,10 +1494,13 @@ impl OriginalNodeWriteLedger {
         self.verify()?;
         evidence.file.original_creation()?.verify()?;
         evidence.file.verify_single_link()?;
+        let expected_length = u64::try_from(evidence.expected.len()).map_err(|_| {
+            ReconcileError::Invariant("ordinary mutation original receipt length overflow")
+        })?;
         if !Arc::ptr_eq(&self.instance, &evidence.instance)
             || evidence.phase > 4
-            || evidence.expected.len() > 256 * 1024
-            || evidence.file.reader().metadata()?.len() != evidence.expected.len() as u64
+            || expected_length > ORIGINAL_WRITE_RECEIPT_MAXIMUM
+            || evidence.file.reader().metadata()?.len() != expected_length
             || (evidence.phase == 4) != evidence.root.is_some()
         {
             return Err(ReconcileError::Invariant(
@@ -2088,6 +2177,7 @@ impl super::VerifiedNodeStateArchive {
             ledger_bounds,
             false,
             None,
+            None,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -2101,6 +2191,7 @@ impl super::VerifiedNodeStateArchive {
         ledger_bounds: super::LedgerBounds,
         exclusive_sqlite: bool,
         fresh_evidence: Option<&FreshSessionRecord>,
+        separated_configs: Option<&crate::SeparatedDeploymentNodeConfigs>,
     ) -> Result<ReacquiredClosedNodeLockedReadScope> {
         let read = self.reacquire_closed_node_scope_internal(
             worktree,
@@ -2182,7 +2273,7 @@ impl super::VerifiedNodeStateArchive {
             ),
         ] {
             let file = held.file.reacquire_existing_node_read_file(&name)?;
-            let bytes = file.exact_bytes(65536)?;
+            let bytes = file.exact_bytes(ORIGINAL_WRITE_OWNER_MAXIMUM)?;
             if bytes != expected {
                 return Err(ReconcileError::Invariant(
                     "locked recovery exact external owner scope",
@@ -2198,8 +2289,18 @@ impl super::VerifiedNodeStateArchive {
         }
         let file = held.file.reacquire_existing_node_read_file(ledger_name)?;
         let bytes = file.exact_bytes(ledger_bounds.max_database_bytes)?;
-        let classification =
-            self.classify_original_node_restart(restore_ledger, ledger_bounds, bounds)?;
+        let classification = if let Some(configs) = separated_configs {
+            self.classify_original_node_restart_for_deployment(
+                restore_ledger,
+                ledger_bounds,
+                bounds,
+                worktree,
+                data,
+                configs,
+            )?
+        } else {
+            self.classify_original_node_restart(restore_ledger, ledger_bounds, bounds)?
+        };
         if !matches!(classification, super::OriginalNodeRestartClassification::CompletedEvidence {
             completion_digest, .. } if completion_digest == scope.completion)
         {
@@ -2393,6 +2494,7 @@ impl super::VerifiedNodeStateArchive {
             bounds,
             ledger_bounds,
             true,
+            None,
             None,
         )?;
         let frames = read
@@ -2881,7 +2983,7 @@ impl super::VerifiedNodeStateArchive {
         )?;
         let owner_name = format!("node-fresh-session-{}.owner", terminal.fresh);
         let owner = directory.reacquire_existing_node_read_file(&owner_name)?;
-        let owner_bytes = owner.exact_bytes(65536)?;
+        let owner_bytes = owner.exact_bytes(ORIGINAL_WRITE_OWNER_MAXIMUM)?;
         if owner_bytes != serde_json::to_vec(&(1u32, self.digest(), &terminal.fresh))? {
             return Err(ReconcileError::Invariant(
                 "fresh restart external owner bytes differ",
@@ -2897,6 +2999,7 @@ impl super::VerifiedNodeStateArchive {
             ledger_bounds,
             true,
             Some(&terminal),
+            None,
         )?;
         read.locks.push(owner_lock);
         for (evidence, lock) in chain {
@@ -3128,7 +3231,7 @@ impl super::VerifiedNodeStateArchive {
             }
             let owner_name = format!("node-fresh-session-{}.owner", old.fresh);
             let owner = directory.reacquire_existing_node_read_file(&owner_name)?;
-            let owner_bytes = owner.exact_bytes(65536)?;
+            let owner_bytes = owner.exact_bytes(ORIGINAL_WRITE_OWNER_MAXIMUM)?;
             if owner_bytes != serde_json::to_vec(&(1u32, self.digest(), &old.fresh))? {
                 return Err(ReconcileError::Invariant(
                     "fresh chain predecessor owner differs",
@@ -3338,6 +3441,7 @@ impl super::VerifiedNodeStateArchive {
             bounds,
             ledger_bounds,
             true,
+            None,
             None,
         )?;
         read.verify()?;
@@ -3765,6 +3869,7 @@ struct RecoveredVerificationKey {
     committed: bool,
 }
 pub struct FreshRecoveredNodeWalV2Session {
+    separated_deployment_configs: Option<crate::SeparatedDeploymentNodeConfigs>,
     read: ReacquiredClosedNodeLockedReadScope,
     native: sync_extend_platform_fs::FreshNativeWalConnection,
     frames: OwnedFileCreation,
@@ -3812,6 +3917,13 @@ impl FreshRecoveredNodeWalV2Session {
     fn verify_objects(&self) -> Result<()> {
         if self.poisoned {
             return Err(ReconcileError::Invariant("recovered WAL uncertain"));
+        }
+        if let Some(configs) = &self.separated_deployment_configs {
+            configs.verify_acquired_scope(
+                &self.archive,
+                &self.read.read.worktree,
+                &self.read.read.data,
+            )?;
         }
         self.read.verify()?;
         for (path, bucket) in &self.new_cas_buckets {
@@ -4062,6 +4174,54 @@ impl super::VerifiedNodeStateArchive {
         bounds: sync_extend_journal::NodeInspectionBounds,
         ledger_bounds: super::LedgerBounds,
     ) -> Result<FreshRecoveredNodeWalV2Session> {
+        self.reacquire_closed_node_wal_v2_session_internal(
+            worktree,
+            data,
+            write_frames,
+            restore_ledger,
+            bounds,
+            ledger_bounds,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reacquire_closed_node_wal_v2_session_for_deployment(
+        &self,
+        worktree: &std::path::Path,
+        data: &std::path::Path,
+        write_frames: &std::path::Path,
+        restore_ledger: &std::path::Path,
+        bounds: sync_extend_journal::NodeInspectionBounds,
+        ledger_bounds: super::LedgerBounds,
+        configs: crate::SeparatedDeploymentNodeConfigs,
+    ) -> Result<FreshRecoveredNodeWalV2Session> {
+        configs.verify_for_archive(self, worktree, data)?;
+        let mut session = self.reacquire_closed_node_wal_v2_session_internal(
+            worktree,
+            data,
+            write_frames,
+            restore_ledger,
+            bounds,
+            ledger_bounds,
+            Some(&configs),
+        )?;
+        // No fallible consuming conversion follows the actual acquisition.
+        session.separated_deployment_configs = Some(configs);
+        Ok(session)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reacquire_closed_node_wal_v2_session_internal(
+        &self,
+        worktree: &std::path::Path,
+        data: &std::path::Path,
+        write_frames: &std::path::Path,
+        restore_ledger: &std::path::Path,
+        bounds: sync_extend_journal::NodeInspectionBounds,
+        ledger_bounds: super::LedgerBounds,
+        separated_configs: Option<&crate::SeparatedDeploymentNodeConfigs>,
+    ) -> Result<FreshRecoveredNodeWalV2Session> {
         let mut read = self.reacquire_closed_node_locked_scope_internal(
             worktree,
             data,
@@ -4071,6 +4231,7 @@ impl super::VerifiedNodeStateArchive {
             ledger_bounds,
             true,
             None,
+            separated_configs,
         )?;
         read.verify()?;
         let frame = read
@@ -4217,6 +4378,7 @@ impl super::VerifiedNodeStateArchive {
         let native_keys = native.all_native_keys()?.map(|key| key.to_string());
         let before_rows = read.read.rows.clone();
         let mut result = FreshRecoveredNodeWalV2Session {
+            separated_deployment_configs: None,
             created_work_directories: std::collections::BTreeMap::new(),
             read,
             native,
@@ -4278,6 +4440,57 @@ impl super::VerifiedNodeStateArchive {
         recovered_frames: &std::path::Path,
         bounds: sync_extend_journal::NodeInspectionBounds,
         ledger_bounds: super::LedgerBounds,
+    ) -> Result<FreshRecoveredNodeWalV2Session> {
+        self.reacquire_fresh_closed_node_wal_v2_session_internal(
+            worktree,
+            data,
+            original_frames,
+            restore_ledger,
+            recovered_frames,
+            bounds,
+            ledger_bounds,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reacquire_fresh_closed_node_wal_v2_session_for_deployment(
+        &self,
+        worktree: &std::path::Path,
+        data: &std::path::Path,
+        original_frames: &std::path::Path,
+        restore_ledger: &std::path::Path,
+        recovered_frames: &std::path::Path,
+        bounds: sync_extend_journal::NodeInspectionBounds,
+        ledger_bounds: super::LedgerBounds,
+        configs: crate::SeparatedDeploymentNodeConfigs,
+    ) -> Result<FreshRecoveredNodeWalV2Session> {
+        configs.verify_for_archive(self, worktree, data)?;
+        let mut session = self.reacquire_fresh_closed_node_wal_v2_session_internal(
+            worktree,
+            data,
+            original_frames,
+            restore_ledger,
+            recovered_frames,
+            bounds,
+            ledger_bounds,
+            Some(&configs),
+        )?;
+        session.separated_deployment_configs = Some(configs);
+        Ok(session)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reacquire_fresh_closed_node_wal_v2_session_internal(
+        &self,
+        worktree: &std::path::Path,
+        data: &std::path::Path,
+        original_frames: &std::path::Path,
+        restore_ledger: &std::path::Path,
+        recovered_frames: &std::path::Path,
+        bounds: sync_extend_journal::NodeInspectionBounds,
+        ledger_bounds: super::LedgerBounds,
+        separated_configs: Option<&crate::SeparatedDeploymentNodeConfigs>,
     ) -> Result<FreshRecoveredNodeWalV2Session> {
         let parent = original_frames
             .parent()
@@ -4347,7 +4560,7 @@ impl super::VerifiedNodeStateArchive {
             let owner_name = format!("node-recovered-wal-{}.owner", old.fresh);
             all_names.insert(owner_name.clone());
             let owner = held.reacquire_existing_node_read_file(&owner_name)?;
-            let owner_bytes = owner.exact_bytes(65536)?;
+            let owner_bytes = owner.exact_bytes(ORIGINAL_WRITE_OWNER_MAXIMUM)?;
             if owner_bytes != serde_json::to_vec(&(2u32, self.digest(), &old.fresh))? {
                 return Err(ReconcileError::Invariant("WAL2 exact owner"));
             }
@@ -4481,6 +4694,7 @@ impl super::VerifiedNodeStateArchive {
             ledger_bounds,
             true,
             Some(&admission),
+            separated_configs,
         )?;
         for (frames, owner, lock) in chain {
             read.external.push(frames);
@@ -4546,6 +4760,7 @@ impl super::VerifiedNodeStateArchive {
         let native_keys = native.all_native_keys()?.map(|key| key.to_string());
         let before_rows = read.read.rows.clone();
         let mut result = FreshRecoveredNodeWalV2Session {
+            separated_deployment_configs: None,
             created_work_directories: std::collections::BTreeMap::new(),
             read,
             native,
@@ -4612,7 +4827,7 @@ impl FreshRecoveredNodeWalV2Session {
             .ok_or(ReconcileError::ResourceLimit(
                 "recovered retained receipts aggregate",
             ))?;
-        if self.retained_receipts.len() >= 384
+        if self.retained_receipts.len() >= FRESH_RECEIPT_COUNT_MAXIMUM
             || self.retained_receipts.contains_key(&name)
             || !file.matches_path(&path)?
         {
@@ -4695,7 +4910,7 @@ impl FreshRecoveredNodeWalV2Session {
     ) -> Result<sync_extend_core_model::SnapshotId> {
         self.verify()?;
         if self.metadata_count != 0
-            || self.history_count >= 128
+            || self.history_count >= FRESH_OPERATION_MAXIMUM
             || self
                 .retained_receipt_bytes
                 .checked_add(256 * 1024)
@@ -4803,7 +5018,7 @@ impl FreshRecoveredNodeWalV2Session {
             || self.closed
             || self.next != 2
             || self.metadata_count != 0
-            || self.history_count >= 128
+            || self.history_count >= FRESH_OPERATION_MAXIMUM
         {
             return Err(ReconcileError::ResourceLimit(
                 "recovered file session attempt bound",
@@ -4899,30 +5114,7 @@ impl FreshRecoveredNodeWalV2Session {
         // Existing CAS chunks were acquired with the complete manifest and
         // remain read-held; no new CAS object or namespace is inferred here.
         for chunk in &content.chunks {
-            let id = chunk.content_id.as_str();
-            let file = self
-                .read
-                .read
-                .files
-                .iter()
-                .find(|f| {
-                    f.path
-                        == self
-                            .read
-                            .read
-                            .data
-                            .join("cas/objects")
-                            .join(&id[..2])
-                            .join(id)
-                })
-                .ok_or(ReconcileError::Invariant(
-                    "recovered file original CAS object absent",
-                ))?;
-            if file.digest != chunk.content_id || file.bytes != u64::from(chunk.length) {
-                return Err(ReconcileError::Invariant(
-                    "recovered file CAS chunk differs",
-                ));
-            }
+            let file = self.held_recovered_cas_chunk(&chunk.content_id, u64::from(chunk.length))?;
         }
         let external = self
             .path
@@ -5159,7 +5351,7 @@ impl FreshRecoveredNodeWalV2Session {
             || self.closed
             || self.next != 2
             || self.metadata_count != 0
-            || self.history_count >= 128
+            || self.history_count >= FRESH_OPERATION_MAXIMUM
             || self
                 .retained_receipt_bytes
                 .checked_add(3 * 256 * 1024)
@@ -5284,7 +5476,7 @@ impl FreshRecoveredNodeWalV2Session {
             || self.closed
             || self.next != 2
             || self.metadata_count != 0
-            || self.history_count >= 128
+            || self.history_count >= FRESH_OPERATION_MAXIMUM
             || bytes.len() > 8 * 1024 * 1024
             || self
                 .new_content_bytes
@@ -5356,7 +5548,7 @@ impl FreshRecoveredNodeWalV2Session {
             || self
                 .new_cas_objects
                 .checked_add(missing_objects)
-                .is_none_or(|n| n > 128 * 128)
+                .is_none_or(|n| n > FRESH_CAS_OBJECT_MAXIMUM)
         {
             return Err(ReconcileError::ResourceLimit(
                 "recovered CAS aggregate physical preeffect budget",
@@ -5568,7 +5760,7 @@ impl FreshRecoveredNodeWalV2Session {
             || self.closed
             || self.next != 2
             || self.metadata_count != 0
-            || self.history_count >= 128
+            || self.history_count >= FRESH_OPERATION_MAXIMUM
             || self.retained_mutations.len() >= 128
             || content.length > 8 * 1024 * 1024
             || content.chunks.len() > 128
@@ -5688,7 +5880,7 @@ impl FreshRecoveredNodeWalV2Session {
         let metadata = self.verified_metadata_close_evidence()?;
         if self.closed
             || (self.history_count == 0 && metadata.is_none())
-            || self.history_count >= 128
+            || self.history_count >= FRESH_OPERATION_MAXIMUM
         {
             return Err(ReconcileError::Invariant(
                 "explicit live recovered history required",
@@ -5935,7 +6127,7 @@ impl super::VerifiedNodeStateArchive {
                 || first.archive != *self.digest()
                 || first.wal2_frames.is_some()
                 || (first.history_count == 0 && first.metadata.is_none())
-                || first.history_count >= 128
+                || first.history_count >= FRESH_OPERATION_MAXIMUM
                 || terminal.index != 1
                 || terminal.phase != "closed"
                 || terminal.wal2_frames.as_ref() != Some(&ContentId::hash(wal2_frames))
@@ -6236,7 +6428,7 @@ impl FreshRecoveredNodeWalV2Session {
             .collect::<Result<Vec<_>>>()?;
         receipts.sort_by(|a, b| a.name.cmp(&b.name));
         if receipts.is_empty()
-            || receipts.len() > 384
+            || receipts.len() > FRESH_RECEIPT_COUNT_MAXIMUM
             || receipts
                 .iter()
                 .try_fold(0u64, |sum, item| {
@@ -6516,7 +6708,7 @@ impl super::VerifiedNodeStateArchive {
         if record.baseline.name != format!("node-history-baseline-{}.image", record.session)
             || close.name != format!("node-recovered-history-close-{}.frames", record.session)
             || wal.name != format!("node-recovered-wal-{}.frames", record.session)
-            || record.receipts.len() > 384
+            || record.receipts.len() > FRESH_RECEIPT_COUNT_MAXIMUM
         {
             return Err(ReconcileError::Invariant("history exact object slots"));
         }
@@ -6612,7 +6804,7 @@ impl super::VerifiedNodeStateArchive {
         let owner_name = format!("node-recovered-wal-{}.owner", record.session);
         names.insert(owner_name.clone());
         let owner = held.reacquire_existing_node_read_file(&owner_name)?;
-        let owner_bytes = owner.exact_bytes(65536)?;
+        let owner_bytes = owner.exact_bytes(ORIGINAL_WRITE_OWNER_MAXIMUM)?;
         if owner_bytes != serde_json::to_vec(&(2u32, self.digest(), &record.session))? {
             return Err(ReconcileError::Invariant("history exact recovered owner"));
         }
@@ -6733,6 +6925,7 @@ impl super::VerifiedNodeStateArchive {
             ledger_bounds,
             true,
             Some(&admission),
+            None,
         )?;
         if read
             .read
@@ -6893,6 +7086,7 @@ impl super::VerifiedNodeStateArchive {
         let native_keys = native.all_native_keys()?.map(|key| key.to_string());
         let before_rows = read.read.rows.clone();
         let mut result = FreshRecoveredNodeWalV2Session {
+            separated_deployment_configs: None,
             created_work_directories: std::collections::BTreeMap::new(),
             read,
             native,
@@ -7124,7 +7318,7 @@ impl FreshRecoveredNodeWalV2Session {
             || self.closed
             || self.next != 2
             || self.metadata_count != 0
-            || self.history_count >= 128
+            || self.history_count >= FRESH_OPERATION_MAXIMUM
             || self.retained_mutations.len() >= 128
             || self
                 .retained_receipt_bytes
@@ -7522,7 +7716,7 @@ impl FreshRecoveredNodeWalV2Session {
         let metadata = self.verified_metadata_close_evidence()?;
         if self.closed
             || (self.history_count == 0 && metadata.is_none())
-            || self.history_count >= 128
+            || self.history_count >= FRESH_OPERATION_MAXIMUM
         {
             return Err(ReconcileError::Invariant(
                 "explicit live recovered history required",
@@ -7777,7 +7971,7 @@ impl super::VerifiedNodeStateArchive {
                 || first.archive != *self.digest()
                 || first.wal2_frames.is_some()
                 || (first.history_count == 0 && first.metadata.is_none())
-                || first.history_count >= 128
+                || first.history_count >= FRESH_OPERATION_MAXIMUM
                 || terminal.index != 1
                 || terminal.phase != "closed"
                 || terminal.wal2_frames.as_ref() != Some(&ContentId::hash(wal2_frames))
@@ -8094,7 +8288,7 @@ impl FreshRecoveredNodeWalV2Session {
                 "history restart explicit live baseline",
             ));
         }
-        if self.history_chain_depth >= 64 {
+        if self.history_chain_depth >= FRESH_HISTORY_GENERATION_MAXIMUM as u32 {
             return Err(ReconcileError::ResourceLimit(
                 "history chain generation preeffect bound",
             ));
@@ -8110,8 +8304,9 @@ impl FreshRecoveredNodeWalV2Session {
             })?;
         if held_bytes
             .checked_add(66 * 1024 * 1024)
-            .is_none_or(|n| n > 256 * 1024 * 1024)
-            || self.retained_history_evidence.len() + self.retained_receipts.len() + 4 > 4096
+            .is_none_or(|n| n > FRESH_HELD_HISTORY_AGGREGATE_MAXIMUM)
+            || self.retained_history_evidence.len() + self.retained_receipts.len() + 4
+                > FRESH_HELD_HISTORY_OBJECT_MAXIMUM
         {
             return Err(ReconcileError::ResourceLimit(
                 "history chain close preeffect aggregate bound",
@@ -8153,7 +8348,7 @@ impl FreshRecoveredNodeWalV2Session {
             .collect::<Result<Vec<_>>>()?;
         receipts.sort_by(|a, b| a.name.cmp(&b.name));
         if receipts.is_empty()
-            || receipts.len() > 384
+            || receipts.len() > FRESH_RECEIPT_COUNT_MAXIMUM
             || receipts
                 .iter()
                 .try_fold(0u64, |sum, item| {
@@ -8470,7 +8665,7 @@ impl super::VerifiedNodeStateArchive {
             || record.baseline.name != format!("node-history-baseline-{}.image", record.session)
             || record.predecessor.is_some() != record.epoch.is_some()
             || record.receipts.is_empty()
-            || record.receipts.len() > 384
+            || record.receipts.len() > FRESH_RECEIPT_COUNT_MAXIMUM
         {
             return Err(ReconcileError::Invariant(
                 "history chain exact generation binding",
@@ -8841,6 +9036,7 @@ impl super::VerifiedNodeStateArchive {
             ledger_bounds,
             false,
             None,
+            None,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -8864,8 +9060,39 @@ impl super::VerifiedNodeStateArchive {
             ledger_bounds,
             true,
             None,
+            None,
         )
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reacquire_closed_history_chain8_with_mutation_for_deployment(
+        &self,
+        worktree: &std::path::Path,
+        data: &std::path::Path,
+        original_frames: &std::path::Path,
+        restore_ledger: &std::path::Path,
+        chain_frames: &std::path::Path,
+        bounds: sync_extend_journal::NodeInspectionBounds,
+        ledger_bounds: super::LedgerBounds,
+        configs: crate::SeparatedDeploymentNodeConfigs,
+    ) -> Result<FreshRecoveredNodeWalV2Session> {
+        configs.verify_for_archive(self, worktree, data)?;
+        let mut session = self.reacquire_closed_history_chain8_internal(
+            worktree,
+            data,
+            original_frames,
+            restore_ledger,
+            chain_frames,
+            bounds,
+            ledger_bounds,
+            true,
+            None,
+            Some(&configs),
+        )?;
+        session.separated_deployment_configs = Some(configs);
+        Ok(session)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn reacquire_closed_history_chain8_internal(
         &self,
@@ -8878,6 +9105,7 @@ impl super::VerifiedNodeStateArchive {
         ledger_bounds: super::LedgerBounds,
         mutation_requested: bool,
         operation_preflight: Option<RecoveredHistoryOperation<'_>>,
+        separated_configs: Option<&crate::SeparatedDeploymentNodeConfigs>,
     ) -> Result<FreshRecoveredNodeWalV2Session> {
         let parent = original_frames
             .parent()
@@ -8914,7 +9142,7 @@ impl super::VerifiedNodeStateArchive {
         let mut owner_evidence = Vec::new();
         let mut owner_locks = Vec::new();
         loop {
-            if generations.len() >= 64 {
+            if generations.len() >= FRESH_HISTORY_GENERATION_MAXIMUM {
                 return Err(ReconcileError::ResourceLimit(
                     "history chain maximum generations",
                 ));
@@ -8938,7 +9166,7 @@ impl super::VerifiedNodeStateArchive {
             }
             let owner_name = format!("node-recovered-wal-{}.owner", record.session);
             let owner = held.reacquire_existing_node_read_file(&owner_name)?;
-            let owner_bytes = owner.exact_bytes(65536)?;
+            let owner_bytes = owner.exact_bytes(ORIGINAL_WRITE_OWNER_MAXIMUM)?;
             let owner_object = HistoryRestartObject {
                 name: owner_name.clone(),
                 key: owner.key()?.to_string(),
@@ -9198,6 +9426,7 @@ impl super::VerifiedNodeStateArchive {
             ledger_bounds,
             true,
             Some(&admission),
+            separated_configs,
         )?;
         if read
             .read
@@ -9268,7 +9497,7 @@ impl super::VerifiedNodeStateArchive {
                 "history native aggregate before effects",
             ));
         }
-        if generations.len() >= 64
+        if generations.len() >= FRESH_HISTORY_GENERATION_MAXIMUM
             || retained.len() + read.external.len() + 4 > 4096
             || aggregate
                 .checked_add(256 * 1024)
@@ -9388,6 +9617,7 @@ impl super::VerifiedNodeStateArchive {
         let native_keys = native.all_native_keys()?.map(|key| key.to_string());
         let before_rows = read.read.rows.clone();
         let mut result = FreshRecoveredNodeWalV2Session {
+            separated_deployment_configs: None,
             created_work_directories: std::collections::BTreeMap::new(),
             read,
             native,
@@ -9512,6 +9742,199 @@ impl FreshRecoveredNodeWalV2Session {
         self.verify()?;
         Ok(snapshots)
     }
+
+    fn held_recovered_cas_chunk(
+        &self,
+        content: &ContentId,
+        length: u64,
+    ) -> Result<&ReacquiredFile> {
+        let id = content.as_str();
+        let path = self
+            .read
+            .read
+            .data
+            .join("cas/objects")
+            .join(&id[..2])
+            .join(id);
+        let file = self
+            .read
+            .read
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .ok_or(ReconcileError::Invariant(
+                "recovered file original CAS object absent",
+            ))?;
+        file.file.verify()?;
+        if file.digest != *content || file.bytes != length || !file.file.matches_path(&path)? {
+            return Err(ReconcileError::Invariant(
+                "recovered file CAS chunk differs",
+            ));
+        }
+        Ok(file)
+    }
+
+    pub(crate) fn recovered_local_file_bytes(
+        &self,
+        path: &sync_extend_core_model::PortablePath,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        self.deployment_runtime_binding()?.verify()?;
+        if max_bytes == 0 || max_bytes > 256 * 1024 * 1024 {
+            return Err(ReconcileError::ResourceLimit(
+                "fresh recovered file read bound",
+            ));
+        }
+        let manifest = self.recovered_local_manifest()?;
+        let content = manifest
+            .entries
+            .values()
+            .find(|entry| {
+                entry.path == *path && entry.kind == sync_extend_core_model::EntryKind::File
+            })
+            .and_then(|entry| entry.content.as_ref())
+            .ok_or(ReconcileError::Invariant(
+                "fresh recovered read manifest file absent",
+            ))?;
+        if content.length > max_bytes || content.chunks.len() > self.bounds.max_entries {
+            return Err(ReconcileError::ResourceLimit(
+                "fresh recovered read content liability",
+            ));
+        }
+        let capacity = usize::try_from(content.length)
+            .map_err(|_| ReconcileError::ResourceLimit("fresh recovered read addressable bytes"))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        for chunk in &content.chunks {
+            let file = self.held_recovered_cas_chunk(&chunk.content_id, u64::from(chunk.length))?;
+            let original = file.file.exact_bytes(file.bytes)?;
+            if original.len() as u64 != file.bytes
+                || ContentId::hash(&original) != chunk.content_id
+                || bytes
+                    .len()
+                    .checked_add(original.len())
+                    .is_none_or(|sum| sum > capacity)
+            {
+                return Err(ReconcileError::Invariant(
+                    "fresh recovered original CAS read differs",
+                ));
+            }
+            bytes.extend_from_slice(&original);
+        }
+        if bytes.len() != capacity || ContentId::hash(&bytes) != content.content_id {
+            return Err(ReconcileError::Invariant(
+                "fresh recovered assembled manifest content differs",
+            ));
+        }
+        self.deployment_runtime_binding()?.verify()?;
+        Ok(bytes)
+    }
+}
+
+/// Borrowed only from the actual committed fresh native session. These values
+/// cannot be supplied by a receipt or ordinary LocalSpace constructor.
+pub(crate) struct DeploymentFreshNodeBinding<'proof> {
+    original: &'proof FreshRecoveredNodeWalV2Session,
+}
+
+impl FreshRecoveredNodeWalV2Session {
+    pub(crate) fn deployment_runtime_binding(&self) -> Result<DeploymentFreshNodeBinding<'_>> {
+        let binding = DeploymentFreshNodeBinding { original: self };
+        binding.verify()?;
+        Ok(binding)
+    }
+
+    pub(crate) fn close_deployment_runtime(&mut self) -> Result<(bool, PathBuf)> {
+        self.deployment_runtime_binding()?.verify()?;
+        if self.history_count == 0 && self.metadata_count == 0 {
+            Ok((false, self.close_completed()?))
+        } else {
+            Ok((true, self.close_recovered_history_for_chain8()?))
+        }
+    }
+
+    pub(crate) fn close_failed_deployment_connection(&mut self) -> Result<()> {
+        // No clean completion, checkpoint or restart evidence is issued.
+        // The actual original object stays poisoned and its files stay held.
+        self.poisoned = true;
+        self.native.close_actual_connection_after_failure()?;
+        self.closed = true;
+        Ok(())
+    }
+}
+
+impl DeploymentFreshNodeBinding<'_> {
+    pub(crate) fn verify(&self) -> Result<()> {
+        let original = self.original;
+        original.verify()?;
+        if !original.committed || original.closed || original.poisoned || original.next != 2 {
+            return Err(ReconcileError::Invariant(
+                "deployment requires an actual live fresh recovered session",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn archive_digest(&self) -> &ContentId {
+        &self.original.archive
+    }
+    pub(crate) fn data_dir(&self) -> &std::path::Path {
+        &self.original.read.read.data
+    }
+    pub(crate) fn worktree(&self) -> &std::path::Path {
+        &self.original.read.read.worktree
+    }
+    pub(crate) fn space_id(&self) -> &SpaceId {
+        &self.original.space
+    }
+    pub(crate) fn fresh_session_id(&self) -> &SpaceId {
+        &self.original.fresh
+    }
+    pub(crate) fn device_id(&self) -> Result<sync_extend_core_model::DeviceId> {
+        self.verify()?;
+        let device = self.original.recovered_local_device_id()?;
+        self.verify()?;
+        Ok(device)
+    }
+    fn root_key(&self, path: &std::path::Path) -> Result<String> {
+        self.verify()?;
+        let root = self
+            .original
+            .read
+            .read
+            .directories
+            .iter()
+            .find(|directory| directory.path == path)
+            .ok_or(ReconcileError::Invariant(
+                "fresh recovered actual root descriptor absent",
+            ))?;
+        if root.file.key()? != root.key || !root.file.matches_path(path)? {
+            return Err(ReconcileError::Invariant(
+                "fresh recovered actual root changed",
+            ));
+        }
+        self.verify()?;
+        Ok(root.key.to_string())
+    }
+    pub(crate) fn data_key(&self) -> Result<String> {
+        self.root_key(self.data_dir())
+    }
+    pub(crate) fn worktree_key(&self) -> Result<String> {
+        self.root_key(self.worktree())
+    }
+    pub(crate) fn native_journal_keys(&self) -> Result<[String; 4]> {
+        self.verify()?;
+        let keys = self
+            .original
+            .native
+            .all_native_keys()?
+            .map(|key| key.to_string());
+        if keys != self.original.native_keys {
+            return Err(ReconcileError::Invariant(
+                "fresh recovered native Journal keys changed",
+            ));
+        }
+        Ok(keys)
+    }
 }
 
 impl super::VerifiedNodeStateArchive {
@@ -9558,7 +9981,7 @@ impl FreshRecoveredNodeWalV2Session {
             || self.closed
             || self.next != 2
             || self.metadata_count != 0
-            || self.history_count >= 128
+            || self.history_count >= FRESH_OPERATION_MAXIMUM
             || self
                 .retained_receipt_bytes
                 .checked_add(3 * 256 * 1024)
@@ -9730,7 +10153,7 @@ impl FreshRecoveredNodeWalV2Session {
         timestamp: u64,
     ) -> Result<sync_extend_core_model::SnapshotId> {
         let (target, parent, name) = self.preflight_recovered_namespace_path(path, true)?;
-        if self.created_work_directories.len() >= 128 {
+        if self.created_work_directories.len() >= FRESH_WORK_DIRECTORY_MAXIMUM {
             return Err(ReconcileError::ResourceLimit(
                 "recovered created directory capacity",
             ));
@@ -10027,7 +10450,7 @@ impl FreshRecoveredNodeWalV2Session {
             || self.closed
             || self.next != 2
             || self.metadata_count != 0
-            || self.history_count >= 128
+            || self.history_count >= FRESH_OPERATION_MAXIMUM
             || self
                 .retained_receipt_bytes
                 .checked_add(3 * 256 * 1024)

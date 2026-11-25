@@ -1,22 +1,21 @@
 //! Immutable TREE future component admission, not complete global capacity.
 use crate::{
-    check_storage_metadata_limit, sql_integer,
+    Journal, JournalStorageInventory, MAX_OPERATION_BYTES, Result, TreeRestoreInventoryLimits,
+    TreeRestorePreparation, check_storage_metadata_limit, sql_integer,
     storage_inventory::reader::{add, hash, invalid},
-    Journal, JournalStorageInventory, Result, TreeRestoreInventoryLimits, TreeRestorePreparation,
-    MAX_OPERATION_BYTES,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use sync_extend_core_model::{
+    ContentId, EntryId, SpaceId,
     tree_native_action_layout::TreeNativeActionScope,
     tree_native_future_obligations::{
-        plan_tree_native_future_obligations_with_observation, TreeNativeFutureGenerations,
-        TreeNativeFutureLimits,
+        TreeNativeFutureGenerations, TreeNativeFutureLimits,
+        plan_tree_native_future_obligations_with_observation,
     },
     tree_restore_history::encode_history_record,
     tree_storage_capacity::{TreeStorageCharge, TreeStorageMetadataObligation},
-    ContentId, EntryId, SpaceId,
 };
 
 mod generations;

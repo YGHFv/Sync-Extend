@@ -33,9 +33,10 @@ pub use protected_artifact::{
 #[path = "owned_file.rs"]
 mod owned_file;
 pub use owned_file::{
-    FreshExclusiveSqliteFile, OriginalFileCreation, OwnedFileCreation, PublishedOriginalFile,
-    ReacquiredNodeFile, ReacquiredNodeLock, ReleasedOriginalCoordinationFile,
-    ReleasedOriginalFileIdentity, ReleasedOriginalReadFile, SealedOriginalFile,
+    FreshExclusiveSqliteFile, OriginalFileCreation, OriginalFileSealFailure, OwnedFileCreation,
+    PublishedOriginalFile, ReacquiredNodeFile, ReacquiredNodeLock,
+    ReleasedOriginalCoordinationFile, ReleasedOriginalFileIdentity, ReleasedOriginalReadFile,
+    SealedOriginalFile,
 };
 
 fn key(file: &File) -> io::Result<FileKey> {
@@ -62,11 +63,26 @@ fn key(file: &File) -> io::Result<FileKey> {
 /// witness must stay live while an incompatible exclusive HANDLE is closed.
 /// The fixed choices grant no namespace CREATE or recovered mutation rights.
 fn reopen_same_file_object(source: &File, expected: FileKey, read: bool) -> io::Result<File> {
+    reopen_same_file_object_retaining(source, expected, read)
+        .map_err(crate::WindowsOriginalResourceOpenFailure::retain_and_report)
+}
+
+fn reopen_same_file_object_retaining(
+    source: &File,
+    expected: FileKey,
+    read: bool,
+) -> Result<File, crate::WindowsOriginalResourceOpenFailure> {
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::{Foundation::INVALID_HANDLE_VALUE, Storage::FileSystem::ReOpenFile};
-    regular(source, false)?;
-    if key(source)? != expected {
-        return Err(invalid("same-object handoff source identity differs"));
+    let before = |error| crate::WindowsOriginalResourceOpenFailure {
+        error,
+        original_resources: None,
+    };
+    regular(source, false).map_err(before)?;
+    if key(source).map_err(before)? != expected {
+        return Err(before(invalid(
+            "same-object handoff source identity differs",
+        )));
     }
     // SAFETY: source owns the original live object. Fixed read/identity access
     // and sharing flags create another handle to it without pathname resolution.
@@ -83,13 +99,24 @@ fn reopen_same_file_object(source: &File, expected: FileKey, read: bool) -> io::
         )
     };
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
+        return Err(before(io::Error::last_os_error()));
     }
     // SAFETY: successful ReOpenFile returned one newly owned HANDLE.
     let reopened = unsafe { File::from_raw_handle(handle) };
-    regular(&reopened, false)?;
-    if key(&reopened)? != expected {
-        return Err(invalid("same-object handoff retained identity differs"));
+    let checked = (|| -> io::Result<()> {
+        regular(&reopened, false)?;
+        if key(&reopened)? != expected {
+            return Err(invalid("same-object handoff retained identity differs"));
+        }
+        Ok(())
+    })();
+    if let Err(error) = checked {
+        let mut terminal = crate::WindowsOriginalCloseAttempt::new();
+        terminal.close_file(reopened);
+        return Err(crate::WindowsOriginalResourceOpenFailure {
+            error,
+            original_resources: terminal.finish().err(),
+        });
     }
     Ok(reopened)
 }
@@ -208,14 +235,49 @@ pub struct LockedDirectory {
 }
 
 impl LockedDirectory {
+    /// Consume only this original held directory HANDLE. Failed CloseHandle
+    /// returns the same original directory; no replacement scope is issued.
+    pub fn close_original(self) -> Result<(), (Self, io::Error)> {
+        match crate::original_resource_close::close_owned_original_file(self.file) {
+            Ok(()) => Ok(()),
+            Err((file, error)) => Err((Self { file }, error)),
+        }
+    }
+
+    pub(crate) fn into_terminal_original_file(self) -> File {
+        self.file
+    }
+
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_retaining(path).map_err(
+            crate::original_resource_close::WindowsOriginalResourceOpenFailure::retain_and_report,
+        )
+    }
+
+    pub fn open_retaining(
+        path: &Path,
+    ) -> Result<Self, crate::original_resource_close::WindowsOriginalResourceOpenFailure> {
+        let before = |error| crate::original_resource_close::WindowsOriginalResourceOpenFailure {
+            error,
+            original_resources: None,
+        };
         let file = OpenOptions::new()
             // Metadata-only opens do not enforce Windows sharing exclusion.
             .access_mode(GENERIC_READ)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
-        regular(&file, true)?;
+            .open(path)
+            .map_err(before)?;
+        if let Err(error) = regular(&file, true) {
+            let mut close = crate::WindowsOriginalCloseAttempt::new();
+            close.close_file(file);
+            return Err(
+                crate::original_resource_close::WindowsOriginalResourceOpenFailure {
+                    error,
+                    original_resources: close.finish().err(),
+                },
+            );
+        }
         Ok(Self { file })
     }
 
@@ -259,6 +321,15 @@ pub struct LockedDirectoryMutation {
 }
 
 impl LockedDirectoryMutation {
+    /// End the actual directory HANDLE and, when present, its original CREATE
+    /// lineage parent. Independent closes continue after the first failure.
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        attempt.close_file(self.file);
+        if let Some(lineage) = self.original_creation {
+            lineage.close_into_attempt(attempt);
+        }
+    }
+
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
             .access_mode(GENERIC_READ | DELETE)
@@ -348,14 +419,48 @@ pub struct GuardedReadFile {
 }
 
 impl GuardedReadFile {
+    /// Resource-only ending of this actual read HANDLE. It cannot mint any
+    /// original reader, creator, target owner, permission or resumed scope.
+    pub fn close_original(self) -> Result<(), (Self, io::Error)> {
+        match crate::original_resource_close::close_owned_original_file(self.file) {
+            Ok(()) => Ok(()),
+            Err((file, error)) => Err((Self { file }, error)),
+        }
+    }
+
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        attempt.close_file(self.file);
+    }
+
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_retaining(path).map_err(
+            crate::original_resource_close::WindowsOriginalResourceOpenFailure::retain_and_report,
+        )
+    }
+
+    pub fn open_retaining(
+        path: &Path,
+    ) -> Result<Self, crate::original_resource_close::WindowsOriginalResourceOpenFailure> {
+        let before = |error| crate::original_resource_close::WindowsOriginalResourceOpenFailure {
+            error,
+            original_resources: None,
+        };
         let file = OpenOptions::new()
             .access_mode(GENERIC_READ)
             .share_mode(FILE_SHARE_READ)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
-        regular(&file, false)?;
-        local_ntfs(&file, path)?;
+            .open(path)
+            .map_err(before)?;
+        if let Err(error) = regular(&file, false).and_then(|_| local_ntfs(&file, path)) {
+            let mut close = crate::WindowsOriginalCloseAttempt::new();
+            close.close_file(file);
+            return Err(
+                crate::original_resource_close::WindowsOriginalResourceOpenFailure {
+                    error,
+                    original_resources: close.finish().err(),
+                },
+            );
+        }
         Ok(Self { file })
     }
 
@@ -495,16 +600,48 @@ pub struct RetainedWriterDirectory {
     pub(crate) key: FileKey,
 }
 
+impl RetainedWriterDirectory {
+    /// End the exact original observer HANDLE without a pathname operation.
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        attempt.close_directory(self.directory);
+    }
+}
+
 fn retain_writer_directory(file: &File, path: &Path) -> io::Result<RetainedWriterDirectory> {
+    retain_writer_directory_retaining(file, path)
+        .map_err(crate::WindowsOriginalResourceOpenFailure::retain_and_report)
+}
+
+fn retain_writer_directory_retaining(
+    file: &File,
+    path: &Path,
+) -> Result<RetainedWriterDirectory, crate::WindowsOriginalResourceOpenFailure> {
+    let mut terminal = crate::WindowsOriginalCloseAttempt::new();
+    retain_writer_directory_into_attempt(file, path, &mut terminal).map_err(|error| {
+        crate::WindowsOriginalResourceOpenFailure {
+            error,
+            original_resources: terminal.finish().err(),
+        }
+    })
+}
+
+fn retain_writer_directory_into_attempt(
+    file: &File,
+    path: &Path,
+    terminal: &mut crate::WindowsOriginalCloseAttempt,
+) -> io::Result<RetainedWriterDirectory> {
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::{Foundation::DuplicateHandle, System::Threading::GetCurrentProcess};
-    if !path.is_absolute() || !directory_matches_path(file, path)? {
-        return Err(invalid("original writer directory slot differs"));
-    }
-    regular(file, true)?;
-    require_case_insensitive(file)?;
-    local_ntfs(file, path)?;
-    let original_key = key(file)?;
+    let checked = (|| -> io::Result<FileKey> {
+        if !path.is_absolute() || !directory_matches_path(file, path)? {
+            return Err(invalid("original writer directory slot differs"));
+        }
+        regular(file, true)?;
+        require_case_insensitive(file)?;
+        local_ntfs(file, path)?;
+        key(file)
+    })();
+    let original_key = checked?;
     let mut handle: HANDLE = ptr::null_mut();
     // SAFETY: file is a live retained directory. The output receives one owned,
     // noninherited READ-only duplicate; WRITE and DELETE are not requested.
@@ -525,9 +662,16 @@ fn retain_writer_directory(file: &File, path: &Path) -> io::Result<RetainedWrite
     }
     // SAFETY: successful DuplicateHandle returned one new handle owned here.
     let observed = unsafe { File::from_raw_handle(handle) };
-    regular(&observed, true)?;
-    if key(&observed)? != original_key || !directory_matches_path(&observed, path)? {
-        return Err(invalid("retained writer directory object differs"));
+    let checked = (|| -> io::Result<()> {
+        regular(&observed, true)?;
+        if key(&observed)? != original_key || !directory_matches_path(&observed, path)? {
+            return Err(invalid("retained writer directory object differs"));
+        }
+        Ok(())
+    })();
+    if let Err(error) = checked {
+        terminal.close_file(observed);
+        return Err(error);
     }
     Ok(RetainedWriterDirectory {
         directory: LockedDirectory { file: observed },
@@ -540,6 +684,23 @@ impl LockedDirectory {
     /// Duplicate an existing directory guard; no pathname opens grant rights.
     pub fn retain_writer_directory(&self, path: &Path) -> io::Result<RetainedWriterDirectory> {
         retain_writer_directory(&self.file, path)
+    }
+
+    pub fn retain_writer_directory_retaining(
+        &self,
+        path: &Path,
+    ) -> Result<RetainedWriterDirectory, crate::WindowsOriginalResourceOpenFailure> {
+        retain_writer_directory_retaining(&self.file, path)
+    }
+
+    /// The caller's existing aggregate preserves both successful native closes
+    /// and the exact refused HANDLE from a failed observer preparation.
+    pub fn retain_writer_directory_into_attempt(
+        &self,
+        path: &Path,
+        terminal: &mut crate::WindowsOriginalCloseAttempt,
+    ) -> io::Result<RetainedWriterDirectory> {
+        retain_writer_directory_into_attempt(&self.file, path, terminal)
     }
 }
 
@@ -558,8 +719,10 @@ pub use owned_file::{
 #[path = "sqlite_original.rs"]
 mod sqlite_original;
 pub use sqlite_original::{
-    OriginalSqliteConnection, OriginalSqliteOpenFailure, OriginalSqliteQuery,
-    OriginalSqliteReadBudget, OriginalSqliteRows, OriginalSqliteStatement, OriginalSqliteValue,
+    OriginalReadonlySqliteCloseFailure, OriginalReadonlySqliteConnection,
+    OriginalReadonlySqliteOpenFailure, OriginalSqliteConnection, OriginalSqliteOpenFailure,
+    OriginalSqliteQuery, OriginalSqliteReadBudget, OriginalSqliteResourceCloseFailure,
+    OriginalSqliteRows, OriginalSqliteStatement, OriginalSqliteValue,
 };
 
 #[path = "current_user_file.rs"]
@@ -572,7 +735,10 @@ pub use fresh_native_sqlite::FreshNativeSqliteConnection;
 
 #[path = "fresh_native_wal.rs"]
 mod fresh_native_wal;
-pub use fresh_native_wal::{FreshNativeRetentionLease, FreshNativeWalConnection};
+pub use fresh_native_wal::{
+    FreshNativeRetentionLease, FreshNativeWalCloseFailure, FreshNativeWalConnection,
+    FreshNativeWalOpenFailure, FRESH_NATIVE_WAL_SHM_CAPACITY,
+};
 
 pub use owned_file::FreshRecoveredMutationFile;
 

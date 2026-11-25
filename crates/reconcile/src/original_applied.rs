@@ -164,4 +164,5 @@ impl LocalSpace {
             .map_err(|_| ReconcileError::Invariant("forwarded applied target post-sign verify"))?;
         Ok(receipt)
     }
+
 }

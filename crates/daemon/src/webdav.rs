@@ -23,16 +23,22 @@ use sync_extend_core_model::{
     deployment::{DeploymentGatewayConfig, DeploymentPlatform, LoopbackTlsConfig},
     limits::LocalLimits,
     webdav::{self, AuthorizedWebDavPath, WebDavListener},
-    Entry, EntryKind, PortablePath, SpaceId,
+    Entry, EntryKind, Manifest, PortablePath, SpaceId,
 };
 use sync_extend_reconcile::{LocalSpace, ReconcileError, WebDavBaseline, WebDavCommit};
 
 mod diagnostics;
 mod host_tls;
 mod polling;
+#[cfg(windows)]
+mod recovered;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use diagnostics::GatewayProbe;
 pub use diagnostics::{check, test_connection};
+#[cfg(windows)]
+pub(crate) use recovered::{
+    ActiveRecoveredGateway, PreparedRecoveredGateway, RecoveredGatewayCloseFailure,
+};
 
 #[cfg(windows)]
 #[path = "webdav_collections.rs"]
@@ -132,6 +138,17 @@ pub(crate) fn parse_original_bytes(bytes: &[u8]) -> Result<Runtime, Box<dyn std:
             DeploymentPlatform::Linux
         },
     )?;
+    from_deployment_document(document)
+}
+
+fn from_deployment_document(
+    document: DeploymentGatewayConfig,
+) -> Result<Runtime, Box<dyn std::error::Error>> {
+    document.validate(if cfg!(windows) {
+        DeploymentPlatform::Windows
+    } else {
+        DeploymentPlatform::Linux
+    })?;
     let runtime = Runtime {
         listener: document.listener,
         credentials: document.credentials,
@@ -292,20 +309,56 @@ struct Gateway {
     credentials: Arc<Credentials>,
 }
 
+struct GatewayBindFailure {
+    error: Box<dyn std::error::Error>,
+    original_gateway: Option<Gateway>,
+}
+
 impl Gateway {
-    fn bind(runtime: &Runtime) -> Result<Self, Box<dyn std::error::Error>> {
+    fn prepare_credentials(
+        runtime: &Runtime,
+    ) -> Result<Arc<Credentials>, Box<dyn std::error::Error>> {
         private_upload_parent(&runtime.uploads)?;
-        let credentials = Arc::new(Credentials::load(&runtime.credentials, &runtime.listener)?);
+        Ok(Arc::new(Credentials::load(
+            &runtime.credentials,
+            &runtime.listener,
+        )?))
+    }
+
+    fn bind(runtime: &Runtime) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::bind_prepared(runtime, Self::prepare_credentials(runtime)?)
+    }
+
+    fn bind_prepared(
+        runtime: &Runtime,
+        credentials: Arc<Credentials>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::bind_retaining(runtime, credentials).map_err(|failure| failure.error)
+    }
+
+    fn bind_retaining(
+        runtime: &Runtime,
+        credentials: Arc<Credentials>,
+    ) -> Result<Self, GatewayBindFailure> {
         let bind = runtime
             .host_loopback_tls
             .as_ref()
             .map_or(runtime.listener.address, |policy| policy.bind.into());
-        let listener = Arc::new(TcpListener::bind(bind)?);
-        listener.set_nonblocking(true)?;
-        Ok(Self {
-            listener,
+        let listener = TcpListener::bind(bind).map_err(|error| GatewayBindFailure {
+            error: error.into(),
+            original_gateway: None,
+        })?;
+        let gateway = Self {
+            listener: Arc::new(listener),
             credentials,
-        })
+        };
+        if let Err(error) = gateway.listener.set_nonblocking(true) {
+            return Err(GatewayBindFailure {
+                error: error.into(),
+                original_gateway: Some(gateway),
+            });
+        }
+        Ok(gateway)
     }
 }
 
@@ -319,6 +372,38 @@ fn handle_connection(
     peer: SocketAddr,
     tls: Option<&Arc<rustls::ServerConfig>>,
     #[cfg(target_os = "linux")] linux_owner: Option<&super::linux_namespace::LinuxDaemonOwner>,
+) -> std::io::Result<()> {
+    with_authenticated_connection(
+        runtime,
+        credentials,
+        stream,
+        peer,
+        tls,
+        |account, request, connection| {
+            dispatch(
+                runtime,
+                limits,
+                locks,
+                account,
+                request,
+                connection,
+                polling,
+                #[cfg(target_os = "linux")]
+                linux_owner,
+            )
+        },
+    )
+}
+
+/// Both ordinary and recovered owners use the same peer/TLS/framing/auth/Host
+/// checks and refusal response; the callback selects the actual node owner.
+fn with_authenticated_connection(
+    runtime: &Runtime,
+    credentials: &Credentials,
+    stream: std::net::TcpStream,
+    peer: SocketAddr,
+    tls: Option<&Arc<rustls::ServerConfig>>,
+    dispatch: impl FnOnce(&str, &Request, &mut Connection) -> Result<(), u16>,
 ) -> std::io::Result<()> {
     if !runtime.host_loopback_tls.as_ref().map_or_else(
         || peer.ip().is_loopback(),
@@ -334,10 +419,19 @@ fn handle_connection(
         // Reject a failed TLS handshake without taking down the listener.
         return Ok(());
     };
-    let request = match Request::read(&mut connection, runtime.listener.max_header_bytes) {
+    authenticated_connection_protocol(runtime, credentials, &mut connection, dispatch)
+}
+
+fn authenticated_connection_protocol(
+    runtime: &Runtime,
+    credentials: &Credentials,
+    connection: &mut Connection,
+    dispatch: impl FnOnce(&str, &Request, &mut Connection) -> Result<(), u16>,
+) -> std::io::Result<()> {
+    let request = match Request::read(connection, runtime.listener.max_header_bytes) {
         Ok(request) => request,
         Err(_) => {
-            let _ = http::response(&mut connection, 400, b"invalid request", &[], false);
+            let _ = http::response(connection, 400, b"invalid request", &[], false);
             return Ok(());
         }
     };
@@ -346,7 +440,7 @@ fn handle_connection(
         .and_then(|header| credentials.authenticate(header))
     else {
         let _ = http::response(
-            &mut connection,
+            connection,
             401,
             b"authentication required",
             &[(
@@ -361,29 +455,13 @@ fn handle_connection(
         return Ok(());
     };
     if request.header("host") != Some(runtime.listener.address.to_string().as_str()) {
-        let _ = http::response(
-            &mut connection,
-            400,
-            b"listener authority differs",
-            &[],
-            false,
-        );
+        let _ = http::response(connection, 400, b"listener authority differs", &[], false);
         return Ok(());
     }
-    if let Err(status) = dispatch(
-        runtime,
-        limits,
-        locks,
-        account,
-        &request,
-        &mut connection,
-        polling,
-        #[cfg(target_os = "linux")]
-        linux_owner,
-    ) {
+    if let Err(status) = dispatch(account, &request, connection) {
         if !connection.response_started {
             let _ = http::response(
-                &mut connection,
+                connection,
                 status,
                 b"request refused; recheck resource state",
                 &[],
@@ -392,6 +470,87 @@ fn handle_connection(
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+struct OriginalAuthenticatedConnectionFailure {
+    error: std::io::Error,
+    close_error: Option<std::io::Error>,
+    original_stream: Option<std::net::TcpStream>,
+}
+
+#[cfg(windows)]
+fn copy_original_io_error(error: &std::io::Error) -> std::io::Error {
+    match error.raw_os_error() {
+        Some(code) => std::io::Error::from_raw_os_error(code),
+        None => std::io::Error::new(error.kind(), error.to_string()),
+    }
+}
+
+#[cfg(windows)]
+fn close_authenticated_original_stream(
+    original: std::net::TcpStream,
+    first_error: Option<std::io::Error>,
+) -> Result<(), OriginalAuthenticatedConnectionFailure> {
+    match sync_extend_platform_fs::close_original_tcp_stream(original) {
+        Ok(_) => first_error.map_or(Ok(()), |error| {
+            Err(OriginalAuthenticatedConnectionFailure {
+                error,
+                close_error: None,
+                original_stream: None,
+            })
+        }),
+        Err((original, error)) => Err(OriginalAuthenticatedConnectionFailure {
+            error: first_error.unwrap_or_else(|| copy_original_io_error(&error)),
+            close_error: Some(error),
+            original_stream: Some(original),
+        }),
+    }
+}
+
+#[cfg(windows)]
+fn with_authenticated_connection_retaining(
+    runtime: &Runtime,
+    credentials: &Credentials,
+    stream: std::net::TcpStream,
+    peer: SocketAddr,
+    tls: Option<&Arc<rustls::ServerConfig>>,
+    dispatch: impl FnOnce(&str, &Request, &mut Connection) -> Result<(), u16>,
+) -> Result<(), OriginalAuthenticatedConnectionFailure> {
+    if !runtime.host_loopback_tls.as_ref().map_or_else(
+        || peer.ip().is_loopback(),
+        |policy| policy.permits(peer.ip()),
+    ) {
+        return close_authenticated_original_stream(stream, None);
+    }
+    if let Err(error) = stream.set_nonblocking(false) {
+        return close_authenticated_original_stream(stream, Some(error));
+    }
+    let mut connection =
+        match Connection::new_retaining(stream, runtime.listener.request_timeout_secs, tls) {
+            Ok(connection) => connection,
+            Err(failure) => {
+                // The original handshake refusal remains a per-request refusal.
+                // Its original socket still has to close before returning.
+                return close_authenticated_original_stream(failure.original_stream, None);
+            }
+        };
+    let first_error =
+        authenticated_connection_protocol(runtime, credentials, &mut connection, dispatch).err();
+    match connection.close_retaining() {
+        Ok(_) => first_error.map_or(Ok(()), |error| {
+            Err(OriginalAuthenticatedConnectionFailure {
+                error,
+                close_error: None,
+                original_stream: None,
+            })
+        }),
+        Err((original, error)) => Err(OriginalAuthenticatedConnectionFailure {
+            error: first_error.unwrap_or_else(|| copy_original_io_error(&error)),
+            close_error: Some(error),
+            original_stream: Some(original),
+        }),
+    }
 }
 
 fn private_upload_parent(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -526,41 +685,23 @@ fn dispatch(
     let baseline = local.capture_webdav_baseline().map_err(core_status)?;
     super::management::observe_local_space(local);
     let entry = find(&baseline, authorized.path.as_ref());
-    if authorized.export_root && authorized.path.is_some() && entry.is_none() {
-        return Err(503);
-    }
-    let tag = entry
-        .map(webdav::resource_etag)
-        .transpose()
-        .map_err(|_| 500u16)?;
-    if !webdav::if_match(request.header("if-match"), tag.as_deref()).map_err(|_| 400u16)? {
-        return Err(412);
-    }
-    if !webdav::if_none_match(request.header("if-none-match"), tag.as_deref())
-        .map_err(|_| 400u16)?
-    {
-        if matches!(request.method.as_str(), "GET" | "HEAD") {
-            return http::head(stream, 304, 0, &[("ETag", tag.unwrap_or_default())])
-                .map_err(|_| 500u16);
-        }
-        return Err(412);
-    }
-    let tokens = evaluate_conditions(
+    let Some(preconditions) = evaluate_resource_preconditions(
         runtime,
         locks,
         account,
         &authorized,
-        &baseline,
-        request.header("if"),
-    )?;
-    let collection =
-        entry.is_some_and(|entry| entry.kind == EntryKind::Directory) || authorized.path.is_none();
-    if write
-        && request.method != "UNLOCK"
-        && !locks.allowed(account, &authorized, &tokens, collection)
-    {
-        return Err(423);
-    }
+        baseline.manifest(),
+        request,
+        stream,
+    )?
+    else {
+        return Ok(());
+    };
+    let ResourcePreconditions {
+        tag,
+        tokens,
+        collection,
+    } = preconditions;
     #[cfg(windows)]
     if matches!(
         request.method.as_str(),
@@ -616,56 +757,18 @@ fn dispatch(
             .map_err(|_| 500u16)
         }
         "GET" | "HEAD" => {
-            if request.content_length != 0 {
-                return Err(400);
-            }
             let entry = entry.ok_or(404u16)?;
             let content = entry.content.as_ref().ok_or(405u16)?;
-            let range_header = if request
-                .header("if-range")
-                .is_none_or(|value| Some(value) == tag.as_deref())
-            {
-                request.header("range")
-            } else {
-                None
-            };
-            let range = match webdav::byte_range(range_header, content.length) {
-                Ok(range) => range,
-                Err(_) => {
-                    return http::response(
-                        stream,
-                        416,
-                        b"",
-                        &[("Content-Range", format!("bytes */{}", content.length))],
-                        false,
-                    )
-                    .map_err(|_| 500u16)
-                }
+            let Some(reply) = prepare_read_reply(request, stream, content.length, tag)? else {
+                return Ok(());
             };
             let read = local
                 .acquire_webdav_read(&entry.path)
                 .map_err(core_status)?;
-            let mut headers = vec![
-                ("ETag", tag.unwrap_or_default()),
-                ("Accept-Ranges", "bytes".into()),
-                ("Content-Type", "application/octet-stream".into()),
-            ];
-            let length = range.map_or(content.length, |(start, end)| end - start + 1);
-            if let Some((start, end)) = range {
-                headers.push((
-                    "Content-Range",
-                    format!("bytes {start}-{end}/{}", content.length),
-                ));
-            }
-            if request.method == "HEAD" || length == 0 {
+            if request.method == "HEAD" || reply.length == 0 {
                 local.finish_webdav_read(read).map_err(core_status)?;
-                return http::head(
-                    stream,
-                    if range.is_some() { 206 } else { 200 },
-                    length,
-                    &headers,
-                )
-                .map_err(|_| 500u16);
+                return http::head(stream, reply.status, reply.length, &reply.headers)
+                    .map_err(|_| 500u16);
             }
             // Keep at most one byte in request memory. A client cannot finish
             // its Content-Length read before the lease terminal is durable.
@@ -673,13 +776,13 @@ fn dispatch(
             let outcome = (|| {
                 http::head(
                     writer.connection(),
-                    if range.is_some() { 206 } else { 200 },
-                    length,
-                    &headers,
+                    reply.status,
+                    reply.length,
+                    &reply.headers,
                 )
                 .map_err(|_| 500u16)?;
                 local
-                    .write_webdav_read(&read, range, &mut writer)
+                    .write_webdav_read(&read, reply.range, &mut writer)
                     .map_err(core_status)
             })();
             let release = local.finish_webdav_read(read).map_err(core_status);
@@ -927,13 +1030,134 @@ fn dispatch(
 }
 
 fn find<'a>(baseline: &'a WebDavBaseline, path: Option<&PortablePath>) -> Option<&'a Entry> {
-    let path = path?;
-    baseline
-        .manifest()
-        .entries
-        .values()
-        .find(|entry| &entry.path == path)
+    find_manifest(baseline.manifest(), path)
 }
+
+fn find_manifest<'a>(manifest: &'a Manifest, path: Option<&PortablePath>) -> Option<&'a Entry> {
+    let path = path?;
+    manifest.entries.values().find(|entry| &entry.path == path)
+}
+
+struct ResourcePreconditions {
+    tag: Option<String>,
+    tokens: Vec<String>,
+    collection: bool,
+}
+
+fn evaluate_resource_preconditions(
+    runtime: &Runtime,
+    locks: &mut Locks,
+    account: &str,
+    authorized: &AuthorizedWebDavPath,
+    manifest: &Manifest,
+    request: &Request,
+    stream: &mut Connection,
+) -> Result<Option<ResourcePreconditions>, u16> {
+    let entry = find_manifest(manifest, authorized.path.as_ref());
+    if authorized.export_root && authorized.path.is_some() && entry.is_none() {
+        return Err(503);
+    }
+    let tag = entry
+        .map(webdav::resource_etag)
+        .transpose()
+        .map_err(|_| 500u16)?;
+    if !webdav::if_match(request.header("if-match"), tag.as_deref()).map_err(|_| 400u16)? {
+        return Err(412);
+    }
+    if !webdav::if_none_match(request.header("if-none-match"), tag.as_deref())
+        .map_err(|_| 400u16)?
+    {
+        if matches!(request.method.as_str(), "GET" | "HEAD") {
+            http::head(stream, 304, 0, &[("ETag", tag.unwrap_or_default())]).map_err(|_| 500u16)?;
+            return Ok(None);
+        }
+        return Err(412);
+    }
+    let tokens = evaluate_manifest_conditions(
+        runtime,
+        locks,
+        account,
+        authorized,
+        manifest,
+        request.header("if"),
+    )?;
+    let collection =
+        entry.is_some_and(|entry| entry.kind == EntryKind::Directory) || authorized.path.is_none();
+    let write = !matches!(
+        request.method.as_str(),
+        "GET" | "HEAD" | "PROPFIND" | "OPTIONS"
+    );
+    if write
+        && request.method != "UNLOCK"
+        && !locks.allowed(account, authorized, &tokens, collection)
+    {
+        return Err(423);
+    }
+    Ok(Some(ResourcePreconditions {
+        tag,
+        tokens,
+        collection,
+    }))
+}
+
+struct ReadReply {
+    range: Option<(u64, u64)>,
+    length: u64,
+    status: u16,
+    headers: Vec<(&'static str, String)>,
+}
+
+fn prepare_read_reply(
+    request: &Request,
+    stream: &mut Connection,
+    content_length: u64,
+    tag: Option<String>,
+) -> Result<Option<ReadReply>, u16> {
+    if request.content_length != 0 {
+        return Err(400);
+    }
+    let range_header = if request
+        .header("if-range")
+        .is_none_or(|value| Some(value) == tag.as_deref())
+    {
+        request.header("range")
+    } else {
+        None
+    };
+    let range = match webdav::byte_range(range_header, content_length) {
+        Ok(range) => range,
+        Err(_) => {
+            http::response(
+                stream,
+                416,
+                b"",
+                &[("Content-Range", format!("bytes */{content_length}"))],
+                false,
+            )
+            .map_err(|_| 500u16)?;
+            return Ok(None);
+        }
+    };
+    let mut headers = vec![
+        ("ETag", tag.unwrap_or_default()),
+        ("Accept-Ranges", "bytes".into()),
+        ("Content-Type", "application/octet-stream".into()),
+    ];
+    let length = range.map_or(content_length, |(start, end)| end - start + 1);
+    if let Some((start, end)) = range {
+        headers.push((
+            "Content-Range",
+            format!("bytes {start}-{end}/{content_length}"),
+        ));
+    }
+    Ok(Some(ReadReply {
+        range,
+        length,
+        status: if range.is_some() { 206 } else { 200 },
+        headers,
+    }))
+}
+
 fn core_status(error: ReconcileError) -> u16 {
     match error {
         ReconcileError::ResourceLimit(_) => 507,
@@ -1036,6 +1260,24 @@ fn evaluate_conditions(
     baseline: &WebDavBaseline,
     value: Option<&str>,
 ) -> Result<Vec<String>, u16> {
+    evaluate_manifest_conditions(
+        runtime,
+        locks,
+        account,
+        requested,
+        baseline.manifest(),
+        value,
+    )
+}
+
+fn evaluate_manifest_conditions(
+    runtime: &Runtime,
+    locks: &mut Locks,
+    account: &str,
+    requested: &AuthorizedWebDavPath,
+    manifest: &Manifest,
+    value: Option<&str>,
+) -> Result<Vec<String>, u16> {
     let lists = conditions::parse(value).map_err(|_| 400u16)?;
     let mut groups: BTreeMap<String, Vec<&conditions::List>> = BTreeMap::new();
     for list in &lists {
@@ -1054,7 +1296,7 @@ fn evaluate_conditions(
         if path.export_name != requested.export_name || path.space_id != requested.space_id {
             return Err(403);
         }
-        let tag = find(baseline, path.path.as_ref())
+        let tag = find_manifest(manifest, path.path.as_ref())
             .map(webdav::resource_etag)
             .transpose()
             .map_err(|_| 500u16)?;
@@ -1094,6 +1336,16 @@ fn propfind(
     depth: u8,
     properties: &Properties,
 ) -> Result<String, u16> {
+    propfind_manifest(runtime, path, baseline.manifest(), depth, properties)
+}
+
+fn propfind_manifest(
+    runtime: &Runtime,
+    path: &AuthorizedWebDavPath,
+    manifest: &Manifest,
+    depth: u8,
+    properties: &Properties,
+) -> Result<String, u16> {
     let export = runtime
         .listener
         .exports
@@ -1101,10 +1353,13 @@ fn propfind(
         .find(|export| export.name == path.export_name)
         .ok_or(403u16)?;
     let mut rows = Vec::new();
-    rows.push((path.path.as_ref(), find(baseline, path.path.as_ref())));
+    rows.push((
+        path.path.as_ref(),
+        find_manifest(manifest, path.path.as_ref()),
+    ));
     if depth == 1 {
         let parent = path.path.as_ref().map_or("", |path| path.as_str());
-        for entry in baseline.manifest().entries.values() {
+        for entry in manifest.entries.values() {
             let (entry_parent, _) = entry
                 .path
                 .as_str()

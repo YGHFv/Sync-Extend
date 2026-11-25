@@ -1,7 +1,7 @@
 use crate::{
-    sql_integer, Journal, JournalError, MutationAction, MutationExecution, MutationState, Result,
+    Journal, JournalError, MutationAction, MutationExecution, MutationState, Result, sql_integer,
 };
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::*;
 

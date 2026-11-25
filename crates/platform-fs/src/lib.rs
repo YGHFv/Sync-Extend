@@ -99,15 +99,29 @@ pub use windows::{
     regular_file_link_count, regular_file_matches_path, sqlite_main_file_identity,
     verify_regular_file, FreshExclusiveSqliteFile, GuardedReadFile, LockedDirectory,
     LockedDirectoryMutation, LockedFile, OriginalDirectoryCreation, OriginalFileCreation,
-    OwnedFileCreation, PublishedOriginalFile, ReacquiredNodeFile, ReacquiredNodeLock,
-    ReleasedOriginalCoordinationFile, ReleasedOriginalFileIdentity, ReleasedOriginalReadFile,
-    RetainedWriterDirectory, SealedOriginalFile,
+    OriginalFileSealFailure, OwnedFileCreation, PublishedOriginalFile, ReacquiredNodeFile,
+    ReacquiredNodeLock, ReleasedOriginalCoordinationFile, ReleasedOriginalFileIdentity,
+    ReleasedOriginalReadFile, RetainedWriterDirectory, SealedOriginalFile,
 };
 #[cfg(windows)]
 pub use windows::{
     SealedWindowsProtectedArtifact, WindowsFailedArtifactCreation,
     WindowsProtectedArtifactCreateFailure, WindowsProtectedArtifactCreator,
     WindowsProtectedArtifactParent, WindowsProtectedArtifactSealFailure,
+};
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod original_resource_close;
+#[cfg(windows)]
+pub use original_resource_close::{
+    close_original_tcp_listener, close_original_tcp_stream, ClosedWindowsOriginalResources,
+    ClosedWindowsOriginalSocket, OriginalDeploymentOwnerInput, WindowsOriginalCloseAttempt,
+    WindowsOriginalResourceCloseFailure, WindowsOriginalResourceOpenFailure,
+};
+#[cfg(windows)]
+pub use writer_owner::{
+    WriterCaptureCloseFailure, WriterCaptureOpenFailure, WriterOriginalCreationFailure,
 };
 
 #[allow(unsafe_code)]
@@ -164,8 +178,10 @@ pub use windows::{
 
 #[cfg(windows)]
 pub use windows::{
-    OriginalSqliteConnection, OriginalSqliteOpenFailure, OriginalSqliteQuery,
-    OriginalSqliteReadBudget, OriginalSqliteRows, OriginalSqliteStatement, OriginalSqliteValue,
+    OriginalReadonlySqliteCloseFailure, OriginalReadonlySqliteConnection,
+    OriginalReadonlySqliteOpenFailure, OriginalSqliteConnection, OriginalSqliteOpenFailure,
+    OriginalSqliteQuery, OriginalSqliteReadBudget, OriginalSqliteResourceCloseFailure,
+    OriginalSqliteRows, OriginalSqliteStatement, OriginalSqliteValue,
 };
 
 #[cfg(windows)]
@@ -179,7 +195,10 @@ pub use windows::FreshNativeSqliteConnection;
 #[cfg(windows)]
 pub use windows::FreshNativeRetentionLease;
 #[cfg(windows)]
-pub use windows::FreshNativeWalConnection;
+pub use windows::{
+    FreshNativeWalCloseFailure, FreshNativeWalConnection, FreshNativeWalOpenFailure,
+    FRESH_NATIVE_WAL_SHM_CAPACITY,
+};
 
 #[cfg(windows)]
 pub use windows::FreshRecoveredMutationFile;

@@ -1,10 +1,10 @@
 //! Complete original persisted chain. Read-only evidence; no restart issuer.
-use super::{phase_evidence, Stored};
+use super::{Stored, phase_evidence};
 use crate::{JournalError, JournalStoredRow, Result};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{Connection, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use sync_extend_core_model::{persisted_rename::RenameObservationMap, ContentId, EntryId};
+use sync_extend_core_model::{ContentId, EntryId, persisted_rename::RenameObservationMap};
 
 pub(super) const PREFIX: &str = "original.native-create.cursor.v1.";
 const NAMESPACE: &str = "original.native-create.cursor.";

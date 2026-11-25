@@ -4,10 +4,10 @@ use super::StorageRetirementAdmission;
 use super::{invalid, owner_schema};
 #[cfg(windows)]
 use crate::storage_inventory::reader::add;
-use crate::{storage_inventory::reader::preflight, Journal, Result};
+use crate::{Journal, Result, storage_inventory::reader::preflight};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
-use sync_extend_core_model::{tree_storage_capacity::TreeStorageCharge, ContentId, EntryId};
+use sync_extend_core_model::{ContentId, EntryId, tree_storage_capacity::TreeStorageCharge};
 
 const RECEIPT_PEAK: u64 = 384;
 
@@ -290,7 +290,7 @@ impl Journal {
         device: &sync_extend_core_model::DeviceId,
         now: impl Fn() -> Result<u64>,
     ) -> Result<StorageRetirementOwnerCreation> {
-        use rusqlite::{params, Transaction, TransactionBehavior};
+        use rusqlite::{Transaction, TransactionBehavior, params};
         use std::io::Write;
         use sync_extend_platform_fs::LockedDirectory;
         if !self.connection.is_autocommit() {

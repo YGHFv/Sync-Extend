@@ -1,12 +1,12 @@
-use super::{audit::Owners, JournalCapacityGap, JournalCapacityObligation};
+use super::{JournalCapacityGap, JournalCapacityObligation, audit::Owners};
 use crate::{
-    storage_inventory::reader::invalid, CleanupState, GcDisposalState, GcExecutionState,
-    GcQuarantineState, GcState, JournalStorageColumnValue, JournalStoredRow, MutationAction,
-    MutationExecution, MutationState, PublicationState, ReadLeaseState, Result,
+    CleanupState, GcDisposalState, GcExecutionState, GcQuarantineState, GcState,
+    JournalStorageColumnValue, JournalStoredRow, MutationAction, MutationExecution, MutationState,
+    PublicationState, ReadLeaseState, Result, storage_inventory::reader::invalid,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
-    reference_owner::ReferenceOwnerKind, tree_storage_capacity::TreeStorageCharge, ContentId,
+    ContentId, reference_owner::ReferenceOwnerKind, tree_storage_capacity::TreeStorageCharge,
 };
 
 pub(super) struct Liabilities {
@@ -321,11 +321,7 @@ fn operations(
                 if !accepted.entry(key).or_default().insert(sequence) {
                     return Err(invalid("journal capacity duplicate received sequence"));
                 }
-                if state == "received" {
-                    4
-                } else {
-                    0
-                }
+                if state == "received" { 4 } else { 0 }
             }
             _ => return Err(invalid("journal capacity operation state")),
         };

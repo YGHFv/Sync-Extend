@@ -1,20 +1,20 @@
 //! Persist original terminal descriptions only, never disposal or pin release.
 use crate::{
-    check_storage_metadata_limit, snapshot_retention::audit_snapshot, sql_integer, CasAccessGuard,
-    Journal, JournalError, Result, TreeRestorePreparation, MAX_OPERATION_BYTES,
+    CasAccessGuard, Journal, JournalError, MAX_OPERATION_BYTES, Result, TreeRestorePreparation,
+    check_storage_metadata_limit, snapshot_retention::audit_snapshot, sql_integer,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
+    ContentId,
     tree_original_disposition::{
-        audit_tree_original_disposition_records, plan_tree_original_dispositions,
         TreeOriginalDispositionInput, TreeOriginalDispositionIntent, TreeOriginalDispositionLimits,
         TreeOriginalDispositionPlan, TreeOriginalDispositionRecord,
         TreeOriginalDispositionRecordAudit, TreeOriginalDispositionRecordLimits,
+        audit_tree_original_disposition_records, plan_tree_original_dispositions,
     },
     tree_restore_history::encode_history_record,
-    ContentId,
 };
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

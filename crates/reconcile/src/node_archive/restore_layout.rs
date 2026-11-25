@@ -42,6 +42,18 @@ pub struct NodeRestoreLayout {
     directories: Vec<NodeRestoreDirectory>,
     files: Vec<NodeRestoreFile>,
     required_file_bytes: u64,
+    config_scope: NodeConfigRestoreScope,
+}
+
+pub(super) enum NodeConfigRestoreScope {
+    Ordinary,
+    InspectionOnly,
+    #[cfg(windows)]
+    SeparatedDeployment {
+        configs: crate::SeparatedDeploymentNodeConfigs,
+        worktree: std::path::PathBuf,
+        data: std::path::PathBuf,
+    },
 }
 impl NodeRestoreLayout {
     pub fn archive_digest(&self) -> &ContentId {
@@ -56,6 +68,48 @@ impl NodeRestoreLayout {
     pub fn required_file_bytes(&self) -> u64 {
         self.required_file_bytes
     }
+
+    pub(super) fn verify_original_source_scope(
+        &self,
+        archive: &VerifiedNodeStateArchive,
+        worktree: &std::path::Path,
+        data: &std::path::Path,
+    ) -> Result<()> {
+        if self.archive_digest != *archive.digest() {
+            return Err(ReconcileError::Invariant(
+                "node layout original full archive differs",
+            ));
+        }
+        match &self.config_scope {
+            NodeConfigRestoreScope::Ordinary => Ok(()),
+            NodeConfigRestoreScope::InspectionOnly => Err(ReconcileError::Invariant(
+                "source inspection layout cannot create original node roots",
+            )),
+            #[cfg(windows)]
+            NodeConfigRestoreScope::SeparatedDeployment {
+                configs,
+                worktree: expected_worktree,
+                data: expected_data,
+            } => {
+                if worktree != expected_worktree || data != expected_data {
+                    return Err(ReconcileError::Invariant(
+                        "separated node layout original target roots differ",
+                    ));
+                }
+                configs.verify_for_archive(archive, worktree, data)
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn separated_deployment_configs(
+        &self,
+    ) -> Option<&crate::SeparatedDeploymentNodeConfigs> {
+        match &self.config_scope {
+            NodeConfigRestoreScope::Ordinary | NodeConfigRestoreScope::InspectionOnly => None,
+            NodeConfigRestoreScope::SeparatedDeployment { configs, .. } => Some(configs),
+        }
+    }
 }
 
 impl VerifiedNodeStateArchive {
@@ -69,6 +123,102 @@ impl VerifiedNodeStateArchive {
         max_creations: usize,
         max_file_bytes: u64,
     ) -> Result<NodeRestoreLayout> {
+        self.current_node_restore_layout_inner(
+            inspection,
+            max_creations,
+            max_file_bytes,
+            NodeConfigRestoreScope::Ordinary,
+        )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn current_node_restore_layout_for_deployment(
+        &self,
+        inspection: NodeInspectionBounds,
+        max_creations: usize,
+        max_file_bytes: u64,
+        worktree: &std::path::Path,
+        data: &std::path::Path,
+        configs: crate::SeparatedDeploymentNodeConfigs,
+    ) -> Result<NodeRestoreLayout> {
+        self.current_node_restore_layout_inner(
+            inspection,
+            max_creations,
+            max_file_bytes,
+            NodeConfigRestoreScope::SeparatedDeployment {
+                configs,
+                worktree: worktree.to_owned(),
+                data: data.to_owned(),
+            },
+        )
+    }
+
+    pub(super) fn current_node_restore_layout_inner(
+        &self,
+        inspection: NodeInspectionBounds,
+        max_creations: usize,
+        max_file_bytes: u64,
+        config_scope: NodeConfigRestoreScope,
+    ) -> Result<NodeRestoreLayout> {
+        let (configs, worktree, data) = match &config_scope {
+            NodeConfigRestoreScope::Ordinary => (
+                None,
+                self.original_worktree(),
+                self.original_config_data().unwrap_or(self.original_worktree()),
+            ),
+            NodeConfigRestoreScope::InspectionOnly => {
+                return Err(ReconcileError::Invariant(
+                    "source inspection layout requires its actual deployment proof",
+                ));
+            }
+            NodeConfigRestoreScope::SeparatedDeployment {
+                configs,
+                worktree,
+                data,
+            } => (Some(configs), worktree.as_path(), data.as_path()),
+        };
+        let mut layout = self.derive_current_node_restore_layout(
+            inspection,
+            max_creations,
+            max_file_bytes,
+            worktree,
+            data,
+            configs,
+        )?;
+        layout.config_scope = config_scope;
+        Ok(layout)
+    }
+
+    /// Source-only restart comparison borrows a newly verified full deployment
+    /// proof. This projection is explicitly unable to create any original root.
+    pub(super) fn current_node_restore_layout_for_deployment_inspection(
+        &self,
+        inspection: NodeInspectionBounds,
+        max_creations: usize,
+        max_file_bytes: u64,
+        worktree: &std::path::Path,
+        data: &std::path::Path,
+        configs: &crate::SeparatedDeploymentNodeConfigs,
+    ) -> Result<NodeRestoreLayout> {
+        self.derive_current_node_restore_layout(
+            inspection,
+            max_creations,
+            max_file_bytes,
+            worktree,
+            data,
+            Some(configs),
+        )
+    }
+
+    fn derive_current_node_restore_layout(
+        &self,
+        inspection: NodeInspectionBounds,
+        max_creations: usize,
+        max_file_bytes: u64,
+        worktree: &std::path::Path,
+        data: &std::path::Path,
+        configs: Option<&crate::SeparatedDeploymentNodeConfigs>,
+    ) -> Result<NodeRestoreLayout> {
         if max_creations == 0
             || max_creations > 1_000_000
             || max_file_bytes == 0
@@ -77,6 +227,9 @@ impl VerifiedNodeStateArchive {
             return Err(ReconcileError::ResourceLimit(
                 "explicit node layout creation/byte bound",
             ));
+        }
+        if let Some(configs) = configs {
+            configs.verify_for_archive(self, worktree, data)?;
         }
         let manifest = self.current_node_manifest(inspection)?;
         let mut directories = vec![
@@ -88,6 +241,7 @@ impl VerifiedNodeStateArchive {
         let mut peers = false;
         let mut files = Vec::new();
         let mut required_file_bytes = 0u64;
+        let mut separated_names = BTreeSet::new();
         for role in self.archive.roles() {
             let section = self.archive.section(role).ok_or(ReconcileError::Invariant(
                 "node layout original role bytes absent",
@@ -113,16 +267,35 @@ impl VerifiedNodeStateArchive {
                         device_id: device_id.clone(),
                     }
                 }
-                ArchiveRole::ExplicitConfig { .. } => {
-                    return Err(ReconcileError::Invariant(
-                        "node layout requires separate explicit original config mapping",
-                    ));
+                ArchiveRole::ExplicitConfig { name } => {
+                    let Some(configs) = configs else {
+                        return Err(ReconcileError::Invariant(
+                            "node layout requires separate explicit original config mapping",
+                        ));
+                    };
+                    configs.verify_excluded_original_config(self, name, section)?;
+                    if !separated_names.insert(name.as_str()) {
+                        return Err(ReconcileError::Invariant(
+                            "separated node layout duplicate original config",
+                        ));
+                    }
+                    // Its exact bytes remain in the whole source and byte
+                    // budget. The deployment CREATE plan independently owns
+                    // this verified mapped config file.
+                    continue;
                 }
             };
             files.push(file);
             if files.len() + directories.len() > max_creations {
                 return Err(ReconcileError::ResourceLimit(
                     "node layout original creation count",
+                ));
+            }
+        }
+        if let Some(configs) = configs {
+            if configs.config_names().collect::<BTreeSet<_>>() != separated_names {
+                return Err(ReconcileError::Invariant(
+                    "separated node layout complete original config membership differs",
                 ));
             }
         }
@@ -193,6 +366,7 @@ impl VerifiedNodeStateArchive {
             directories,
             files,
             required_file_bytes,
+            config_scope: NodeConfigRestoreScope::InspectionOnly,
         })
     }
 }

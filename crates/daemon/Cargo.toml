@@ -18,6 +18,7 @@ sync-extend-platform-fs = { path = "../platform-fs" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = { version = "=0.11.1", default-features = false }
 tokio.workspace = true
 fs2.workspace = true
 quick-xml = "=0.41.0"

@@ -1,10 +1,10 @@
 //! Durable ordinary history liability. No restart issuer or native authority.
 use crate::{Journal, JournalError, Result};
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::{
-    persisted_rename::RenameObservationMap, tree_storage_capacity::TreeStorageCharge, EntryId,
-    Manifest, Operation, PortablePath, SnapshotId,
+    EntryId, Manifest, Operation, PortablePath, SnapshotId, persisted_rename::RenameObservationMap,
+    tree_storage_capacity::TreeStorageCharge,
 };
 
 pub(crate) const KEY: &str = "original.local-history.reservation.v1";
@@ -722,6 +722,8 @@ pub use phases::OriginalNativePhaseObservationReceipt;
 
 mod linux_terminal;
 mod phase_evidence;
+#[allow(unused_imports)]
+pub(crate) use linux_terminal::audit_source_native_terminals;
 #[cfg(target_os = "linux")]
 pub use linux_terminal::{
     OriginalLinuxCleanupCompletion, OriginalLinuxPublisherBinding, OriginalLinuxSuccessorReceipt,

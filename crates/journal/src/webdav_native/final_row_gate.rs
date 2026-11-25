@@ -1,6 +1,6 @@
 //! One exact original causal Final row statement; no transaction-wide bypass.
 use crate::{JournalError, JournalStorageColumnValue, Result};
-use rusqlite::{functions::FunctionFlags, Connection};
+use rusqlite::{Connection, functions::FunctionFlags};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17,7 +17,7 @@ struct Reset(Gate);
 #[cfg(windows)]
 impl Drop for Reset {
     fn drop(&mut self) {
-        if let Ok(mut held) = self.0 .0.lock() {
+        if let Ok(mut held) = self.0.0.lock() {
             *held = None;
         }
     }

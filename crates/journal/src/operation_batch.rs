@@ -1,8 +1,8 @@
-use crate::{cursor, Journal, JournalError, Result};
+use crate::{Journal, JournalError, Result, cursor};
 use rusqlite::params;
 use sync_extend_core_model::{
-    operation_batch::{OperationBatch, MAX_OPERATION_BATCH, MAX_OPERATION_BATCH_BYTES},
-    DeviceId, Operation, SpaceId, PROTOCOL_VERSION,
+    DeviceId, Operation, PROTOCOL_VERSION, SpaceId,
+    operation_batch::{MAX_OPERATION_BATCH, MAX_OPERATION_BATCH_BYTES, OperationBatch},
 };
 
 impl Journal {

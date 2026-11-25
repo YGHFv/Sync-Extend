@@ -5,7 +5,76 @@ use std::{
     path::{Path, PathBuf},
 };
 use sync_extend_core_model::ContentId;
-use sync_extend_platform_fs::{FileKey, GuardedReadFile, LockedDirectory};
+use sync_extend_platform_fs::{
+    FileKey, GuardedReadFile, LockedDirectory, WindowsOriginalCloseAttempt,
+    WindowsOriginalResourceCloseFailure,
+};
+
+pub(super) struct CapturedFileOpenFailure {
+    pub(super) error: ReconcileError,
+    pub(super) original_resources: Option<WindowsOriginalResourceCloseFailure>,
+}
+
+#[derive(Default)]
+struct OriginalFilePrefix {
+    original: Option<GuardedReadFile>,
+    ancestors: Vec<(PathBuf, LockedDirectory, FileKey)>,
+    unverified_ancestors: Vec<LockedDirectory>,
+}
+
+impl OriginalFilePrefix {
+    fn acquire(&mut self, path: &Path) -> Result<()> {
+        check_ancestors(path)?;
+        let parent = path
+            .parent()
+            .ok_or(ReconcileError::Invariant("backup original parent is absent"))?;
+        for ancestor in parent.ancestors() {
+            if self.ancestors.len() >= 128 {
+                return Err(ReconcileError::ResourceLimit("backup ancestor depth"));
+            }
+            self.unverified_ancestors.push(LockedDirectory::open(ancestor)?);
+            let held = self
+                .unverified_ancestors
+                .last()
+                .ok_or(ReconcileError::Unstable)?;
+            held.require_local_ntfs(ancestor)?;
+            held.require_case_insensitive()?;
+            if !held.matches_path(ancestor)? {
+                return Err(ReconcileError::Unstable);
+            }
+            let key = held.key()?;
+            let held = self
+                .unverified_ancestors
+                .pop()
+                .ok_or(ReconcileError::Unstable)?;
+            self.ancestors.push((ancestor.to_owned(), held, key));
+        }
+        self.original = Some(GuardedReadFile::open(path)?);
+        self.original()?.verify_single_link()?;
+        Ok(())
+    }
+
+    fn original(&self) -> Result<&GuardedReadFile> {
+        self.original.as_ref().ok_or(ReconcileError::Unstable)
+    }
+
+    fn fail(mut self, error: ReconcileError) -> CapturedFileOpenFailure {
+        let mut close = WindowsOriginalCloseAttempt::new();
+        if let Some(original) = self.original.take() {
+            original.close_into_attempt(&mut close);
+        }
+        for (_, original, _) in self.ancestors.drain(..) {
+            close.close_directory(original);
+        }
+        for original in self.unverified_ancestors.drain(..) {
+            close.close_directory(original);
+        }
+        CapturedFileOpenFailure {
+            error,
+            original_resources: close.finish().err(),
+        }
+    }
+}
 
 /// Retains all source ancestors and the original single-link readonly file.
 /// The caller owns the node session and rejects mutable transaction residue.
@@ -20,55 +89,49 @@ pub(super) struct CapturedFile {
 }
 
 impl CapturedFile {
-    pub(super) fn open(path: &Path, max_bytes: usize) -> Result<Self> {
-        if max_bytes == 0 {
-            return Err(ReconcileError::ResourceLimit("explicit backup file bound"));
-        }
-        check_ancestors(path)?;
-        let mut ancestors = Vec::new();
-        let parent = path.parent().ok_or(ReconcileError::Invariant(
-            "backup original parent is absent",
-        ))?;
-        for ancestor in parent.ancestors() {
-            let held = LockedDirectory::open(ancestor)?;
-            held.require_local_ntfs(ancestor)?;
-            held.require_case_insensitive()?;
-            if !held.matches_path(ancestor)? {
+    pub(super) fn open(
+        path: &Path,
+        max_bytes: usize,
+    ) -> std::result::Result<Self, CapturedFileOpenFailure> {
+        let mut prefix = OriginalFilePrefix::default();
+        let prepared = (|| {
+            if max_bytes == 0 {
+                return Err(ReconcileError::ResourceLimit("explicit backup file bound"));
+            }
+            prefix.acquire(path)?;
+            let original = prefix.original()?;
+            let key = original.key()?;
+            let expected = original.reader().metadata()?.len();
+            if expected > max_bytes as u64 {
+                return Err(ReconcileError::ResourceLimit("backup source file bytes"));
+            }
+            let mut reader = original.reader();
+            reader.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            reader
+                .take((max_bytes as u64).saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > max_bytes || bytes.len() as u64 != expected {
                 return Err(ReconcileError::Unstable);
             }
-            let key = held.key()?;
-            ancestors.push((ancestor.to_owned(), held, key));
-            if ancestors.len() > 128 {
-                return Err(ReconcileError::ResourceLimit("backup ancestor depth"));
-            }
-        }
-        let original = GuardedReadFile::open(path)?;
-        let key = original.key()?;
-        original.verify_single_link()?;
-        let expected = original.reader().metadata()?.len();
-        if expected > max_bytes as u64 {
-            return Err(ReconcileError::ResourceLimit("backup source file bytes"));
-        }
-        let mut reader = original.reader().try_clone()?;
-        reader.seek(SeekFrom::Start(0))?;
-        let mut bytes = Vec::new();
-        reader
-            .take((max_bytes as u64).saturating_add(1))
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > max_bytes || bytes.len() as u64 != expected {
-            return Err(ReconcileError::Unstable);
-        }
-        let digest = ContentId::hash(&bytes);
+            Ok((key, expected, bytes))
+        })();
+        let (key, captured_length, bytes) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return Err(prefix.fail(error)),
+        };
         let captured = Self {
             path: path.to_owned(),
-            original,
-            ancestors,
+            original: prefix.original.take().expect("acquired original was checked"),
+            ancestors: std::mem::take(&mut prefix.ancestors),
             key,
-            captured_length: expected,
+            captured_length,
+            digest: ContentId::hash(&bytes),
             bytes,
-            digest,
         };
-        captured.verify()?;
+        if let Err(error) = captured.verify() {
+            return Err(captured.fail(error));
+        }
         Ok(captured)
     }
 
@@ -78,41 +141,46 @@ impl CapturedFile {
         path: &Path,
         expected_length: u64,
         expected_digest: &ContentId,
-    ) -> Result<Self> {
-        check_ancestors(path)?;
-        let parent = path
-            .parent()
-            .ok_or(ReconcileError::Invariant("node original parent absent"))?;
-        let mut ancestors = Vec::new();
-        for ancestor in parent.ancestors() {
-            if ancestors.len() >= 128 {
-                return Err(ReconcileError::ResourceLimit(
-                    "node original ancestor depth",
-                ));
-            }
-            let held = LockedDirectory::open(ancestor)?;
-            held.require_local_ntfs(ancestor)?;
-            held.require_case_insensitive()?;
-            if !held.matches_path(ancestor)? {
-                return Err(ReconcileError::Unstable);
-            }
-            let key = held.key()?;
-            ancestors.push((ancestor.to_owned(), held, key));
-        }
-        let original = GuardedReadFile::open(path)?;
-        let key = original.key()?;
+    ) -> std::result::Result<Self, CapturedFileOpenFailure> {
+        let mut prefix = OriginalFilePrefix::default();
+        let prepared = (|| {
+            prefix.acquire(path)?;
+            prefix.original()?.key().map_err(ReconcileError::from)
+        })();
+        let key = match prepared {
+            Ok(key) => key,
+            Err(error) => return Err(prefix.fail(error)),
+        };
         let held = Self {
             path: path.to_owned(),
-            original,
-            ancestors,
+            original: prefix.original.take().expect("acquired original was checked"),
+            ancestors: std::mem::take(&mut prefix.ancestors),
             key,
             bytes: Vec::new(),
             captured_length: expected_length,
             digest: expected_digest.clone(),
         };
         // verify rereads only the original retained single-link handle in 64KiB.
-        held.verify()?;
+        if let Err(error) = held.verify() {
+            return Err(held.fail(error));
+        }
         Ok(held)
+    }
+
+    fn fail(self, error: ReconcileError) -> CapturedFileOpenFailure {
+        let mut close = WindowsOriginalCloseAttempt::new();
+        self.close_into_attempt(&mut close);
+        CapturedFileOpenFailure {
+            error,
+            original_resources: close.finish().err(),
+        }
+    }
+
+    pub(super) fn close_into_attempt(self, close: &mut WindowsOriginalCloseAttempt) {
+        self.original.close_into_attempt(close);
+        for (_, ancestor, _) in self.ancestors {
+            close.close_directory(ancestor);
+        }
     }
 
     pub(super) fn bytes(&self) -> &[u8] {
@@ -152,7 +220,7 @@ impl CapturedFile {
         {
             return Err(ReconcileError::Unstable);
         }
-        let mut reader = self.original.reader().try_clone()?;
+        let mut reader = self.original.reader();
         reader.seek(SeekFrom::Start(0))?;
         let mut limited = reader.take((self.captured_length).saturating_add(1));
         let mut hasher = blake3::Hasher::new();

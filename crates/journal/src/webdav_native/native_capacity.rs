@@ -2,8 +2,8 @@
 use crate::{JournalError, Result};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::{
-    webdav_native::{WebDavNativeAction, WebDavNativePlan},
     Manifest,
+    webdav_native::{WebDavNativeAction, WebDavNativePlan},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

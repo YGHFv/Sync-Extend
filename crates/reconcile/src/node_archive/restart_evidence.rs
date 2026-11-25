@@ -34,6 +34,34 @@ impl VerifiedNodeStateArchive {
         limits: LedgerBounds,
         inspection: sync_extend_journal::NodeInspectionBounds,
     ) -> Result<OriginalNodeRestartClassification> {
+        self.classify_original_node_restart_inner(path, limits, inspection, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn classify_original_node_restart_for_deployment(
+        &self,
+        path: &Path,
+        limits: LedgerBounds,
+        inspection: sync_extend_journal::NodeInspectionBounds,
+        worktree: &Path,
+        data: &Path,
+        configs: &crate::SeparatedDeploymentNodeConfigs,
+    ) -> Result<OriginalNodeRestartClassification> {
+        if let Err(error) = configs.verify_for_archive(self, worktree, data) {
+            return Ok(OriginalNodeRestartClassification::RefusedEvidence {
+                reason: error.to_string().chars().take(1024).collect(),
+            });
+        }
+        self.classify_original_node_restart_inner(path, limits, inspection, Some(configs))
+    }
+
+    fn classify_original_node_restart_inner(
+        &self,
+        path: &Path,
+        limits: LedgerBounds,
+        inspection: sync_extend_journal::NodeInspectionBounds,
+        configs: Option<&crate::SeparatedDeploymentNodeConfigs>,
+    ) -> Result<OriginalNodeRestartClassification> {
         let inspected = (|| -> Result<OriginalNodeRestartClassification> {
             super::ledger::bounds::validate(limits)?;
             let parent = path
@@ -139,7 +167,11 @@ impl VerifiedNodeStateArchive {
                     &ledger,
                     limits,
                 )?;
-                manifest.verify_archive_source(self, inspection)?;
+                if let Some(configs) = configs {
+                    manifest.verify_archive_source_for_deployment(self, inspection, configs)?;
+                } else {
+                    manifest.verify_archive_source(self, inspection)?;
+                }
                 OriginalNodeRestartClassification::CompletedEvidence {
                     records: chain.count,
                     original_terminal: chain.previous.parse()?,

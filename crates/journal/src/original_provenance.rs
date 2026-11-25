@@ -1,12 +1,11 @@
 //! Exact durable individual signature provenance, not operation reception or apply.
 use crate::{
-    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
     Journal, JournalError, RemotePublicationProof, Result,
+    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
 };
 use rusqlite::{
-    params,
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params,
     types::{Value, ValueRef},
-    Connection, OptionalExtension, Transaction, TransactionBehavior,
 };
 use std::{
     collections::BTreeMap,
@@ -40,7 +39,7 @@ pub(crate) struct Gate(Arc<Mutex<Option<Vec<Value>>>>);
 pub(crate) struct Permit(Gate);
 impl Drop for Permit {
     fn drop(&mut self) {
-        if let Ok(mut held) = self.0 .0.lock() {
+        if let Ok(mut held) = self.0.0.lock() {
             *held = None;
         }
     }

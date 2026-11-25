@@ -1,8 +1,8 @@
 //! Immutable native Final/THAWED evidence and append-only cleanup progress.
 //! Deserialized diagnostics cannot construct a live cleanup permit.
-use super::{phase_evidence, Stored};
+use super::{Stored, phase_evidence};
 use crate::{JournalError, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::{
     ContentId, EntryId, FileManifest, Manifest, Operation, PortablePath, SnapshotId,
@@ -311,7 +311,7 @@ fn validate_final(json: &str) -> Result<(Final, Stored)> {
         _ => {
             return Err(JournalError::Invariant(
                 "CREATE/REPLACE Final retained contract differs",
-            ))
+            ));
         }
     }
     Ok((value, stored))
@@ -461,9 +461,9 @@ fn validate_progress(
                               expected_parent: Key,
                               expected_file: Key,
                               component: &str| {
-                actual.0 .1 == expected_parent.1
-                    && actual.1 .1 == expected_file.1
-                    && actual.0 .0 == actual.1 .0
+                actual.0.1 == expected_parent.1
+                    && actual.1.1 == expected_file.1
+                    && actual.0.0 == actual.1.0
                     && actual.2 == component
             };
             if !same_inode(
@@ -601,6 +601,66 @@ pub(super) fn cleaned_rows(rows: &[crate::JournalStoredRow], attempt: &EntryId) 
     validate_progress(prepared, final_json, thawed, &value, None)?;
     validate_progress(cleaned, final_json, thawed, &value, Some(prepared))?;
     Ok(true)
+}
+
+/// Complete immutable Final/THAWED/cleanup audit on the caller's same read view.
+/// This performs SELECTs and validation only; no live Journal or permit is issued.
+pub(crate) fn audit_source_native_terminals(
+    connection: &Connection,
+    max: usize,
+) -> Result<Vec<OriginalLinuxNativeFinalDiagnostic>> {
+    let mut query = connection.prepare(
+        "SELECT key,value FROM local_state WHERE substr(key,1,?1)=?2 ORDER BY key LIMIT ?3",
+    )?;
+    let rows = query
+        .query_map(params![FINAL.len() as i64, FINAL, max as i64 + 1], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if rows.len() > max {
+        return Err(JournalError::Invariant("native Final inventory limit"));
+    }
+    let mut result = Vec::new();
+    for (name, json) in rows {
+        let (value, stored) = validate_final(&json)?;
+        if name != key(FINAL, &value.attempt) {
+            return Err(JournalError::Invariant("native Final row key differs"));
+        }
+        validate_context(connection, &value, &stored)?;
+        let thawed = state(connection, &key(THAWED, &value.attempt))?;
+        if let Some(thawed) = &thawed {
+            validate_thawed(thawed, &json, &value)?;
+        }
+        let prepared = state(connection, &key(PREPARED, &value.attempt))?;
+        if let Some(prepared) = &prepared {
+            validate_progress(
+                prepared,
+                &json,
+                thawed
+                    .as_deref()
+                    .ok_or(JournalError::Invariant("prepared cleanup THAWED absent"))?,
+                &value,
+                None,
+            )?;
+        }
+        let cleaned = cleaned_connection(connection, &value.attempt)?;
+        result.push(OriginalLinuxNativeFinalDiagnostic {
+            transaction_id: value.attempt,
+            target: value.target,
+            snapshot_id: stored.planned.root()?,
+            native_action: if stored.version == 2 {
+                "REPLACE"
+            } else {
+                "CREATE"
+            },
+            final_exact_digest: ContentId::hash(json.as_bytes()),
+            helper_thawed: thawed.is_some(),
+            cleanup_prepared: prepared.is_some(),
+            cleanup_completed: cleaned,
+            immutable_history_and_native_receipts_retained: true,
+        });
+    }
+    Ok(result)
 }
 
 #[cfg(target_os = "linux")]

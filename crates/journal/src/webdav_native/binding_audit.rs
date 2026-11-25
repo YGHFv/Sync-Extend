@@ -9,9 +9,9 @@ use std::{
     path::{Path, PathBuf},
 };
 use sync_extend_core_model::{
+    ContentId, EntryKind, Manifest,
     tree_restore_identity::TreeNativeIdentity,
     webdav_native::{WebDavNativeAction, WebDavNativePlan},
-    ContentId, EntryKind, Manifest,
 };
 
 fn invalid() -> JournalError {

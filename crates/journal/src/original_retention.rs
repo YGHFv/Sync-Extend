@@ -1,12 +1,12 @@
 use crate::{
-    check_storage_metadata_limit, sql_integer, CasAccessGuard, Journal, JournalError,
-    MutationAction, MutationState, Result,
+    CasAccessGuard, Journal, JournalError, MutationAction, MutationState, Result,
+    check_storage_metadata_limit, sql_integer,
 };
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::{
-    original_retention::{OriginalRetentionScope, RetainedOriginalAction},
     ContentId, EntryId, SpaceId,
+    original_retention::{OriginalRetentionScope, RetainedOriginalAction},
 };
 
 const MAX_INTENT_BYTES: usize = 16 * 1024 * 1024;

@@ -25,6 +25,21 @@ struct CreatedDirectory {
 }
 
 impl CreatedNodeDirectorySet<'_> {
+    pub fn close_into_attempt<'scope>(
+        self,
+        attempt: &mut super::OriginalNodeResourceCloseAttempt<'scope>,
+    ) where
+        Self: 'scope,
+    {
+        let Self { roots, marker, mapped, original, directories, archive_digest } = self;
+        attempt.keep_context((roots, marker, mapped, original, archive_digest));
+        for (slot, original) in directories.into_iter().rev() {
+            let CreatedDirectory { creator, path, key, parent } = original;
+            attempt.keep_context((slot, path, key, parent));
+            creator.close_into_attempt(&mut attempt.native);
+        }
+    }
+
     pub fn archive_digest(&self) -> &ContentId {
         &self.archive_digest
     }

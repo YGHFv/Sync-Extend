@@ -86,19 +86,22 @@ impl Journal {
             max_vm_instructions: 100_000_000,
             max_query_time: std::time::Duration::from_secs(60),
         };
-        bounds.configure_original_connection(&mut observed.connection)?;
-        let snapshot =
-            Transaction::new_unchecked(&observed.connection, TransactionBehavior::Deferred)?;
-        let original = observed.read_view().audit_original_provenance_capacity(
-            space,
-            bounds.max_entries,
-            bounds.capacity,
-        )?;
-        let digest = completion_rows_hash(&original.rows)?;
-        snapshot.rollback()?;
-        observed.verify_original_created_image()?;
-        self.verify_original_created_image()?;
-        Ok(digest)
+        let result = (|| {
+            bounds.configure_original_connection(&mut observed.connection)?;
+            let snapshot =
+                Transaction::new_unchecked(&observed.connection, TransactionBehavior::Deferred)?;
+            let original = observed.read_view().audit_original_provenance_capacity(
+                space,
+                bounds.max_entries,
+                bounds.capacity,
+            )?;
+            let digest = completion_rows_hash(&original.rows)?;
+            snapshot.rollback()?;
+            observed.verify_original_created_image()?;
+            self.verify_original_created_image()?;
+            Ok(digest)
+        })();
+        observed.finish_original_coordination_observation(result)
     }
 }
 

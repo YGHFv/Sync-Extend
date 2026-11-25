@@ -2,7 +2,7 @@
 use crate::{JournalError, Result};
 use rusqlite::Connection;
 use std::collections::BTreeSet;
-use sync_extend_core_model::{tree_original_disposition::TreeOriginalDispositionPlan, EntryId};
+use sync_extend_core_model::{EntryId, tree_original_disposition::TreeOriginalDispositionPlan};
 
 fn existing(connection: &Connection, max: usize) -> Result<BTreeSet<EntryId>> {
     let mut statement =

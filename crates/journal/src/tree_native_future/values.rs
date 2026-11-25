@@ -1,10 +1,9 @@
 use super::{Capacity, TreeNativeFutureAdmissionAudit};
 use crate::{
-    sql_integer,
+    MAX_OPERATION_BYTES, Result, sql_integer,
     storage_inventory::reader::{add, hash, invalid},
-    Result, MAX_OPERATION_BYTES,
 };
-use rusqlite::{params_from_iter, types::Value, Connection};
+use rusqlite::{Connection, params_from_iter, types::Value};
 use sync_extend_core_model::{
     tree_restore_history::encode_history_record,
     tree_storage_footprint::{TreeStorageColumn, TreeStorageColumnValue},

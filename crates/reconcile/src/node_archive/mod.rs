@@ -5,7 +5,7 @@ mod created_section;
 mod file_content;
 mod layout;
 mod verifier;
-pub use capture::CapturedNodeArchive;
+pub use capture::{CapturedNodeArchive, NodeArchiveCaptureFailure};
 pub use created_section::CreatedNodeSection;
 pub use layout::{ArchiveBounds, ArchiveRole, FramedNodeArchive};
 pub use verifier::VerifiedNodeStateArchive;
@@ -39,17 +39,23 @@ pub use layout_mapping::{NodeRestoreMappedLayout, NodeRestoreSlot, NodeTargetRoo
 pub use portable_source::ReadLeaseMigrationPreview;
 
 mod assembly;
+mod assembly_prepare;
 mod data_locks;
 mod local_space;
 mod read_content;
 pub use assembly::OriginalNodeReadAssembly;
-pub use data_locks::CreatedNodeDataLocks;
+pub use data_locks::{CreatedNodeDataLocks, OriginalNodeDataLockCreationFailure};
 pub use local_space::OriginalRestoredLocalSpace;
 mod inventory;
 
 mod preflight;
 mod prepared_files;
 pub use preflight::PreparedOriginalNodeRestore;
+mod initial_close;
+pub use initial_close::{OriginalNodeResourceCloseAttempt, OriginalNodeResourceCloseFailure};
+mod scoped_close;
+pub use scoped_close::OriginalNodeScopedResourceCloseFailure;
+mod read_close;
 
 mod completion;
 mod durable_schema;
@@ -65,8 +71,10 @@ mod restart_evidence;
 mod node_write_transition;
 pub use local_space::{
     OriginalNodeWriteCloseFailure, OriginalNodeWriteClosed, OriginalNodeWriteOpenFailure,
-    OriginalNodeWriteSession,
+    OriginalNodeWriteResourceCloseFailure, OriginalNodeWriteSession,
 };
+pub(crate) use node_write_transition::DeploymentFreshNodeBinding;
+pub use node_write_transition::DeploymentNativeRuntimeLiability;
 pub use node_write_transition::OriginalNodeWriteFrameClassification;
 
 mod config_mapping;
@@ -94,6 +102,8 @@ pub use node_write_transition::FreshRecoveredNodeWalSession;
 #[cfg(windows)]
 pub use node_write_transition::RecoveredWalFrameClassification;
 
+#[cfg(windows)]
+pub use node_write_transition::DeploymentFreshNodeResourceCloseFailure;
 #[cfg(windows)]
 pub use node_write_transition::FreshRecoveredNodeWalV2Session;
 

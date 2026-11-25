@@ -3,10 +3,10 @@ use super::*;
 use sync_extend_core_model::{
     tree_final_terminal_layout::TreeFinalTerminalLayoutLimits,
     tree_native_final_layout::{
-        plan_tree_native_final_layout, TreeNativeFinalLayoutInput, TreeNativeFinalLayoutPlan,
+        TreeNativeFinalLayoutInput, TreeNativeFinalLayoutPlan, plan_tree_native_final_layout,
     },
-    tree_storage_footprint::tree_final_terminal_row_values,
     tree_storage_footprint::TreeStorageTable,
+    tree_storage_footprint::tree_final_terminal_row_values,
 };
 
 pub(crate) fn terminal_table(table: TreeStorageTable) -> Result<&'static str> {

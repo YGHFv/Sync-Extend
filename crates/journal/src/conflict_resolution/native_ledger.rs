@@ -2,8 +2,8 @@
 use super::*;
 use super::{
     native_binding::Binding,
-    native_history_templates::{history_partition, HistorySelection},
-    native_templates::{cleanup_partition, native_partition, Ledger},
+    native_history_templates::{HistorySelection, history_partition},
+    native_templates::{Ledger, cleanup_partition, native_partition},
 };
 use sync_extend_core_model::tree_storage_capacity::TreeStorageCharge;
 
@@ -50,7 +50,7 @@ fn layout(
     header: &Header,
 ) -> Result<sync_extend_core_model::conflict_native_layout::ConflictNativeLayout> {
     use sync_extend_core_model::conflict_native_layout::{
-        plan_conflict_native_layout, ConflictNativeLayoutLimits,
+        ConflictNativeLayoutLimits, plan_conflict_native_layout,
     };
     Ok(plan_conflict_native_layout(
         &header.intent.baseline,

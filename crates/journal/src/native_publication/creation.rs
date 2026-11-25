@@ -1,14 +1,15 @@
 //! The Journal directly performs each selected CREATE after durable activation.
-use super::{issuance, peak, physical, steps, Ancestor, Header, Key};
+use super::{Ancestor, Header, Key, issuance, peak, physical, steps};
 use crate::{
+    CasAccessGuard, Journal, JournalStorageColumn, JournalStorageColumnValue, PublicationState,
+    Result,
     storage_capacity::CapacitySnapshot,
     storage_inventory::reader::{hash, invalid},
-    storage_policy, CasAccessGuard, Journal, JournalStorageColumn, JournalStorageColumnValue,
-    PublicationState, Result,
+    storage_policy,
 };
-use rusqlite::{params_from_iter, types::Value, Transaction, TransactionBehavior};
+use rusqlite::{Transaction, TransactionBehavior, params_from_iter, types::Value};
 use std::{collections::BTreeMap, fs::File, path::PathBuf};
-use sync_extend_core_model::{tree_storage_capacity::TreeStorageCharge, EntryId};
+use sync_extend_core_model::{EntryId, tree_storage_capacity::TreeStorageCharge};
 use sync_extend_platform_fs::{
     FileKey, LockedDirectory, LockedDirectoryMutation, OriginalDirectoryCreation,
     OriginalFileCreation, OwnedFileCreation,

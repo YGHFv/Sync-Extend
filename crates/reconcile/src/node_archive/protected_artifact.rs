@@ -126,61 +126,36 @@ pub struct OriginalProtectedArtifact {
     source: sync_extend_platform_fs::UnixProtectedArtifactSource,
 }
 
+#[cfg(windows)]
+pub struct OriginalProtectedArtifactOpenFailure {
+    pub error: ReconcileError,
+    pub original_resources: Option<sync_extend_platform_fs::WindowsOriginalResourceCloseFailure>,
+}
+
+#[cfg(windows)]
+impl OriginalProtectedArtifactOpenFailure {
+    pub fn retain_and_report(self) -> ReconcileError {
+        if let Some(original) = self.original_resources {
+            original.retain_until_process_exit();
+        }
+        self.error
+    }
+}
+
 impl OriginalProtectedArtifact {
     pub fn capture(path: &Path, maximum: usize, private: bool) -> Result<Self> {
+        #[cfg(windows)]
+        {
+            return Self::capture_retaining(path, maximum, private)
+                .map_err(OriginalProtectedArtifactOpenFailure::retain_and_report);
+        }
+        #[cfg(not(windows))]
+        {
         if !normalized(path) || maximum == 0 || maximum > MAX_SOURCE {
             return Err(ReconcileError::Invariant(
                 "bounded original deployment artifact path",
             ));
         }
-        #[cfg(windows)]
-        let source = {
-            let mut ancestors = Vec::new();
-            for path in path
-                .parent()
-                .ok_or(ReconcileError::Invariant(
-                    "original deployment artifact parent",
-                ))?
-                .ancestors()
-                .filter(|path| path.is_absolute())
-            {
-                let original = sync_extend_platform_fs::LockedDirectory::open(path)?;
-                original.require_local_ntfs(path)?;
-                original.require_case_insensitive()?;
-                if !original.matches_path(path)? {
-                    return Err(ReconcileError::Unstable);
-                }
-                let key = original.key()?;
-                ancestors.push((path.to_path_buf(), original, key));
-            }
-            if private {
-                ancestors
-                    .first()
-                    .ok_or(ReconcileError::Invariant(
-                        "private deployment source parent absent",
-                    ))?
-                    .1
-                    .require_current_user_private()?;
-            }
-            let original = sync_extend_platform_fs::GuardedReadFile::open(path)?;
-            let metadata = original.reader().metadata()?;
-            let private_owner_acl = if private {
-                let (owner, acl) =
-                    sync_extend_platform_fs::capture_current_user_private_acl(original.reader())?;
-                Some((ContentId::hash(&owner), ContentId::hash(&acl)))
-            } else {
-                None
-            };
-            WindowsSource {
-                path: path.to_path_buf(),
-                key: original.key()?,
-                bytes: metadata.len(),
-                modified: metadata.modified()?,
-                ancestors,
-                original,
-                private_owner_acl,
-            }
-        };
         #[cfg(target_os = "linux")]
         let source = sync_extend_platform_fs::UnixProtectedArtifactSource::open_original(
             path, maximum, private,
@@ -208,6 +183,130 @@ impl OriginalProtectedArtifact {
             result.verify_original()?;
             Ok(result)
         }
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn capture_retaining(
+        path: &Path,
+        maximum: usize,
+        private: bool,
+    ) -> std::result::Result<Self, OriginalProtectedArtifactOpenFailure> {
+        let mut ancestors = Vec::<(
+            PathBuf,
+            sync_extend_platform_fs::LockedDirectory,
+            Option<sync_extend_platform_fs::FileKey>,
+        )>::new();
+        let mut original = None;
+        let mut failed_opens = Vec::new();
+        let observed = (|| -> Result<_> {
+            if !normalized(path) || maximum == 0 || maximum > MAX_SOURCE {
+                return Err(ReconcileError::Invariant(
+                    "bounded original deployment artifact path",
+                ));
+            }
+            for parent in path.parent().ok_or(ReconcileError::Invariant(
+                "original deployment artifact parent",
+            ))?.ancestors().filter(|parent| parent.is_absolute()) {
+                let directory = sync_extend_platform_fs::LockedDirectory::open_retaining(parent)
+                    .map_err(|failure| {
+                        if let Some(resources) = failure.original_resources {
+                            failed_opens.push(resources);
+                        }
+                        ReconcileError::Io(failure.error)
+                    })?;
+                // Own the acquired prefix before the first fallible check.
+                ancestors.push((parent.to_path_buf(), directory, None));
+                let (_, directory, key) = ancestors.last_mut().ok_or(ReconcileError::Unstable)?;
+                directory.require_local_ntfs(parent)?;
+                directory.require_case_insensitive()?;
+                if !directory.matches_path(parent)? {
+                    return Err(ReconcileError::Unstable);
+                }
+                *key = Some(directory.key()?);
+            }
+            if private {
+                ancestors.first().ok_or(ReconcileError::Invariant(
+                    "private deployment source parent absent",
+                ))?.1.require_current_user_private()?;
+            }
+            original = Some(sync_extend_platform_fs::GuardedReadFile::open_retaining(path)
+                .map_err(|failure| {
+                    if let Some(resources) = failure.original_resources {
+                        failed_opens.push(resources);
+                    }
+                    ReconcileError::Io(failure.error)
+                })?);
+            let file = original.as_ref().ok_or(ReconcileError::Unstable)?;
+            let metadata = file.reader().metadata()?;
+            if metadata.len() == 0 || metadata.len() > maximum as u64 {
+                return Err(ReconcileError::ResourceLimit("original deployment artifact bytes"));
+            }
+            let private_owner_acl = if private {
+                let (owner, acl) =
+                    sync_extend_platform_fs::capture_current_user_private_acl(file.reader())?;
+                Some((ContentId::hash(&owner), ContentId::hash(&acl)))
+            } else {
+                None
+            };
+            Ok((file.key()?, metadata.len(), metadata.modified()?, private_owner_acl))
+        })();
+        let (key, bytes, modified, private_owner_acl) = match observed {
+            Ok(observed) => observed,
+            Err(error) => {
+                let mut close = sync_extend_platform_fs::WindowsOriginalCloseAttempt::new();
+                if let Some(file) = original {
+                    file.close_into_attempt(&mut close);
+                }
+                for (_, directory, _) in ancestors {
+                    close.close_directory(directory);
+                }
+                for resources in failed_opens {
+                    close.append_failure(resources);
+                }
+                return Err(OriginalProtectedArtifactOpenFailure {
+                    error,
+                    original_resources: close.finish().err(),
+                });
+            }
+        };
+        let source = WindowsSource {
+            path: path.to_path_buf(),
+            ancestors: ancestors.into_iter().map(|(path, directory, key)| {
+                (path, directory, key.expect("successful original ancestor key"))
+            }).collect(),
+            original: original.expect("successful original artifact acquisition"),
+            key, bytes, modified, private_owner_acl,
+        };
+        let observed = read_original(&source, maximum);
+        let captured_bytes = match observed {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let mut close = sync_extend_platform_fs::WindowsOriginalCloseAttempt::new();
+                source.original.close_into_attempt(&mut close);
+                for (_, directory, _) in source.ancestors {
+                    close.close_directory(directory);
+                }
+                return Err(OriginalProtectedArtifactOpenFailure {
+                    error,
+                    original_resources: close.finish().err(),
+                });
+            }
+        };
+        let result = Self {
+            path: path.to_path_buf(),
+            digest: ContentId::hash(&captured_bytes),
+            bytes: SecretBytes(captured_bytes),
+            private,
+            source,
+        };
+        if let Err(error) = result.verify_original() {
+            return Err(OriginalProtectedArtifactOpenFailure {
+                error,
+                original_resources: result.close_retaining().err(),
+            });
+        }
+        Ok(result)
     }
 
     pub fn source_digest(&self) -> &ContentId {
@@ -216,6 +315,16 @@ impl OriginalProtectedArtifact {
 
     pub fn source_bytes(&self) -> usize {
         self.bytes.0.len()
+    }
+
+    /// Only artifacts explicitly opened as public documents have a byte view.
+    /// Secret/provider artifacts keep their separate protected interface.
+    pub fn public_document_bytes(&self) -> Result<&[u8]> {
+        if self.private {
+            return Err(ReconcileError::Invariant("private artifact has no public document view"));
+        }
+        self.verify_original()?;
+        Ok(&self.bytes.0)
     }
 
     pub fn verify_original(&self) -> Result<()> {
@@ -250,11 +359,37 @@ impl OriginalProtectedArtifact {
     }
 
     pub fn close(self) -> Result<()> {
+        #[cfg(windows)]
+        {
+            return self.close_retaining()
+                .map(|_| ())
+                .map_err(|failure| failure.retain_and_report().into());
+        }
         #[cfg(target_os = "linux")]
-        self.source.close()?;
-        // Windows File and LockedDirectory drops close only the retained
-        // original HANDLEs. Neither platform deletes or adopts a named file.
-        Ok(())
+        {
+            self.source.close()?;
+            Ok(())
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        Err(ReconcileError::Invariant("original deployment close unavailable"))
+    }
+
+    #[cfg(windows)]
+    pub fn close_retaining(
+        self,
+    ) -> std::result::Result<
+        sync_extend_platform_fs::ClosedWindowsOriginalResources,
+        sync_extend_platform_fs::WindowsOriginalResourceCloseFailure,
+    > {
+        let mut attempt = sync_extend_platform_fs::WindowsOriginalCloseAttempt::new();
+        if let Err(error) = self.verify_original() {
+            attempt.note_error(std::io::Error::other(error.to_string()));
+        }
+        self.source.original.close_into_attempt(&mut attempt);
+        for (_, directory, _) in self.source.ancestors {
+            attempt.close_directory(directory);
+        }
+        attempt.finish()
     }
 }
 
@@ -334,18 +469,14 @@ pub struct DeploymentProtectionProvider {
 
 impl DeploymentProtectionProvider {
     pub fn open_original(private_anchor: &Path) -> Result<Self> {
-        let original_anchor = OriginalProtectedArtifact::capture(private_anchor, 65_536, true)?;
         #[cfg(windows)]
-        let scope = {
-            let (principal_digest, _) = original_anchor.source.private_owner_acl.as_ref().ok_or(
-                ReconcileError::Invariant("actual private Windows provider anchor"),
-            )?;
-            ProtectionScope {
-                provider: ProtectionProviderKind::WindowsCurrentUserDpapi,
-                principal_digest: principal_digest.clone(),
-                independent_key_digest: None,
-            }
-        };
+        {
+            return Self::open_original_retaining(private_anchor)
+                .map_err(OriginalProtectedArtifactOpenFailure::retain_and_report);
+        }
+        #[cfg(not(windows))]
+        {
+        let original_anchor = OriginalProtectedArtifact::capture(private_anchor, 65_536, true)?;
         #[cfg(target_os = "linux")]
         let (scope, key) = {
             if original_anchor.original_bytes().len() != 32 {
@@ -384,6 +515,37 @@ impl DeploymentProtectionProvider {
             provider.verify_original()?;
             Ok(provider)
         }
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn open_original_retaining(
+        private_anchor: &Path,
+    ) -> std::result::Result<Self, OriginalProtectedArtifactOpenFailure> {
+        let original_anchor = OriginalProtectedArtifact::capture_retaining(
+            private_anchor, 65_536, true,
+        )?;
+        let scope = match original_anchor.source.private_owner_acl.as_ref() {
+            Some((principal_digest, _)) => ProtectionScope {
+                provider: ProtectionProviderKind::WindowsCurrentUserDpapi,
+                principal_digest: principal_digest.clone(),
+                independent_key_digest: None,
+            },
+            None => {
+                return Err(OriginalProtectedArtifactOpenFailure {
+                    error: ReconcileError::Invariant("actual private Windows provider anchor"),
+                    original_resources: original_anchor.close_retaining().err(),
+                });
+            }
+        };
+        let provider = Self { original_anchor, scope };
+        if let Err(error) = provider.verify_original() {
+            return Err(OriginalProtectedArtifactOpenFailure {
+                error,
+                original_resources: provider.close_retaining().err(),
+            });
+        }
+        Ok(provider)
     }
 
     pub fn scope(&self) -> &ProtectionScope {
@@ -596,6 +758,16 @@ impl DeploymentProtectionProvider {
 
     pub fn close(self) -> Result<()> {
         self.original_anchor.close()
+    }
+
+    #[cfg(windows)]
+    pub fn close_retaining(
+        self,
+    ) -> std::result::Result<
+        sync_extend_platform_fs::ClosedWindowsOriginalResources,
+        sync_extend_platform_fs::WindowsOriginalResourceCloseFailure,
+    > {
+        self.original_anchor.close_retaining()
     }
 }
 

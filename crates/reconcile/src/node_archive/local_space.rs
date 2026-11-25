@@ -1,6 +1,6 @@
 //! Actual restored LocalSpace reads while original creator scope remains live.
 use super::{CreatedNodeDirectorySet, OriginalNodeReadAssembly, VerifiedNodeStateArchive};
-use crate::{filesystem, identity, LocalSpace, ReconcileError, Result};
+use crate::{LocalSpace, ReconcileError, Result};
 use sync_extend_core_model::{limits::LocalLimits, ContentId};
 
 /// Exposes owned status and manifest values only. LocalSpace has effectful
@@ -11,6 +11,8 @@ pub struct OriginalRestoredLocalSpace<'a> {
     readers: super::assembly::ReadContents,
     data_locks: super::CreatedNodeDataLocks<'a>,
     archive_digest: ContentId,
+    original_cas_readers: crate::original_managed_cas::OriginalManagedCasReadResources,
+    original_observer_closed: sync_extend_platform_fs::ClosedWindowsOriginalResources,
 }
 
 impl OriginalRestoredLocalSpace<'_> {
@@ -68,6 +70,117 @@ impl OriginalRestoredLocalSpace<'_> {
     }
 }
 
+impl<'scope> OriginalRestoredLocalSpace<'scope> {
+    pub fn close_original_resources_retaining(
+        self,
+    ) -> std::result::Result<
+        sync_extend_platform_fs::ClosedWindowsOriginalResources,
+        super::OriginalNodeScopedResourceCloseFailure<'scope>,
+    > {
+        let Self {
+            local,
+            directories,
+            readers,
+            data_locks,
+            archive_digest,
+            original_cas_readers,
+            original_observer_closed,
+        } = self;
+        let LocalSpace {
+            space_id,
+            device_id,
+            worktree,
+            data_dir,
+            cas,
+            journal,
+            limits,
+            root_identity,
+            _lock,
+            _worktree_lock,
+        } = local;
+        let pending = super::read_close::OriginalReadPendingResources {
+            directories,
+            readers,
+            data_locks,
+            writers: Some((_lock, _worktree_lock)),
+            identity: Some(root_identity),
+            identity_failure: None,
+            already_closed: vec![original_observer_closed],
+            context: (
+                archive_digest,
+                space_id,
+                device_id,
+                worktree,
+                data_dir,
+                limits,
+            ),
+        };
+        super::scoped_close::close_original_scoped_resources(
+            Some(super::scoped_close::OriginalNodeJournalToClose::Read(
+                journal,
+            )),
+            cas,
+            original_cas_readers,
+            pending,
+        )
+    }
+
+    pub fn close_failed_original_resources_retaining(
+        self,
+        error: ReconcileError,
+    ) -> super::OriginalNodeScopedResourceCloseFailure<'scope> {
+        let Self {
+            local,
+            directories,
+            readers,
+            data_locks,
+            archive_digest,
+            original_cas_readers,
+            original_observer_closed,
+        } = self;
+        let LocalSpace {
+            space_id,
+            device_id,
+            worktree,
+            data_dir,
+            cas,
+            journal,
+            limits,
+            root_identity,
+            _lock,
+            _worktree_lock,
+        } = local;
+        let pending = super::read_close::OriginalReadPendingResources {
+            directories,
+            readers,
+            data_locks,
+            writers: Some((_lock, _worktree_lock)),
+            identity: Some(root_identity),
+            identity_failure: None,
+            already_closed: vec![original_observer_closed],
+            context: (
+                archive_digest,
+                space_id,
+                device_id,
+                worktree,
+                data_dir,
+                limits,
+            ),
+        };
+        super::scoped_close::fail_original_scoped_resources(
+            error,
+            Some(super::scoped_close::OriginalNodeJournalToClose::Read(
+                journal,
+            )),
+            Some(cas),
+            Some(super::scoped_close::OriginalNodeCasReadersToClose::Read(
+                original_cas_readers,
+            )),
+            pending,
+        )
+    }
+}
+
 impl<'a> OriginalNodeReadAssembly<'a> {
     /// Actual original archive device and roots are checked before constructing
     /// LocalSpace directly with real original Journal/CAS and retained writerlocks.
@@ -77,104 +190,24 @@ impl<'a> OriginalNodeReadAssembly<'a> {
         archive: &VerifiedNodeStateArchive,
         limits: LocalLimits,
     ) -> Result<OriginalRestoredLocalSpace<'a>> {
-        self.verify()?;
-        limits.validate()?;
-        let mut journal = self.journal;
-        journal.set_max_storage_entries(limits.max_storage_entries)?;
-        let current = journal
-            .current(archive.space())?
-            .ok_or(ReconcileError::Invariant(
-                "actual original current manifest absent beforeLocalSpace",
-            ))?;
-        if current.entries.len() > limits.max_scan_entries {
-            return Err(ReconcileError::ResourceLimit(
-                "actual restored LocalSpace entry bound",
-            ));
-        }
+        self.into_original_local_space_retaining(archive, limits)
+            .map_err(|original| original.retain_and_report())
+    }
 
-        if self.archive_digest != *archive.digest() || self.space != *archive.space() {
-            return Err(ReconcileError::Invariant(
-                "originalLocalSpace actual archive scope",
-            ));
-        }
-        let inspection = sync_extend_journal::NodeInspectionBounds {
-            max_entries: limits.max_storage_entries,
-            capacity: sync_extend_journal::JournalCapacityLimits {
-                inventory: sync_extend_journal::TreeRestoreInventoryLimits {
-                    max_rows: limits.max_storage_entries,
-                    max_logical_bytes: limits.max_storage_entries as u64 * 1024,
-                },
-                max_rows: limits.max_storage_entries as u64,
-                max_logical_bytes: limits.max_storage_entries as u64 * 1024,
-            },
-            max_vm_instructions: 100_000_000,
-            max_query_time: std::time::Duration::from_secs(60),
-        };
-        let mapped = archive.map_original_restore_journal(
-            &self.directories.roots.worktree_path,
-            inspection,
-            256 * 1024 * 1024,
-            self.read_lease_hold.as_ref(),
-        )?;
-        journal.verify_original_image_rows(&mapped, archive.space(), inspection)?;
-        self.directories.marker.enable_original_readers()?;
-        let data = self.directories.roots.data_path.clone();
-        let worktree = self.directories.roots.worktree_path.clone();
-        let device = identity::load_or_create(&data.join("device.secret"), false)?;
-        if device != *archive.device()
-            || journal.state("space_id")?.as_deref() != Some(archive.space().as_str())
-            || journal.state("device_id")?.as_deref() != Some(archive.device().as_str())
-            || journal.state("worktree")?.as_deref() != worktree.to_str()
-        {
-            return Err(ReconcileError::Invariant(
-                "originalLocalSpace device/worktree states differ",
-            ));
-        }
-        let root_identity = filesystem::PathIdentity::capture(&worktree)?;
-        let data_chain = self.directories.roots.original_writer_chain(false)?;
-        let writer = sync_extend_platform_fs::WriterOwner::from_original_creation(
-            &data,
-            self.data_locks.writer.original_creation()?,
-            data_chain,
-        )?;
-        let marker_path = worktree.join(".sync-extend");
-        let mut worktree_chain = self.directories.roots.original_writer_chain(true)?;
-        worktree_chain.push(
-            self.directories
-                .marker
-                .directory
-                .original_creation()?
-                .retain_writer_directory(&marker_path)?,
-        );
-        let worktree_writer = sync_extend_platform_fs::WriterOwner::from_original_creation(
-            &marker_path,
-            self.directories.marker.writer_lock.original_creation()?,
-            worktree_chain,
-        )?;
-        let local = LocalSpace {
-            space_id: archive.space().clone(),
-            device_id: device,
-            worktree,
-            data_dir: data,
-            cas: self.cas,
-            journal,
-            limits,
-            root_identity,
-            _lock: writer,
-            _worktree_lock: worktree_writer,
-        };
-        let result = OriginalRestoredLocalSpace {
-            local,
-            directories: self.directories,
-            readers: self.readers,
-            data_locks: self.data_locks,
-            archive_digest: self.archive_digest,
-        };
-        result.verify()?;
-        crate::fault::checkpoint("node_actual_local_space_verified");
-        Ok(result)
+    pub fn into_original_local_space_retaining(
+        self,
+        archive: &VerifiedNodeStateArchive,
+        limits: LocalLimits,
+    ) -> std::result::Result<
+        OriginalRestoredLocalSpace<'a>,
+        super::OriginalNodeScopedResourceCloseFailure<'a>,
+    > {
+        deployment_prepare::prepare_original_local(self, archive, limits)
     }
 }
+
+#[path = "local_space/deployment_prepare.rs"]
+mod deployment_prepare;
 
 // Appended inside local_space.rs; observe private originals, never export handles.
 impl OriginalRestoredLocalSpace<'_> {
@@ -398,3 +431,7 @@ impl OriginalRestoredLocalSpace<'_> {
 }
 
 include!("local_write_transition.rs");
+#[path = "local_space/deployment_open_failure.rs"]
+mod deployment_open_failure;
+mod deployment_restore_close;
+pub use deployment_restore_close::OriginalNodeWriteResourceCloseFailure;

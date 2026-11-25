@@ -1,7 +1,7 @@
 //! Append-only recovered history pins. Rows are conservative GC references,
 //! never native issuers; only a held fresh WAL lease executes their transitions.
 use crate::{JournalBackupImage, JournalError, NodeInspectionBounds, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{ContentId, DeviceId, EntryId, SnapshotId, SpaceId};

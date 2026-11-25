@@ -1,8 +1,8 @@
 //! Ordered native C/D effects. Each effect retains exact original handles.
 use super::*;
 use sync_extend_core_model::{
-    tree_native_action_layout::{TreeNativeActionIntent, TreeNativeActionObservation},
     PortablePath,
+    tree_native_action_layout::{TreeNativeActionIntent, TreeNativeActionObservation},
 };
 
 pub struct TreeNativeExecution {

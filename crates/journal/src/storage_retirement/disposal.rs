@@ -1,12 +1,12 @@
 //! Durable pre-request, exact native close, absence, and original marker cleanup.
 use super::{disposal_schema, invalid};
 use crate::{
-    storage_inventory::reader::{add, preflight},
     Journal, Result,
+    storage_inventory::reader::{add, preflight},
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
-use sync_extend_core_model::{tree_storage_capacity::TreeStorageCharge, ContentId, EntryId};
+use sync_extend_core_model::{ContentId, EntryId, tree_storage_capacity::TreeStorageCharge};
 const KINDS: [&str; 4] = [
     "delete_requested",
     "deleted",
@@ -174,7 +174,7 @@ impl Journal {
 #[cfg(windows)]
 pub(super) mod windows {
     use super::*;
-    use rusqlite::{params, Transaction, TransactionBehavior};
+    use rusqlite::{Transaction, TransactionBehavior, params};
     use std::{
         io::Read,
         path::{Path, PathBuf},

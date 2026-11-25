@@ -1,10 +1,10 @@
 //! Independently signed forwarding provenance; current approvals are supplied separately.
 use crate::{
-    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
     Journal, JournalError, RemotePublicationProof, Result,
+    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
 };
 use rusqlite::{
-    params, types::Value, Connection, OptionalExtension, Transaction, TransactionBehavior,
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Value,
 };
 use std::collections::BTreeMap;
 use sync_extend_core_model::{ContentId, SpaceId};

@@ -249,8 +249,8 @@ impl Journal {
             owner_generation: owner.owner_generation(),
             process_ids: terminal.process_ids(),
             startup: (startup.0.to_vec(), startup.1.to_vec()),
-            stdout: (streams.0 .0.to_vec(), streams.1 .0.to_vec()),
-            stderr: (streams.0 .1.to_vec(), streams.1 .1.to_vec()),
+            stdout: (streams.0.0.to_vec(), streams.1.0.to_vec()),
+            stderr: (streams.0.1.to_vec(), streams.1.1.to_vec()),
         };
         let json = serde_json::to_string(&thawed)?;
         validate_thawed(&json, &final_json, &value)?;
@@ -265,63 +265,7 @@ impl Journal {
     pub fn original_linux_native_final_diagnostics(
         &self,
     ) -> Result<Vec<OriginalLinuxNativeFinalDiagnostic>> {
-        let mut query = self.connection.prepare(
-            "SELECT key,value FROM local_state WHERE substr(key,1,?1)=?2 ORDER BY key LIMIT ?3",
-        )?;
-        let rows = query
-            .query_map(
-                params![
-                    FINAL.len() as i64,
-                    FINAL,
-                    self.max_storage_entries as i64 + 1
-                ],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        if rows.len() > self.max_storage_entries {
-            return Err(JournalError::Invariant("native Final inventory limit"));
-        }
-        let mut result = Vec::new();
-        for (name, json) in rows {
-            let (value, stored) = validate_final(&json)?;
-            if name != key(FINAL, &value.attempt) {
-                return Err(JournalError::Invariant("native Final row key differs"));
-            }
-            validate_context(&self.connection, &value, &stored)?;
-            let thawed = state(&self.connection, &key(THAWED, &value.attempt))?;
-            if let Some(thawed) = &thawed {
-                validate_thawed(thawed, &json, &value)?;
-            }
-            let prepared = state(&self.connection, &key(PREPARED, &value.attempt))?;
-            if let Some(prepared) = &prepared {
-                validate_progress(
-                    prepared,
-                    &json,
-                    thawed
-                        .as_deref()
-                        .ok_or(JournalError::Invariant("prepared cleanup THAWED absent"))?,
-                    &value,
-                    None,
-                )?;
-            }
-            let cleaned = cleaned_connection(&self.connection, &value.attempt)?;
-            result.push(OriginalLinuxNativeFinalDiagnostic {
-                transaction_id: value.attempt,
-                target: value.target,
-                snapshot_id: stored.planned.root()?,
-                native_action: if stored.version == 2 {
-                    "REPLACE"
-                } else {
-                    "CREATE"
-                },
-                final_exact_digest: ContentId::hash(json.as_bytes()),
-                helper_thawed: thawed.is_some(),
-                cleanup_prepared: prepared.is_some(),
-                cleanup_completed: cleaned,
-                immutable_history_and_native_receipts_retained: true,
-            });
-        }
-        Ok(result)
+        audit_source_native_terminals(&self.connection, self.max_storage_entries)
     }
 
     pub fn acquire_original_linux_cleanup(

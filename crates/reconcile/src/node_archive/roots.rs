@@ -18,6 +18,32 @@ pub struct CreatedNodeRestoreRoots {
 }
 
 impl CreatedNodeRestoreRoots {
+    pub fn close_into_attempt<'scope>(
+        self,
+        attempt: &mut super::OriginalNodeResourceCloseAttempt<'scope>,
+    ) {
+        let Self {
+            archive_digest,
+            worktree,
+            data,
+            worktree_path,
+            data_path,
+            worktree_ancestors,
+            data_ancestors,
+        } = self;
+        attempt.keep_context((archive_digest, worktree_path, data_path));
+        data.close_into_attempt(&mut attempt.native);
+        worktree.close_into_attempt(&mut attempt.native);
+        for (path, original, key) in data_ancestors.into_iter().rev() {
+            attempt.keep_context((path, key));
+            attempt.native.close_directory(original);
+        }
+        for (path, original, key) in worktree_ancestors.into_iter().rev() {
+            attempt.keep_context((path, key));
+            attempt.native.close_directory(original);
+        }
+    }
+
     pub fn archive_digest(&self) -> &ContentId {
         &self.archive_digest
     }
@@ -146,7 +172,23 @@ impl CreatedNodeRestoreRoots {
         &self,
         worktree: bool,
     ) -> Result<Vec<sync_extend_platform_fs::RetainedWriterDirectory>> {
-        self.verify()?;
+        self.original_writer_chain_retaining(worktree)
+            .map(|original| original.retained)
+            .map_err(|original| {
+                let error = ReconcileError::Io(std::io::Error::other(original.error.to_string()));
+                let mut attempt = super::OriginalNodeResourceCloseAttempt::new();
+                original.close_into_attempt(&mut attempt);
+                if let Err(original) = attempt.finish() {
+                    original.retain_until_process_exit();
+                }
+                error
+            })
+    }
+
+    pub(super) fn original_writer_chain_retaining(
+        &self,
+        worktree: bool,
+    ) -> std::result::Result<OriginalNodeWriterChain, OriginalNodeWriterChainFailure<'_>> {
         let (ancestors, root, path) = if worktree {
             (
                 &self.worktree_ancestors,
@@ -157,16 +199,94 @@ impl CreatedNodeRestoreRoots {
             (&self.data_ancestors, &self.data, &self.data_path)
         };
         let mut retained = Vec::with_capacity(ancestors.len() + 1);
-        for (path, held, key) in ancestors {
-            if held.key()? != *key || !held.matches_path(path)? {
-                return Err(ReconcileError::Invariant(
-                    "original writer ancestor differs",
-                ));
+        let mut native = sync_extend_platform_fs::WindowsOriginalCloseAttempt::new();
+        let result = (|| -> Result<()> {
+            self.verify()?;
+            for (path, held, key) in ancestors {
+                if held.key()? != *key || !held.matches_path(path)? {
+                    return Err(ReconcileError::Invariant(
+                        "original writer ancestor differs",
+                    ));
+                }
+                retained.push(held.retain_writer_directory_into_attempt(path, &mut native)?);
             }
-            retained.push(held.retain_writer_directory(path)?);
+            retained.push(
+                root.original_creation()?
+                    .retain_writer_directory_into_attempt(path, &mut native)?,
+            );
+            self.verify()?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => match native.finish() {
+                Ok(actual_closed) => Ok(OriginalNodeWriterChain {
+                    retained,
+                    actual_closed,
+                }),
+                Err(original) => Err(OriginalNodeWriterChainFailure {
+                    roots: self,
+                    error: ReconcileError::Io(std::io::Error::other(original.error.to_string())),
+                    retained,
+                    native_failure: Some(original),
+                    actual_closed: None,
+                }),
+            },
+            Err(error) => {
+                let (native_failure, actual_closed) = match native.finish() {
+                    Ok(closed) => (None, Some(closed)),
+                    Err(original) => (Some(original), None),
+                };
+                Err(OriginalNodeWriterChainFailure {
+                    roots: self,
+                    error,
+                    retained,
+                    native_failure,
+                    actual_closed,
+                })
+            }
         }
-        retained.push(root.original_creation()?.retain_writer_directory(path)?);
-        self.verify()?;
-        Ok(retained)
+    }
+}
+
+pub(super) struct OriginalNodeWriterChain {
+    pub(super) retained: Vec<sync_extend_platform_fs::RetainedWriterDirectory>,
+    pub(super) actual_closed: sync_extend_platform_fs::ClosedWindowsOriginalResources,
+}
+
+pub(super) struct OriginalNodeWriterChainFailure<'scope> {
+    roots: &'scope CreatedNodeRestoreRoots,
+    pub(super) error: ReconcileError,
+    retained: Vec<sync_extend_platform_fs::RetainedWriterDirectory>,
+    native_failure: Option<sync_extend_platform_fs::WindowsOriginalResourceCloseFailure>,
+    actual_closed: Option<sync_extend_platform_fs::ClosedWindowsOriginalResources>,
+}
+
+impl OriginalNodeWriterChainFailure<'_> {
+    pub(super) fn close_into_attempt<'scope>(
+        self,
+        attempt: &mut super::OriginalNodeResourceCloseAttempt<'scope>,
+    ) where
+        Self: 'scope,
+    {
+        let Self {
+            roots,
+            error,
+            retained,
+            native_failure,
+            actual_closed,
+        } = self;
+        attempt
+            .native
+            .note_error(std::io::Error::other(error.to_string()));
+        attempt.keep_context((roots, error));
+        if let Some(closed) = actual_closed {
+            attempt.append_closed(closed);
+        }
+        if let Some(original) = native_failure {
+            attempt.native.append_failure(original.close_remaining());
+        }
+        for original in retained.into_iter().rev() {
+            original.close_into_attempt(&mut attempt.native);
+        }
     }
 }

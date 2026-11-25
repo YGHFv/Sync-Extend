@@ -1,14 +1,14 @@
 //! Actual Journal liabilities, not configured writer or native execution authority.
 use crate::{
+    Journal, JournalStoredRow, Result, SCHEMA_VERSION, TreeRestoreInventoryLimits,
     storage_inventory::reader::{
-        add, hash, invalid, preflight, read_table, validate_schema, Namespace,
+        Namespace, add, hash, invalid, preflight, read_table, validate_schema,
     },
-    Journal, JournalStoredRow, Result, TreeRestoreInventoryLimits, SCHEMA_VERSION,
 };
 use rusqlite::{Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use sync_extend_core_model::{tree_storage_capacity::TreeStorageCharge, ContentId, SpaceId};
+use sync_extend_core_model::{ContentId, SpaceId, tree_storage_capacity::TreeStorageCharge};
 
 mod audit;
 mod ordinary;

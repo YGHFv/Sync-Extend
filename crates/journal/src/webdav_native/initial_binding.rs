@@ -1,6 +1,6 @@
 //! Original binding descriptions only; decoding never reconstructs a native guard.
 use serde::{Deserialize, Serialize};
-use sync_extend_core_model::{tree_restore_identity::TreeNativeIdentity, ContentId, Entry};
+use sync_extend_core_model::{ContentId, Entry, tree_restore_identity::TreeNativeIdentity};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case", deny_unknown_fields)]

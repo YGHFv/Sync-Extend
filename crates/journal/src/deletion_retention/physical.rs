@@ -1,8 +1,8 @@
 //! Preserve an existing held SQLite physical reservation across metadata writes.
 //! An ordinary writer has no such receipt and is never certified by this guard.
-use crate::{Journal, Result};
 #[cfg(target_os = "linux")]
 use crate::JournalError;
+use crate::{Journal, Result};
 
 pub(crate) struct PhysicalMetadataGuard {
     #[cfg(target_os = "linux")]
@@ -42,7 +42,7 @@ impl PhysicalMetadataGuard {
             _ => {
                 return Err(JournalError::Invariant(
                     "retention held metadata physical reservation changed",
-                ))
+                ));
             }
         }
         #[cfg(not(target_os = "linux"))]

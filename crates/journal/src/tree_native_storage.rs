@@ -1,30 +1,30 @@
 //! Durable initial intention only. No syscall or externally supplied observation.
 use crate::{
+    Journal, JournalStorageInventory, MAX_OPERATION_BYTES, Result,
+    TreeCoordinatorAdmissionInspection, TreeRestoreInventoryLimits, TreeRestorePreparation,
     check_storage_metadata_limit, sql_integer,
-    storage_inventory::reader::{add, hash, invalid, preflight, validate_schema, Namespace},
-    Journal, JournalStorageInventory, Result, TreeCoordinatorAdmissionInspection,
-    TreeRestoreInventoryLimits, TreeRestorePreparation, MAX_OPERATION_BYTES,
+    storage_inventory::reader::{Namespace, add, hash, invalid, preflight, validate_schema},
 };
 use rusqlite::{
-    params_from_iter, types::Value, Connection, OptionalExtension, Transaction, TransactionBehavior,
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params_from_iter, types::Value,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use sync_extend_core_model::{
+    ContentId, EntryId, SpaceId,
     tree_native_action_layout::{
-        plan_tree_native_action_layout, TreeNativeActionLayoutLimits, TreeNativeActionLayoutPlan,
-        TreeNativeActionLayoutRecord, TreeNativeActionPayload, TreeNativeActionScope,
+        TreeNativeActionLayoutLimits, TreeNativeActionLayoutPlan, TreeNativeActionLayoutRecord,
+        TreeNativeActionPayload, TreeNativeActionScope, plan_tree_native_action_layout,
     },
     tree_native_protocol::{
-        plan_tree_native_protocol, TreeNativeAdmissionBinding, TreeNativeProtocolInput,
-        TreeNativeProtocolLimits, TreeNativeProtocolPlan,
+        TreeNativeAdmissionBinding, TreeNativeProtocolInput, TreeNativeProtocolLimits,
+        TreeNativeProtocolPlan, plan_tree_native_protocol,
     },
     tree_restore_history::encode_history_record,
     tree_storage_footprint::{
-        tree_native_action_row_values, tree_native_header_row_values,
         TreeNativeStorageHeaderRequest, TreeStorageColumn, TreeStorageColumnValue,
+        tree_native_action_row_values, tree_native_header_row_values,
     },
-    ContentId, EntryId, SpaceId,
 };
 
 pub(crate) mod schema;

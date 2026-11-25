@@ -2,9 +2,9 @@
 use super::receipt_protocol::{ReceiptDescription, ReceiptEvidence, ReceiptStage, VerifiedPrefix};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::{
+    ContentId, EntryId, ModelError, PortablePath, Result,
     tree_restore_identity::TreeNativeIdentity,
     webdav_native::{WebDavNativeAction, WebDavNativeParent, WebDavNativePlan, WebDavNativeSlot},
-    ContentId, EntryId, ModelError, PortablePath, Result,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

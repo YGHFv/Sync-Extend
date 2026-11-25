@@ -1,7 +1,7 @@
 // Exact schema32 native prewrite values, not future obligations.
 use crate::{
-    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
     MAX_OPERATION_BYTES,
+    storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec},
 };
 
 const fn column(name: &'static str, kind: ColumnKind, primary_key: usize) -> ColumnSpec {

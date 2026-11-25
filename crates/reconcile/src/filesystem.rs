@@ -13,6 +13,72 @@ pub(crate) struct PathIdentity {
 }
 
 impl PathIdentity {
+    #[cfg(windows)]
+    pub(crate) fn close_stopped_capture(
+        self,
+        attempt: &mut sync_extend_platform_fs::WindowsOriginalCloseAttempt,
+    ) {
+        let _ = self.close_original_into_attempt(attempt);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn close_original_into_attempt(
+        self,
+        attempt: &mut sync_extend_platform_fs::WindowsOriginalCloseAttempt,
+    ) -> ContentId {
+        let Self { handle, physical } = self;
+        attempt.close_identity_handle(handle);
+        physical
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn capture_original_into_attempt(
+        path: &Path,
+        attempt: &mut sync_extend_platform_fs::WindowsOriginalCloseAttempt,
+    ) -> Result<Self> {
+        let mut original = None;
+        let mut observer = None;
+        let mut physical = None;
+        let prepared = (|| -> Result<()> {
+            check_ancestors(path)?;
+            original = Some(Handle::from_path(path)?);
+            physical = Some(physical_identity(path)?);
+            check_ancestors(path)?;
+            observer = Some(Handle::from_path(path)?);
+            if original.as_ref() != observer.as_ref()
+                || physical.as_ref() != Some(&physical_identity(path)?)
+            {
+                return Err(ReconcileError::Unstable);
+            }
+            Ok(())
+        })();
+        if let Some(observer) = observer.take() {
+            attempt.close_identity_handle(observer);
+        }
+        if let Err(error) = prepared {
+            if let Some(original) = original.take() {
+                attempt.close_identity_handle(original);
+            }
+            return Err(error);
+        }
+        if attempt.has_retained_originals() {
+            if let Some(original) = original.take() {
+                attempt.close_identity_handle(original);
+            }
+            return Err(ReconcileError::Invariant(
+                "original identity observation terminal remains incomplete",
+            ));
+        }
+        Ok(Self {
+            handle: original
+                .take()
+                .expect("prepared same original identity handle"),
+            physical: physical
+                .take()
+                .expect("prepared original physical identity"),
+        })
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn original_descriptor(&self) -> &File {
         self.handle.as_file()

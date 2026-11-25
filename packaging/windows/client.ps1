@@ -149,11 +149,13 @@ function Add-ColumnsTab {
     $list = [Windows.Forms.ListView]::new()
     $list.Dock = 'Fill'
     $list.View = 'Details'
+    $list.Scrollable = $true
     $list.GridLines = $true
     $list.FullRowSelect = $true
     $list.ShowItemToolTips = $true
     for ($index = 0; $index -lt $Names.Length; $index++) {
-        [void]$list.Columns.Add($Names[$index], $Widths[$index])
+        $headerWidth = [Windows.Forms.TextRenderer]::MeasureText($Names[$index], $form.Font).Width + 24
+        [void]$list.Columns.Add($Names[$index], [Math]::Max($Widths[$index], $headerWidth))
     }
     $page.Controls.Add($list)
     $tabs.TabPages.Add($page)
@@ -161,7 +163,8 @@ function Add-ColumnsTab {
 }
 
 Add-ColumnsTab 'Status' @('项目', '状态') @(225, 665) '本机状态'
-Add-ColumnsTab 'Files' @('相对路径', '类型', '逻辑大小') @(480, 95, 230) '工作区'
+Add-ColumnsTab 'Files' @('相对路径', '类型', '逻辑大小', '源修改时间（UTC）', '只读属性', '元数据能力', '时间精度') `
+    @(360, 70, 170, 275, 85, 240, 100) '工作区'
 Add-ColumnsTab 'History' @('快照', '原状态', '快照创建时间', '当前 / 锁定', '内容状态', '裁剪时间') @(275, 100, 180, 140, 150, 180) '本机历史'
 Add-ColumnsTab 'Pruned history' @('快照', '原状态', '快照创建时间', '当前 / 锁定', '内容状态', '裁剪时间') @(275, 100, 180, 140, 150, 180) '裁剪审计'
 Add-ColumnsTab 'Recovery' @('项目', '只读观察与手动入口') @(230, 800) '恢复与预览'
@@ -585,6 +588,12 @@ function Add-ClientRow {
         [void]$item.SubItems.Add([string]$Values[$index])
     }
     $item.ToolTipText = ($Values -join "`r`n")
+    if ($Tab -ceq 'Files') {
+        foreach ($index in @(3, 5, 6)) {
+            $textWidth = [Windows.Forms.TextRenderer]::MeasureText([string]$Values[$index], $lists[$Tab].Font).Width + 24
+            $lists[$Tab].Columns[$index].Width = [Math]::Max($lists[$Tab].Columns[$index].Width, $textWidth)
+        }
+    }
     [void]$lists[$Tab].Items.Add($item)
 }
 

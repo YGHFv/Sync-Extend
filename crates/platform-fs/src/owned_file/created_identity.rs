@@ -12,8 +12,7 @@ use std::{
 use windows_sys::Win32::{
     Foundation::{HANDLE, INVALID_HANDLE_VALUE},
     Storage::FileSystem::{
-        ReOpenFile, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
+        ReOpenFile, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
     },
 };
 
@@ -25,9 +24,122 @@ pub struct ReleasedOriginalFileIdentity {
     original_parent: File,
     key: FileKey,
     parent_key: FileKey,
+    original_creator_terminal: Option<crate::ClosedWindowsOriginalResources>,
+}
+
+pub(super) enum OriginalSqliteIdentityReleaseFailure {
+    Creator {
+        creator: Box<OwnedFileCreation>,
+        original_resources: Option<crate::WindowsOriginalResourceCloseFailure>,
+        error: io::Error,
+    },
+    Released {
+        identity: ReleasedOriginalFileIdentity,
+        original_resources: crate::WindowsOriginalResourceCloseFailure,
+        error: io::Error,
+    },
+}
+
+pub(super) struct OriginalSqliteIdentityReadFailure {
+    pub(super) identity: ReleasedOriginalFileIdentity,
+    pub(super) original_resources: Option<crate::WindowsOriginalResourceCloseFailure>,
+    pub(super) error: io::Error,
 }
 
 impl OwnedFileCreation {
+    /// The SQLite handoff ends both actual exclusive CREATE HANDLEs and carries
+    /// the resulting original terminal witness forward with its identity.
+    /// Every failed native prefix remains typed, without a replacement creator.
+    pub(super) fn release_original_sqlite_identity(
+        self,
+    ) -> Result<ReleasedOriginalFileIdentity, OriginalSqliteIdentityReleaseFailure> {
+        let prepared = (|| -> io::Result<(FileKey, FileKey)> {
+            let original = self.original_creation()?;
+            original.verify()?;
+            self.verify_single_link()?;
+            Ok((original.key()?, original.parent_key()?))
+        })();
+        let (file_key, parent_key) = match prepared {
+            Ok(keys) => keys,
+            Err(error) => {
+                return Err(OriginalSqliteIdentityReleaseFailure::Creator {
+                    creator: Box::new(self),
+                    original_resources: None,
+                    error,
+                })
+            }
+        };
+        let original =
+            match super::super::reopen_same_file_object_retaining(self.reader(), file_key, false) {
+                Ok(original) => original,
+                Err(failure) => {
+                    return Err(OriginalSqliteIdentityReleaseFailure::Creator {
+                        creator: Box::new(self),
+                        original_resources: failure.original_resources,
+                        error: failure.error,
+                    })
+                }
+            };
+        let original_parent = match self.parent.try_clone() {
+            Ok(parent) => parent,
+            Err(error) => {
+                let mut terminal = crate::WindowsOriginalCloseAttempt::new();
+                terminal.close_file(original);
+                return Err(OriginalSqliteIdentityReleaseFailure::Creator {
+                    creator: Box::new(self),
+                    original_resources: terminal.finish().err(),
+                    error,
+                });
+            }
+        };
+        let checked = (|| -> io::Result<()> {
+            if key(&original)? != file_key || key(&original_parent)? != parent_key {
+                return Err(invalid("original SQLite identity handoff lineage differs"));
+            }
+            regular(&original, false)?;
+            regular(&original_parent, true)
+        })();
+        if let Err(error) = checked {
+            let mut terminal = crate::WindowsOriginalCloseAttempt::new();
+            terminal.close_file(original);
+            terminal.close_file(original_parent);
+            return Err(OriginalSqliteIdentityReleaseFailure::Creator {
+                creator: Box::new(self),
+                original_resources: terminal.finish().err(),
+                error,
+            });
+        }
+        let mut identity = ReleasedOriginalFileIdentity {
+            original,
+            original_parent,
+            key: file_key,
+            parent_key,
+            original_creator_terminal: None,
+        };
+        let mut terminal = crate::WindowsOriginalCloseAttempt::new();
+        self.close_into_attempt(&mut terminal);
+        match terminal.finish() {
+            Ok(closed) => {
+                identity.original_creator_terminal = Some(closed);
+                Ok(identity)
+            }
+            Err(original_resources) => {
+                let error = match original_resources.error.raw_os_error() {
+                    Some(code) => io::Error::from_raw_os_error(code),
+                    None => io::Error::new(
+                        original_resources.error.kind(),
+                        original_resources.error.to_string(),
+                    ),
+                };
+                Err(OriginalSqliteIdentityReleaseFailure::Released {
+                    identity,
+                    original_resources,
+                    error,
+                })
+            }
+        }
+    }
+
     /// Caller records the handoff before consuming the exclusive creator.
     /// The new object handle comes from ReOpenFile on the actual original handle.
     /// All errors before handoff retain the caller's creator via the Err tuple.
@@ -62,11 +174,43 @@ impl OwnedFileCreation {
             original_parent,
             key,
             parent_key,
+            original_creator_terminal: None,
         })
     }
 }
 
 impl ReleasedOriginalFileIdentity {
+    pub(super) fn retain_original_sqlite_read(
+        self,
+    ) -> Result<ReleasedOriginalReadFile, OriginalSqliteIdentityReadFailure> {
+        if let Err(error) = self.verify() {
+            return Err(OriginalSqliteIdentityReadFailure {
+                identity: self,
+                original_resources: None,
+                error,
+            });
+        }
+        match super::super::reopen_same_file_object_retaining(&self.original, self.key, true) {
+            Ok(reader) => Ok(ReleasedOriginalReadFile {
+                reader,
+                original: self,
+            }),
+            Err(failure) => Err(OriginalSqliteIdentityReadFailure {
+                identity: self,
+                original_resources: failure.original_resources,
+                error: failure.error,
+            }),
+        }
+    }
+
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        if let Some(closed) = self.original_creator_terminal {
+            attempt.append_result(Ok(closed));
+        }
+        attempt.close_file(self.original);
+        attempt.close_file(self.original_parent);
+    }
+
     pub fn key(&self) -> io::Result<FileKey> {
         self.verify()?;
         Ok(self.key)
@@ -101,6 +245,7 @@ impl ReleasedOriginalFileIdentity {
             original_parent: self.original_parent.try_clone()?,
             key: self.key,
             parent_key: self.parent_key,
+            original_creator_terminal: None,
         };
         observed.verify()?;
         Ok(observed)
@@ -115,6 +260,11 @@ pub struct ReleasedOriginalReadFile {
 }
 
 impl ReleasedOriginalReadFile {
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        attempt.close_file(self.reader);
+        self.original.close_into_attempt(attempt);
+    }
+
     pub fn original_key(&self) -> io::Result<FileKey> {
         self.original.key()
     }
@@ -164,6 +314,11 @@ pub struct ReleasedOriginalCoordinationFile {
     original: ReleasedOriginalFileIdentity,
 }
 impl ReleasedOriginalCoordinationFile {
+    pub fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        attempt.close_file(self.file);
+        self.original.close_into_attempt(attempt);
+    }
+
     pub fn verify(&self, path: &Path) -> io::Result<()> {
         self.original.verify()?;
         regular(&self.file, false)?;
@@ -276,9 +431,26 @@ impl ReleasedOriginalReadFile {
         if let Err(error) = self.verify_identity() {
             return Err((self, error));
         }
-        let Self { reader, original } = self;
-        drop(reader);
-        Ok(original)
+        let Self {
+            reader,
+            mut original,
+        } = self;
+        match crate::original_resource_close::close_owned_original_file(reader) {
+            Ok(()) => {
+                let mut terminal = crate::WindowsOriginalCloseAttempt::new();
+                terminal.note_actual_handle_closed();
+                if let Some(closed) = original.original_creator_terminal.take() {
+                    terminal.append_result(Ok(closed));
+                }
+                original.original_creator_terminal = Some(
+                    terminal
+                        .finish()
+                        .expect("only actual successful original closes were appended"),
+                );
+                Ok(original)
+            }
+            Err((reader, error)) => Err((Self { reader, original }, error)),
+        }
     }
 }
 

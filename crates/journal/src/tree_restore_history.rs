@@ -1,17 +1,18 @@
 use crate::{
-    check_storage_metadata_limit, snapshot_retention::audit_snapshot, sql_integer, CasAccessGuard,
-    Journal, JournalError, Result, TreeRestorePreparationIntent, MAX_OPERATION_BYTES,
+    CasAccessGuard, Journal, JournalError, MAX_OPERATION_BYTES, Result,
+    TreeRestorePreparationIntent, check_storage_metadata_limit, snapshot_retention::audit_snapshot,
+    sql_integer,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
-    tree_restore::{plan_tree_restore, TreeRestorePlan},
-    tree_restore_history::{
-        encode_history_record, plan_tree_restore_history, TreeRestoreHistoryFootprint,
-        TreeRestoreHistoryInput, TreeRestoreHistoryPlan,
-    },
     Change, ContentId, EntryId, Manifest, Operation, SnapshotId, VersionVector,
+    tree_restore::{TreeRestorePlan, plan_tree_restore},
+    tree_restore_history::{
+        TreeRestoreHistoryFootprint, TreeRestoreHistoryInput, TreeRestoreHistoryPlan,
+        encode_history_record, plan_tree_restore_history,
+    },
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -239,7 +239,7 @@ pub struct LedgerDescriptor {
 }
 
 impl Descriptor {
-    fn validate_paths(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(crate) fn validate_paths(&self) -> Result<(), Box<dyn std::error::Error>> {
         if self.version != 1 || self.generation == u32::MAX {
             return Err("unsupported recovered-local descriptor version/generation".into());
         }
@@ -279,32 +279,12 @@ impl Descriptor {
         Ok(())
     }
 
-    fn inspection(&self) -> NodeInspectionBounds {
-        NodeInspectionBounds {
-            max_entries: self.inspection.max_entries,
-            capacity: JournalCapacityLimits {
-                inventory: TreeRestoreInventoryLimits {
-                    max_rows: self.inspection.inventory_max_rows,
-                    max_logical_bytes: self.inspection.inventory_max_logical_bytes,
-                },
-                max_rows: self.inspection.max_rows,
-                max_logical_bytes: self.inspection.max_logical_bytes,
-            },
-            max_vm_instructions: self.inspection.max_vm_instructions,
-            max_query_time: Duration::from_secs(self.inspection.max_query_time_secs),
-        }
+    pub(crate) fn inspection(&self) -> NodeInspectionBounds {
+        self.inspection.bounds()
     }
 
-    fn ledger(&self) -> LedgerBounds {
-        LedgerBounds {
-            max_records: self.ledger.max_records,
-            max_intents: self.ledger.max_intents,
-            max_record_bytes: self.ledger.max_record_bytes,
-            max_database_bytes: self.ledger.max_database_bytes,
-            max_content_bytes: self.ledger.max_content_bytes,
-            max_vm_instructions: self.ledger.max_vm_instructions,
-            max_query_time: Duration::from_secs(self.ledger.max_query_time_secs),
-        }
+    pub(crate) fn ledger(&self) -> LedgerBounds {
+        self.ledger.bounds()
     }
 
     fn successor(&self) -> Result<Self, Box<dyn std::error::Error>> {
@@ -322,6 +302,38 @@ impl Descriptor {
         let mut next = self.successor()?;
         next.history_chain = history_chain;
         Ok(next)
+    }
+}
+
+impl InspectionDescriptor {
+    pub(crate) fn bounds(&self) -> NodeInspectionBounds {
+        NodeInspectionBounds {
+            max_entries: self.max_entries,
+            capacity: JournalCapacityLimits {
+                inventory: TreeRestoreInventoryLimits {
+                    max_rows: self.inventory_max_rows,
+                    max_logical_bytes: self.inventory_max_logical_bytes,
+                },
+                max_rows: self.max_rows,
+                max_logical_bytes: self.max_logical_bytes,
+            },
+            max_vm_instructions: self.max_vm_instructions,
+            max_query_time: Duration::from_secs(self.max_query_time_secs),
+        }
+    }
+}
+
+impl LedgerDescriptor {
+    pub(crate) fn bounds(&self) -> LedgerBounds {
+        LedgerBounds {
+            max_records: self.max_records,
+            max_intents: self.max_intents,
+            max_record_bytes: self.max_record_bytes,
+            max_database_bytes: self.max_database_bytes,
+            max_content_bytes: self.max_content_bytes,
+            max_vm_instructions: self.max_vm_instructions,
+            max_query_time: Duration::from_secs(self.max_query_time_secs),
+        }
     }
 }
 
@@ -422,7 +434,7 @@ fn print(value: &impl Serialize) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-enum RestoreMode<'a> {
+pub(crate) enum RestoreMode<'a> {
     ReadOnly,
     FirstWrite,
     ReadLeaseHold(&'a ContentId),
@@ -434,22 +446,36 @@ fn restore_original(
     ledger_directory: &Path,
     mode: RestoreMode<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let next = if matches!(mode, RestoreMode::FirstWrite) {
-        Some(descriptor.successor()?)
-    } else {
-        None
-    };
+    let output =
+        with_original_node_restore(archive, descriptor, ledger_directory, mode, |_| Ok(()))?;
+    print(&output.receipt)
+}
+
+pub(crate) struct OriginalNodeRestoreOutput<T> {
+    pub value: T,
+    pub receipt: serde_json::Value,
+    pub successor: Option<Descriptor>,
+}
+
+/// The callback borrows the actual completed CREATE scope while all original
+/// roots, readers, locks and ledger are still alive. Its result must be owned.
+/// The same native first-write pipeline then closes on return from the callback.
+pub(crate) fn with_original_node_restore<T>(
+    archive: &VerifiedNodeStateArchive,
+    descriptor: &Descriptor,
+    ledger_directory: &Path,
+    mode: RestoreMode<'_>,
+    completed: impl FnOnce(
+        &sync_extend_reconcile::OriginalNodeCompletionObservation<'_, '_>,
+    ) -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<OriginalNodeRestoreOutput<T>, Box<dyn std::error::Error>> {
+    descriptor.validate_paths()?;
     let expected_hold_digest = match mode {
         RestoreMode::ReadLeaseHold(digest) => Some(digest),
         RestoreMode::ReadOnly | RestoreMode::FirstWrite => None,
     };
     let inspection = descriptor.inspection();
     let ledger_bounds = descriptor.ledger();
-    let local_limits = LocalLimits {
-        max_storage_entries: inspection.max_entries,
-        ..LocalLimits::default()
-    };
-    local_limits.validate()?;
     let prepared = if let Some(digest) = expected_hold_digest {
         archive.prepare_original_node_restore_with_read_lease_hold(
             &descriptor.worktree,
@@ -470,14 +496,81 @@ fn restore_original(
             ledger_bounds,
         )?
     };
+    with_prepared_original_node_restore(
+        archive,
+        &prepared,
+        descriptor,
+        ledger_directory,
+        mode,
+        completed,
+    )
+}
+
+/// Allows a deployment to prepare every selected node before the first CREATE,
+/// then reuse the same original native restoration pipeline and live callback.
+pub(crate) fn with_prepared_original_node_restore<T>(
+    archive: &VerifiedNodeStateArchive,
+    prepared: &sync_extend_reconcile::PreparedOriginalNodeRestore,
+    descriptor: &Descriptor,
+    ledger_directory: &Path,
+    mode: RestoreMode<'_>,
+    completed: impl FnOnce(
+        &sync_extend_reconcile::OriginalNodeCompletionObservation<'_, '_>,
+    ) -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<OriginalNodeRestoreOutput<T>, Box<dyn std::error::Error>> {
+    let output = with_prepared_original_node_restore_result(
+        archive,
+        prepared,
+        descriptor,
+        ledger_directory,
+        mode,
+        completed,
+    )?;
+    Ok(OriginalNodeRestoreOutput {
+        value: output.value?,
+        receipt: output.receipt,
+        successor: output.successor,
+    })
+}
+
+/// Keeps the callback's owned outcome through the same real native closure.
+/// Deployment composition can retain an installed file prefix separately and
+/// observe each successful original first-write successor even if its nested
+/// installation callback failed. A callback error never skips native closure.
+pub(crate) fn with_prepared_original_node_restore_result<T>(
+    archive: &VerifiedNodeStateArchive,
+    prepared: &sync_extend_reconcile::PreparedOriginalNodeRestore,
+    descriptor: &Descriptor,
+    ledger_directory: &Path,
+    mode: RestoreMode<'_>,
+    completed: impl FnOnce(
+        &sync_extend_reconcile::OriginalNodeCompletionObservation<'_, '_>,
+    ) -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<OriginalNodeRestoreOutput<Result<T, Box<dyn std::error::Error>>>, Box<dyn std::error::Error>> {
+    descriptor.validate_paths()?;
+    let next = if matches!(mode, RestoreMode::FirstWrite) {
+        Some(descriptor.successor()?)
+    } else {
+        None
+    };
+    let expected_hold_digest = match mode {
+        RestoreMode::ReadLeaseHold(digest) => Some(digest),
+        RestoreMode::ReadOnly | RestoreMode::FirstWrite => None,
+    };
+    let inspection = descriptor.inspection();
+    let local_limits = LocalLimits {
+        max_storage_entries: inspection.max_entries,
+        ..LocalLimits::default()
+    };
+    local_limits.validate()?;
     let mut ledger = if next.is_some() {
         NodeRestoreLedger::create_external_for_prepared_first_write(
             ledger_directory,
             archive,
-            &prepared,
+            prepared,
         )?
     } else {
-        NodeRestoreLedger::create_external_for_prepared(ledger_directory, archive, &prepared)?
+        NodeRestoreLedger::create_external_for_prepared(ledger_directory, archive, prepared)?
     };
     let roots = prepared.create_original_roots(archive, &mut ledger)?;
     let marker = archive.create_worktree_marker(&roots, &mut ledger)?;
@@ -498,14 +591,18 @@ fn restore_original(
         .manifest()?
         .ok_or("restored manifest absent")?
         .root()?;
+    let value = {
+        let observation = local.observe_original_completion(archive, prepared, &ledger)?;
+        completed(&observation)
+    };
     let (completion, frames) = if let Some(mut next) = next {
         let (completion, frames) =
-            local.complete_original_restore_with_first_write(archive, &prepared, &mut ledger)?;
+            local.complete_original_restore_with_first_write(archive, prepared, &mut ledger)?;
         next.restore_ledger = ledger.path().to_path_buf();
         next.original_frames = frames.clone();
         (completion, Some((frames, next)))
     } else {
-        let observation = local.observe_original_completion(archive, &prepared, &ledger)?;
+        let observation = local.observe_original_completion(archive, prepared, &ledger)?;
         (ledger.commit_original_completion(observation)?, None)
     };
     let mut receipt = serde_json::json!({
@@ -524,13 +621,18 @@ fn restore_original(
             "activate_read_leases": false,
         },
     });
+    let successor = frames.as_ref().map(|(_, next)| next.clone());
     if let Some((frames, next)) = frames {
         receipt["original_frames"] = serde_json::to_value(frames)?;
         receipt["first_journal_write_closed"] = true.into();
         receipt["next_descriptor"] = serde_json::to_value(next)?;
         receipt["old_descriptor_rewritten"] = false.into();
     }
-    print(&receipt)
+    Ok(OriginalNodeRestoreOutput {
+        value,
+        receipt,
+        successor,
+    })
 }
 
 pub fn run(descriptor_path: &Path, action: Action) -> Result<(), Box<dyn std::error::Error>> {

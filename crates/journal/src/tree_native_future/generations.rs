@@ -1,12 +1,12 @@
 //! Immutable globally single-use future resource names, not native identity IDs.
 use crate::{
-    storage_inventory::reader::{add, invalid},
     Result,
+    storage_inventory::reader::{add, invalid},
 };
 use rusqlite::Connection;
 use std::collections::BTreeSet;
 use sync_extend_core_model::{
-    tree_native_future_obligations::TreeNativeFutureGenerations, EntryId,
+    EntryId, tree_native_future_obligations::TreeNativeFutureGenerations,
 };
 
 pub(super) fn ids(plan: &TreeNativeFutureGenerations) -> Result<BTreeSet<EntryId>> {

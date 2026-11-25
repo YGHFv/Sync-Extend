@@ -9,12 +9,16 @@ use std::{
     os::windows::io::FromRawHandle,
     ptr,
     rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::Ordering,
 };
 use windows_sys::Win32::{
     Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE},
     System::Threading::GetCurrentProcess,
 };
+
+#[path = "scoped_vfs/callback_gate.rs"]
+mod callback_gate;
+use callback_gate::{callback_base, callback_policy, CallbackRegistration, OriginalCallbackScope};
 
 struct ApprovedFiles {
     main_name: CString,
@@ -24,6 +28,15 @@ struct ApprovedFiles {
     wal: FileKey,
     journal: FileKey,
     limits: [u64; 3],
+    mode: OriginalSqliteVfsMode,
+    wal_allowed: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OriginalSqliteVfsMode {
+    OriginalWritable,
+    OriginalReadonly,
+    StoppedCaptureReadonly,
 }
 
 struct Policy {
@@ -35,18 +48,25 @@ struct Policy {
     wal: FileKey,
     journal: FileKey,
     limits: [u64; 3],
-    native_offset: usize,
+    mode: OriginalSqliteVfsMode,
+    wal_allowed: bool,
     opened_rollback: std::cell::RefCell<Option<File>>,
+    held_main: std::cell::RefCell<Option<HeldRollback>>,
+    held_wal: std::cell::RefCell<Option<HeldRollback>>,
     held_rollback: std::cell::RefCell<Option<HeldRollback>>,
+    original_observation_closes: std::cell::RefCell<crate::WindowsOriginalCloseAttempt>,
     rollback_reset_authorized: std::cell::Cell<bool>,
     poisoned: std::sync::atomic::AtomicBool,
 }
 
-/// Registration owns its policy and name until its connection is fully closed.
-/// This type has no Send/Sync implementation; callers retain it on the same thread.
-struct OriginalSqliteVfs {
-    table: Box<ffi::sqlite3_vfs>,
-    name: CString,
+/// A private whole context owns its policy until its connection/native IO end.
+/// Stable bounded global lookup slots never expose that policy to another DB.
+pub(super) struct OriginalSqliteVfs {
+    context: Option<OriginalSqliteVfsContext>,
+}
+
+struct OriginalSqliteVfsContext {
+    callback: CallbackRegistration,
     policy: Rc<Policy>,
 }
 
@@ -67,12 +87,14 @@ fn error() -> i32 {
     ffi::SQLITE_CANTOPEN
 }
 
-unsafe fn policy<'a>(vfs: *mut ffi::sqlite3_vfs) -> &'a Policy {
-    // SAFETY: our live registered table stores Rc::as_ptr from its retained owner.
-    unsafe { &*((*vfs).pAppData.cast::<Policy>()) }
+fn copy_original_terminal_error(error: &io::Error) -> io::Error {
+    match error.raw_os_error() {
+        Some(code) => io::Error::from_raw_os_error(code),
+        None => io::Error::new(error.kind(), error.to_string()),
+    }
 }
 
-unsafe fn actual_file(file: *mut ffi::sqlite3_file) -> io::Result<File> {
+unsafe fn actual_file(file: *mut ffi::sqlite3_file, policy: &Policy) -> io::Result<File> {
     // SAFETY: base xOpen returned a sized initialized sqlite3_file.
     let methods = unsafe { (*file).pMethods };
     if methods.is_null() {
@@ -115,13 +137,27 @@ unsafe fn actual_file(file: *mut ffi::sqlite3_file) -> io::Result<File> {
     }
     // SAFETY: successful DuplicateHandle transfers one new locally owned handle.
     let observed = unsafe { File::from_raw_handle(duplicate) };
-    super::verify_regular_file(&observed)?;
+    if let Err(error) = super::verify_regular_file(&observed) {
+        policy
+            .original_observation_closes
+            .borrow_mut()
+            .close_file(observed);
+        return Err(error);
+    }
     Ok(observed)
 }
 
-unsafe fn actual_identity(file: *mut ffi::sqlite3_file) -> io::Result<FileKey> {
+unsafe fn actual_identity(file: *mut ffi::sqlite3_file, policy: &Policy) -> io::Result<FileKey> {
     // SAFETY: caller supplies the actual initialized builtin file for this callback.
-    FileKey::from_file(&unsafe { actual_file(file)? })
+    let observed = unsafe { actual_file(file, policy)? };
+    let identity = FileKey::from_file(&observed);
+    let mut terminal = policy.original_observation_closes.borrow_mut();
+    terminal.close_file(observed);
+    if let Some(error) = terminal.original_close_error() {
+        policy.poisoned.store(true, Ordering::SeqCst);
+        return Err(copy_original_terminal_error(error));
+    }
+    identity
 }
 
 unsafe extern "C" fn open(
@@ -134,8 +170,30 @@ unsafe extern "C" fn open(
     if vfs.is_null() || name.is_null() || file.is_null() {
         return error();
     }
-    // SAFETY: callback receives our live registered table and SQLite filename.
-    let policy = unsafe { policy(vfs) };
+    // A failed or foreign xOpen must never expose an initialized outer IO.
+    // SAFETY: SQLite supplies fresh, correctly sized outer file storage.
+    unsafe {
+        (*file).pMethods = ptr::null();
+    }
+    let kind =
+        flags & (ffi::SQLITE_OPEN_MAIN_DB | ffi::SQLITE_OPEN_WAL | ffi::SQLITE_OPEN_MAIN_JOURNAL);
+    if !matches!(
+        kind,
+        ffi::SQLITE_OPEN_MAIN_DB | ffi::SQLITE_OPEN_WAL | ffi::SQLITE_OPEN_MAIN_JOURNAL
+    ) {
+        return error();
+    }
+    // SAFETY: the stable slot checks thread authority before any live Policy
+    // dereference; the guard also prevents context destruction during callback.
+    let Some(mut original) = (unsafe { callback_policy(vfs) }) else {
+        return error();
+    };
+    if kind == ffi::SQLITE_OPEN_MAIN_DB && !original.take_single_main_open() {
+        // Another safe Connection, including ATTACH from a foreign memory DB,
+        // receives no original main loan and cannot poison the original owner.
+        return error();
+    }
+    let policy = &*original;
     if policy.poisoned.load(Ordering::SeqCst) {
         return error();
     }
@@ -144,16 +202,17 @@ unsafe extern "C" fn open(
     if name_bytes.to_bytes().len() > 16_384 {
         return error();
     }
-    let kind =
-        flags & (ffi::SQLITE_OPEN_MAIN_DB | ffi::SQLITE_OPEN_WAL | ffi::SQLITE_OPEN_MAIN_JOURNAL);
     let (expected, limit) = if kind == ffi::SQLITE_OPEN_MAIN_DB
         && normalized(name_bytes) == normalized(&policy.main_name)
     {
         (policy.main, policy.limits[0])
-    } else if kind == ffi::SQLITE_OPEN_WAL && normalized(name_bytes) == normalized(&policy.wal_name)
+    } else if kind == ffi::SQLITE_OPEN_WAL
+        && policy.wal_allowed
+        && normalized(name_bytes) == normalized(&policy.wal_name)
     {
         (policy.wal, policy.limits[1])
     } else if kind == ffi::SQLITE_OPEN_MAIN_JOURNAL
+        && policy.mode == OriginalSqliteVfsMode::OriginalWritable
         && normalized(name_bytes) == normalized(&policy.journal_name)
     {
         (policy.journal, policy.limits[2])
@@ -163,76 +222,44 @@ unsafe extern "C" fn open(
         policy.poisoned.store(true, Ordering::SeqCst);
         return error();
     };
-    if flags & ffi::SQLITE_OPEN_READWRITE == 0 || flags & ffi::SQLITE_OPEN_DELETEONCLOSE != 0 {
+    let readonly = policy.mode != OriginalSqliteVfsMode::OriginalWritable;
+    if (readonly
+        && (flags & ffi::SQLITE_OPEN_READONLY == 0 || flags & ffi::SQLITE_OPEN_READWRITE != 0))
+        || (!readonly && flags & ffi::SQLITE_OPEN_READWRITE == 0)
+        || flags & ffi::SQLITE_OPEN_DELETEONCLOSE != 0
+    {
         policy.poisoned.store(true, Ordering::SeqCst);
         return error();
     }
     // Windows base must apply share0 to main. SQLite URI parameters are retained
     // alongside this filename; no string-built query or global default modifies it.
     // SAFETY: SQLite filename has the documented URI extra data representation.
-    if kind == ffi::SQLITE_OPEN_MAIN_DB
+    if !readonly && kind == ffi::SQLITE_OPEN_MAIN_DB
         // SAFETY: SQLite supplies this callback filename and its documented URI data.
         && unsafe { ffi::sqlite3_uri_boolean(name, c"exclusive".as_ptr(), 0) } != 1
     {
         policy.poisoned.store(true, Ordering::SeqCst);
         return error();
     }
-    // SAFETY: retained base VFS is SQLite's builtin Windows VFS for this process.
-    let base_open = unsafe { (*policy.base).xOpen };
-    let Some(base_open) = base_open else {
-        return error();
-    };
     // Never create or delete via SQLite. Original creator and ledger precreate WAL.
     let flags = flags
         & !(ffi::SQLITE_OPEN_CREATE | ffi::SQLITE_OPEN_EXCLUSIVE | ffi::SQLITE_OPEN_DELETEONCLOSE);
-    // SAFETY: pass SQLite's exact sized file storage/filename to the builtin VFS.
-    // SAFETY: this VFS advertises outer aligned IO header plus builtin file size.
-    let original = unsafe {
-        file.cast::<u8>()
-            .add(policy.native_offset)
-            .cast::<ffi::sqlite3_file>()
-    };
     // SAFETY: fresh outer storage is SQLite-owned; failure must not expose methods.
     unsafe {
         (*file).pMethods = ptr::null();
     }
-    if kind == ffi::SQLITE_OPEN_MAIN_JOURNAL {
-        // SAFETY: original approved filename/kind/flags and sized outer storage
-        // were validated above; this uses only the retained exact builtin object.
-        return match unsafe { open_held_rollback(policy, file, flags, out) } {
-            Ok(()) => ffi::SQLITE_OK,
-            Err(_) => {
-                policy.poisoned.store(true, Ordering::SeqCst);
-                error()
-            }
-        };
-    }
-    // SAFETY: SQLite-owned storage contains exactly advertised native offset and base szOsFile.
-    let result = unsafe { base_open(policy.base, name, original, flags, out) };
-    if result != ffi::SQLITE_OK {
-        return result;
-    }
-    // SAFETY: successful xOpen initialized this exact file. Check before first IO.
-    if !matches!(unsafe{actual_identity(original)},Ok(key) if key==expected) {
-        policy.poisoned.store(true, Ordering::SeqCst);
-        // SAFETY: initialized file methods can close this exact newly opened file once.
-        unsafe {
-            let methods = (*original).pMethods;
-            if !methods.is_null() {
-                if let Some(close) = (*methods).xClose {
-                    close(original);
-                }
-            }
-            (*file).pMethods = ptr::null();
+    // Each actual builtin file is allocated and owned in the original Policy
+    // before the first xOpen. SQLite's logical xClose leaves that same native
+    // owner intact for the explicit, checked terminal after actual DB close.
+    // SAFETY: exact approved kind, path, flags, and original outer storage were
+    // admitted above. No replacement path or additional native open is used.
+    match unsafe { open_held_original(policy, file, flags, out, kind, expected, limit) } {
+        Ok(()) => ffi::SQLITE_OK,
+        Err(_) => {
+            policy.poisoned.store(true, Ordering::SeqCst);
+            error()
         }
-        return error();
     }
-    // SAFETY: base xOpen and exact identity succeeded; outer storage is aligned
-    // and only this wrapper owns the original base file/methods and retained policy.
-    unsafe {
-        super::bounded_io::install(file, original, limit, &policy.poisoned, false);
-    }
-    result
 }
 
 unsafe extern "C" fn delete(
@@ -243,8 +270,16 @@ unsafe extern "C" fn delete(
     if vfs.is_null() || name.is_null() {
         return ffi::SQLITE_IOERR_DELETE;
     }
-    // SAFETY: SQLite calls our registered table with a terminated filename.
-    let policy = unsafe { policy(vfs) };
+    // Only the private original writable issuer scopes this exact reset. Foreign
+    // memory/failed-open cleanup never accesses Rc or original rollback state.
+    // SAFETY: stable slot and admitted same owner thread before Policy access.
+    let Some(original) = (unsafe { callback_policy(vfs) }) else {
+        return ffi::SQLITE_IOERR_DELETE;
+    };
+    if !original.permits_rollback_reset() {
+        return ffi::SQLITE_IOERR_DELETE;
+    }
+    let policy = &*original;
     // SAFETY: SQLite owns this callback filename through the synchronous call.
     let name = unsafe { CStr::from_ptr(name) };
     if policy.poisoned.load(Ordering::SeqCst)
@@ -297,35 +332,72 @@ unsafe extern "C" fn access(
     if vfs.is_null() || name.is_null() || out.is_null() {
         return error();
     }
-    // SAFETY: our registered policy remains retained and filename is SQLite-owned.
-    let policy = unsafe { policy(vfs) };
+    // Discovery uses the immutable builtin VFS and remains truthful even for a
+    // foreign memory/empty/failed-open DB; no original Policy is borrowed.
+    // SAFETY: this callback table's bounded slot and builtin base have process lifetime.
+    let base = unsafe { callback_base(vfs) };
+    if base.is_null() {
+        return error();
+    }
     // SAFETY: SQLite supplies a terminated filename for this callback.
     let name_bytes = unsafe { CStr::from_ptr(name) };
     if name_bytes.to_bytes().len() > 16_384 {
         return error();
     }
-    if normalized(name_bytes) == normalized(&policy.main_name)
-        || normalized(name_bytes) == normalized(&policy.wal_name)
-    {
-        // SAFETY: builtin base access callback handles these exact approved names.
-        if let Some(access) = unsafe { (*policy.base).xAccess } {
-            // SAFETY: unchanged SQLite filename and sized output to builtin VFS.
-            return unsafe { access(policy.base, name, flags, out) };
-        }
-        return error();
-    }
-    // For discovery SQLite may ask whether a rollback/SHM name exists. Do not
-    // conceal foreign files: let caller's explicit inventory and base access see it.
+    // For discovery SQLite may ask whether a rollback/SHM name exists. The
+    // caller's explicit inventory and builtin access observe every actual path.
     // SAFETY: builtin base access only observes filename state, never creates/deletes.
-    if let Some(access) = unsafe { (*policy.base).xAccess } {
+    if let Some(access) = unsafe { (*base).xAccess } {
         // SAFETY: unchanged SQLite callback arguments to builtin VFS.
-        unsafe { access(policy.base, name, flags, out) }
+        unsafe { access(base, name, flags, out) }
     } else {
         error()
     }
 }
 
 impl OriginalSqliteVfs {
+    pub(super) fn register_readonly(
+        main_path: &std::path::Path,
+        expected_main: FileKey,
+        maximum_main_bytes: u64,
+        existing_wal: Option<(FileKey, u64)>,
+        stopped_capture: bool,
+    ) -> io::Result<Self> {
+        if !main_path.is_absolute() || (!stopped_capture && existing_wal.is_some()) {
+            return Err(io::Error::other(
+                "exact readonly original VFS purpose required",
+            ));
+        }
+        let main_name = CString::new(
+            main_path
+                .to_str()
+                .ok_or_else(|| io::Error::other("readonly original SQLite path encoding"))?,
+        )
+        .map_err(|_| io::Error::other("readonly original SQLite filename"))?;
+        let mut wal_bytes = main_name.as_bytes().to_vec();
+        wal_bytes.extend_from_slice(b"-wal");
+        let mut journal_bytes = main_name.as_bytes().to_vec();
+        journal_bytes.extend_from_slice(b"-journal");
+        let (wal, wal_limit) = existing_wal.unwrap_or((expected_main, 512));
+        Self::register(ApprovedFiles {
+            main_name,
+            wal_name: CString::new(wal_bytes)
+                .map_err(|_| io::Error::other("readonly original WAL filename"))?,
+            journal_name: CString::new(journal_bytes)
+                .map_err(|_| io::Error::other("readonly original rollback filename"))?,
+            main: expected_main,
+            wal,
+            journal: expected_main,
+            limits: [maximum_main_bytes, wal_limit, 512],
+            mode: if stopped_capture {
+                OriginalSqliteVfsMode::StoppedCaptureReadonly
+            } else {
+                OriginalSqliteVfsMode::OriginalReadonly
+            },
+            wal_allowed: existing_wal.is_some(),
+        })
+    }
+
     /// Exact names/keys come from living original creator witnesses. Numeric
     /// observations alone must not be accepted by the private recovery issuer.
     fn register(approved: ApprovedFiles) -> io::Result<Self> {
@@ -337,6 +409,8 @@ impl OriginalSqliteVfs {
             wal,
             journal,
             limits,
+            mode,
+            wal_allowed,
         } = approved;
         if limits
             .iter()
@@ -364,12 +438,29 @@ impl OriginalSqliteVfs {
             ));
         }
         // SAFETY: SQLite initializes before returning its builtin named VFS.
-        let base = unsafe { ffi::sqlite3_vfs_find(c"win32".as_ptr()) };
+        let base = unsafe {
+            ffi::sqlite3_vfs_find(
+                if mode == OriginalSqliteVfsMode::StoppedCaptureReadonly {
+                    c"win32-none"
+                } else {
+                    c"win32"
+                }
+                .as_ptr(),
+            )
+        };
         if base.is_null() {
             return Err(io::Error::other("builtin Windows VFS required"));
         }
-        // SAFETY: SQLite builtin VFS table has process lifetime and C-compatible layout.
-        let mut table = Box::new(unsafe { *base });
+        // SAFETY: zero initializes only C integers/pointers/nullable functions.
+        // Copy immutable ABI integers individually: copying the full builtin
+        // table would race SQLite's pNext mutations during other registrations.
+        let mut table: ffi::sqlite3_vfs = unsafe { std::mem::zeroed() };
+        // SAFETY: builtin immutable ABI fields have process lifetime.
+        unsafe {
+            table.iVersion = (*base).iVersion;
+            table.szOsFile = (*base).szOsFile;
+            table.mxPathname = (*base).mxPathname;
+        }
         if table.szOsFile <= 0 || table.szOsFile > 64 * 1024 || table.iVersion < 2 {
             return Err(io::Error::other("bounded builtin Windows VFS ABI required"));
         }
@@ -383,13 +474,6 @@ impl OriginalSqliteVfs {
             .ok_or_else(|| io::Error::other("SQLite wrapper file storage overflow"))?;
         table.szOsFile =
             i32::try_from(size).map_err(|_| io::Error::other("SQLite wrapper file size bound"))?;
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        if id == 0 || id == u64::MAX {
-            return Err(io::Error::other("original VFS registration exhausted"));
-        }
-        let name = CString::new(format!("sync-original-{}-{id}", std::process::id()))
-            .map_err(|_| io::Error::other("private VFS name"))?;
         let policy = Rc::new(Policy {
             base,
             main_name,
@@ -399,15 +483,21 @@ impl OriginalSqliteVfs {
             wal,
             journal,
             limits,
-            native_offset,
+            mode,
+            wal_allowed,
             opened_rollback: std::cell::RefCell::new(None),
+            held_main: std::cell::RefCell::new(None),
+            held_wal: std::cell::RefCell::new(None),
             held_rollback: std::cell::RefCell::new(None),
+            original_observation_closes: std::cell::RefCell::new(
+                crate::WindowsOriginalCloseAttempt::new(),
+            ),
             rollback_reset_authorized: std::cell::Cell::new(false),
             poisoned: std::sync::atomic::AtomicBool::new(false),
         });
         table.pNext = ptr::null_mut();
-        table.zName = name.as_ptr();
-        table.pAppData = Rc::as_ptr(&policy).cast_mut().cast();
+        table.zName = ptr::null();
+        table.pAppData = ptr::null_mut();
         table.xOpen = Some(open);
         table.xDelete = Some(delete);
         table.xAccess = Some(access);
@@ -426,32 +516,172 @@ impl OriginalSqliteVfs {
         table.xGetSystemCall = None;
         table.xNextSystemCall = None;
 
-        // SAFETY: boxed table, CString and policy live in returned registration;
-        // makeDefault=0 prevents changing any unrelated normal Journal connections.
-        let result = unsafe { ffi::sqlite3_vfs_register(&mut *table, 0) };
-        if result != ffi::SQLITE_OK {
-            return Err(io::Error::other("private scoped VFS registration refused"));
-        }
+        // SAFETY: this same private context owns Rc until the gate detaches after
+        // actual logical/native close. The bounded global table/name stays
+        // valid for foreign vfs_find pointers, without retaining Rc/native IO.
+        let callback = unsafe { CallbackRegistration::register(table, base, Rc::as_ptr(&policy)) }?;
         Ok(Self {
-            table,
-            name,
-            policy,
+            context: Some(OriginalSqliteVfsContext { callback, policy }),
         })
     }
-    fn name(&self) -> &CStr {
-        &self.name
+    fn context_ref(&self) -> &OriginalSqliteVfsContext {
+        self.context
+            .as_ref()
+            .expect("original registered VFS context retained")
     }
-    fn refused_effect(&self) -> bool {
-        self.policy.poisoned.load(Ordering::SeqCst)
+    pub(super) fn name(&self) -> &CStr {
+        self.context_ref().callback.name()
+    }
+
+    pub(super) fn activate_current_thread(&self) -> io::Result<()> {
+        self.context_ref().callback.activate_current_thread()
+    }
+
+    pub(super) fn begin_single_main_open(&self) -> io::Result<OriginalCallbackScope> {
+        self.context_ref().callback.begin_single_main_open()
+    }
+    pub(super) fn refused_effect(&self) -> bool {
+        self.context_ref().policy.poisoned.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn has_original_context(&self) -> bool {
+        self.context.is_some()
+    }
+
+    pub(super) fn original_logical_io_remains(&self) -> bool {
+        self.context.as_ref().is_some_and(|context| {
+            let slot = context.callback.slot();
+            let Ok(_original) = context.callback.lock_owner_on_slot(&slot) else {
+                return true;
+            };
+            [
+                &context.policy.held_main,
+                &context.policy.held_wal,
+                &context.policy.held_rollback,
+            ]
+            .iter()
+            .any(|original| {
+                original.borrow().as_ref().is_some_and(|original| {
+                    !original.original_logical_terminal.load(Ordering::SeqCst)
+                })
+            })
+        })
+    }
+
+    pub(super) fn verify_readonly_original(&self) -> io::Result<()> {
+        let context = self.context_ref();
+        let slot = context.callback.slot();
+        let _original = context.callback.lock_owner_on_slot(&slot)?;
+        let policy = &context.policy;
+        if policy.mode == OriginalSqliteVfsMode::OriginalWritable
+            || policy.poisoned.load(Ordering::SeqCst)
+        {
+            return Err(io::Error::other("healthy original readonly VFS required"));
+        }
+        let held = policy.held_main.borrow();
+        let main = held
+            .as_ref()
+            .ok_or_else(|| io::Error::other("original readonly main IO absent"))?;
+        if !main.initialized || main.original_logical_terminal.load(Ordering::SeqCst) {
+            return Err(io::Error::other("live original readonly main IO required"));
+        }
+        // SAFETY: the continuously retained owning builtin IO remains borrowed
+        // by its original SQLite wrapper; observation closes its actual duplicate.
+        if unsafe { actual_identity(main.file(), policy) }? != policy.main {
+            return Err(io::Error::other("actual original readonly main differs"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn close_original_into_attempt(
+        &mut self,
+        attempt: &mut crate::WindowsOriginalCloseAttempt,
+    ) {
+        let Some(context) = self.context.as_mut() else {
+            return;
+        };
+        let slot = context.callback.slot();
+        let mut original_callback = match context.callback.lock_owner_on_slot(&slot) {
+            Ok(original) => original,
+            Err(error) => {
+                attempt.note_error(error);
+                return;
+            }
+        };
+        let policy = &context.policy;
+        if [&policy.held_main, &policy.held_wal, &policy.held_rollback]
+            .iter()
+            .any(|original| {
+                original.borrow().as_ref().is_some_and(|original| {
+                    !original.original_logical_terminal.load(Ordering::SeqCst)
+                })
+            })
+        {
+            attempt.note_error(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "same original SQLite pager still borrows native IO",
+            ));
+            return;
+        }
+        let original_observations =
+            std::mem::take(&mut *policy.original_observation_closes.borrow_mut());
+        attempt.append_result(original_observations.finish());
+        if let Some(original) = policy.opened_rollback.borrow_mut().take() {
+            attempt.close_file(original);
+        }
+        for original in [&policy.held_main, &policy.held_wal, &policy.held_rollback] {
+            let mut retained = original.borrow_mut();
+            if let Some(original) = retained.as_mut() {
+                original.close_original_into_attempt(attempt);
+                if !original.original_resources_remain() {
+                    retained.take();
+                }
+            }
+        }
+        if let Err(error) = context.callback.unregister() {
+            attempt.note_error(error);
+            return;
+        }
+        if [&policy.held_main, &policy.held_wal, &policy.held_rollback]
+            .iter()
+            .any(|original| original.borrow().is_some())
+        {
+            attempt.note_error(io::Error::other(
+                "original SQLite native IO remains retained after terminal",
+            ));
+            return;
+        }
+        if Rc::strong_count(policy) != 1 {
+            attempt.note_error(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "original SQLite VFS has an outstanding original policy loan",
+            ));
+            return;
+        }
+        if let Err(error) = context.callback.detach(&mut original_callback) {
+            attempt.note_error(error);
+            return;
+        }
+        drop(original_callback);
+        self.context.take();
     }
 }
 
 impl Drop for OriginalSqliteVfs {
     fn drop(&mut self) {
-        // SAFETY: owner must close its connection before registration drops.
-        // Unregister only this unique private table, never builtin/default VFS.
-        unsafe {
-            ffi::sqlite3_vfs_unregister(&mut *self.table);
+        if self.context.is_none() {
+            return;
+        }
+        let mut original = Self {
+            context: self.context.take(),
+        };
+        let mut terminal = crate::WindowsOriginalCloseAttempt::new();
+        original.close_original_into_attempt(&mut terminal);
+        if original.context.is_some() {
+            let _ = Box::leak(Box::new(original));
+        }
+        if let Err(original) = terminal.finish() {
+            original.retain_until_process_exit();
         }
     }
 }
@@ -462,8 +692,11 @@ unsafe extern "C" fn full_path(
     n: i32,
     out: *mut std::ffi::c_char,
 ) -> i32 {
-    // SAFETY: callback receives our registered table, policy/base has owner lifetime.
-    let base = unsafe { policy(vfs).base };
+    // SAFETY: the stable slot forwards without touching an active original Policy.
+    let base = unsafe { callback_base(vfs) };
+    if base.is_null() {
+        return error();
+    }
     // SAFETY: builtin VFS table is live for process lifetime.
     let Some(method) = (unsafe { (*base).xFullPathname }) else {
         return error();
@@ -500,8 +733,11 @@ unsafe extern "C" fn randomness(
     n: i32,
     out: *mut std::ffi::c_char,
 ) -> i32 {
-    // SAFETY: our policy's base is retained builtin VFS.
-    let base = unsafe { policy(vfs).base };
+    // SAFETY: immutable process-lifetime base; foreign memory DBs use no Policy.
+    let base = unsafe { callback_base(vfs) };
+    if base.is_null() {
+        return 0;
+    }
     // SAFETY: method table is builtin process-lifetime object.
     let Some(method) = (unsafe { (*base).xRandomness }) else {
         return 0;
@@ -510,8 +746,11 @@ unsafe extern "C" fn randomness(
     unsafe { method(base, n, out) }
 }
 unsafe extern "C" fn sleep(vfs: *mut ffi::sqlite3_vfs, microseconds: i32) -> i32 {
-    // SAFETY: registered callback table owns policy throughout this call.
-    let base = unsafe { policy(vfs).base };
+    // SAFETY: the bounded slot/base remains valid after original context close.
+    let base = unsafe { callback_base(vfs) };
+    if base.is_null() {
+        return 0;
+    }
     // SAFETY: process-lifetime builtin method table.
     let Some(method) = (unsafe { (*base).xSleep }) else {
         return 0;
@@ -520,8 +759,11 @@ unsafe extern "C" fn sleep(vfs: *mut ffi::sqlite3_vfs, microseconds: i32) -> i32
     unsafe { method(base, microseconds) }
 }
 unsafe extern "C" fn current_time(vfs: *mut ffi::sqlite3_vfs, out: *mut f64) -> i32 {
-    // SAFETY: retained policy/base valid for registered table callback.
-    let base = unsafe { policy(vfs).base };
+    // SAFETY: pointer-free builtin clock uses the stable slot/base only.
+    let base = unsafe { callback_base(vfs) };
+    if base.is_null() {
+        return ffi::SQLITE_ERROR;
+    }
     // SAFETY: builtin process-lifetime method table.
     let Some(method) = (unsafe { (*base).xCurrentTime }) else {
         return ffi::SQLITE_ERROR;
@@ -533,8 +775,11 @@ unsafe extern "C" fn current_time64(
     vfs: *mut ffi::sqlite3_vfs,
     out: *mut ffi::sqlite3_int64,
 ) -> i32 {
-    // SAFETY: registered policy and process-lifetime builtin base are live.
-    let base = unsafe { policy(vfs).base };
+    // SAFETY: immutable process-lifetime base, without an original Policy loan.
+    let base = unsafe { callback_base(vfs) };
+    if base.is_null() {
+        return ffi::SQLITE_ERROR;
+    }
     // SAFETY: builtin table live for this callback.
     let Some(method) = (unsafe { (*base).xCurrentTimeInt64 }) else {
         return ffi::SQLITE_ERROR;
@@ -547,8 +792,11 @@ unsafe extern "C" fn last_error(
     n: i32,
     out: *mut std::ffi::c_char,
 ) -> i32 {
-    // SAFETY: policy retained by the registered VFS owner.
-    let base = unsafe { policy(vfs).base };
+    // SAFETY: process-lifetime base serves foreign failed-open diagnostics too.
+    let base = unsafe { callback_base(vfs) };
+    if base.is_null() {
+        return 0;
+    }
     // SAFETY: builtin process-lifetime method table.
     let Some(method) = (unsafe { (*base).xGetLastError }) else {
         return 0;
@@ -561,31 +809,55 @@ unsafe extern "C" fn last_error(
 /// or VFS handle escapes; private Journal adapter must retain this whole owner.
 pub(super) struct ScopedOriginalSqlite {
     connection: Option<rusqlite::Connection>,
+    opening_connection: Option<*mut ffi::sqlite3>,
     registration: OriginalSqliteVfs,
-    main: crate::ReleasedOriginalFileIdentity,
-    wal: crate::ReleasedOriginalFileIdentity,
-    journal: crate::ReleasedOriginalFileIdentity,
+    main: Option<crate::ReleasedOriginalFileIdentity>,
+    wal: Option<crate::ReleasedOriginalFileIdentity>,
+    journal: Option<crate::ReleasedOriginalFileIdentity>,
     write_attempted: bool,
+    original_terminal_error: Option<io::Error>,
+    original_resource_terminal: Option<crate::WindowsOriginalResourceCloseFailure>,
+    actual_closed_handle_prefix: usize,
 }
 
-impl ScopedOriginalSqlite {
-    pub(super) fn open(
-        uri: &str,
-        main_path: &std::path::Path,
-        main: crate::ReleasedOriginalFileIdentity,
-        wal: crate::ReleasedOriginalFileIdentity,
-        journal: crate::ReleasedOriginalFileIdentity,
-        limits: [u64; 3],
-    ) -> Result<
-        Self,
+enum ScopedOriginalSqliteOpenFailure {
+    Released(
         Box<(
             crate::ReleasedOriginalFileIdentity,
             crate::ReleasedOriginalFileIdentity,
             crate::ReleasedOriginalFileIdentity,
             io::Error,
         )>,
-    > {
-        let attempt = || -> io::Result<(rusqlite::Connection, OriginalSqliteVfs)> {
+    ),
+    Open(Box<ScopedOriginalSqlite>, io::Error),
+}
+
+impl ScopedOriginalSqlite {
+    fn main_ref(&self) -> &crate::ReleasedOriginalFileIdentity {
+        self.main
+            .as_ref()
+            .expect("original main identity remains retained")
+    }
+    fn wal_ref(&self) -> &crate::ReleasedOriginalFileIdentity {
+        self.wal
+            .as_ref()
+            .expect("original WAL identity remains retained")
+    }
+    fn journal_ref(&self) -> &crate::ReleasedOriginalFileIdentity {
+        self.journal
+            .as_ref()
+            .expect("original rollback identity remains retained")
+    }
+
+    fn open(
+        uri: &str,
+        main_path: &std::path::Path,
+        main: crate::ReleasedOriginalFileIdentity,
+        wal: crate::ReleasedOriginalFileIdentity,
+        journal: crate::ReleasedOriginalFileIdentity,
+        limits: [u64; 3],
+    ) -> Result<Self, ScopedOriginalSqliteOpenFailure> {
+        let attempt = || -> io::Result<OriginalSqliteVfs> {
             main.verify()?;
             wal.verify()?;
             journal.verify()?;
@@ -625,7 +897,7 @@ impl ScopedOriginalSqlite {
                     .ok_or_else(|| io::Error::other("original rollback path encoding"))?,
             )
             .map_err(|_| io::Error::other("original rollback filename"))?;
-            let registration = OriginalSqliteVfs::register(ApprovedFiles {
+            OriginalSqliteVfs::register(ApprovedFiles {
                 main_name,
                 wal_name,
                 journal_name,
@@ -633,38 +905,112 @@ impl ScopedOriginalSqlite {
                 wal: wal.key()?,
                 journal: journal.key()?,
                 limits,
-            })?;
-            let name = registration
-                .name()
-                .to_str()
-                .map_err(|_| io::Error::other("private VFS name encoding"))?;
-            let connection = rusqlite::Connection::open_with_flags_and_vfs(
-                uri,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                    | rusqlite::OpenFlags::SQLITE_OPEN_URI
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                name,
-            )
-            .map_err(|_| io::Error::other("scoped original VFS connection refused"))?;
-            if registration.refused_effect()
-                || crate::sqlite_main_file_identity(&connection)? != main.key()?
-            {
-                return Err(io::Error::other("scoped VFS main identity refused"));
-            }
-            Ok((connection, registration))
+                mode: OriginalSqliteVfsMode::OriginalWritable,
+                wal_allowed: true,
+            })
         };
-        let (connection, registration) = match attempt() {
+        let registration = match attempt() {
             Ok(value) => value,
-            Err(error) => return Err(Box::new((main, wal, journal, error))),
+            Err(error) => {
+                return Err(ScopedOriginalSqliteOpenFailure::Released(Box::new((
+                    main, wal, journal, error,
+                ))))
+            }
         };
-        Ok(Self {
-            connection: Some(connection),
+        let mut owner = Self {
+            connection: None,
+            opening_connection: None,
             registration,
-            main,
-            wal,
-            journal,
+            main: Some(main),
+            wal: Some(wal),
+            journal: Some(journal),
             write_attempted: false,
-        })
+            original_terminal_error: None,
+            original_resource_terminal: None,
+            actual_closed_handle_prefix: 0,
+        };
+        let uri = match CString::new(uri) {
+            Ok(uri) => uri,
+            Err(error) => {
+                return Err(ScopedOriginalSqliteOpenFailure::Open(
+                    Box::new(owner),
+                    io::Error::other(error),
+                ))
+            }
+        };
+        let _original_open = match owner.registration.begin_single_main_open() {
+            Ok(original_open) => original_open,
+            Err(error) => {
+                return Err(ScopedOriginalSqliteOpenFailure::Open(
+                    Box::new(owner),
+                    error,
+                ))
+            }
+        };
+        let mut database = ptr::null_mut();
+        // SAFETY: the one original registration owns names/policy/native IO.
+        // Retain the actual returned DB even if this original open fails.
+        let opened = unsafe {
+            ffi::sqlite3_open_v2(
+                uri.as_ptr(),
+                &mut database,
+                ffi::SQLITE_OPEN_READWRITE
+                    | ffi::SQLITE_OPEN_URI
+                    | ffi::SQLITE_OPEN_NOMUTEX
+                    | ffi::SQLITE_OPEN_PRIVATECACHE,
+                owner.registration.name().as_ptr(),
+            )
+        };
+        if !database.is_null() {
+            owner.opening_connection = Some(database);
+        }
+        if opened != ffi::SQLITE_OK || database.is_null() {
+            let error = if database.is_null() {
+                io::Error::other(format!(
+                    "original scoped SQLite open returned {opened} without a database",
+                ))
+            } else {
+                // SAFETY: the exact failed-open DB is still owned and live.
+                let message = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(database)) }
+                    .to_string_lossy()
+                    .into_owned();
+                io::Error::other(rusqlite::Error::SqliteFailure(
+                    ffi::Error::new(opened),
+                    Some(message),
+                ))
+            };
+            return Err(ScopedOriginalSqliteOpenFailure::Open(
+                Box::new(owner),
+                error,
+            ));
+        }
+        // SAFETY: ownership transfers once from the actual original open_v2 DB
+        // to rusqlite. It does not open a database or register a replacement VFS.
+        let connection = match unsafe { rusqlite::Connection::from_handle_owned(database) } {
+            Ok(connection) => connection,
+            Err(error) => {
+                return Err(ScopedOriginalSqliteOpenFailure::Open(
+                    Box::new(owner),
+                    io::Error::other(error),
+                ))
+            }
+        };
+        owner.opening_connection = None;
+        owner.connection = Some(connection);
+        let checked = owner
+            .connection
+            .as_ref()
+            .expect("original connection just retained")
+            .busy_timeout(std::time::Duration::ZERO)
+            .map_err(io::Error::other)
+            .and_then(|()| owner.verify());
+        if let Err(error) = checked {
+            return Err(ScopedOriginalSqliteOpenFailure::Open(
+                Box::new(owner),
+                error,
+            ));
+        }
+        Ok(owner)
     }
     /// Only the crate's private recovery issuer calls this after all current
     /// roots/archive/ledger/content budgets have been re-established.
@@ -675,7 +1021,9 @@ impl ScopedOriginalSqlite {
             .as_ref()
             .ok_or_else(|| io::Error::other("original SQLite closed"))?;
         let (actual, bytes) = crate::sqlite_main_exact_bytes(connection, accepted.len() as u64)?;
-        if actual != self.main.key()? || bytes != accepted || accepted.get(18..20) != Some(&[1, 1])
+        if actual != self.main_ref().key()?
+            || bytes != accepted
+            || accepted.get(18..20) != Some(&[1, 1])
         {
             return Err(io::Error::other(
                 "accepted standalone main differs before VFS effects",
@@ -705,17 +1053,43 @@ impl ScopedOriginalSqlite {
         crate::sqlite_retain_actual_wal(connection)?;
         // Limit exact-object rollback invalidation to this admitted main-header
         // transition. Every other SQLite deletion request continues to refuse.
-        self.registration.policy.rollback_reset_authorized.set(true);
+        let original_reset = self
+            .registration
+            .context_ref()
+            .callback
+            .begin_original_rollback_reset()?;
+        self.registration
+            .context_ref()
+            .policy
+            .rollback_reset_authorized
+            .set(true);
         let change_mode = connection.pragma_update(None, "journal_mode", "WAL");
         self.registration
+            .context_ref()
             .policy
             .rollback_reset_authorized
             .set(false);
+        drop(original_reset);
         change_mode.map_err(io::Error::other)?;
         // The reset duplicate is needed only during the admitted WAL transition.
         // Relinquish its old SQLite share settings after successful invalidation;
         // the retained original identity and parent witnesses stay live.
-        self.registration.policy.opened_rollback.borrow_mut().take();
+        if let Some(original) = self
+            .registration
+            .context_ref()
+            .policy
+            .opened_rollback
+            .borrow_mut()
+            .take()
+        {
+            let policy = &self.registration.context_ref().policy;
+            let mut terminal = policy.original_observation_closes.borrow_mut();
+            terminal.close_file(original);
+            if let Some(error) = terminal.original_close_error() {
+                policy.poisoned.store(true, Ordering::SeqCst);
+                return Err(copy_original_terminal_error(error));
+            }
+        }
         connection
             .pragma_update(None, "synchronous", "FULL")
             .map_err(io::Error::other)?;
@@ -725,11 +1099,11 @@ impl ScopedOriginalSqlite {
         connection
             .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
             .map_err(io::Error::other)?;
-        if crate::sqlite_wal_file_identity(connection)? != self.wal.key()? {
+        if crate::sqlite_wal_file_identity(connection)? != self.wal_ref().key()? {
             return Err(io::Error::other("original WAL actual VFS handle differs"));
         }
         let (actual, current) = crate::sqlite_main_exact_bytes(connection, accepted.len() as u64)?;
-        if actual != self.main.key()?
+        if actual != self.main_ref().key()?
             || current.len() != accepted.len()
             || current.get(18..20) != Some(&[2, 2])
         {
@@ -760,11 +1134,11 @@ impl ScopedOriginalSqlite {
         // This consumes the private issuer once. The independent VFS policy still
         // permits only the exact precreated objects within their admitted bounds.
         let result = operation(connection);
-        self.main.verify()?;
-        self.wal.verify()?;
-        self.journal.verify()?;
-        if crate::sqlite_main_file_identity(connection)? != self.main.key()?
-            || crate::sqlite_wal_file_identity(connection)? != self.wal.key()?
+        self.main_ref().verify()?;
+        self.wal_ref().verify()?;
+        self.journal_ref().verify()?;
+        if crate::sqlite_main_file_identity(connection)? != self.main_ref().key()?
+            || crate::sqlite_wal_file_identity(connection)? != self.wal_ref().key()?
         {
             return Err(io::Error::other(
                 "actual main/WAL changed during single write attempt",
@@ -777,14 +1151,14 @@ impl ScopedOriginalSqlite {
         if self.registration.refused_effect() {
             return Err(io::Error::other("unapproved SQLite VFS effect"));
         }
-        self.main.verify()?;
-        self.wal.verify()?;
-        self.journal.verify()?;
+        self.main_ref().verify()?;
+        self.wal_ref().verify()?;
+        self.journal_ref().verify()?;
         let connection = self
             .connection
             .as_ref()
             .ok_or_else(|| io::Error::other("scoped SQLite closed"))?;
-        if crate::sqlite_main_file_identity(connection)? != self.main.key()? {
+        if crate::sqlite_main_file_identity(connection)? != self.main_ref().key()? {
             return Err(io::Error::other("scoped original SQLite main changed"));
         }
         Ok(())
@@ -792,6 +1166,75 @@ impl ScopedOriginalSqlite {
 }
 
 impl ScopedOriginalSqlite {
+    fn original_resources_remain(&self) -> bool {
+        self.connection.is_some()
+            || self.opening_connection.is_some()
+            || self.registration.context.is_some()
+            || self.main.is_some()
+            || self.wal.is_some()
+            || self.journal.is_some()
+            || self
+                .original_resource_terminal
+                .as_ref()
+                .is_some_and(|original| original.retained_resource_groups() != 0)
+    }
+
+    fn close_original_database_retaining(&mut self) -> io::Result<()> {
+        if let Some(connection) = self.connection.take() {
+            if let Err((connection, error)) = connection.close() {
+                self.connection = Some(connection);
+                let error = io::Error::other(error);
+                self.original_terminal_error
+                    .get_or_insert_with(|| copy_original_terminal_error(&error));
+                return Err(error);
+            }
+        }
+        if let Some(database) = self.opening_connection {
+            // SAFETY: this is the actual failed-open DB retained from open_v2,
+            // never transferred to another connection or new native owner.
+            let closed = unsafe { ffi::sqlite3_close(database) };
+            if closed != ffi::SQLITE_OK {
+                // SAFETY: the failed close retains that same live database.
+                let message = unsafe { CStr::from_ptr(ffi::sqlite3_errmsg(database)) }
+                    .to_string_lossy()
+                    .into_owned();
+                let error = io::Error::other(rusqlite::Error::SqliteFailure(
+                    ffi::Error::new(closed),
+                    Some(message),
+                ));
+                self.original_terminal_error
+                    .get_or_insert_with(|| copy_original_terminal_error(&error));
+                return Err(error);
+            }
+            self.opening_connection = None;
+        }
+        Ok(())
+    }
+
+    fn close_original_into_attempt(&mut self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        attempt
+            .append_original_handle_prefix(std::mem::take(&mut self.actual_closed_handle_prefix));
+        if let Some(error) = self.original_terminal_error.take() {
+            attempt.note_error(error);
+        }
+        if let Some(original) = self.original_resource_terminal.take() {
+            attempt.append_failure(original.close_remaining());
+        }
+        if let Err(error) = self.close_original_database_retaining() {
+            attempt.note_error(error);
+            return;
+        }
+        self.registration.close_original_into_attempt(attempt);
+        if self.registration.context.is_some() || attempt.has_retained_originals() {
+            return;
+        }
+        for original in [&mut self.main, &mut self.wal, &mut self.journal] {
+            if let Some(original) = original.take() {
+                original.close_into_attempt(attempt);
+            }
+        }
+    }
+
     /// Close uncertainty returns the same actual connection, registration and
     /// original object witnesses. No drop/reopen path can invent completion.
     pub(super) fn close(
@@ -805,10 +1248,10 @@ impl ScopedOriginalSqlite {
         (Box<Self>, io::Error),
     > {
         if let Err(error) = self
-            .main
+            .main_ref()
             .verify()
-            .and_then(|_| self.wal.verify())
-            .and_then(|_| self.journal.verify())
+            .and_then(|_| self.wal_ref().verify())
+            .and_then(|_| self.journal_ref().verify())
         {
             return Err((Box::new(self), error));
         }
@@ -837,14 +1280,16 @@ impl ScopedOriginalSqlite {
             if mode != "persist" || !connection.is_autocommit() {
                 return Err(io::Error::other("standalone original close format refused"));
             }
-            let (key, bytes) =
-                crate::sqlite_main_exact_bytes(connection, self.registration.policy.limits[0])?;
-            if key != self.main.key()? || bytes.get(18..20) != Some(&[1, 1]) {
+            let (key, bytes) = crate::sqlite_main_exact_bytes(
+                connection,
+                self.registration.context_ref().policy.limits[0],
+            )?;
+            if key != self.main_ref().key()? || bytes.get(18..20) != Some(&[1, 1]) {
                 return Err(io::Error::other("standalone original main header differs"));
             }
-            self.main.verify()?;
-            self.wal.verify()?;
-            self.journal.verify()?;
+            self.main_ref().verify()?;
+            self.wal_ref().verify()?;
+            self.journal_ref().verify()?;
             if self.registration.refused_effect() {
                 return Err(io::Error::other("original close VFS effect refused"));
             }
@@ -853,27 +1298,56 @@ impl ScopedOriginalSqlite {
         if let Err(error) = finish() {
             return Err((Box::new(self), error));
         }
-        let Some(connection) = self.connection.take() else {
-            return Err((
-                Box::new(self),
-                io::Error::other("original SQLite connection already closed"),
-            ));
-        };
-        if let Err((connection, error)) = connection.close() {
-            self.connection = Some(connection);
-            return Err((Box::new(self), io::Error::other(error.to_string())));
+        if let Err(error) = self.close_original_database_retaining() {
+            return Err((Box::new(self), error));
         }
-        let Self {
-            connection: _,
-            registration,
-            main,
-            wal,
-            journal,
-            write_attempted: _,
-        } = self;
-        // No Connection still owns a sqlite3_file referencing this private table.
-        drop(registration);
+        let mut terminal = crate::WindowsOriginalCloseAttempt::new();
+        self.registration.close_original_into_attempt(&mut terminal);
+        match terminal.finish() {
+            Ok(closed) => self.actual_closed_handle_prefix += closed.actual_closed_handles(),
+            Err(original) => {
+                let error = copy_original_terminal_error(&original.error);
+                self.original_resource_terminal = Some(original);
+                return Err((Box::new(self), error));
+            }
+        }
+        let main = self.main.take().expect("verified original main retained");
+        let wal = self.wal.take().expect("verified original WAL retained");
+        let journal = self
+            .journal
+            .take()
+            .expect("verified original rollback retained");
         Ok((main, wal, journal))
+    }
+}
+
+impl Drop for ScopedOriginalSqlite {
+    fn drop(&mut self) {
+        if !self.original_resources_remain() {
+            return;
+        }
+        let mut original = Self {
+            connection: self.connection.take(),
+            opening_connection: self.opening_connection.take(),
+            registration: OriginalSqliteVfs {
+                context: self.registration.context.take(),
+            },
+            main: self.main.take(),
+            wal: self.wal.take(),
+            journal: self.journal.take(),
+            write_attempted: self.write_attempted,
+            original_terminal_error: self.original_terminal_error.take(),
+            original_resource_terminal: self.original_resource_terminal.take(),
+            actual_closed_handle_prefix: std::mem::take(&mut self.actual_closed_handle_prefix),
+        };
+        let mut terminal = crate::WindowsOriginalCloseAttempt::new();
+        original.close_original_into_attempt(&mut terminal);
+        if original.original_resources_remain() {
+            let _ = Box::leak(Box::new(original));
+        }
+        if let Err(original) = terminal.finish() {
+            original.retain_until_process_exit();
+        }
     }
 }
 
@@ -935,6 +1409,144 @@ pub enum OriginalSqliteOpenFailure {
         original: Box<OriginalSqliteConnection>,
         error: io::Error,
     },
+}
+
+/// Retains the same actual DB, VFS, aligned native IOs, identity witnesses, and
+/// failed original HANDLEs. A terminal failure has no usable writer or restart.
+pub struct OriginalSqliteResourceCloseFailure {
+    pub error: io::Error,
+    pub actual_closed_handles: usize,
+    original: Option<OriginalSqliteConnection>,
+    original_resources: Option<crate::WindowsOriginalResourceCloseFailure>,
+}
+
+impl std::fmt::Debug for OriginalSqliteResourceCloseFailure {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("OriginalSqliteResourceCloseFailure")
+            .field("error", &self.error)
+            .field("actual_closed_handles", &self.actual_closed_handles)
+            .field(
+                "whole_original_sqlite_owner_retained",
+                &self.original.is_some(),
+            )
+            .field("has_retained_originals", &self.has_retained_originals())
+            .finish()
+    }
+}
+
+impl OriginalSqliteResourceCloseFailure {
+    pub fn has_retained_originals(&self) -> bool {
+        self.original
+            .as_ref()
+            .is_some_and(|original| original.original.original_resources_remain())
+            || self
+                .original_resources
+                .as_ref()
+                .is_some_and(|original| original.retained_resource_groups() != 0)
+    }
+
+    pub fn close_remaining(mut self) -> Self {
+        let mut terminal = crate::WindowsOriginalCloseAttempt::new();
+        if let Some(original) = self.original_resources.take() {
+            terminal.append_failure(original.close_remaining());
+        } else {
+            terminal.note_error(copy_original_terminal_error(&self.error));
+            terminal.append_original_handle_prefix(self.actual_closed_handles);
+        }
+        if let Some(mut original) = self.original.take() {
+            original.original.close_original_into_attempt(&mut terminal);
+            if original.original.original_resources_remain() {
+                self.original = Some(original);
+            }
+        }
+        let original_resources = match terminal.finish() {
+            Err(original) => original,
+            Ok(_) => unreachable!("the original first terminal error remains recorded"),
+        };
+        self.actual_closed_handles = original_resources.actual_closed_handles;
+        self.original_resources = Some(original_resources);
+        self
+    }
+
+    pub fn retain_until_process_exit(self) {
+        let _ = Box::leak(Box::new(self));
+    }
+}
+
+impl OriginalSqliteOpenFailure {
+    /// Terminal all original open-prefix resources, including a failed actual
+    /// partial DB. The original opening error never becomes clean completion.
+    pub fn close_original_resources_retaining(
+        self,
+    ) -> Result<crate::ClosedWindowsOriginalResources, OriginalSqliteResourceCloseFailure> {
+        let mut terminal = crate::WindowsOriginalCloseAttempt::new();
+        let mut original_owner = None;
+        match self {
+            Self::Prepared {
+                main,
+                wal,
+                rollback,
+                error,
+            } => {
+                terminal.note_error(error);
+                main.close_into_attempt(&mut terminal);
+                wal.close_into_attempt(&mut terminal);
+                rollback.close_into_attempt(&mut terminal);
+            }
+            Self::MainReleased {
+                main,
+                wal,
+                rollback,
+                error,
+            } => {
+                terminal.note_error(error);
+                main.close_into_attempt(&mut terminal);
+                wal.close_into_attempt(&mut terminal);
+                rollback.close_into_attempt(&mut terminal);
+            }
+            Self::WalReleased {
+                main,
+                wal,
+                rollback,
+                error,
+            } => {
+                terminal.note_error(error);
+                main.close_into_attempt(&mut terminal);
+                wal.close_into_attempt(&mut terminal);
+                rollback.close_into_attempt(&mut terminal);
+            }
+            Self::Released {
+                main,
+                wal,
+                rollback,
+                error,
+            } => {
+                terminal.note_error(error);
+                main.close_into_attempt(&mut terminal);
+                wal.close_into_attempt(&mut terminal);
+                rollback.close_into_attempt(&mut terminal);
+            }
+            Self::Open {
+                mut original,
+                error,
+            } => {
+                terminal.note_error(error);
+                original.original.close_original_into_attempt(&mut terminal);
+                if original.original.original_resources_remain() {
+                    original_owner = Some(*original);
+                }
+            }
+        }
+        match terminal.finish() {
+            Err(original_resources) => Err(OriginalSqliteResourceCloseFailure {
+                error: copy_original_terminal_error(&original_resources.error),
+                actual_closed_handles: original_resources.actual_closed_handles,
+                original: original_owner,
+                original_resources: Some(original_resources),
+            }),
+            Ok(_) => unreachable!("the original opening error remains recorded"),
+        }
+    }
 }
 #[derive(Clone)]
 pub enum OriginalSqliteValue {
@@ -1112,12 +1724,22 @@ impl OriginalSqliteConnection {
         };
         let original = match ScopedOriginalSqlite::open(&uri, &path, main, wal, rollback, limits) {
             Ok(value) => value,
-            Err(failed) => {
+            Err(ScopedOriginalSqliteOpenFailure::Released(failed)) => {
                 let (main, wal, rollback, error) = *failed;
                 return Err(OriginalSqliteOpenFailure::Released {
                     main: Box::new(main),
                     wal: Box::new(wal),
                     rollback: Box::new(rollback),
+                    error,
+                });
+            }
+            Err(ScopedOriginalSqliteOpenFailure::Open(original, error)) => {
+                return Err(OriginalSqliteOpenFailure::Open {
+                    original: Box::new(Self {
+                        original: *original,
+                        write_bytes: max_write_bytes,
+                        uncertain: std::cell::Cell::new(true),
+                    }),
                     error,
                 });
             }
@@ -1152,8 +1774,8 @@ impl OriginalSqliteConnection {
             .ok_or_else(|| io::Error::other("original SQLite closed"))?;
         let main = crate::sqlite_main_file_identity(connection)?;
         let wal = crate::sqlite_wal_file_identity(connection)?;
-        let rollback = self.original.journal.key()?;
-        if main != self.original.main.key()? || wal != self.original.wal.key()? {
+        let rollback = self.original.journal_ref().key()?;
+        if main != self.original.main_ref().key()? || wal != self.original.wal_ref().key()? {
             return Err(io::Error::other(
                 "actual sealed SQLite main/WAL objects changed",
             ));
@@ -1275,6 +1897,30 @@ impl OriginalSqliteConnection {
                 }),
                 error,
             )),
+        }
+    }
+
+    /// End this actual original DB/VFS/IO and metadata scope even after an
+    /// earlier verification failure. It yields no writer, receipt, or restart.
+    pub fn close_original_resources_retaining(
+        mut self,
+    ) -> Result<crate::ClosedWindowsOriginalResources, OriginalSqliteResourceCloseFailure> {
+        self.uncertain.set(true);
+        let mut terminal = crate::WindowsOriginalCloseAttempt::new();
+        self.original.close_original_into_attempt(&mut terminal);
+        match terminal.finish() {
+            Ok(closed) if !self.original.original_resources_remain() => Ok(closed),
+            Ok(_) => unreachable!("a retained original SQLite resource records its terminal error"),
+            Err(original_resources) => Err(OriginalSqliteResourceCloseFailure {
+                error: copy_original_terminal_error(&original_resources.error),
+                actual_closed_handles: original_resources.actual_closed_handles,
+                original: if self.original.original_resources_remain() {
+                    Some(self)
+                } else {
+                    None
+                },
+                original_resources: Some(original_resources),
+            }),
         }
     }
 }
@@ -2043,19 +2689,77 @@ fn validate_ordinary_whole_catalog(
     Ok(())
 }
 
-// Retain the exact builtin rollback file across SQLite's logical xClose/xOpen.
+// Retain each exact builtin file across SQLite's logical xClose/xOpen.
 // Filename and aligned builtin storage live until after the connection closes.
 struct HeldRollback {
     storage: Box<[usize]>,
     filename: ffi::sqlite3_filename,
     initialized: bool,
+    original_logical_terminal: Box<std::sync::atomic::AtomicBool>,
 }
 impl HeldRollback {
+    fn original_resources_remain(&self) -> bool {
+        self.initialized || !self.filename.is_null()
+    }
+
+    fn close_original_into_attempt(&mut self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        if !self.original_logical_terminal.load(Ordering::SeqCst) {
+            attempt.note_error(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "original builtin SQLite IO still has its original pager loan",
+            ));
+            return;
+        }
+        if self.initialized {
+            let file = self.file();
+            // SAFETY: the original aligned Box still owns this one successful
+            // builtin xOpen. Its connection has ended before terminal calls.
+            let methods = unsafe { (*file).pMethods };
+            let closed = if methods.is_null() {
+                ffi::SQLITE_IOERR_CLOSE
+            } else {
+                // SAFETY: the exact original builtin method table is retained.
+                match unsafe { (*methods).xClose } {
+                    // SAFETY: call the terminal only on that same owning IO.
+                    Some(close) => unsafe { close(file) },
+                    None => ffi::SQLITE_IOERR_CLOSE,
+                }
+            };
+            if closed != ffi::SQLITE_OK {
+                attempt.note_error(io::Error::other(format!(
+                    "original builtin SQLite native xClose returned {closed}",
+                )));
+                return;
+            }
+            self.initialized = false;
+            // SAFETY: only actual successful xClose of this same owning IO
+            // permits clearing its installed original method table.
+            unsafe {
+                (*file).pMethods = ptr::null();
+            }
+            attempt.note_actual_handle_closed();
+        }
+        if !self.filename.is_null() {
+            // SAFETY: the exact create_filename allocation is no longer
+            // borrowed by an actual native IO or an active SQLite wrapper.
+            unsafe { ffi::sqlite3_free_filename(self.filename) };
+            self.filename = ptr::null();
+        }
+    }
+
     fn file(&self) -> *mut ffi::sqlite3_file {
         self.storage.as_ptr().cast_mut().cast()
     }
     fn prepare(policy: &Policy) -> io::Result<Self> {
-        let mut parameters = [c"exclusive".as_ptr(), c"1".as_ptr()];
+        let mut parameters = [
+            c"exclusive".as_ptr(),
+            if policy.mode == OriginalSqliteVfsMode::OriginalWritable {
+                c"1"
+            } else {
+                c"0"
+            }
+            .as_ptr(),
+        ];
         // SAFETY: all strings are retained Policy CStrings; SQLite copies them
         // into its owned filename layout with one exact URI key/value pair.
         let filename = unsafe {
@@ -2084,83 +2788,127 @@ impl HeldRollback {
                 .into_boxed_slice(),
             filename,
             initialized: false,
+            original_logical_terminal: Box::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 }
 impl Drop for HeldRollback {
     fn drop(&mut self) {
-        if self.initialized {
-            // SAFETY: owned storage contains the one successful builtin xOpen;
-            // Policy drops only after SQLite no longer owns an outer file.
-            unsafe {
-                let file = self.file();
-                if !(*file).pMethods.is_null() {
-                    if let Some(close) = (*(*file).pMethods).xClose {
-                        close(file);
-                    }
-                }
-            }
+        if !self.original_resources_remain() {
+            return;
         }
-        // SAFETY: filename is our exact allocation and is freed after xClose.
-        unsafe {
-            ffi::sqlite3_free_filename(self.filename);
+        let mut original = Self {
+            storage: std::mem::replace(&mut self.storage, Box::new([])),
+            filename: std::mem::replace(&mut self.filename, ptr::null()),
+            initialized: std::mem::take(&mut self.initialized),
+            original_logical_terminal: std::mem::replace(
+                &mut self.original_logical_terminal,
+                Box::new(std::sync::atomic::AtomicBool::new(true)),
+            ),
+        };
+        let mut terminal = crate::WindowsOriginalCloseAttempt::new();
+        original.close_original_into_attempt(&mut terminal);
+        if original.original_resources_remain() {
+            let _ = Box::leak(Box::new(original));
+        }
+        if let Err(original) = terminal.finish() {
+            original.retain_until_process_exit();
         }
     }
 }
 
-unsafe fn open_held_rollback(
+unsafe fn open_held_original(
     policy: &Policy,
     outer: *mut ffi::sqlite3_file,
     flags: i32,
     out: *mut i32,
+    kind: i32,
+    expected: FileKey,
+    limit: u64,
 ) -> io::Result<()> {
-    let mut held = policy.held_rollback.borrow_mut();
+    let retained = match kind {
+        ffi::SQLITE_OPEN_MAIN_DB => &policy.held_main,
+        ffi::SQLITE_OPEN_WAL => &policy.held_wal,
+        ffi::SQLITE_OPEN_MAIN_JOURNAL => &policy.held_rollback,
+        _ => return Err(io::Error::other("original builtin IO kind refused")),
+    };
+    let mut held = retained.borrow_mut();
     if held.is_none() {
         let mut value = HeldRollback::prepare(policy)?;
-        // SAFETY: retained builtin VFS and owned SQLite filename layout; its
-        // journal pointer preserves the exact exclusive URI share-zero setting.
-        let name = unsafe { ffi::sqlite3_filename_journal(value.filename) };
+        // SAFETY: the actual owning SQLite filename allocation preserves the
+        // exact approved names and exclusive URI setting for these three IOs.
+        let name = unsafe {
+            match kind {
+                ffi::SQLITE_OPEN_MAIN_DB => ffi::sqlite3_filename_database(value.filename),
+                ffi::SQLITE_OPEN_WAL => ffi::sqlite3_filename_wal(value.filename),
+                ffi::SQLITE_OPEN_MAIN_JOURNAL => ffi::sqlite3_filename_journal(value.filename),
+                _ => unreachable!("the original kind was checked"),
+            }
+        };
         // SAFETY: process-lifetime builtin table reports its native xOpen.
         let open = unsafe { (*policy.base).xOpen }
             .ok_or_else(|| io::Error::other("builtin rollback xOpen absent"))?;
         // SAFETY: storage is aligned/sized for builtin file, filename remains
         // owned through actual xClose, CREATE/DELETE flags were already removed.
         let result = unsafe { open(policy.base, name, value.file(), flags, out) };
-        if result != ffi::SQLITE_OK {
-            return Err(io::Error::other("exact held rollback native xOpen refused"));
-        }
-        value.initialized = true;
-        // SAFETY: successful builtin xOpen initialized value's exact file storage.
-        if unsafe { actual_identity(value.file()) }? != policy.journal {
-            return Err(io::Error::other("held original rollback key differs"));
-        }
-        // The reset duplicate derives only from this actual builtin original.
-        // SAFETY: initialized retained native file control yields original handle.
-        *policy.opened_rollback.borrow_mut() = Some(unsafe { actual_file(value.file()) }?);
+        // Retain the owning aligned original before any post-open error. A
+        // failed builtin open with methods also remains available for terminal.
+        // SAFETY: zeroed sized storage remains owned by value after base xOpen.
+        value.initialized = unsafe { !(*value.file()).pMethods.is_null() };
         *held = Some(value);
+        if result != ffi::SQLITE_OK {
+            return Err(io::Error::other(format!(
+                "exact original builtin SQLite xOpen returned {result}",
+            )));
+        }
     }
     let value = held
         .as_ref()
-        .ok_or_else(|| io::Error::other("held rollback absent"))?;
+        .ok_or_else(|| io::Error::other("held original builtin IO absent"))?;
+    if !value.initialized {
+        return Err(io::Error::other(
+            "held original builtin IO lacks open methods",
+        ));
+    }
+    if !value.original_logical_terminal.load(Ordering::SeqCst) {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "same original builtin SQLite IO already has a live logical loan",
+        ));
+    }
     // SAFETY: stored builtin file remains open continuously until Policy drops.
-    if unsafe { actual_identity(value.file()) }? != policy.journal {
-        return Err(io::Error::other("reused original rollback key differs"));
+    if unsafe { actual_identity(value.file(), policy) }? != expected {
+        return Err(io::Error::other("held original builtin SQLite key differs"));
+    }
+    if kind == ffi::SQLITE_OPEN_MAIN_JOURNAL && policy.opened_rollback.borrow().is_none() {
+        // The reset observer derives only from this continuously owned actual
+        // native IO and is retained before every later verification or effect.
+        // SAFETY: initialized original file control yields this same HANDLE.
+        *policy.opened_rollback.borrow_mut() = Some(unsafe { actual_file(value.file(), policy) }?);
     }
     if !out.is_null() {
         // SAFETY: SQLite supplies writable one-int output when nonnull.
         unsafe {
-            *out = ffi::SQLITE_OPEN_READWRITE;
+            *out = if policy.mode == OriginalSqliteVfsMode::OriginalWritable {
+                ffi::SQLITE_OPEN_READWRITE
+            } else {
+                ffi::SQLITE_OPEN_READONLY
+            };
         }
     }
     // SAFETY: outer is SQLite-owned aligned wrapper storage; retained Policy
     // native file remains open after each logical xClose and through next xOpen.
     unsafe {
+        value
+            .original_logical_terminal
+            .store(false, Ordering::SeqCst);
         super::bounded_io::install(
             outer,
             value.file(),
-            policy.limits[2],
+            limit,
             &policy.poisoned,
             true,
+            &*value.original_logical_terminal,
         );
     }
     Ok(())

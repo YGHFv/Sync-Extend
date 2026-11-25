@@ -5,11 +5,11 @@ use super::{
     initial_binding::InitialHeldBinding,
     receipt_protocol::{ReceiptScope, ReceiptTemplate},
 };
-use crate::{storage_inventory::reader::add, JournalError, Result};
+use crate::{JournalError, Result, storage_inventory::reader::add};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::{
-    tree_restore_history::encode_history_record, tree_storage_capacity::TreeStorageCharge,
-    ContentId,
+    ContentId, tree_restore_history::encode_history_record,
+    tree_storage_capacity::TreeStorageCharge,
 };
 
 const TEMPLATE_FIXED: u64 = 128;

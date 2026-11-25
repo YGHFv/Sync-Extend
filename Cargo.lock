@@ -1071,6 +1071,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "sync-extend-core-model",
  "sync-extend-journal",
  "sync-extend-platform-fs",

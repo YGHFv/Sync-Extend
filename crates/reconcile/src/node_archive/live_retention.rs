@@ -870,6 +870,7 @@ impl VerifiedNodeStateArchive {
             ledger_bounds,
             true,
             Some(operation),
+            None,
         )?;
         session.verify()?;
         session.commit_fresh_session()?;

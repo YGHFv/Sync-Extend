@@ -1,16 +1,15 @@
 use crate::{
-    check_storage_metadata_limit, snapshot_retention::audit_snapshot, sql_integer, CasAccessGuard,
-    Journal, JournalError, Result, MAX_OPERATION_BYTES,
+    CasAccessGuard, Journal, JournalError, MAX_OPERATION_BYTES, Result,
+    check_storage_metadata_limit, snapshot_retention::audit_snapshot, sql_integer,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use sync_extend_core_model::{
-    limits,
+    ContentId, EntryId, Manifest, SpaceId, limits,
     tree_restore::{
-        plan_tree_restore, TreeRestoreLimits, TreeRestorePlan, TreeRestoreScope, TreeRestoreStep,
+        TreeRestoreLimits, TreeRestorePlan, TreeRestoreScope, TreeRestoreStep, plan_tree_restore,
     },
-    ContentId, EntryId, Manifest, SpaceId,
 };
 
 const TERMINAL_BYTES: u64 = 4096;
@@ -218,9 +217,8 @@ impl Journal {
         space: &SpaceId,
         max: usize,
     ) -> Result<Vec<TreeRestorePreparation>> {
-        self.read_view().complete_tree_restore_audit(
-            space, max, self.writer_capacity_limits(max)?,
-        )
+        self.read_view()
+            .complete_tree_restore_audit(space, max, self.writer_capacity_limits(max)?)
     }
 
     pub fn require_no_tree_restore(&self, space: &SpaceId, max: usize) -> Result<()> {

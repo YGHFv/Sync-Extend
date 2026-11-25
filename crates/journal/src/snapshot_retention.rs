@@ -1,5 +1,5 @@
-use crate::{storage_policy, Journal, JournalError, Result, MAX_OPERATION_BYTES};
-use rusqlite::{params, Connection, Transaction, TransactionBehavior};
+use crate::{Journal, JournalError, MAX_OPERATION_BYTES, Result, storage_policy};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use std::collections::BTreeSet;
 use sync_extend_core_model::*;
 

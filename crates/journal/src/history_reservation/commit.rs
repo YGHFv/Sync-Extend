@@ -1,8 +1,8 @@
 //! Transactional bridge from an issued ordinary reservation to exact history.
-use super::{consume, OriginalLocalHistoryReservation};
+use super::{OriginalLocalHistoryReservation, consume};
 use crate::{Journal, JournalError, LocalHistoryCommitReceipt, Result};
 use sync_extend_core_model::{
-    persisted_rename::RenameObservationMap, Manifest, Operation, SnapshotId,
+    Manifest, Operation, SnapshotId, persisted_rename::RenameObservationMap,
 };
 
 impl Journal {

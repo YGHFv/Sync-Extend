@@ -1,16 +1,17 @@
 //! Immutable prospective local resolution, not a native execution or pin release.
 use crate::{
+    CasAccessGuard, Journal, JournalCapacityObligation, JournalStoredRow, Result,
     storage_inventory::reader::{hash, invalid, preflight},
-    storage_policy, CasAccessGuard, Journal, JournalCapacityObligation, JournalStoredRow, Result,
+    storage_policy,
 };
-use rusqlite::{params, types::Value, Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params, types::Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
-    causal::reduce_operations,
-    conflict_resolution::{FileResolutionPlan, ResolutionLimits},
     ChunkRef, ContentId, EntryId, EntryKind, Manifest, Operation, SnapshotId, SpaceId,
     VersionVector,
+    causal::reduce_operations,
+    conflict_resolution::{FileResolutionPlan, ResolutionLimits},
 };
 
 mod equivalent;

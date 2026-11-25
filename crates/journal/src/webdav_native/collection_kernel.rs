@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use sync_extend_core_model::{
-    tree_restore_identity::TreeNativeIdentity, ContentId, Entry, EntryKind, PortablePath,
+    ContentId, Entry, EntryKind, PortablePath, tree_restore_identity::TreeNativeIdentity,
 };
 use sync_extend_platform_fs::{
     FileKey, GuardedReadFile, LockedDirectory, LockedDirectoryMutation, LockedFile,

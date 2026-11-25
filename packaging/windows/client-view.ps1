@@ -516,6 +516,113 @@ function Format-SyncExtendViewTime([long]$Milliseconds) {
     catch [ArgumentOutOfRangeException] { return "$Milliseconds ms (Unix epoch)" }
 }
 
+function Get-SyncExtendMetadataPrecisionText($Value) {
+    if ($Value -isnot [byte] -and $Value -isnot [sbyte] -and
+        $Value -isnot [uint16] -and $Value -isnot [int16] -and
+        $Value -isnot [uint32] -and $Value -isnot [int32] -and
+        $Value -isnot [uint64] -and $Value -isnot [int64] -and
+        $Value -isnot [bigint]) {
+        throw 'The declared timestamp precision is not an exact integer.'
+    }
+    $integer = [bigint]$Value
+    if ($integer -le 0 -or $integer -gt [bigint]([uint64]::MaxValue)) {
+        throw 'The declared timestamp precision exceeds its positive u64 range.'
+    }
+    return "$($integer.ToString([Globalization.CultureInfo]::InvariantCulture)) ns（后台声明）"
+}
+
+function New-SyncExtendMetadataCapabilitiesView($Capabilities) {
+    $view = @{
+        Capabilities = '捕获未知 / 应用未知 / 校验未知'
+        Precision = '未知'; Declared = $false
+    }
+    if ($null -eq $Capabilities) { return $view }
+    try {
+        Assert-SyncExtendViewObject $Capabilities
+        $fields = @('capture', 'apply', 'verify', 'timestamp_precision_ns')
+        if ($Capabilities.Count -lt 3 -or $Capabilities.Count -gt 4 -or
+            @($Capabilities.Keys | Where-Object { $_ -cnotin $fields }).Count) {
+            throw 'The optional metadata capability shape cannot be verified.'
+        }
+        $states = @{ supported = '支持'; unsupported = '不支持'; unknown = '未知' }
+        $labels = [ordered]@{ capture = '捕获'; apply = '应用'; verify = '校验' }
+        $segments = [Collections.Generic.List[string]]::new()
+        $allUnknown = $true
+        foreach ($phase in $labels.Keys) {
+            $stage = $Capabilities[$phase]
+            Assert-SyncExtendViewObject $stage
+            if ($stage.Count -ne 2 -or
+                @($stage.Keys | Where-Object { $_ -cnotin @('modified', 'readonly') }).Count -or
+                $stage.modified -isnot [string] -or $stage.readonly -isnot [string] -or
+                $stage.modified -cnotin @('supported', 'unsupported', 'unknown') -or
+                $stage.readonly -cnotin @('supported', 'unsupported', 'unknown')) {
+                throw 'The optional metadata capability stage cannot be verified.'
+            }
+            if ($stage.modified -cne 'unknown' -or $stage.readonly -cne 'unknown') { $allUnknown = $false }
+            [void]$segments.Add("$($labels[$phase]) 时间$($states[$stage.modified])、只读$($states[$stage.readonly])")
+        }
+        $precision = '未知'
+        if ($null -ne $Capabilities.timestamp_precision_ns) {
+            $value = $Capabilities.timestamp_precision_ns
+            if (($value -is [double] -or $value -is [single]) -and
+                ![double]::IsNaN([double]$value) -and ![double]::IsInfinity([double]$value) -and
+                [Math]::Truncate([double]$value) -eq [double]$value -and [double]$value -gt 9007199254740991) {
+                # A rounded JSON number cannot supply an exact precision value.
+                $precision = '未知（整数超出客户端精确范围）'
+            } else {
+                $precision = Get-SyncExtendMetadataPrecisionText $value
+            }
+        }
+        if (!$allUnknown) { $view.Capabilities = $segments -join ' / ' }
+        $view.Precision = $precision
+        $view.Declared = $true
+    } catch {
+        # Optional fields from older or malformed observations remain unknown.
+    }
+    return $view
+}
+
+function New-SyncExtendEntryMetadataView($Metadata, $Capabilities = $null) {
+    $capabilityView = New-SyncExtendMetadataCapabilitiesView $Capabilities
+    $view = @{
+        Modified = '未知'; Readonly = '未知'
+        Capabilities = $capabilityView.Capabilities; Precision = $capabilityView.Precision
+    }
+    if ($null -eq $Metadata) { return $view }
+    Assert-SyncExtendViewObject $Metadata
+    $fields = @('format_version', 'modified', 'readonly')
+    if ($Metadata.Count -ne $fields.Count -or
+        @($Metadata.Keys | Where-Object { $_ -cnotin $fields }).Count -or
+        (Get-SyncExtendViewInteger $Metadata.format_version) -ne 1) {
+        throw 'The source entry metadata format cannot be verified.'
+    }
+    Assert-SyncExtendViewFlag $Metadata.readonly
+    $modified = $Metadata.modified
+    Assert-SyncExtendViewObject $modified
+    if ($modified.Count -ne 2 -or
+        @($modified.Keys | Where-Object { $_ -cnotin @('seconds', 'nanoseconds') }).Count -or
+        ($modified.seconds -isnot [int] -and $modified.seconds -isnot [long] -and
+            $modified.seconds -isnot [uint32] -and $modified.seconds -isnot [uint64]) -or
+        [decimal]$modified.seconds -lt [long]::MinValue -or [decimal]$modified.seconds -gt [long]::MaxValue) {
+        throw 'The source modification timestamp cannot be verified.'
+    }
+    $seconds = [long]$modified.seconds
+    $nanoseconds = Get-SyncExtendViewInteger $modified.nanoseconds
+    if ($nanoseconds -ge 1000000000) { throw 'The source timestamp nanoseconds exceed one second.' }
+    $fraction = $nanoseconds.ToString('D9', [Globalization.CultureInfo]::InvariantCulture)
+    try {
+        $whole = [DateTimeOffset]::FromUnixTimeSeconds($seconds).UtcDateTime.ToString(
+            'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+        $view.Modified = "$whole.$fraction UTC"
+    } catch [ArgumentOutOfRangeException] {
+        $view.Modified = "Unix 秒 $($seconds.ToString([Globalization.CultureInfo]::InvariantCulture))；纳秒 $fraction"
+    }
+    $view.Readonly = if ($Metadata.readonly) { '是' } else { '否' }
+    # Source values and supported capabilities do not certify an application
+    # or verification result. Precision comes only from the explicit field.
+    return $view
+}
+
 function Add-SyncExtendViewRow($View, [string]$Tab, [object[]]$Values) {
     [void]$View.Rows[$Tab].Add($Values)
 }
@@ -835,12 +942,18 @@ function New-SyncExtendClientView($Dashboard) {
         Add-SyncExtendViewRow $view 'Status' @('空间采样距今', "$age ms")
         Add-SyncExtendViewRow $view 'Status' @('路径 / 历史快照总数', "$($local.total_entries) / $($local.total_snapshots)")
         Add-SyncExtendViewRow $view 'Status' @('待处理文件 / 发布', "$($local.outstanding_mutations) / $($local.outstanding_publications)")
+        $metadataCapabilities = New-SyncExtendMetadataCapabilitiesView $local.metadata_capabilities
+        if ($metadataCapabilities.Declared) {
+            Add-SyncExtendViewRow $view 'Status' @('元数据能力说明', '捕获、应用、校验分别声明支持能力；支持不代表该文件已应用或已校验。')
+        }
         foreach ($entry in $local.entries) {
             Assert-SyncExtendViewObject $entry
             Assert-SyncExtendViewText $entry.path
             Assert-SyncExtendViewText $entry.kind 64
             $bytes = if ($null -ne $entry.logical_bytes) { Format-SyncExtendViewBytes (Get-SyncExtendViewInteger $entry.logical_bytes) } else { '—' }
-            Add-SyncExtendViewRow $view 'Files' @($entry.path, $entry.kind, $bytes)
+            $metadata = New-SyncExtendEntryMetadataView $entry.metadata $local.metadata_capabilities
+            Add-SyncExtendViewRow $view 'Files' @($entry.path, $entry.kind, $bytes,
+                $metadata.Modified, $metadata.Readonly, $metadata.Capabilities, $metadata.Precision)
         }
         $seenSnapshots = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         foreach ($snapshot in $local.snapshots) {

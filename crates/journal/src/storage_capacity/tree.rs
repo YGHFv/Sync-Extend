@@ -1,10 +1,11 @@
 use super::{
+    JournalCapacityReservation, JournalCapacityRow, JournalTreeCapacity,
     ordinary::{integer, text},
-    plus, row_charge, JournalCapacityReservation, JournalCapacityRow, JournalTreeCapacity,
+    plus, row_charge,
 };
 use crate::{
-    storage_inventory::reader::invalid, JournalStorageColumnValue, JournalStoredRow, Result,
-    TreeRestorePreparation,
+    JournalStorageColumnValue, JournalStoredRow, Result, TreeRestorePreparation,
+    storage_inventory::reader::invalid,
 };
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};

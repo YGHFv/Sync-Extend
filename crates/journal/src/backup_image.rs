@@ -2,7 +2,7 @@
 //! This image covers only the Journal. CAS, private identities, native objects,
 //! retained descriptors and a complete node backup require separate protocols.
 use super::{Journal, JournalError, Result, SCHEMA_VERSION};
-use rusqlite::{backup::Backup, backup::StepResult, Connection, MAIN_DB};
+use rusqlite::{Connection, MAIN_DB, backup::Backup, backup::StepResult};
 
 const MAX_IMAGE_BYTES: usize = 256 * 1024 * 1024;
 const MIN_IMAGE_BYTES: usize = 512;
@@ -202,6 +202,22 @@ pub use restore_created::CreatedJournalRestore;
 
 mod readonly;
 pub use readonly::NodeInspectionBounds;
+
+// Legacy schema-69 native history is inspected only through the fixed compiled
+// family registry and its bounded SELECT-only source audit. The resulting proof
+// is sealed by that audit and contains no recovered native issuer.
+mod native_history_family_registry;
+mod native_history_source_audit;
+mod native_history_source_proof;
+pub use native_history_family_registry::{
+    NativeHistoryCatalogDefinition, NativeHistoryColumnKind, NativeHistoryColumnSpec,
+    NativeHistoryFamilyRegistry, NativeHistorySliceSpec, NativeHistoryTableRule,
+};
+pub use native_history_source_proof::{
+    ImmutableNativeHistorySourceProof, NativeHistoryCasReference, NativeHistoryHoldSpec,
+    NativeHistoryProjectionPlan, NativeHistoryReferenceKind, NativeHistoryRootColumnMapping,
+    NativeHistoryRootMapping, NativeHistoryRowKey, NativeHistorySourceTable,
+};
 
 mod map_worktree;
 mod portable_scope;

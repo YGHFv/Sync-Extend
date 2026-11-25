@@ -1,5 +1,5 @@
 use crate::{JournalError, Result};
-use rusqlite::{functions::FunctionFlags, Connection};
+use rusqlite::{Connection, functions::FunctionFlags};
 use std::sync::{Arc, Mutex};
 
 /// Exact one-shot issuance, never an SQL caller supplied boolean.

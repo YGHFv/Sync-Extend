@@ -1,4 +1,4 @@
-use crate::{storage_inventory::reader::invalid, storage_policy, Journal, Result};
+use crate::{Journal, Result, storage_inventory::reader::invalid, storage_policy};
 use rusqlite::{Transaction, TransactionBehavior};
 use serde::Serialize;
 use sync_extend_core_model::EntryId;

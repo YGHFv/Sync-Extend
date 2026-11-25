@@ -3,7 +3,7 @@ use crate::{Journal, JournalError, RemotePublicationProof, Result};
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use sync_extend_core_model::{
-    causal::{reduce_operations, CausalReduction, MAX_CAUSAL_OPERATIONS},
+    causal::{CausalReduction, MAX_CAUSAL_OPERATIONS, reduce_operations},
     *,
 };
 

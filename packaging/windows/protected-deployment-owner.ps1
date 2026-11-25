@@ -160,7 +160,9 @@ function Read-SyncExtendProtectedOwnerEvent($Owner) {
                 Assert-SyncExtendProtectedFields $value @(
                     'event', 'format_version', 'bundle_sha256', 'mapping_sha256',
                     'state', 'resources_ready', 'services_started', 'generation', 'status', 'reason')
-                if ($value.reason -cne 'authenticated_management_stop') {
+                if ($value.reason -isnot [string] -or $value.reason -cnotin @(
+                        'authenticated_management_stop', 'stdin_eof', 'owner_timeout', 'service_limit',
+                        'input_protocol_error', 'input_read_failed', 'runtime_failed')) {
                     throw 'The original deployment owner emitted an unsupported state event.'
                 }
             } else { throw 'The original deployment owner emitted an unsupported event.' }
@@ -173,7 +175,7 @@ function Read-SyncExtendProtectedOwnerEvent($Owner) {
                 throw 'The original deployment owner emitted an invalid runtime state.'
             }
         }
-        if ($Owner.Native.Original.HasExited -and $value.state -cne 'closed') {
+        if ($Owner.Native.Original.HasExited -and $value.state -cnotin @('closed', 'uncertain')) {
             throw 'The original deployment control process exited before its state was verified.'
         }
         $Owner.LastState = $value
@@ -202,6 +204,9 @@ function Send-SyncExtendProtectedOwnerCommand {
         throw 'The original deployment control process is not ready for a new request.'
     }
     if ($Command -ceq 'run') {
+        if ($Owner.LastState.state -cin @('closed', 'uncertain')) {
+            throw 'The original deployment state does not allow another service start.'
+        }
         foreach ($binding in @(
             @{path=$Owner.Input.Image;digest=$Owner.Input.ImageSha256}
             @{path=$Owner.Input.Descriptor;digest=$Owner.Input.DescriptorSha256}

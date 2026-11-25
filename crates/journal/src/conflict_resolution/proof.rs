@@ -3,11 +3,11 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use sync_extend_core_model::{
-    conflict_resolution::{
-        plan_file_resolution, resolving_file_operations, verify_file_resolution_projection,
-        FileResolutionPlan, ResolutionLimits,
-    },
     ContentId, DeviceId, Operation, SpaceId,
+    conflict_resolution::{
+        FileResolutionPlan, ResolutionLimits, plan_file_resolution, resolving_file_operations,
+        verify_file_resolution_projection,
+    },
 };
 
 /// Exact transport signed-operation representation, with no wire-supplied keys.

@@ -41,10 +41,21 @@ pub struct CasAccessGuard {
     original_linux: Option<sync_extend_platform_fs::LinuxStorageCasCoordinationGuard>,
     #[cfg(windows)]
     _directories: Vec<sync_extend_platform_fs::LockedDirectory>,
+    #[cfg(windows)]
+    ordinary_capture_close: bool,
 }
 
 impl CasAccessGuard {
     fn shared(database: &Path) -> Result<Self> {
+        Self::shared_impl(database, true)
+    }
+
+    #[cfg(windows)]
+    fn shared_existing(database: &Path) -> Result<Self> {
+        Self::shared_impl(database, false)
+    }
+
+    fn shared_impl(database: &Path, allow_create: bool) -> Result<Self> {
         let parent = database
             .parent()
             .ok_or(JournalError::Invariant("CAS lock parent missing"))?;
@@ -69,11 +80,15 @@ impl CasAccessGuard {
                     return Err(JournalError::Invariant("unsafe CAS coordination file"));
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && allow_create => {}
             Err(e) => return Err(e.into()),
         }
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
+        options
+            .read(true)
+            .write(true)
+            .create(allow_create)
+            .truncate(false);
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -89,6 +104,8 @@ impl CasAccessGuard {
             original_linux: None,
             #[cfg(windows)]
             _directories: directories,
+            #[cfg(windows)]
+            ordinary_capture_close: true,
         };
         guard.verify()?;
         Ok(guard)
@@ -297,12 +314,74 @@ impl Journal {
             self.verify_original_created_image()?;
             return CasAccessGuard::shared_original(&self.database_path, original);
         }
+        #[cfg(windows)]
+        if self.stopped_capture_existing_only {
+            return CasAccessGuard::shared_existing(&self.database_path);
+        }
         CasAccessGuard::shared(&self.database_path)
     }
 }
 
 // Included inside original cas_access.rs to reuse exact guard/verify/upgrade.
 impl CasAccessGuard {
+    /// End the actual ordinary CAS capture guard without opening a replacement.
+    /// Native-original guards retain their complete original scope on refusal.
+    #[cfg(windows)]
+    pub fn close_stopped_capture(
+        self,
+    ) -> std::result::Result<
+        sync_extend_platform_fs::ClosedWindowsOriginalResources,
+        crate::CasCaptureCloseFailure,
+    > {
+        if !self.ordinary_capture_close {
+            return Err(crate::CasCaptureCloseFailure {
+                error: JournalError::Invariant(
+                    "original-created CAS guard cannot use stopped capture close",
+                ),
+                original_native_guard: Some(self),
+                original_resources: None,
+            });
+        }
+        let verification_error = self.verify().err();
+        let mut attempt = sync_extend_platform_fs::WindowsOriginalCloseAttempt::new();
+        if let Some(error) = &verification_error {
+            attempt.note_error(std::io::Error::other(error.to_string()));
+        }
+        let Self {
+            file, _directories, ..
+        } = self;
+        if let Some(file) = file {
+            attempt.close_file(file);
+        } else {
+            attempt.note_error(std::io::Error::other(
+                "ordinary CAS capture descriptor absent at actual close",
+            ));
+        }
+        for directory in _directories {
+            attempt.close_directory(directory);
+        }
+        match attempt.finish() {
+            Ok(closed) => Ok(closed),
+            Err(original_resources) => {
+                let error = verification_error.unwrap_or_else(|| {
+                    let error = match original_resources.error.raw_os_error() {
+                        Some(code) => std::io::Error::from_raw_os_error(code),
+                        None => std::io::Error::new(
+                            original_resources.error.kind(),
+                            original_resources.error.to_string(),
+                        ),
+                    };
+                    JournalError::from(error)
+                });
+                Err(crate::CasCaptureCloseFailure {
+                    error,
+                    original_native_guard: None,
+                    original_resources: Some(original_resources),
+                })
+            }
+        }
+    }
+
     #[cfg(windows)]
     fn shared_original(
         database: &Path,
@@ -329,6 +408,7 @@ impl CasAccessGuard {
             file: Some(file),
             path,
             _directories: directories,
+            ordinary_capture_close: false,
         };
         guard.verify()?;
         original.verify(&guard.path)?;

@@ -1,17 +1,17 @@
 //! Immutable actual-admission-bound descriptions, never native effect evidence.
 use crate::{
-    check_storage_metadata_limit, sql_integer, CasAccessGuard, Journal, JournalError, Result,
-    TreeRestorePreparation, MAX_OPERATION_BYTES,
+    CasAccessGuard, Journal, JournalError, MAX_OPERATION_BYTES, Result, TreeRestorePreparation,
+    check_storage_metadata_limit, sql_integer,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::{
+    ContentId,
     tree_native_protocol::{
-        audit_tree_native_protocol_records, plan_tree_native_protocol, TreeNativeProtocolAudit,
-        TreeNativeProtocolInput, TreeNativeProtocolLimits, TreeNativeProtocolRecord,
+        TreeNativeProtocolAudit, TreeNativeProtocolInput, TreeNativeProtocolLimits,
+        TreeNativeProtocolRecord, audit_tree_native_protocol_records, plan_tree_native_protocol,
     },
     tree_restore_history::encode_history_record,
-    ContentId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

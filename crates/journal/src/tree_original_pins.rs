@@ -1,20 +1,20 @@
 //! Exact original content references, not native ownership or action admission.
 use crate::{
-    check_storage_metadata_limit, snapshot_retention::audit_snapshot, sql_integer, CasAccessGuard,
-    Journal, JournalError, Result, TreeExecutionDescriptionAudit, TreeRestoreHistoryReservation,
-    TreeRestoreNativeReservation, TreeRestorePreparationIntent, MAX_OPERATION_BYTES,
+    CasAccessGuard, Journal, JournalError, MAX_OPERATION_BYTES, Result,
+    TreeExecutionDescriptionAudit, TreeRestoreHistoryReservation, TreeRestoreNativeReservation,
+    TreeRestorePreparationIntent, check_storage_metadata_limit, snapshot_retention::audit_snapshot,
+    sql_integer,
 };
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use sync_extend_core_model::{
-    limits,
+    ContentId, EntryId, Manifest, limits,
     tree_original_reference::{
-        plan_tree_original_references, TreeOriginalReferenceIntent, TreeOriginalReferenceLimits,
-        TreeOriginalReferencePlan,
+        TreeOriginalReferenceIntent, TreeOriginalReferenceLimits, TreeOriginalReferencePlan,
+        plan_tree_original_references,
     },
     tree_restore_history::encode_history_record,
-    ContentId, EntryId, Manifest,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

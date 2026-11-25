@@ -232,6 +232,25 @@ fn managed_cas(data_dir: &Path) -> Result<Cas> {
     )?)
 }
 
+fn verified_existing_local_identity(
+    data_dir: &Path,
+    journal: &Journal,
+) -> Result<(SpaceId, DeviceId, PathBuf)> {
+    let required = |key| {
+        journal
+            .state(key)?
+            .ok_or(ReconcileError::Invariant("incomplete initialization"))
+    };
+    let space_id = required("space_id")?.parse()?;
+    let device_id: DeviceId = required("device_id")?.parse()?;
+    let worktree = PathBuf::from(required("worktree")?);
+    if identity::load_or_create(&data_dir.join("device.secret"), false)? != device_id {
+        return Err(ReconcileError::Invariant("device public key mismatch"));
+    }
+    validate_roots(data_dir, &worktree)?;
+    Ok((space_id, device_id, worktree))
+}
+
 #[cfg(target_os = "linux")]
 fn managed_cas_with_linux_metadata(
     data_dir: &Path,
@@ -597,18 +616,8 @@ impl LocalSpace {
             &data_dir.join("journal.sqlite"),
             limits.max_storage_entries,
         )?;
-        let required = |key| {
-            journal
-                .state(key)?
-                .ok_or(ReconcileError::Invariant("incomplete initialization"))
-        };
-        let space_id = required("space_id")?.parse()?;
-        let device_id: DeviceId = required("device_id")?.parse()?;
-        let worktree = PathBuf::from(required("worktree")?);
-        if identity::load_or_create(&data_dir.join("device.secret"), false)? != device_id {
-            return Err(ReconcileError::Invariant("device public key mismatch"));
-        }
-        validate_roots(&data_dir, &worktree)?;
+        let (space_id, device_id, worktree) =
+            verified_existing_local_identity(&data_dir, &journal)?;
         #[cfg(target_os = "linux")]
         if let Some(owner) = &linux_namespace {
             let relative = worktree.strip_prefix(owner.mount_path()).map_err(|_| {
@@ -1560,14 +1569,17 @@ mod node_archive;
 pub use node_archive::{
     ArchiveBounds, ArchiveRole, CapturedNodeArchive, CreatedNodeCurrentFile, CreatedNodeDataLocks,
     CreatedNodeDirectorySet, CreatedNodeFileSet, CreatedNodeRestoreRoots, CreatedNodeSection,
-    CreatedNodeWorktreeMarker, FramedNodeArchive, InitializedNodeLedger, LedgerBounds,
-    NodeLedgerEvidence, NodeRestoreAttempt, NodeRestoreDirectory, NodeRestoreFile,
-    NodeRestoreLayout, NodeRestoreLedger, NodeRestoreMappedLayout, NodeRestoreSlot, NodeTargetRoot,
+    CreatedNodeWorktreeMarker, DeploymentNativeRuntimeLiability, FramedNodeArchive,
+    InitializedNodeLedger, LedgerBounds, NodeArchiveCaptureFailure, NodeLedgerEvidence,
+    NodeRestoreAttempt, NodeRestoreDirectory, NodeRestoreFile, NodeRestoreLayout,
+    NodeRestoreLedger, NodeRestoreMappedLayout, NodeRestoreSlot, NodeTargetRoot,
     OriginalNodeCompletionEvidence, OriginalNodeCompletionManifest,
-    OriginalNodeCompletionObservation, OriginalNodeReadAssembly, OriginalNodeRestartClassification,
+    OriginalNodeCompletionObservation, OriginalNodeDataLockCreationFailure,
+    OriginalNodeReadAssembly, OriginalNodeResourceCloseAttempt, OriginalNodeResourceCloseFailure,
+    OriginalNodeRestartClassification, OriginalNodeScopedResourceCloseFailure,
     OriginalNodeWriteCloseFailure, OriginalNodeWriteClosed, OriginalNodeWriteFrameClassification,
-    OriginalNodeWriteOpenFailure, OriginalNodeWriteSession, OriginalRestoredLocalSpace,
-    PreparedOriginalNodeRestore, VerifiedNodeStateArchive,
+    OriginalNodeWriteOpenFailure, OriginalNodeWriteResourceCloseFailure, OriginalNodeWriteSession,
+    OriginalRestoredLocalSpace, PreparedOriginalNodeRestore, VerifiedNodeStateArchive,
 };
 
 #[cfg(windows)]
@@ -1796,6 +1808,17 @@ pub use node_archive::RecoveredHistoryOperation;
 pub use node_archive::RecoveredLiveHistoryBinding;
 #[cfg(windows)]
 pub use node_archive::{ExplicitAclMappingEvidence, ExplicitOriginalAclMapping};
+
+#[cfg(windows)]
+#[path = "node_archive/deployment_node_runtime.rs"]
+mod deployment_node_runtime;
+#[cfg(windows)]
+pub use deployment_node_runtime::{
+    DeploymentClosedNodeRuntime, DeploymentNodeRuntimeCloseFailure,
+    DeploymentNodeRuntimeOpenFailure,
+};
+#[cfg(windows)]
+pub use node_archive::DeploymentFreshNodeResourceCloseFailure;
 
 #[cfg(windows)]
 #[derive(Serialize)]

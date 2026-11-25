@@ -1,19 +1,19 @@
 //! Immutable descriptive native binding, never executable or current native proof.
 
 use crate::{
-    check_storage_metadata_limit, sql_integer, CasAccessGuard, Journal, JournalError, Result,
-    TreeRestoreHistoryReservation, TreeRestorePreparationIntent, MAX_OPERATION_BYTES,
+    CasAccessGuard, Journal, JournalError, MAX_OPERATION_BYTES, Result,
+    TreeRestoreHistoryReservation, TreeRestorePreparationIntent, check_storage_metadata_limit,
+    sql_integer,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sync_extend_core_model::{
-    limits,
-    tree_restore::{plan_tree_restore, TreeRestorePlan},
+    ContentId, EntryId, Manifest, limits,
+    tree_restore::{TreeRestorePlan, plan_tree_restore},
     tree_restore_history::encode_history_record,
     tree_restore_identity::{
-        plan_tree_restore_identities, TreeIdentityLimits, TreeIdentityPlan, TreeNativeInventory,
+        TreeIdentityLimits, TreeIdentityPlan, TreeNativeInventory, plan_tree_restore_identities,
     },
-    ContentId, EntryId, Manifest,
 };
 
 const ROW_BYTES: u64 = 384;

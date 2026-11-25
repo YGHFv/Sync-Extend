@@ -1,10 +1,10 @@
 use crate::{
-    storage_capacity::CapacitySnapshot, JournalError, JournalStorageColumn,
-    JournalStorageColumnValue, JournalStoredRow, ReceiveOutcome, Result,
+    JournalError, JournalStorageColumn, JournalStorageColumnValue, JournalStoredRow,
+    ReceiveOutcome, Result, storage_capacity::CapacitySnapshot,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
-    tree_storage_capacity::TreeStorageCharge, DeviceId, Operation, OperationId, SpaceId,
+    DeviceId, Operation, OperationId, SpaceId, tree_storage_capacity::TreeStorageCharge,
 };
 
 fn text<'a>(row: &'a JournalStoredRow, name: &str) -> Result<&'a str> {

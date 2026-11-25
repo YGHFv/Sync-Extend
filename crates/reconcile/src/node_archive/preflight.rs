@@ -1,7 +1,7 @@
 //! Whole source and ledger capacity checks before the first target root effect.
 use super::{
     CreatedNodeRestoreRoots, LedgerBounds, NodeRestoreFile, NodeRestoreLayout, NodeRestoreLedger,
-    NodeRestoreMappedLayout, VerifiedNodeStateArchive,
+    NodeRestoreMappedLayout, NodeTargetRoot, VerifiedNodeStateArchive,
 };
 use crate::{ReconcileError, Result};
 use std::path::{Path, PathBuf};
@@ -26,6 +26,7 @@ pub struct PreparedOriginalNodeRestore {
     pub(super) completion_manifest_reserve: u64,
     pub(super) reserved_database_bytes: u64,
     pub(super) ledger_bounds: LedgerBounds,
+    future_file_bytes: Vec<(NodeTargetRoot, u64)>,
 }
 
 impl PreparedOriginalNodeRestore {
@@ -49,6 +50,34 @@ impl PreparedOriginalNodeRestore {
     }
     pub fn original_journal_bytes(&self) -> u64 {
         self.journal.bytes().len() as u64
+    }
+    /// Exact planned native file lengths, in mapped file order. Separately
+    /// owned deployment configs and the three empty coordination sentinels
+    /// have their own slots and are budgeted by their actual owners.
+    /// These values grant no filesystem or creation authority.
+    pub fn future_file_bytes_by_root(&self) -> Result<Vec<(NodeTargetRoot, u64)>> {
+        if self.future_file_bytes.len() != self.mapped.files().len()
+            || self
+                .future_file_bytes
+                .iter()
+                .zip(self.mapped.files())
+                .any(|((root, _), slot)| *root != slot.root())
+        {
+            return Err(ReconcileError::Invariant(
+                "prepared original per-file liability scope differs",
+            ));
+        }
+        let total = self.future_file_bytes.iter().try_fold(0u64, |total, (_, bytes)| {
+            total.checked_add(*bytes).ok_or(ReconcileError::ResourceLimit(
+                "prepared original per-file liability overflow",
+            ))
+        })?;
+        if total > self.required_file_bytes {
+            return Err(ReconcileError::Invariant(
+                "prepared original native files exceed full source budget",
+            ));
+        }
+        Ok(self.future_file_bytes.clone())
     }
     /// Read-only original first-write budget. It supplies no native creator,
     /// registered VFS, descriptor, ledger, or reactivation authority.
@@ -81,6 +110,8 @@ impl PreparedOriginalNodeRestore {
                 "preflight root original archive differs",
             ));
         }
+        self.original
+            .verify_original_source_scope(archive, &self.worktree, &self.data)?;
         ledger.require_original_preflight_capacity(self)?;
         ledger.prepare_durable_original_completion(self.completion_manifest_reserve)?;
         archive.create_restore_roots(ledger, &self.worktree, &self.data)
@@ -108,6 +139,7 @@ impl VerifiedNodeStateArchive {
             max_file_bytes,
             ledger_bounds,
             None,
+            super::restore_layout::NodeConfigRestoreScope::Ordinary,
         )
     }
 
@@ -132,6 +164,38 @@ impl VerifiedNodeStateArchive {
             max_file_bytes,
             ledger_bounds,
             Some(expected_hold),
+            super::restore_layout::NodeConfigRestoreScope::Ordinary,
+        )
+    }
+
+    /// The verified deployment protocol owns the separately mapped config
+    /// CREATEs. Its non-cloneable proof remains in the owned original layout.
+    #[cfg(windows)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_original_node_restore_for_deployment(
+        &self,
+        worktree: &Path,
+        data: &Path,
+        inspection: NodeInspectionBounds,
+        max_creations: usize,
+        max_file_bytes: u64,
+        ledger_bounds: LedgerBounds,
+        separated_configs: crate::SeparatedDeploymentNodeConfigs,
+        expected_hold: Option<&ContentId>,
+    ) -> Result<PreparedOriginalNodeRestore> {
+        self.prepare_original_node_restore_inner(
+            worktree,
+            data,
+            inspection,
+            max_creations,
+            max_file_bytes,
+            ledger_bounds,
+            expected_hold,
+            super::restore_layout::NodeConfigRestoreScope::SeparatedDeployment {
+                configs: separated_configs,
+                worktree: worktree.to_owned(),
+                data: data.to_owned(),
+            },
         )
     }
 
@@ -145,6 +209,7 @@ impl VerifiedNodeStateArchive {
         max_file_bytes: u64,
         ledger_bounds: LedgerBounds,
         expected_hold: Option<&ContentId>,
+        config_scope: super::restore_layout::NodeConfigRestoreScope,
     ) -> Result<PreparedOriginalNodeRestore> {
         ledger_bounds.validate().map_err(ReconcileError::from)?;
         super::roots::split_target(worktree)?;
@@ -157,8 +222,12 @@ impl VerifiedNodeStateArchive {
         if expected_hold.is_some() {
             self.validate_read_lease_migration_roots(worktree, data)?;
         }
-        let original =
-            self.current_node_restore_layout(inspection, max_creations, max_file_bytes)?;
+        let original = self.current_node_restore_layout_inner(
+            inspection,
+            max_creations,
+            max_file_bytes,
+            config_scope,
+        )?;
         let mapped = original.map_original_slots(max_creations)?;
         let bytes = self.journal_bytes()?;
         let journal = self.map_original_restore_journal(
@@ -184,6 +253,41 @@ impl VerifiedNodeStateArchive {
             .any(|file| matches!(file, NodeRestoreFile::Journal))
         {
             return Err(ReconcileError::Invariant("preflight Journal slot absent"));
+        }
+        let mut future_file_bytes = Vec::with_capacity(mapped.files().len());
+        let mut native_file_total = 0u64;
+        for slot in mapped.files() {
+            let length = match mapped.file(slot, &original)? {
+                NodeRestoreFile::Journal => journal.bytes().len() as u64,
+                NodeRestoreFile::WorktreeCurrent { bytes, .. } => *bytes,
+                NodeRestoreFile::WorktreeSpaceMarker => self.space().as_str().len() as u64,
+                source => {
+                    let role = match source {
+                        NodeRestoreFile::ProtectedDeviceIdentity => super::ArchiveRole::DeviceSecret,
+                        NodeRestoreFile::CasObject { content_id } => super::ArchiveRole::CasObject {
+                            content_id: content_id.clone(),
+                        },
+                        NodeRestoreFile::PeerApproval { device_id } => super::ArchiveRole::PeerApproval {
+                            device_id: device_id.clone(),
+                        },
+                        _ => return Err(ReconcileError::Invariant(
+                            "prepared original native file liability role unsupported",
+                        )),
+                    };
+                    self.archive.section(&role).ok_or(ReconcileError::Invariant(
+                        "prepared original file liability section absent",
+                    ))?.len() as u64
+                }
+            };
+            native_file_total = native_file_total.checked_add(length).ok_or(
+                ReconcileError::ResourceLimit("prepared original native file liability overflow"),
+            )?;
+            future_file_bytes.push((slot.root(), length));
+        }
+        if native_file_total > required_file_bytes {
+            return Err(ReconcileError::Invariant(
+                "prepared original native file liability exceeds full source",
+            ));
         }
         // Two roots plus all derived directories/files; three additional empty
         // writer/CAS sentinels are not represented by the original archive.
@@ -274,6 +378,7 @@ impl VerifiedNodeStateArchive {
             completion_manifest_reserve,
             reserved_database_bytes,
             ledger_bounds,
+            future_file_bytes,
         })
     }
 }

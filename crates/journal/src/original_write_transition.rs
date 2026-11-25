@@ -6,6 +6,10 @@ use sync_extend_platform_fs::{
     OriginalSqliteQuery, OriginalSqliteReadBudget, OriginalSqliteRows,
     OriginalSqliteSidecarHandoff, OriginalSqliteValue, ReleasedOriginalCoordinationFile,
 };
+mod failed_open_close;
+mod resource_close;
+pub use failed_open_close::OriginalJournalTransitionResourceCloseFailure;
+pub use resource_close::OriginalJournalWriteResourceCloseFailure;
 
 pub struct OriginalJournalWriteTransition {
     original: OriginalSqliteConnection,
@@ -15,8 +19,27 @@ pub struct OriginalJournalWriteTransition {
     max_entries: usize,
     complete_queries: Vec<OriginalSqliteQuery>,
     inspection: NodeInspectionBounds,
+    readonly_closed: sync_extend_platform_fs::ClosedWindowsOriginalResources,
 }
 pub enum OriginalJournalTransitionFailure {
+    ReadonlyClose {
+        failed: Box<crate::OriginalReadonlyJournalCloseFailure>,
+        wal: Box<OriginalSqliteSidecarHandoff>,
+        rollback: Box<OriginalSqliteSidecarHandoff>,
+    },
+    ReadonlyHandoff {
+        handoff: Box<crate::OriginalReadonlyJournalWriteHandoff>,
+        wal: Box<OriginalSqliteSidecarHandoff>,
+        rollback: Box<OriginalSqliteSidecarHandoff>,
+        error: JournalError,
+    },
+    ReadonlyContextClose {
+        failed: Box<crate::OriginalReadonlyJournalCloseFailure>,
+        main: Box<OriginalSqliteMainHandoff>,
+        wal: Box<OriginalSqliteSidecarHandoff>,
+        rollback: Box<OriginalSqliteSidecarHandoff>,
+        cas: Box<ReleasedOriginalCoordinationFile>,
+    },
     InertClosed {
         journal: Box<Journal>,
         main: Box<Option<OriginalSqliteMainHandoff>>,
@@ -42,6 +65,7 @@ pub enum OriginalJournalTransitionFailure {
     Opening {
         failed: Box<OriginalSqliteOpenFailure>,
         cas: Box<ReleasedOriginalCoordinationFile>,
+        readonly_closed: sync_extend_platform_fs::ClosedWindowsOriginalResources,
     },
     Open {
         transition: Box<OriginalJournalWriteTransition>,
@@ -57,7 +81,7 @@ impl Journal {
     // explicit in the original linear capability API and original fixtures.
     #[allow(clippy::too_many_arguments)]
     pub fn begin_original_write_transition(
-        mut self,
+        self,
         wal: OriginalSqliteSidecarHandoff,
         rollback: OriginalSqliteSidecarHandoff,
         image: &JournalBackupImage,
@@ -149,55 +173,46 @@ impl Journal {
                 error,
             });
         }
-        // Allocate an inert memory placeholder before moving the live connection.
-        // It is never returned as an accepted Journal or used for target writes.
-        let replacement = match rusqlite::Connection::open_in_memory() {
-            Ok(value) => value,
-            Err(error) => {
-                return Err(OriginalJournalTransitionFailure::Read {
-                    journal: Box::new(self),
+        let mut handoff = match self.end_original_readonly_for_write_retaining() {
+            Ok(handoff) => handoff,
+            Err(failed) => {
+                return Err(OriginalJournalTransitionFailure::ReadonlyClose {
+                    failed: Box::new(failed),
                     wal: Box::new(wal),
                     rollback: Box::new(rollback),
-                    error: error.into(),
-                })
+                });
             }
         };
-        let actual = std::mem::replace(&mut self.connection, replacement);
-        if let Err((connection, error)) = actual.close() {
-            self.connection = connection;
-            return Err(OriginalJournalTransitionFailure::Read {
-                journal: Box::new(self),
-                wal: Box::new(wal),
-                rollback: Box::new(rollback),
-                error: error.into(),
-            });
-        }
-        // All own read Connection locks are actually closed before protected
-        // readers can be relinquished. Observer connections cause share0 refusal.
-        let main = self.original_main_handoff.take();
-        let cas = self.original_cas_coordination.take();
-        let (main, cas) = match (main, cas) {
-            (Some(main), Some(cas)) => (main, cas),
-            (main, cas) => {
-                return Err(OriginalJournalTransitionFailure::InertClosed {
-                    journal: Box::new(self),
-                    main: Box::new(main),
-                    cas: Box::new(cas),
+        let max_entries = handoff.max_storage_entries();
+        let (main, cas) = match handoff.take_original_write_inputs() {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                return Err(OriginalJournalTransitionFailure::ReadonlyHandoff {
+                    handoff: Box::new(handoff),
                     wal: Box::new(wal),
                     rollback: Box::new(rollback),
-                    error: JournalError::Invariant(
-                        "original closed transition lacks sealed capability",
-                    ),
-                })
+                    error,
+                });
+            }
+        };
+        // End the same remaining readonly identity/callback scope before any
+        // private writer open. Its CREATE-issued inputs still own their exact
+        // authoritative object/parent lineage. Failure preserves all inputs.
+        let readonly_closed = match handoff.close_original_resources_retaining() {
+            Ok(closed) => closed,
+            Err(failed) => {
+                return Err(OriginalJournalTransitionFailure::ReadonlyContextClose {
+                    failed: Box::new(failed),
+                    main: Box::new(main),
+                    wal: Box::new(wal),
+                    rollback: Box::new(rollback),
+                    cas: Box::new(cas),
+                });
             }
         };
         // Keep the already verified original CREATE slot spelling for the
         // private VFS URI; this introduces no pathname-issued authority.
         let path = main.path().to_owned();
-        let max_entries = self.max_storage_entries;
-        // Drop the old plain read protection and gates before private VFS open.
-        // The linear main's actual original/parent witnesses remain live.
-        drop(self);
         let original = match OriginalSqliteConnection::open(
             main,
             wal,
@@ -212,6 +227,7 @@ impl Journal {
                 return Err(OriginalJournalTransitionFailure::Opening {
                     failed: Box::new(failed),
                     cas: Box::new(cas),
+                    readonly_closed,
                 });
             }
         };
@@ -223,6 +239,7 @@ impl Journal {
             max_entries,
             complete_queries: Vec::new(),
             inspection: bounds,
+            readonly_closed,
         };
         if let Err(error) = transition.verify_complete_original_rows(image, bounds) {
             return Err(OriginalJournalTransitionFailure::Open {
@@ -285,6 +302,7 @@ impl OriginalJournalWriteTransition {
         (
             [sync_extend_platform_fs::ReleasedOriginalFileIdentity; 3],
             ReleasedOriginalCoordinationFile,
+            sync_extend_platform_fs::ClosedWindowsOriginalResources,
         ),
         (Box<Self>, JournalError),
     > {
@@ -296,9 +314,10 @@ impl OriginalJournalWriteTransition {
             max_entries,
             complete_queries,
             inspection,
+            readonly_closed,
         } = self;
         match original.close() {
-            Ok(objects) => Ok((objects, cas)),
+            Ok(objects) => Ok((objects, cas, readonly_closed)),
             Err((original, error)) => Err((
                 Box::new(Self {
                     original: *original,
@@ -308,6 +327,7 @@ impl OriginalJournalWriteTransition {
                     max_entries,
                     complete_queries,
                     inspection,
+                    readonly_closed,
                 }),
                 error.into(),
             )),
@@ -480,7 +500,7 @@ fn expected_rows(
                 rusqlite::types::ValueRef::Real(_) => {
                     return Err(JournalError::Invariant(
                         "original expected nonfinite numeric cell",
-                    ))
+                    ));
                 }
                 rusqlite::types::ValueRef::Text(value) => OriginalSqliteValue::Text(
                     std::str::from_utf8(value)
@@ -662,7 +682,20 @@ impl OriginalJournalWriteTransition {
             audit
         };
         // Planner's private Connection is moved back only inside this module.
-        memory = planner.connection;
+        memory = match planner.connection.into_original() {
+            Ok(connection) => connection,
+            Err(connection) => {
+                let original = Journal {
+                    connection,
+                    ..planner
+                };
+                let error = JournalError::Invariant(
+                    "original planning terminal cannot yield an absent connection",
+                );
+                let _ = Box::leak(Box::new((original, error.to_string())));
+                return Err(error);
+            }
+        };
         let mut aggregate = ExpectedAggregate { rows: 0, bytes: 0 };
         let mut after = Vec::new();
         for query in &self.complete_queries {
@@ -705,7 +738,7 @@ fn original_planning_memory(
         ));
     }
     let mut memory = rusqlite::Connection::open_in_memory()?;
-    bounds.configure_original_connection(&mut memory)?;
+    bounds.configure_planning_connection(&mut memory)?;
     memory.pragma_update(None, "query_only", false)?;
     memory.pragma_update(None, "temp_store", "MEMORY")?;
     memory.pragma_update(None, "foreign_keys", false)?;
@@ -780,7 +813,7 @@ fn original_planning_memory(
     }
     tx.pragma_update(None, "user_version", crate::SCHEMA_VERSION)?;
     tx.commit()?;
-    bounds.configure_original_connection(&mut memory)?;
+    bounds.configure_planning_connection(&mut memory)?;
     memory.pragma_update(None, "query_only", false)?;
     memory.pragma_update(None, "trusted_schema", true)?;
     Ok(memory)
@@ -791,7 +824,7 @@ fn original_owned_value(value: &OriginalSqliteValue) -> Result<rusqlite::types::
         OriginalSqliteValue::Integer(n) => rusqlite::types::Value::Integer(*n),
         OriginalSqliteValue::Real(n) if n.is_finite() => rusqlite::types::Value::Real(*n),
         OriginalSqliteValue::Real(_) => {
-            return Err(JournalError::Invariant("original planning finite real"))
+            return Err(JournalError::Invariant("original planning finite real"));
         }
         OriginalSqliteValue::Text(s) => rusqlite::types::Value::Text(s.clone()),
         OriginalSqliteValue::Blob(b) => rusqlite::types::Value::Blob(b.clone()),

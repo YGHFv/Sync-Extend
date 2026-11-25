@@ -16,6 +16,11 @@ pub(super) struct DirectoryCreationLineage {
     original_parent_key: FileKey,
     created_component: String,
 }
+impl DirectoryCreationLineage {
+    pub(super) fn close_into_attempt(self, attempt: &mut crate::WindowsOriginalCloseAttempt) {
+        attempt.close_file(self.parent);
+    }
+}
 
 /// Borrowed lineage from an actual native directory CREATE. Reopened mutation
 /// guards cannot mint this proof. It does not freeze membership or grant durable
@@ -468,6 +473,27 @@ impl OriginalDirectoryCreation<'_> {
     ) -> io::Result<super::RetainedWriterDirectory> {
         self.verify()?;
         super::retain_writer_directory(&self.creator.file, path)
+    }
+
+    pub fn retain_writer_directory_retaining(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<super::RetainedWriterDirectory, crate::WindowsOriginalResourceOpenFailure> {
+        self.verify()
+            .map_err(|error| crate::WindowsOriginalResourceOpenFailure {
+                error,
+                original_resources: None,
+            })?;
+        super::retain_writer_directory_retaining(&self.creator.file, path)
+    }
+
+    pub fn retain_writer_directory_into_attempt(
+        &self,
+        path: &std::path::Path,
+        terminal: &mut crate::WindowsOriginalCloseAttempt,
+    ) -> io::Result<super::RetainedWriterDirectory> {
+        self.verify()?;
+        super::retain_writer_directory_into_attempt(&self.creator.file, path, terminal)
     }
 }
 

@@ -1,5 +1,5 @@
-use crate::{sql_integer, Journal, JournalError, Result, MAX_OPERATION_BYTES};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use crate::{Journal, JournalError, MAX_OPERATION_BYTES, Result, sql_integer};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use sync_extend_core_model::*;

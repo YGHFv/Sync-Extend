@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use sync_extend_core_model::{
-    tree_restore_identity::TreeNativeIdentity, ContentId, Entry, EntryKind, Manifest, PortablePath,
+    ContentId, Entry, EntryKind, Manifest, PortablePath, tree_restore_identity::TreeNativeIdentity,
 };
 use sync_extend_platform_fs::{FileKey, LockedDirectoryMutation, LockedFile};
 

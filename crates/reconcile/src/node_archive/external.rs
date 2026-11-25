@@ -14,6 +14,18 @@ pub(super) struct ExternalLedgerOwnership {
 }
 
 impl ExternalLedgerOwnership {
+    pub(super) fn close_into_attempt<'scope>(
+        self,
+        attempt: &mut super::OriginalNodeResourceCloseAttempt<'scope>,
+    ) {
+        let Self { ancestors, owner_lock } = self;
+        owner_lock.close_into_attempt(&mut attempt.native);
+        for (path, original, key) in ancestors.into_iter().rev() {
+            attempt.keep_context((path, key));
+            attempt.native.close_directory(original);
+        }
+    }
+
     pub(super) fn verify(&self) -> Result<()> {
         for (path, held, key) in &self.ancestors {
             if held.key()? != *key || !held.matches_path(path)? {

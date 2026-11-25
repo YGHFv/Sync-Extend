@@ -7,6 +7,7 @@ use super::{
         DeploymentReferenceTarget, RestrictedDeploymentMapping,
     },
     protected_artifact::{DeploymentProtectionProvider, OriginalProtectedArtifact},
+    NativeCreator, NativeFailedCreate, NativeParent, NativeSealed,
 };
 use crate::{ReconcileError, Result};
 use serde::{Deserialize, Serialize};
@@ -15,23 +16,6 @@ use std::{
     path::{Path, PathBuf},
 };
 use sync_extend_core_model::{ContentId, EntryId, PortablePath};
-
-#[cfg(windows)]
-type NativeParent = sync_extend_platform_fs::WindowsProtectedArtifactParent;
-#[cfg(target_os = "linux")]
-type NativeParent = sync_extend_platform_fs::UnixProtectedArtifactParent;
-#[cfg(windows)]
-type NativeCreator = sync_extend_platform_fs::WindowsProtectedArtifactCreator;
-#[cfg(target_os = "linux")]
-type NativeCreator = sync_extend_platform_fs::UnixProtectedArtifactCreator;
-#[cfg(windows)]
-type NativeSealed = sync_extend_platform_fs::SealedWindowsProtectedArtifact;
-#[cfg(target_os = "linux")]
-type NativeSealed = sync_extend_platform_fs::SealedUnixProtectedArtifact;
-#[cfg(windows)]
-type NativeFailedCreate = sync_extend_platform_fs::WindowsFailedArtifactCreation;
-#[cfg(target_os = "linux")]
-type NativeFailedCreate = sync_extend_platform_fs::UnixFailedArtifactCreation;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,17 +31,26 @@ pub struct DeploymentNodeCompletionReceipt {
 
 /// This wrapper can only borrow a living R06 completion. Neither a node
 /// descriptor, ordinary LocalSpace, JSON manifest nor reopened path can mint it.
-pub struct OriginalDeploymentNodeCompletion<'proof, 'local, 'scope> {
+pub struct OriginalDeploymentNodeCompletion<'proof> {
     id: u32,
-    #[cfg(windows)]
-    original: &'proof crate::OriginalNodeCompletionObservation<'local, 'scope>,
-    #[cfg(not(windows))]
-    unavailable: std::marker::PhantomData<(&'proof (), &'local (), &'scope ())>,
+    original: &'proof dyn ActualDeploymentNodeProof,
 }
 
-impl<'proof, 'local, 'scope> OriginalDeploymentNodeCompletion<'proof, 'local, 'scope> {
+/// Only this crate implements the sealed proof. Erasing its internal local and
+/// directory lifetimes permits several live node scopes to be borrowed together.
+/// It does not expose a public receipt/proof constructor or LocalSpace.
+trait ActualDeploymentNodeProof {
+    fn verify_target(
+        &self,
+        id: u32,
+        descriptor: &DeploymentNodeDescriptor,
+        target: &DeploymentNodeTarget,
+    ) -> Result<DeploymentNodeCompletionReceipt>;
+}
+
+impl<'proof> OriginalDeploymentNodeCompletion<'proof> {
     #[cfg(windows)]
-    pub fn from_original(
+    pub fn from_original<'local, 'scope>(
         id: u32,
         original: &'proof crate::OriginalNodeCompletionObservation<'local, 'scope>,
     ) -> Result<Self> {
@@ -70,15 +63,33 @@ impl<'proof, 'local, 'scope> OriginalDeploymentNodeCompletion<'proof, 'local, 's
         Ok(Self { id, original })
     }
 
+    /// Consume this borrow while retaining the same living sealed proof.
+    pub fn into_shorter_borrow<'short>(self) -> OriginalDeploymentNodeCompletion<'short>
+    where
+        'proof: 'short,
+    {
+        self
+    }
+
     fn verify(
         &self,
         descriptor: &DeploymentNodeDescriptor,
         target: &DeploymentNodeTarget,
     ) -> Result<DeploymentNodeCompletionReceipt> {
-        #[cfg(windows)]
-        {
-            let binding = self.original.deployment_binding()?;
-            if self.id != descriptor.id
+        self.original.verify_target(self.id, descriptor, target)
+    }
+}
+
+#[cfg(windows)]
+impl ActualDeploymentNodeProof for crate::OriginalNodeCompletionObservation<'_, '_> {
+    fn verify_target(
+        &self,
+        id: u32,
+        descriptor: &DeploymentNodeDescriptor,
+        target: &DeploymentNodeTarget,
+    ) -> Result<DeploymentNodeCompletionReceipt> {
+            let binding = self.deployment_binding()?;
+            if id != descriptor.id
                 || binding.archive_digest() != &descriptor.archive_digest
                 || binding.data_dir() != target.data_dir
                 || binding.worktree() != target.worktree
@@ -90,7 +101,7 @@ impl<'proof, 'local, 'scope> OriginalDeploymentNodeCompletion<'proof, 'local, 's
                 ));
             }
             let receipt = DeploymentNodeCompletionReceipt {
-                id: self.id,
+                id,
                 archive_digest: binding.archive_digest().clone(),
                 data_dir: binding.data_dir().to_path_buf(),
                 worktree: binding.worktree().to_path_buf(),
@@ -100,14 +111,6 @@ impl<'proof, 'local, 'scope> OriginalDeploymentNodeCompletion<'proof, 'local, 's
             };
             binding.verify()?;
             Ok(receipt)
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (descriptor, target);
-            Err(ReconcileError::Invariant(
-                "R06 actual complete node restoration is unavailable on this platform",
-            ))
-        }
     }
 }
 
@@ -171,16 +174,61 @@ pub struct DeploymentInstallReceipt {
 
 /// Every source/provider, actual completed target node, private parent, future
 /// file byte charge and empty slot is checked before the first CREATE.
-pub struct PreparedDeploymentInstall<'proof, 'local, 'scope> {
+pub struct PreparedDeploymentInstall<'proof> {
     mapping: RestrictedDeploymentMapping,
-    completions: Vec<OriginalDeploymentNodeCompletion<'proof, 'local, 'scope>>,
+    completions: Vec<OriginalDeploymentNodeCompletion<'proof>>,
     parents: BTreeMap<PathBuf, NativeParent>,
     runtime_directories: Vec<NativeParent>,
     pinned_programs: Vec<OriginalProtectedArtifact>,
     node_receipts: Vec<DeploymentNodeCompletionReceipt>,
 }
 
-fn component(path: &Path) -> Result<&str> {
+/// All future private file slots, provider bytes, executable pins and runtime
+/// parents can be retained before any selected node restore CREATE.
+pub struct PreparedDeploymentTargets {
+    mapping: RestrictedDeploymentMapping,
+    parents: BTreeMap<PathBuf, NativeParent>,
+    runtime_directories: Vec<NativeParent>,
+    pinned_programs: Vec<OriginalProtectedArtifact>,
+}
+
+#[cfg(windows)]
+pub struct DeploymentTargetsPreflightFailure {
+    pub error: ReconcileError,
+    pub original_targets: PreparedDeploymentTargets,
+    pub original_open_failures: Vec<sync_extend_platform_fs::WindowsOriginalResourceCloseFailure>,
+}
+
+#[cfg(windows)]
+impl DeploymentTargetsPreflightFailure {
+    pub fn close_retaining(self) -> std::result::Result<
+        sync_extend_platform_fs::ClosedWindowsOriginalResources,
+        sync_extend_platform_fs::WindowsOriginalResourceCloseFailure,
+    > {
+        let mut close = sync_extend_platform_fs::WindowsOriginalCloseAttempt::new();
+        close.append_result(self.original_targets.close_retaining());
+        for original in self.original_open_failures {
+            close.append_failure(original);
+        }
+        close.finish()
+    }
+}
+
+#[cfg(windows)]
+pub struct DeploymentCompletionPreflightFailure {
+    pub error: ReconcileError,
+    pub original_targets: PreparedDeploymentTargets,
+}
+
+#[derive(Serialize)]
+pub struct DeploymentFilesystemLiability {
+    pub filesystem: String,
+    pub allocation_bytes: u64,
+    pub available_bytes: u64,
+    pub allocation_unit: u64,
+}
+
+pub(super) fn component(path: &Path) -> Result<&str> {
     let value =
         path.file_name()
             .and_then(|name| name.to_str())
@@ -197,11 +245,11 @@ fn component(path: &Path) -> Result<&str> {
 }
 
 #[cfg(windows)]
-fn parent_key(parent: &NativeParent) -> Result<String> {
+pub(super) fn parent_key(parent: &NativeParent) -> Result<String> {
     Ok(parent.key()?.to_string())
 }
 #[cfg(target_os = "linux")]
-fn parent_key(parent: &NativeParent) -> Result<String> {
+pub(super) fn parent_key(parent: &NativeParent) -> Result<String> {
     let key = parent.key()?;
     Ok(format!("unix:{}:{}:{}", key.device, key.inode, key.uid))
 }
@@ -215,11 +263,11 @@ fn creator_key(creator: &NativeCreator) -> String {
     format!("unix:{}:{}:{}", key.device, key.inode, key.uid)
 }
 #[cfg(windows)]
-fn sealed_key(file: &NativeSealed) -> String {
+pub(super) fn sealed_key(file: &NativeSealed) -> String {
     file.key().to_string()
 }
 #[cfg(target_os = "linux")]
-fn sealed_key(file: &NativeSealed) -> String {
+pub(super) fn sealed_key(file: &NativeSealed) -> String {
     let key = file.key();
     format!("unix:{}:{}:{}", key.device, key.inode, key.uid)
 }
@@ -243,47 +291,167 @@ fn filesystem_key(parent: &NativeParent) -> Result<String> {
     Ok(format!("unix-device:{}", parent.key()?.device))
 }
 
-impl<'proof, 'local, 'scope> PreparedDeploymentInstall<'proof, 'local, 'scope> {
+fn verify_resource_scope(
+    mapping: &RestrictedDeploymentMapping,
+    parents: &BTreeMap<PathBuf, NativeParent>,
+    runtime_directories: &[NativeParent],
+    pinned_programs: &[OriginalProtectedArtifact],
+    provider: &DeploymentProtectionProvider,
+) -> Result<()> {
+    mapping.original.reverify_provider(provider)?;
+    for parent in parents.values() { parent.verify_original()?; }
+    for directory in runtime_directories { directory.verify_original()?; }
+    for original in pinned_programs { original.verify_original()?; }
+    Ok(())
+}
+
+fn verify_preflight_resources(
+    mapping: &RestrictedDeploymentMapping,
+    parents: &BTreeMap<PathBuf, NativeParent>,
+    runtime_directories: &[NativeParent],
+    pinned_programs: &[OriginalProtectedArtifact],
+    provider: &DeploymentProtectionProvider,
+) -> Result<()> {
+    verify_resource_scope(mapping, parents, runtime_directories, pinned_programs, provider)?;
+    let mut available = BTreeMap::<String, u64>::new();
+    let mut liabilities = BTreeMap::<String, u64>::new();
+    for artifact in &mapping.artifacts {
+        let parent = &parents[artifact.target.parent()
+            .ok_or(ReconcileError::Invariant("deployment actual target parent"))?];
+        parent.require_absent(component(&artifact.target)?)?;
+        let filesystem = filesystem_key(parent)?;
+        let (bytes, unit) = parent.available_space()?;
+        available.entry(filesystem.clone())
+            .and_modify(|previous| *previous = (*previous).min(bytes)).or_insert(bytes);
+        let rounded = (artifact.bytes.len() as u64)
+            .checked_add(unit.checked_sub(1)
+                .ok_or(ReconcileError::Invariant("actual deployment allocation unit is zero"))?)
+            .and_then(|bytes| bytes.checked_div(unit))
+            .and_then(|units| units.checked_mul(unit))
+            .ok_or(ReconcileError::ResourceLimit("deployment future allocation rounding"))?;
+        let prior = liabilities.entry(filesystem).or_default();
+        *prior = prior.checked_add(rounded)
+            .ok_or(ReconcileError::ResourceLimit("deployment complete filesystem byte liability"))?;
+    }
+    if liabilities.iter().any(|(filesystem, bytes)| available[filesystem] < *bytes) {
+        return Err(ReconcileError::ResourceLimit("deployment actual filesystem available bytes"));
+    }
+    for directory in runtime_directories { directory.require_empty()?; }
+    Ok(())
+}
+
+impl PreparedDeploymentTargets {
+    pub fn future_file_liabilities(
+        &self,
+        provider: &DeploymentProtectionProvider,
+    ) -> Result<Vec<DeploymentFilesystemLiability>> {
+        self.verify(provider)?;
+        let mut result = Vec::new();
+        for artifact in &self.mapping.artifacts {
+            let parent = &self.parents[artifact.target.parent()
+                .ok_or(ReconcileError::Invariant("actual deployment file parent absent"))?];
+            let (available_bytes, allocation_unit) = parent.available_space()?;
+            let allocation_bytes = (artifact.bytes.len() as u64)
+                .checked_add(allocation_unit.checked_sub(1).ok_or(ReconcileError::Invariant(
+                    "original deployment allocation unit is zero",
+                ))?)
+                .and_then(|bytes| bytes.checked_div(allocation_unit))
+                .and_then(|units| units.checked_mul(allocation_unit))
+                .ok_or(ReconcileError::ResourceLimit("original deployment file allocation bound"))?;
+            result.push(DeploymentFilesystemLiability {
+                filesystem: filesystem_key(parent)?, allocation_bytes,
+                available_bytes, allocation_unit,
+            });
+        }
+        self.verify(provider)?;
+        Ok(result)
+    }
+
+    #[cfg(windows)]
+    pub fn close_retaining(self) -> std::result::Result<
+        sync_extend_platform_fs::ClosedWindowsOriginalResources,
+        sync_extend_platform_fs::WindowsOriginalResourceCloseFailure,
+    > {
+        close_original_deployment_resources(
+            self.mapping, Vec::new(), None, None, self.parents,
+            self.runtime_directories, self.pinned_programs,
+        )
+    }
+
+    #[cfg(windows)]
+    pub fn node_restore_inputs(
+        &self,
+        provider: &DeploymentProtectionProvider,
+    ) -> Result<Vec<super::deployment_bundle::DeploymentNodeRestoreInput>> {
+        self.verify(provider)?;
+        self.mapping.node_restore_inputs(provider)
+    }
+
     pub fn preflight(
         mapping: RestrictedDeploymentMapping,
-        completions: Vec<OriginalDeploymentNodeCompletion<'proof, 'local, 'scope>>,
         provider: &DeploymentProtectionProvider,
     ) -> Result<Self> {
-        mapping.original.reverify_provider(provider)?;
-        if mapping.artifacts.len() > mapping.original.bounds.artifacts
-            || completions.len() != mapping.original.graph.nodes.len()
+        #[cfg(windows)]
         {
+            return Self::preflight_retaining(mapping, provider).map_err(|failure| {
+                let error = ReconcileError::Io(std::io::Error::other(failure.error.to_string()));
+                if let Err(original) = failure.close_retaining() {
+                    original.retain_until_process_exit();
+                }
+                error
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let mut result = Self {
+                mapping, parents: BTreeMap::new(), runtime_directories: Vec::new(),
+                pinned_programs: Vec::new(),
+            };
+            Self::prepare_resource_scope(
+                &result.mapping, provider, &mut result.parents,
+                &mut result.runtime_directories, &mut result.pinned_programs,
+            )?;
+            Ok(result)
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn preflight_retaining(
+        mapping: RestrictedDeploymentMapping,
+        provider: &DeploymentProtectionProvider,
+    ) -> std::result::Result<Self, DeploymentTargetsPreflightFailure> {
+        let mut original_targets = Self {
+            mapping, parents: BTreeMap::new(), runtime_directories: Vec::new(),
+            pinned_programs: Vec::new(),
+        };
+        let mut original_open_failures = Vec::new();
+        if let Err(error) = Self::prepare_resource_scope(
+            &original_targets.mapping, provider, &mut original_targets.parents,
+            &mut original_targets.runtime_directories, &mut original_targets.pinned_programs,
+            &mut original_open_failures,
+        ) {
+            return Err(DeploymentTargetsPreflightFailure {
+                error, original_targets, original_open_failures,
+            });
+        }
+        Ok(original_targets)
+    }
+
+    fn prepare_resource_scope(
+        mapping: &RestrictedDeploymentMapping,
+        provider: &DeploymentProtectionProvider,
+        parents: &mut BTreeMap<PathBuf, NativeParent>,
+        runtime_directories: &mut Vec<NativeParent>,
+        pinned_programs: &mut Vec<OriginalProtectedArtifact>,
+        #[cfg(windows)] original_open_failures:
+            &mut Vec<sync_extend_platform_fs::WindowsOriginalResourceCloseFailure>,
+    ) -> Result<()> {
+        mapping.original.reverify_provider(provider)?;
+        if mapping.artifacts.len() > mapping.original.bounds.artifacts {
             return Err(ReconcileError::ResourceLimit(
                 "complete deployment installation membership",
             ));
         }
-        let mut ids = BTreeSet::new();
-        let mut node_receipts = Vec::new();
-        for completion in &completions {
-            if !ids.insert(completion.id) {
-                return Err(ReconcileError::Invariant(
-                    "duplicate actual node completion loan",
-                ));
-            }
-            let descriptor = mapping.original.graph.node(completion.id)?;
-            node_receipts
-                .push(completion.verify(descriptor, &mapping.mapping.node_roots[&completion.id])?);
-        }
-        node_receipts.sort_by_key(|receipt| receipt.id);
-        if ids
-            != mapping
-                .original
-                .graph
-                .nodes
-                .iter()
-                .map(|node| node.id)
-                .collect()
-        {
-            return Err(ReconcileError::Invariant(
-                "missing actual target completion",
-            ));
-        }
-        let mut parents = BTreeMap::new();
         let mut native_slots = BTreeSet::new();
         let mut future_bytes = 0u64;
         for artifact in &mapping.artifacts {
@@ -292,7 +460,16 @@ impl<'proof, 'local, 'scope> PreparedDeploymentInstall<'proof, 'local, 'scope> {
                 "deployment target retained parent",
             ))?;
             if !parents.contains_key(path) {
-                parents.insert(path.to_path_buf(), NativeParent::open_private(path)?);
+                #[cfg(windows)]
+                let original = NativeParent::open_private_retaining(path).map_err(|failure| {
+                    if let Some(resources) = failure.original_resources {
+                        original_open_failures.push(resources);
+                    }
+                    ReconcileError::Io(failure.error)
+                })?;
+                #[cfg(not(windows))]
+                let original = NativeParent::open_private(path)?;
+                parents.insert(path.to_path_buf(), original);
             }
             let parent = &parents[path];
             let key = parent_key(parent)?;
@@ -321,19 +498,26 @@ impl<'proof, 'local, 'scope> PreparedDeploymentInstall<'proof, 'local, 'scope> {
                     "deployment complete future file byte liability",
                 ))?;
         }
-        let mut runtime_directories = Vec::new();
         let mut runtime_keys = BTreeSet::new();
         for path in mapping.mapping.runtime_directories.values() {
+            #[cfg(windows)]
+            let directory = NativeParent::open_private_retaining(path).map_err(|failure| {
+                if let Some(resources) = failure.original_resources {
+                    original_open_failures.push(resources);
+                }
+                ReconcileError::Io(failure.error)
+            })?;
+            #[cfg(not(windows))]
             let directory = NativeParent::open_private(path)?;
+            runtime_directories.push(directory);
+            let directory = runtime_directories.last().ok_or(ReconcileError::Unstable)?;
             directory.require_empty()?;
             if !runtime_keys.insert(parent_key(&directory)?) {
                 return Err(ReconcileError::Invariant(
                     "actual runtime directory native alias",
                 ));
             }
-            runtime_directories.push(directory);
         }
-        let mut pinned_programs = Vec::new();
         let mut programs = BTreeMap::new();
         for reference in &mapping.original.graph.references {
             if let DeploymentReferenceTarget::PinnedExecutable { path, digest } = &reference.target
@@ -359,11 +543,23 @@ impl<'proof, 'local, 'scope> PreparedDeploymentInstall<'proof, 'local, 'scope> {
                 .ok_or(ReconcileError::ResourceLimit(
                     "pinned executable pre-CREATE memory liability",
                 ))?;
+            #[cfg(windows)]
+            let original = OriginalProtectedArtifact::capture_retaining(
+                &path, remaining.min(256 * 1024 * 1024) as usize, false,
+            ).map_err(|failure| {
+                if let Some(resources) = failure.original_resources {
+                    original_open_failures.push(resources);
+                }
+                failure.error
+            })?;
+            #[cfg(not(windows))]
             let original = OriginalProtectedArtifact::capture(
                 &path,
                 remaining.min(256 * 1024 * 1024) as usize,
                 false,
             )?;
+            pinned_programs.push(original);
+            let original = pinned_programs.last().ok_or(ReconcileError::Unstable)?;
             if original.source_digest() != &digest
                 || !program_keys.insert(original.native_identity()?)
             {
@@ -375,18 +571,103 @@ impl<'proof, 'local, 'scope> PreparedDeploymentInstall<'proof, 'local, 'scope> {
                 ReconcileError::ResourceLimit("pinned executable aggregate bytes"),
             )?;
             mapping.original.bounds.memory([known])?;
-            pinned_programs.push(original);
         }
-        let result = Self {
-            mapping,
-            completions,
-            parents,
-            runtime_directories,
-            pinned_programs,
-            node_receipts,
+        verify_preflight_resources(mapping, parents, runtime_directories, pinned_programs, provider)
+    }
+
+    pub fn with_original_completions<'proof>(
+        self,
+        completions: Vec<OriginalDeploymentNodeCompletion<'proof>>,
+        provider: &DeploymentProtectionProvider,
+    ) -> Result<PreparedDeploymentInstall<'proof>> {
+        #[cfg(windows)]
+        {
+            return self.with_original_completions_retaining(completions, provider)
+                .map_err(|failure| {
+                    if let Err(original) = failure.original_targets.close_retaining() {
+                        original.retain_until_process_exit();
+                    }
+                    failure.error
+                });
+        }
+        #[cfg(not(windows))]
+        {
+            let node_receipts = self.checked_original_completions(&completions, provider)?;
+            Ok(PreparedDeploymentInstall {
+                mapping: self.mapping, completions, parents: self.parents,
+                runtime_directories: self.runtime_directories, pinned_programs: self.pinned_programs,
+                node_receipts,
+            })
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn with_original_completions_retaining<'proof>(
+        self,
+        completions: Vec<OriginalDeploymentNodeCompletion<'proof>>,
+        provider: &DeploymentProtectionProvider,
+    ) -> std::result::Result<PreparedDeploymentInstall<'proof>, DeploymentCompletionPreflightFailure> {
+        let node_receipts = match self.checked_original_completions(&completions, provider) {
+            Ok(receipts) => receipts,
+            Err(error) => return Err(DeploymentCompletionPreflightFailure {
+                error, original_targets: self,
+            }),
         };
-        result.verify_preflight(provider)?;
-        Ok(result)
+        Ok(PreparedDeploymentInstall {
+            mapping: self.mapping, completions, parents: self.parents,
+            runtime_directories: self.runtime_directories, pinned_programs: self.pinned_programs,
+            node_receipts,
+        })
+    }
+
+    fn checked_original_completions(
+        &self,
+        completions: &[OriginalDeploymentNodeCompletion<'_>],
+        provider: &DeploymentProtectionProvider,
+    ) -> Result<Vec<DeploymentNodeCompletionReceipt>> {
+        if completions.len() != self.mapping.original.graph.nodes.len() {
+            return Err(ReconcileError::Invariant("complete original node completion set required"));
+        }
+        let mut ids = BTreeSet::new();
+        let mut node_receipts = Vec::new();
+        for completion in completions {
+            if !ids.insert(completion.id) {
+                return Err(ReconcileError::Invariant("duplicate actual node completion loan"));
+            }
+            let descriptor = self.mapping.original.graph.node(completion.id)?;
+            node_receipts.push(completion.verify(
+                descriptor, &self.mapping.mapping.node_roots[&completion.id],
+            )?);
+        }
+        node_receipts.sort_by_key(|receipt| receipt.id);
+        if ids != self.mapping.original.graph.nodes.iter().map(|node| node.id).collect() {
+            return Err(ReconcileError::Invariant("missing actual target completion"));
+        }
+        self.verify(provider)?;
+        Ok(node_receipts)
+    }
+
+    pub fn verify(&self, provider: &DeploymentProtectionProvider) -> Result<()> {
+        verify_preflight_resources(&self.mapping, &self.parents,
+            &self.runtime_directories, &self.pinned_programs, provider)
+    }
+
+    pub fn preview(&self) -> Result<serde_json::Value> {
+        let mut value = self.mapping.preview()?;
+        value["all_future_slots_private_empty_and_retained_before_node_restore"] = true.into();
+        value["node_completion_authority"] = false.into();
+        Ok(value)
+    }
+}
+
+impl<'proof> PreparedDeploymentInstall<'proof> {
+    pub fn preflight(
+        mapping: RestrictedDeploymentMapping,
+        completions: Vec<OriginalDeploymentNodeCompletion<'proof>>,
+        provider: &DeploymentProtectionProvider,
+    ) -> Result<Self> {
+        PreparedDeploymentTargets::preflight(mapping, provider)?
+            .with_original_completions(completions, provider)
     }
 
     pub fn preview(&self) -> Result<serde_json::Value> {
@@ -428,70 +709,23 @@ impl<'proof, 'local, 'scope> PreparedDeploymentInstall<'proof, 'local, 'scope> {
     }
 
     fn verify_scope(&self, provider: &DeploymentProtectionProvider) -> Result<()> {
-        self.mapping.original.reverify_provider(provider)?;
         self.verify_nodes()?;
-        for parent in self.parents.values() {
-            parent.verify_original()?;
-        }
-        for directory in &self.runtime_directories {
-            directory.verify_original()?;
-        }
-        for original in &self.pinned_programs {
-            original.verify_original()?;
-        }
-        Ok(())
+        verify_resource_scope(&self.mapping, &self.parents, &self.runtime_directories,
+            &self.pinned_programs, provider)
     }
 
     fn verify_preflight(&self, provider: &DeploymentProtectionProvider) -> Result<()> {
-        self.verify_scope(provider)?;
-        let mut available = BTreeMap::<String, u64>::new();
-        let mut liabilities = BTreeMap::<String, u64>::new();
-        for artifact in &self.mapping.artifacts {
-            let parent = &self.parents[artifact
-                .target
-                .parent()
-                .ok_or(ReconcileError::Invariant("deployment actual target parent"))?];
-            parent.require_absent(component(&artifact.target)?)?;
-            let filesystem = filesystem_key(parent)?;
-            let (bytes, unit) = parent.available_space()?;
-            available
-                .entry(filesystem.clone())
-                .and_modify(|previous| *previous = (*previous).min(bytes))
-                .or_insert(bytes);
-            let rounded = (artifact.bytes.len() as u64)
-                .checked_add(unit - 1)
-                .and_then(|bytes| bytes.checked_div(unit))
-                .and_then(|units| units.checked_mul(unit))
-                .ok_or(ReconcileError::ResourceLimit(
-                    "deployment future allocation rounding",
-                ))?;
-            let prior = liabilities.entry(filesystem).or_default();
-            *prior = prior
-                .checked_add(rounded)
-                .ok_or(ReconcileError::ResourceLimit(
-                    "deployment complete filesystem byte liability",
-                ))?;
-        }
-        if liabilities
-            .iter()
-            .any(|(filesystem, bytes)| available[filesystem] < *bytes)
-        {
-            return Err(ReconcileError::ResourceLimit(
-                "deployment actual filesystem available bytes",
-            ));
-        }
-        for directory in &self.runtime_directories {
-            directory.require_empty()?;
-        }
-        Ok(())
+        self.verify_nodes()?;
+        verify_preflight_resources(&self.mapping, &self.parents,
+            &self.runtime_directories, &self.pinned_programs, provider)
     }
 
     pub fn install(
         self,
         provider: &DeploymentProtectionProvider,
     ) -> std::result::Result<
-        CompleteDeploymentInstall<'proof, 'local, 'scope>,
-        DeploymentInstallFailure<'proof, 'local, 'scope>,
+        CompleteDeploymentInstall<'proof>,
+        DeploymentInstallFailure<'proof>,
     > {
         let attempt_id = match EntryId::random() {
             Ok(value) => value,
@@ -714,8 +948,8 @@ fn installation_priority(role: DeploymentArtifactRole) -> u8 {
 
 /// No public native creator view exists. The retained actual successful prefix
 /// and failed original file are closed explicitly, and are never deleted here.
-pub struct OriginalDeploymentInstallAttempt<'proof, 'local, 'scope> {
-    prepared: PreparedDeploymentInstall<'proof, 'local, 'scope>,
+pub struct OriginalDeploymentInstallAttempt<'proof> {
+    prepared: PreparedDeploymentInstall<'proof>,
     attempt_id: Option<EntryId>,
     file_receipts: Vec<DeploymentFileReceipt>,
     files: Vec<(usize, NativeSealed)>,
@@ -725,7 +959,165 @@ pub struct OriginalDeploymentInstallAttempt<'proof, 'local, 'scope> {
     complete: bool,
 }
 
-impl OriginalDeploymentInstallAttempt<'_, '_, '_> {
+fn verify_original_installed_files(
+    mapping: &RestrictedDeploymentMapping,
+    parents: &BTreeMap<PathBuf, NativeParent>,
+    files: &[(usize, NativeSealed)],
+    receipts: &[DeploymentFileReceipt],
+) -> Result<()> {
+    if files.len() != mapping.artifacts.len()
+        || receipts.len() != files.len()
+        || receipts.last().is_none_or(|receipt| {
+            receipt.original_attempt.artifact_id != mapping.original.graph.root_deployment
+        })
+    {
+        return Err(ReconcileError::Invariant(
+            "complete original deployment installation prefix",
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    let mut keys = BTreeSet::new();
+    let mut previous = ContentId::hash(b"SyncExtend deployment original CREATE chain v2");
+    let attempt_id = &receipts[0].original_attempt.attempt_id;
+    for (sequence, ((index, file), receipt)) in files.iter().zip(receipts).enumerate() {
+        let artifact = mapping
+            .artifacts
+            .get(*index)
+            .ok_or(ReconcileError::Invariant("installed artifact index absent"))?;
+        let parent = parents
+            .get(artifact.target.parent().ok_or(ReconcileError::Invariant(
+                "installed original artifact parent absent",
+            ))?)
+            .ok_or(ReconcileError::Invariant(
+                "installed original retained parent absent",
+            ))?;
+        parent.verify_original()?;
+        file.verify_original(&artifact.bytes)?;
+        let attempt = &receipt.original_attempt;
+        if attempt.format_version != 2
+            || &attempt.attempt_id != attempt_id
+            || attempt.sequence as usize != sequence
+            || attempt.artifact_id != artifact.id
+            || attempt.role != artifact.role
+            || attempt.target != artifact.target
+            || attempt.parent_key != parent_key(parent)?
+            || attempt.expected_bytes != artifact.bytes.len() as u64
+            || attempt.expected_digest != artifact.digest
+            || attempt.bundle_digest != *mapping.original.digest()
+            || attempt.mapping_digest != mapping.mapping_digest
+            || attempt.previous_receipt_digest != previous
+            || receipt.actual_digest != artifact.digest
+            || receipt.actual_bytes != artifact.bytes.len() as u64
+            || !receipt.original_private_create_verified
+            || !receipt.original_file_sync_and_readback_verified
+            || !receipt.original_parent_sync_verified
+            || !receipt.original_sealed_read_scope_verified
+            || receipt.original_key != sealed_key(file)
+            || !ids.insert(artifact.id)
+            || !keys.insert(receipt.original_key.clone())
+            || receipt.receipt_digest
+                != ContentId::hash(&serde_json::to_vec(&(
+                    "sync-extend-deployment-original-file-receipt-v2",
+                    attempt,
+                    &receipt.original_key,
+                    artifact.bytes.len() as u64,
+                    &artifact.digest,
+                ))?)
+        {
+            return Err(ReconcileError::Invariant(
+                "complete installed graph original file/attempt/chain",
+            ));
+        }
+        previous = receipt.receipt_digest.clone();
+    }
+    if ids != mapping.artifacts.iter().map(|row| row.id).collect() {
+        return Err(ReconcileError::Invariant(
+            "complete installed original artifact membership",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn close_original_deployment_resources(
+    files: Vec<(usize, NativeSealed)>,
+    failed_create: Option<NativeFailedCreate>,
+    unsealed_creator: Option<NativeCreator>,
+    parents: BTreeMap<PathBuf, NativeParent>,
+    runtime_directories: Vec<NativeParent>,
+    pinned_programs: Vec<OriginalProtectedArtifact>,
+) -> Result<()> {
+    let mut first_error: Option<ReconcileError> = None;
+    for (_, file) in files {
+        if let Err(error) = file.close() {
+            first_error.get_or_insert(error.into());
+        }
+    }
+    if let Some(file) = failed_create {
+        if let Err(error) = file.close() {
+            first_error.get_or_insert(error.into());
+        }
+    }
+    if let Some(file) = unsealed_creator {
+        if let Err(error) = file.close() {
+            first_error.get_or_insert(error.into());
+        }
+    }
+    for (_, parent) in parents {
+        if let Err(error) = parent.close() {
+            first_error.get_or_insert(error.into());
+        }
+    }
+    for directory in runtime_directories {
+        if let Err(error) = directory.close() {
+            first_error.get_or_insert(error.into());
+        }
+    }
+    for original in pinned_programs {
+        if let Err(error) = original.close() {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(windows)]
+fn close_original_deployment_resources(
+    mut mapping: RestrictedDeploymentMapping,
+    files: Vec<(usize, NativeSealed)>,
+    failed_create: Option<NativeFailedCreate>,
+    unsealed_creator: Option<NativeCreator>,
+    parents: BTreeMap<PathBuf, NativeParent>,
+    runtime_directories: Vec<NativeParent>,
+    pinned_programs: Vec<OriginalProtectedArtifact>,
+) -> std::result::Result<
+    sync_extend_platform_fs::ClosedWindowsOriginalResources,
+    sync_extend_platform_fs::WindowsOriginalResourceCloseFailure,
+> {
+    let mut close = sync_extend_platform_fs::WindowsOriginalCloseAttempt::new();
+    for (_, original) in files {
+        close.append_result(original.close_retaining());
+    }
+    if let Some(original) = failed_create {
+        close.append_result(original.close_retaining());
+    }
+    if let Some(original) = unsealed_creator {
+        close.append_result(original.close_retaining());
+    }
+    for (_, parent) in parents {
+        close.close_artifact_parent(parent);
+    }
+    for parent in runtime_directories {
+        close.close_artifact_parent(parent);
+    }
+    for original in pinned_programs {
+        close.append_result(original.close_retaining());
+    }
+    mapping.original.framing.close_original_sources_into(&mut close);
+    close.finish()
+}
+
+impl OriginalDeploymentInstallAttempt<'_> {
     pub fn receipt(&self) -> DeploymentInstallReceipt {
         let root = self.prepared.mapping.original.graph.root_deployment;
         DeploymentInstallReceipt {
@@ -751,62 +1143,21 @@ impl OriginalDeploymentInstallAttempt<'_, '_, '_> {
         if self.failed_file.is_some()
             || self.failed_create.is_some()
             || self.unsealed_creator.is_some()
-            || self.files.len() != self.prepared.mapping.artifacts.len()
-            || self.file_receipts.len() != self.files.len()
-            || self.file_receipts.last().is_none_or(|receipt| {
-                receipt.original_attempt.artifact_id
-                    != self.prepared.mapping.original.graph.root_deployment
-            })
         {
             return Err(ReconcileError::Invariant(
                 "complete original deployment installation prefix",
             ));
         }
-        let mut ids = BTreeSet::new();
-        let mut keys = BTreeSet::new();
-        let mut previous = ContentId::hash(b"SyncExtend deployment original CREATE chain v2");
-        for ((index, file), receipt) in self.files.iter().zip(&self.file_receipts) {
-            let artifact = &self.prepared.mapping.artifacts[*index];
-            file.verify_original(&artifact.bytes)?;
-            if receipt.original_attempt.artifact_id != artifact.id
-                || receipt.original_attempt.expected_digest != artifact.digest
-                || receipt.actual_digest != artifact.digest
-                || receipt.actual_bytes != artifact.bytes.len() as u64
-                || receipt.original_attempt.previous_receipt_digest != previous
-                || receipt.original_key != sealed_key(file)
-                || !ids.insert(artifact.id)
-                || !keys.insert(receipt.original_key.clone())
-                || receipt.receipt_digest
-                    != ContentId::hash(&serde_json::to_vec(&(
-                        "sync-extend-deployment-original-file-receipt-v2",
-                        &receipt.original_attempt,
-                        &receipt.original_key,
-                        artifact.bytes.len() as u64,
-                        &artifact.digest,
-                    ))?)
-            {
-                return Err(ReconcileError::Invariant(
-                    "complete installed graph original file/attempt/chain",
-                ));
-            }
-            previous = receipt.receipt_digest.clone();
-        }
-        if ids
-            != self
-                .prepared
-                .mapping
-                .artifacts
-                .iter()
-                .map(|row| row.id)
-                .collect()
-        {
-            return Err(ReconcileError::Invariant(
-                "complete installed original artifact membership",
-            ));
-        }
+        verify_original_installed_files(
+            &self.prepared.mapping,
+            &self.prepared.parents,
+            &self.files,
+            &self.file_receipts,
+        )?;
         self.prepared.verify_scope(provider)
     }
 
+    #[cfg(not(windows))]
     pub fn close(self) -> Result<DeploymentInstallReceipt> {
         let receipt = self.receipt();
         let Self {
@@ -816,56 +1167,45 @@ impl OriginalDeploymentInstallAttempt<'_, '_, '_> {
             prepared,
             ..
         } = self;
-        let mut first_error = None;
-        for (_, file) in files {
-            if let Err(error) = file.close() {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        if let Some(file) = failed_create {
-            if let Err(error) = file.close() {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        if let Some(file) = unsealed_creator {
-            if let Err(error) = file.close() {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        for (_, parent) in prepared.parents {
-            if let Err(error) = parent.close() {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        for directory in prepared.runtime_directories {
-            if let Err(error) = directory.close() {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        if let Some(error) = first_error {
-            return Err(error.into());
-        }
+        close_original_deployment_resources(
+            files,
+            failed_create,
+            unsealed_creator,
+            prepared.parents,
+            prepared.runtime_directories,
+            prepared.pinned_programs,
+        )?;
+        Ok(receipt)
+    }
+
+    #[cfg(windows)]
+    pub fn close(self) -> Result<DeploymentInstallReceipt> {
+        self.close_retaining()
+            .map_err(|original| ReconcileError::Io(original.retain_and_report()))
+    }
+
+    #[cfg(windows)]
+    pub fn close_retaining(self) -> std::result::Result<
+        DeploymentInstallReceipt,
+        sync_extend_platform_fs::WindowsOriginalResourceCloseFailure,
+    > {
+        let receipt = self.receipt();
+        let Self { files, failed_create, unsealed_creator, prepared, .. } = self;
+        close_original_deployment_resources(
+            prepared.mapping, files, failed_create, unsealed_creator,
+            prepared.parents, prepared.runtime_directories, prepared.pinned_programs,
+        )?;
         Ok(receipt)
     }
 }
 
-pub struct DeploymentInstallFailure<'proof, 'local, 'scope> {
+pub struct DeploymentInstallFailure<'proof> {
     pub error: ReconcileError,
-    pub original_attempt: OriginalDeploymentInstallAttempt<'proof, 'local, 'scope>,
+    pub original_attempt: OriginalDeploymentInstallAttempt<'proof>,
 }
-impl<'proof, 'local, 'scope> DeploymentInstallFailure<'proof, 'local, 'scope> {
+impl<'proof> DeploymentInstallFailure<'proof> {
     fn before_create(
-        prepared: PreparedDeploymentInstall<'proof, 'local, 'scope>,
+        prepared: PreparedDeploymentInstall<'proof>,
         error: ReconcileError,
     ) -> Self {
         Self {
@@ -883,7 +1223,7 @@ impl<'proof, 'local, 'scope> DeploymentInstallFailure<'proof, 'local, 'scope> {
         }
     }
     fn before_create_with_id(
-        prepared: PreparedDeploymentInstall<'proof, 'local, 'scope>,
+        prepared: PreparedDeploymentInstall<'proof>,
         attempt_id: EntryId,
         error: ReconcileError,
     ) -> Self {
@@ -906,10 +1246,10 @@ impl<'proof, 'local, 'scope> DeploymentInstallFailure<'proof, 'local, 'scope> {
 /// Its constructor and originals are private. A serialized receipt cannot
 /// create this value or cause a start; capture, mapping, install and run remain
 /// separate operations.
-pub struct CompleteDeploymentInstall<'proof, 'local, 'scope> {
-    original_attempt: OriginalDeploymentInstallAttempt<'proof, 'local, 'scope>,
+pub struct CompleteDeploymentInstall<'proof> {
+    original_attempt: OriginalDeploymentInstallAttempt<'proof>,
 }
-impl CompleteDeploymentInstall<'_, '_, '_> {
+impl<'proof> CompleteDeploymentInstall<'proof> {
     pub fn receipt(&self) -> DeploymentInstallReceipt {
         self.original_attempt.receipt()
     }
@@ -929,5 +1269,165 @@ impl CompleteDeploymentInstall<'_, '_, '_> {
     }
     pub fn close(self) -> Result<DeploymentInstallReceipt> {
         self.original_attempt.close()
+    }
+
+    #[cfg(windows)]
+    pub fn close_retaining(self) -> std::result::Result<
+        DeploymentInstallReceipt,
+        sync_extend_platform_fs::WindowsOriginalResourceCloseFailure,
+    > {
+        self.original_attempt.close_retaining()
+    }
+
+    /// Transfers the actual original installed files after full completion
+    /// verification. Node completion borrows end here. This owned value alone
+    /// does not authorize any service or fresh recovered-node session.
+    pub fn retain_files(
+        self,
+        provider: &DeploymentProtectionProvider,
+    ) -> std::result::Result<
+        RetainedInstalledDeploymentFiles,
+        DeploymentFileRetentionFailure<'proof>,
+    > {
+        if let Err(error) = self.verify(provider) {
+            return Err(DeploymentFileRetentionFailure {
+                error,
+                original_install: self,
+            });
+        }
+        let receipt = self.receipt();
+        let OriginalDeploymentInstallAttempt {
+            prepared,
+            files,
+            failed_create,
+            unsealed_creator,
+            ..
+        } = self.original_attempt;
+        debug_assert!(failed_create.is_none() && unsealed_creator.is_none());
+        let PreparedDeploymentInstall {
+            mapping,
+            completions,
+            parents,
+            runtime_directories,
+            pinned_programs,
+            ..
+        } = prepared;
+        drop(completions);
+        Ok(RetainedInstalledDeploymentFiles {
+            mapping,
+            parents,
+            runtime_directories,
+            pinned_programs,
+            files,
+            receipt,
+        })
+    }
+}
+
+pub struct DeploymentFileRetentionFailure<'proof> {
+    pub error: ReconcileError,
+    pub original_install: CompleteDeploymentInstall<'proof>,
+}
+
+/// Private fields retain the real CREATE objects and original source graph.
+/// No receipt, path reopening, deserializer or public constructor can mint it.
+pub struct RetainedInstalledDeploymentFiles {
+    pub(super) mapping: RestrictedDeploymentMapping,
+    parents: BTreeMap<PathBuf, NativeParent>,
+    runtime_directories: Vec<NativeParent>,
+    pinned_programs: Vec<OriginalProtectedArtifact>,
+    files: Vec<(usize, NativeSealed)>,
+    pub(super) receipt: DeploymentInstallReceipt,
+}
+
+impl RetainedInstalledDeploymentFiles {
+    #[cfg(windows)]
+    pub fn fresh_node_restore_inputs(
+        &self,
+        provider: &DeploymentProtectionProvider,
+    ) -> Result<Vec<super::deployment_bundle::DeploymentNodeRestoreInput>> {
+        self.verify(provider)?;
+        let inputs = self.mapping.node_restore_inputs(provider)?;
+        self.verify(provider)?;
+        Ok(inputs)
+    }
+
+    pub fn receipt(&self) -> DeploymentInstallReceipt {
+        self.receipt.clone()
+    }
+
+    pub fn verify(&self, provider: &DeploymentProtectionProvider) -> Result<()> {
+        verify_resource_scope(
+            &self.mapping,
+            &self.parents,
+            &self.runtime_directories,
+            &self.pinned_programs,
+            provider,
+        )?;
+        if !self.receipt.full_graph_and_original_creators_verified
+            || !self.receipt.root_deployment_written_last
+            || self.receipt.failed_file.is_some()
+            || self.receipt.services_started
+        {
+            return Err(ReconcileError::Invariant(
+                "retained original installation is incomplete",
+            ));
+        }
+        verify_original_installed_files(
+            &self.mapping,
+            &self.parents,
+            &self.files,
+            &self.receipt.files,
+        )?;
+        verify_resource_scope(
+            &self.mapping,
+            &self.parents,
+            &self.runtime_directories,
+            &self.pinned_programs,
+            provider,
+        )
+    }
+
+    pub fn root_deployment_path(&self) -> &Path {
+        self.mapping.root_deployment_path()
+    }
+
+    #[cfg(not(windows))]
+    pub fn close(self) -> Result<DeploymentInstallReceipt> {
+        let Self {
+            files,
+            parents,
+            runtime_directories,
+            pinned_programs,
+            receipt,
+            ..
+        } = self;
+        close_original_deployment_resources(
+            files,
+            None,
+            None,
+            parents,
+            runtime_directories,
+            pinned_programs,
+        )?;
+        Ok(receipt)
+    }
+
+    #[cfg(windows)]
+    pub fn close(self) -> Result<DeploymentInstallReceipt> {
+        self.close_retaining()
+            .map_err(|original| ReconcileError::Io(original.retain_and_report()))
+    }
+
+    #[cfg(windows)]
+    pub fn close_retaining(self) -> std::result::Result<
+        DeploymentInstallReceipt,
+        sync_extend_platform_fs::WindowsOriginalResourceCloseFailure,
+    > {
+        let Self { mapping, files, parents, runtime_directories, pinned_programs, receipt } = self;
+        close_original_deployment_resources(
+            mapping, files, None, None, parents, runtime_directories, pinned_programs,
+        )?;
+        Ok(receipt)
     }
 }

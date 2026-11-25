@@ -20,6 +20,43 @@ pub struct CreatedNodeWorktreeMarker<'a> {
 }
 
 impl CreatedNodeWorktreeMarker<'_> {
+    pub fn close_into_attempt<'scope>(
+        self,
+        attempt: &mut super::OriginalNodeResourceCloseAttempt<'scope>,
+    ) where
+        Self: 'scope,
+    {
+        let Self {
+            roots,
+            directory,
+            marker,
+            writer_lock,
+            archive_digest,
+            marker_digest,
+            marker_bytes,
+            key,
+            parent_key,
+        } = self;
+        attempt.keep_context((
+            roots,
+            archive_digest,
+            marker_digest,
+            marker_bytes,
+            key,
+            parent_key,
+        ));
+        match marker.into_inner() {
+            MarkerContent::Created(original) => original.close_into_attempt(&mut attempt.native),
+            MarkerContent::Read(original) => original.close_into_attempt(&mut attempt.native),
+            MarkerContent::Identity(original) => original.close_into_attempt(&mut attempt.native),
+            MarkerContent::Failed => attempt.native.note_error(std::io::Error::other(
+                "original marker has no completed content handoff",
+            )),
+        }
+        writer_lock.close_into_attempt(&mut attempt.native);
+        directory.close_into_attempt(&mut attempt.native);
+    }
+
     pub fn verify(&self) -> Result<()> {
         self.roots.verify()?;
         self.directory.original_creation()?.verify()?;
@@ -49,6 +86,9 @@ impl CreatedNodeWorktreeMarker<'_> {
                 }
                 super::read_content::verify(reader, self.marker_bytes, &self.marker_digest)
             }
+            MarkerContent::Identity(_) => Err(ReconcileError::Invariant(
+                "original marker failed read handoff retains its identity",
+            )),
             MarkerContent::Failed => Err(ReconcileError::Invariant(
                 "original marker content handoff failed",
             )),
@@ -129,6 +169,7 @@ impl VerifiedNodeStateArchive {
 enum MarkerContent {
     Created(OwnedFileCreation),
     Read(sync_extend_platform_fs::ReleasedOriginalReadFile),
+    Identity(sync_extend_platform_fs::ReleasedOriginalFileIdentity),
     Failed,
 }
 
@@ -151,6 +192,12 @@ impl CreatedNodeWorktreeMarker<'_> {
                     }
                 }
             }
+            MarkerContent::Identity(original) => {
+                *current = MarkerContent::Identity(original);
+                return Err(ReconcileError::Invariant(
+                    "original marker failed read handoff cannot resume",
+                ));
+            }
             MarkerContent::Failed => {
                 return Err(ReconcileError::Invariant("original marker handoff failed"))
             }
@@ -158,9 +205,11 @@ impl CreatedNodeWorktreeMarker<'_> {
         crate::fault::checkpoint("node_marker_original_identity_released");
         let reader = match original.retain_read_after_creation() {
             Ok(reader) => reader,
-            Err((_original, error)) => return Err(error.into()),
+            Err((original, error)) => {
+                *current = MarkerContent::Identity(original);
+                return Err(error.into());
+            }
         };
-        super::read_content::verify(&reader, self.marker_bytes, &self.marker_digest)?;
         *current = MarkerContent::Read(reader);
         drop(current);
         self.verify()?;

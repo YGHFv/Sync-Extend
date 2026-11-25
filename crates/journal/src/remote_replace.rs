@@ -1,7 +1,7 @@
 //! Original signed Replace receipts; never local reauthoring or legacy owner adoption.
 use crate::{
-    storage_inventory::reader::{hash, invalid},
     Journal, JournalCapacityObligation, JournalStoredRow, RemotePublicationProof, Result,
+    storage_inventory::reader::{hash, invalid},
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -185,11 +185,7 @@ fn creator_charge(header: &Header, step: u64) -> TreeStorageCharge {
     }
 }
 fn creator_kind(step: u64) -> &'static str {
-    if step == 2 {
-        "file"
-    } else {
-        "directory"
-    }
+    if step == 2 { "file" } else { "directory" }
 }
 fn pins(header: &Header) -> Vec<(&'static str, ContentId)> {
     contents(&header.baseline)

@@ -1,12 +1,12 @@
 //! Uncompiled private ordinary-history projection draft; no native authority.
 use crate::{
-    storage_capacity::CapacitySnapshot, JournalError, JournalStorageColumn,
-    JournalStorageColumnValue as Value, Result,
+    JournalError, JournalStorageColumn, JournalStorageColumnValue as Value, Result,
+    storage_capacity::CapacitySnapshot,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
-    tree_storage_capacity::TreeStorageCharge, ContentId, Manifest, Operation, SnapshotId,
-    VersionVector,
+    ContentId, Manifest, Operation, SnapshotId, VersionVector,
+    tree_storage_capacity::TreeStorageCharge,
 };
 
 type Key = (String, Vec<String>);

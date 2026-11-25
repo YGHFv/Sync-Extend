@@ -412,6 +412,24 @@ impl OriginalNodeCompletionManifest {
         archive: &VerifiedNodeStateArchive,
         inspection: sync_extend_journal::NodeInspectionBounds,
     ) -> Result<()> {
+        self.verify_archive_source_inner(archive, inspection, None)
+    }
+
+    pub(super) fn verify_archive_source_for_deployment(
+        &self,
+        archive: &VerifiedNodeStateArchive,
+        inspection: sync_extend_journal::NodeInspectionBounds,
+        configs: &crate::SeparatedDeploymentNodeConfigs,
+    ) -> Result<()> {
+        self.verify_archive_source_inner(archive, inspection, Some(configs))
+    }
+
+    fn verify_archive_source_inner(
+        &self,
+        archive: &VerifiedNodeStateArchive,
+        inspection: sync_extend_journal::NodeInspectionBounds,
+        configs: Option<&crate::SeparatedDeploymentNodeConfigs>,
+    ) -> Result<()> {
         use super::{ArchiveRole, NodeRestoreFile, NodeRestoreLayout, NodeTargetRoot};
         use std::collections::BTreeMap;
         self.validate()?;
@@ -441,11 +459,22 @@ impl OriginalNodeCompletionManifest {
                 "completion restart original mapped Journal/typedrows differs",
             ));
         }
-        let layout: NodeRestoreLayout = archive.current_node_restore_layout(
-            inspection,
-            super::completion_codec::MAX_OBJECTS,
-            1024 * 1024 * 1024,
-        )?;
+        let layout: NodeRestoreLayout = if let Some(configs) = configs {
+            archive.current_node_restore_layout_for_deployment_inspection(
+                inspection,
+                super::completion_codec::MAX_OBJECTS,
+                1024 * 1024 * 1024,
+                worktree,
+                std::path::Path::new(&self.original_data_target),
+                configs,
+            )?
+        } else {
+            archive.current_node_restore_layout(
+                inspection,
+                super::completion_codec::MAX_OBJECTS,
+                1024 * 1024 * 1024,
+            )?
+        };
         let mapped = layout.map_original_slots(super::completion_codec::MAX_OBJECTS)?;
         if self.object_count != mapped.directories().len() + mapped.files().len() + 5 {
             return Err(ReconcileError::Invariant(

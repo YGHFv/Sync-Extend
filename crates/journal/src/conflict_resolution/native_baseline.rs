@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use sync_extend_core_model::conflict_native_layout::{
-    plan_conflict_native_layout, ConflictNativeLayout, ConflictNativeLayoutLimits,
+    ConflictNativeLayout, ConflictNativeLayoutLimits, plan_conflict_native_layout,
 };
 use sync_extend_platform_fs::{FileKey, GuardedReadFile, LockedDirectory, LockedFile};
 

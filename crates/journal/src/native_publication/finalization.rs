@@ -1,13 +1,13 @@
 //! One atomic exact admitted history and original guarded native final receipt.
 use super::NativePublicationObservation;
 use crate::{
+    Completion, Journal, JournalStorageColumn, JournalStorageColumnValue as ColumnValue,
+    PublicationState, Result,
     native_publication::{issuance, physical, schema},
     storage_inventory::reader::{hash, invalid},
     storage_policy::{self, local_commit},
-    Completion, Journal, JournalStorageColumn, JournalStorageColumnValue as ColumnValue,
-    PublicationState, Result,
 };
-use rusqlite::{params_from_iter, types::Value, Transaction, TransactionBehavior};
+use rusqlite::{Transaction, TransactionBehavior, params_from_iter, types::Value};
 use sync_extend_core_model::{EntryId, SnapshotId};
 
 impl Journal {

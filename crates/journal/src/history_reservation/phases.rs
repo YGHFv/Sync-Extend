@@ -1,13 +1,13 @@
 //! Original live attempt phase observations, not restart/native/cleanup issuers.
 use super::{OriginalLocalHistoryReservation, Stored};
 use crate::{Journal, JournalError, Result};
-use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sync_extend_core_model::{ContentId, EntryId};
 use sync_extend_platform_fs::{
     HeldPrivateVolume, OriginalOutsideIntent, OriginalPrivateVolumeFile,
 };
 
-use super::phase_evidence::{Phase, PREFIX};
+use super::phase_evidence::{PREFIX, Phase};
 
 pub struct OriginalNativePhaseObservationReceipt {
     attempt: EntryId,

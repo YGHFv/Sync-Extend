@@ -1,7 +1,7 @@
 use crate::{Journal, JournalError, Result};
 use sync_extend_core_model::{
-    causal::{reduce_operations, CausalReduction, MAX_CAUSAL_OPERATIONS},
     Operation, SpaceId,
+    causal::{CausalReduction, MAX_CAUSAL_OPERATIONS, reduce_operations},
 };
 
 impl Journal {
