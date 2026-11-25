@@ -165,7 +165,7 @@ Add-ColumnsTab 'Files' @('相对路径', '类型', '逻辑大小', '源修改时
 Add-ColumnsTab 'History' @('快照', '原状态', '快照创建时间', '当前 / 锁定', '内容状态', '裁剪时间') @(275, 100, 180, 140, 150, 180) '本机历史'
 Add-ColumnsTab 'Pruned history' @('快照', '原状态', '快照创建时间', '当前 / 锁定', '内容状态', '裁剪时间') @(275, 100, 180, 140, 150, 180) '裁剪审计'
 Add-ColumnsTab 'Recovery' @('项目', '只读观察与手动入口') @(230, 800) '恢复与预览'
-Add-ColumnsTab 'Selection preview' @('历史源路径', '实际目标路径', '差异', '新操作描述', '历史逻辑大小', '当前逻辑大小', '冲突路径') @(230, 250, 150, 180, 140, 140, 220) '选择恢复预览'
+Add-ColumnsTab 'Selection preview' @('历史源路径', '实际目标路径', '差异', '新操作描述', '历史逻辑大小', '当前逻辑大小', '冲突路径') @(180, 190, 95, 135, 120, 120, 180) '选择恢复预览'
 Add-ColumnsTab 'Conflicts' @('事务', '处置', '文件已物化') @(510, 130, 130) '冲突'
 Add-ColumnsTab 'Unavailable chunks' @('样本来源', '不可读取块') @(150, 670) '缺块'
 Add-ColumnsTab 'WebDAV' @('导出地址', '配置权限', '上传上限') @(470, 140, 200)
@@ -182,9 +182,9 @@ $restoreLayout = [Windows.Forms.TableLayoutPanel]::new()
 $restoreLayout.Dock = 'Fill'
 $restoreLayout.ColumnCount = 1
 $restoreLayout.RowCount = 3
-[void]$restoreLayout.RowStyles.Add([Windows.Forms.RowStyle]::new('Absolute', 292))
+[void]$restoreLayout.RowStyles.Add([Windows.Forms.RowStyle]::new('Absolute', 264))
 [void]$restoreLayout.RowStyles.Add([Windows.Forms.RowStyle]::new('Percent', 100))
-[void]$restoreLayout.RowStyles.Add([Windows.Forms.RowStyle]::new('Absolute', 153))
+[void]$restoreLayout.RowStyles.Add([Windows.Forms.RowStyle]::new('Absolute', 126))
 $restorePanel = [Windows.Forms.TableLayoutPanel]::new()
 $restorePanel.Dock = 'Fill'
 $restorePanel.Padding = [Windows.Forms.Padding]::new(8)
@@ -195,7 +195,7 @@ foreach ($style in @(
         [Windows.Forms.ColumnStyle]::new('Percent', 50),
         [Windows.Forms.ColumnStyle]::new('Absolute', 90),
         [Windows.Forms.ColumnStyle]::new('Percent', 50))) { [void]$restorePanel.ColumnStyles.Add($style) }
-foreach ($height in @(30, 30, 30, 64, 34, 34, 42)) {
+foreach ($height in @(30, 30, 30, 48, 34, 34, 42)) {
     [void]$restorePanel.RowStyles.Add([Windows.Forms.RowStyle]::new('Absolute', $height))
 }
 function Add-RestoreLabel([string]$Text, [int]$Column, [int]$Row) {
@@ -333,6 +333,8 @@ function Set-ClientPendingRestore($Pending) {
         $gatewayButton.Enabled = $false
     }
     $stopButton.Enabled = $false
+    $summary.Text = $view.Summary
+    $tabs.SelectedTab = $restorePage
     Set-ClientRestoreBusy $script:busy
 }
 
@@ -602,6 +604,10 @@ function Add-ClientRow {
 
 function Clear-Client {
     $script:current = $null
+    # Refresh re-reads the managed status. A pending receipt from the
+    # previous observation must not keep stale Continue controls alive if
+    # the new status read fails.
+    $script:pendingRestore = $null
     foreach ($list in $lists.Values) { $list.Items.Clear() }
     Clear-ClientRestore
     $stopButton.Enabled = $false
@@ -863,6 +869,7 @@ if (!$LayoutProbe) {
 }
 if ($LayoutProbe) {
     $outputPath = Resolve-SyncExtendPath $LayoutProbe
+    $probeDirectory = [IO.Path]::GetDirectoryName($outputPath)
     $form.ShowInTaskbar = $false
     $form.StartPosition = 'Manual'
     $form.Location = [Drawing.Point]::new(-32000, -32000)
@@ -872,13 +879,115 @@ if ($LayoutProbe) {
     $form.PerformLayout()
     $form.Show()
     [Windows.Forms.Application]::DoEvents()
-    $bitmap = [Drawing.Bitmap]::new($form.Width, $form.Height)
-    try {
-        $form.DrawToBitmap($bitmap, [Drawing.Rectangle]::new(0, 0, $bitmap.Width, $bitmap.Height))
-        $bitmap.Save($outputPath, [Drawing.Imaging.ImageFormat]::Png)
-    } finally {
-        $bitmap.Dispose()
+
+    $graphics = [Drawing.Graphics]::FromHwnd($form.Handle)
+    try { $graphicsDpiX = $graphics.DpiX; $graphicsDpiY = $graphics.DpiY }
+    finally { $graphics.Dispose() }
+
+    function Get-ProbeDescendants([Windows.Forms.Control]$Root) {
+        foreach ($child in $Root.Controls) {
+            $child
+            Get-ProbeDescendants $child
+        }
     }
+    function Test-ProbeAncestor([Windows.Forms.Control]$Ancestor, [Windows.Forms.Control]$Candidate) {
+        $cursor = $Candidate.Parent
+        while ($cursor) {
+            if ([object]::ReferenceEquals($cursor, $Ancestor)) { return $true }
+            $cursor = $cursor.Parent
+        }
+        return $false
+    }
+    function Get-ProbeOverlaps([Windows.Forms.Control]$Page) {
+        $visible = @(Get-ProbeDescendants $Page | Where-Object {
+            $_.Visible -and $_.Width -gt 0 -and $_.Height -gt 0
+        })
+        for ($left = 0; $left -lt $visible.Count; $left++) {
+            for ($right = $left + 1; $right -lt $visible.Count; $right++) {
+                $a = $visible[$left]; $b = $visible[$right]
+                if ((Test-ProbeAncestor $a $b) -or (Test-ProbeAncestor $b $a)) { continue }
+                $ra = $a.RectangleToScreen($a.ClientRectangle)
+                $rb = $b.RectangleToScreen($b.ClientRectangle)
+                if ($ra.Right -gt $rb.Left -and $rb.Right -gt $ra.Left -and
+                    $ra.Bottom -gt $rb.Top -and $rb.Bottom -gt $ra.Top) {
+                    [ordered]@{
+                        left = if ($a.Name) { $a.Name } else { $a.GetType().Name }
+                        right = if ($b.Name) { $b.Name } else { $b.GetType().Name }
+                    }
+                }
+            }
+        }
+    }
+    function Save-ProbeImage([string]$Path) {
+        $bitmap = [Drawing.Bitmap]::new($form.Width, $form.Height)
+        try {
+            $form.DrawToBitmap($bitmap, [Drawing.Rectangle]::new(0, 0, $bitmap.Width, $bitmap.Height))
+            $bitmap.Save($Path, [Drawing.Imaging.ImageFormat]::Png)
+        } finally { $bitmap.Dispose() }
+    }
+
+    $sizeProbes = [Collections.Generic.List[object]]::new()
+    $screenshots = [Collections.Generic.List[object]]::new()
+    foreach ($size in @(
+            [ordered]@{ name = 'default'; width = 1120; height = 900 },
+            [ordered]@{ name = 'minimum'; width = 900; height = 780 })) {
+        $form.Size = [Drawing.Size]::new($size.width, $size.height)
+        $form.PerformLayout()
+        [Windows.Forms.Application]::DoEvents()
+        $tabIndex = 0
+        foreach ($page in $tabs.TabPages) {
+            $tabs.SelectedTab = $page
+            $form.PerformLayout()
+            [Windows.Forms.Application]::DoEvents()
+            $pageLists = @(Get-ProbeDescendants $page | Where-Object { $_ -is [Windows.Forms.ListView] })
+            $list = $pageLists | Select-Object -First 1
+            $overlaps = @(Get-ProbeOverlaps $page)
+            $columns = @()
+            if ($list) {
+                $columns = @(foreach ($column in $list.Columns) {
+                    $measured = [Windows.Forms.TextRenderer]::MeasureText($column.Text, $form.Font).Width + 24
+                    [ordered]@{
+                        text = $column.Text; width = $column.Width
+                        measured_header_plus_24 = $measured; pass = ($column.Width -ge $measured)
+                    }
+                })
+            }
+            $columnsPass = ($columns.Count -gt 0) -and @($columns | Where-Object { !$_.pass }).Count -eq 0
+            $measurement = [ordered]@{
+                size = $size.name; form_width = $form.Width; form_height = $form.Height
+                tab_index = $tabIndex; tab = $page.Text
+                page_width = $page.ClientSize.Width; page_height = $page.ClientSize.Height
+                list_count = $pageLists.Count
+                list = if ($list) {
+                    [ordered]@{
+                        x = $list.Left; y = $list.Top; width = $list.Width; height = $list.Height
+                        parent_width = $list.Parent.ClientSize.Width
+                        parent_height = $list.Parent.ClientSize.Height
+                        dock = [string]$list.Dock; visible = $list.Visible; scrollable = $list.Scrollable
+                    }
+                } else { $null }
+                overlaps = @($overlaps)
+                columns = @($columns)
+                pass = [bool]($page.ClientSize.Width -gt 0 -and $page.ClientSize.Height -gt 0 -and
+                    $pageLists.Count -eq 1 -and $list -and $list.Visible -and $list.Width -gt 0 -and
+                    $list.Height -gt 0 -and [string]$list.Dock -ceq 'Fill' -and $list.Scrollable -and
+                    $overlaps.Count -eq 0 -and $columnsPass)
+            }
+            $sizeProbes.Add($measurement)
+            if ($size.name -ceq 'default' -or ($size.name -ceq 'minimum' -and $page -ceq $restorePage)) {
+                $shot = Join-Path $probeDirectory ('{0}-tab-{1:D2}.png' -f $size.name, $tabIndex)
+                Save-ProbeImage $shot
+                $screenshots.Add([ordered]@{ path = $shot; bytes = (Get-Item -LiteralPath $shot).Length })
+            }
+            $tabIndex++
+        }
+    }
+
+    $form.Size = [Drawing.Size]::new(1120, 900)
+    $tabs.SelectedTab = $restorePage
+    $form.PerformLayout()
+    [Windows.Forms.Application]::DoEvents()
+    Save-ProbeImage $outputPath
     $restoreList = $lists['Selection preview']
     $controls = @($restorePanel, $restoreList, $restoreNotes)
     $bounds = foreach ($control in $controls) {
@@ -905,11 +1014,46 @@ if ($LayoutProbe) {
             measured_header_plus_24 = [Windows.Forms.TextRenderer]::MeasureText($column.Text, $form.Font).Width + 24
         }
     }
+    $defaultProbes = @($sizeProbes | Where-Object { $_.size -ceq 'default' })
+    $pendingProbe = $null
+    try {
+        Set-ClientPendingRestore ([ordered]@{
+            transaction_id = 'a' * 32; request_sha256 = 'b' * 64; scope_sha256 = 'c' * 64
+            phase = 'execution_requested'; original_process_exit_verified = $true
+            native_final_verified = $false; helper_active = $false
+        })
+        [Windows.Forms.Application]::DoEvents()
+        $pendingProbe = [ordered]@{
+            selected_restore_page = [object]::ReferenceEquals($tabs.SelectedTab, $restorePage)
+            selected_tab = $tabs.SelectedTab.Text
+            summary_has_phase = $summary.Text -match '正在恢复内容'
+            restore_rows = $lists['Recovery'].Items.Count
+            resume_enabled = $restoreResume.Enabled
+            execute_disabled = !$restoreExecute.Enabled
+            budget_disabled = !$restoreBudgetButton.Enabled
+            stop_disabled = !$stopButton.Enabled
+        }
+        $pendingProbe.pass = [bool]($pendingProbe.selected_restore_page -and
+            $pendingProbe.summary_has_phase -and $pendingProbe.restore_rows -eq 5 -and
+            $pendingProbe.resume_enabled -and $pendingProbe.execute_disabled -and
+            $pendingProbe.budget_disabled -and $pendingProbe.stop_disabled)
+    } finally {
+        Set-ClientPendingRestore $null
+    }
     $probe = [ordered]@{
         probe = 'sync_extend_windows_hidden_form_layout'
         screenshot = $outputPath
         screenshot_bytes = (Get-Item -LiteralPath $outputPath).Length
-        form = [ordered]@{ width = $form.Width; height = $form.Height; minimum_width = $form.MinimumSize.Width; minimum_height = $form.MinimumSize.Height }
+        device_dpi = $form.DeviceDpi
+        graphics_dpi_x = $graphicsDpiX; graphics_dpi_y = $graphicsDpiY
+        dpi_scale = [Math]::Round($form.DeviceDpi / 96.0, 4)
+        form = [ordered]@{
+            width = $form.Width; height = $form.Height
+            minimum_width = $form.MinimumSize.Width; minimum_height = $form.MinimumSize.Height
+            auto_scale_mode = [string]$form.AutoScaleMode
+            auto_scale_dimensions = [ordered]@{ width = $form.AutoScaleDimensions.Width; height = $form.AutoScaleDimensions.Height }
+            client_width = $form.ClientSize.Width; client_height = $form.ClientSize.Height
+        }
         tabs = [ordered]@{ width = $tabs.Width; height = $tabs.Height; page_count = $tabs.TabPages.Count }
         restore_page = [ordered]@{ width = $restorePage.ClientSize.Width; height = $restorePage.ClientSize.Height }
         restore_controls = @($bounds)
@@ -917,11 +1061,20 @@ if ($LayoutProbe) {
         list_notes_overlap = $listNotesOverlap
         list_scrollable = $restoreList.Scrollable
         columns = @($columns)
-        passed = (!$panelListOverlap -and !$listNotesOverlap -and $restoreList.Scrollable -and
-            @($columns | Where-Object { $_.width -lt $_.measured_header_plus_24 }).Count -eq 0)
+        tab_probes = @($defaultProbes)
+        size_probes = @($sizeProbes)
+        screenshots = @($screenshots)
+        pending_probe = $pendingProbe
+        passed = [bool]($form.DeviceDpi -gt 0 -and $defaultProbes.Count -eq $tabs.TabPages.Count -and
+            @($sizeProbes | Where-Object { !$_.pass }).Count -eq 0 -and
+            @($sizeProbes | Where-Object { $_.tab -ceq $restorePage.Text -and $_.list.height -lt 64 }).Count -eq 0 -and
+            !$panelListOverlap -and !$listNotesOverlap -and $restoreList.Scrollable -and
+            @($columns | Where-Object { $_.width -lt $_.measured_header_plus_24 }).Count -eq 0 -and
+            $pendingProbe -and $pendingProbe.pass -and
+            @($screenshots | Where-Object { $_.bytes -le 0 }).Count -eq 0)
     }
     $form.Dispose()
-    $probe | ConvertTo-Json -Depth 8 -Compress
+    $probe | ConvertTo-Json -Depth 12 -Compress
     return
 }
 $form.Add_Shown({ Update-Client })

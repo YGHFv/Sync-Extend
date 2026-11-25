@@ -4,7 +4,7 @@
 function Assert-SyncExtendRestorePath($Value) {
     Assert-SyncExtendViewText $Value 4096
     if ($Value -cmatch '[\x00-\x1f<>:"\\|?*]' -or
-        [Text.Encoding]::UTF8.GetByteCount($Value) -gt 4096) { throw 'Invalid portable restore path.' }
+        (Get-SyncExtendUtf8ByteCount $Value) -gt 4096) { throw 'Invalid portable restore path.' }
     foreach ($part in $Value.Split('/')) {
         if (!$part -or $part -ceq '.' -or $part -ceq '..' -or $part.EndsWith('.') -or $part.EndsWith(' ')) {
             throw 'Invalid portable restore path component.'
@@ -80,7 +80,7 @@ function New-SyncExtendRestoreRequest {
         $bytes = 0
         foreach ($name in $names) {
             Assert-SyncExtendRestorePath $name
-            $bytes += [Text.Encoding]::UTF8.GetByteCount($name)
+            $bytes += Get-SyncExtendUtf8ByteCount $name
             if (!$seen.Add($name)) { throw 'Duplicate restore source path.' }
         }
         if ($bytes -gt 16384) { throw 'Restore source paths exceed their byte limit.' }
@@ -104,7 +104,7 @@ function New-SyncExtendRestoreRequest {
 
 function Get-SyncExtendRestoreRequestHex($Request) {
     $json = $Request | ConvertTo-Json -Depth 24 -Compress
-    $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+    $bytes = Get-SyncExtendUtf8Bytes $json
     # Keep the native Windows command line below its 32767-character bound.
     if ($bytes.Length -gt 8192) { throw 'Restore request exceeds the Windows client command limit.' }
     return [Convert]::ToHexString($bytes).ToLowerInvariant()
@@ -249,7 +249,7 @@ function Assert-SyncExtendRestoreRequest($Value) {
             foreach ($path in $selection.paths) {
                 Assert-SyncExtendRestorePath $path
                 if (!$seen.Add($path)) { throw 'Duplicate historical path.' }
-                $bytes += [Text.Encoding]::UTF8.GetByteCount($path)
+                $bytes += Get-SyncExtendUtf8ByteCount $path
             }
             if ($bytes -gt 16384) { throw 'Selected historical paths exceed their byte limit.' }
         }
@@ -293,7 +293,7 @@ function ConvertTo-SyncExtendRestoreCanonicalValue($Value) {
 function Get-SyncExtendRestoreObjectDigest($Value) {
     $canonical = ConvertTo-SyncExtendRestoreCanonicalValue $Value
     $json = ConvertTo-Json -InputObject $canonical -Depth 32 -Compress
-    return Get-SyncExtendRestoreByteDigest ([Text.Encoding]::UTF8.GetBytes($json))
+    return Get-SyncExtendRestoreByteDigest (Get-SyncExtendUtf8Bytes $json)
 }
 
 function ConvertFrom-SyncExtendRestoreRequestHex([string]$Hex) {
@@ -455,7 +455,7 @@ function New-SyncExtendPendingRestoreView($Pending) {
     $phase = if ($phaseNames.ContainsKey($Pending.phase)) { $phaseNames[$Pending.phase] } else { '需要核对持久事务' }
     $summary = "恢复事务 $($Pending.transaction_id)`r`n$phase。普通启动、版本切换和 WebDAV 更改已暂停。"
     if ($Pending.refusal_reason) {
-        Assert-SyncExtendViewText $Pending.refusal_reason 512
+        Assert-SyncExtendViewTextCharacters $Pending.refusal_reason 512
         $summary += "`r`n拒绝原因：$($Pending.refusal_reason)"
     }
     return @{
@@ -616,8 +616,9 @@ function New-SyncExtendNativeHistoryAuditView($Audit, $Request) {
         $Audit.limits.max_query_secs -ne $Request.bounds.max_query_secs) {
         throw 'Native history audit limits do not match the explicit request.'
     }
-    $canonical = [Text.Encoding]::UTF8.GetBytes(($Audit | ConvertTo-Json -Depth 12 -Compress))
-    if ($canonical.Length -gt 3072) { throw 'Native history audit exceeds the client display budget.' }
+    if ((Get-SyncExtendCanonicalJsonByteCount $Audit 12) -gt 3072) {
+        throw 'Native history audit exceeds the client display budget.'
+    }
     $tableText = $Audit.tables.sample | ForEach-Object {
         "$($_.table): $($_.rows) 行 / $(Format-SyncExtendViewBytes $_.logical_bytes)"
     }
@@ -670,9 +671,19 @@ function Assert-SyncExtendViewId($Value, [int]$Length = 64) {
     }
 }
 
-function Assert-SyncExtendViewText($Value, [int]$MaxLength = 4096) {
-    if ($Value -isnot [string] -or $Value.Length -eq 0 -or $Value.Length -gt $MaxLength -or
+function Assert-SyncExtendViewText($Value, [int]$MaxBytes = 4096) {
+    if ($Value -isnot [string] -or $Value.Length -eq 0 -or
+        $Value.IndexOf([char]0) -ge 0 -or (Get-SyncExtendUtf8ByteCount $Value) -gt $MaxBytes) {
+        throw 'The local observation has invalid text.'
+    }
+}
+
+function Assert-SyncExtendViewTextCharacters($Value, [int]$MaxCharacters = 512) {
+    # A few producer fields (the pending refusal reason) are bounded by
+    # characters, not bytes. Reject invalid UTF-16 without changing that bound.
+    if ($Value -isnot [string] -or $Value.Length -eq 0 -or $Value.Length -gt $MaxCharacters -or
         $Value.IndexOf([char]0) -ge 0) { throw 'The local observation has invalid text.' }
+    $null = Get-SyncExtendUtf8ByteCount $Value
 }
 
 function Assert-SyncExtendViewList($Value, [int]$Maximum) {

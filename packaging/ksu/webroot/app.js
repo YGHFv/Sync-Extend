@@ -37,6 +37,46 @@ let restoreContext = null;
 const validExportName = (name) => typeof name === "string" && name.length >= 1 &&
   name.length <= 64 && !/[^A-Za-z0-9_-]/.test(name);
 
+function utf8ByteLength(value) {
+  if (typeof value !== "string") throw new Error("Expected UTF-8 text");
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (!(low >= 0xdc00 && low <= 0xdfff)) throw new Error("Unpaired high surrogate");
+      index += 1;
+      bytes += 4;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      throw new Error("Unpaired low surrogate");
+    } else if (unit <= 0x7f) bytes += 1;
+    else if (unit <= 0x7ff) bytes += 2;
+    else bytes += 3;
+  }
+  return bytes;
+}
+
+function assertValidUtf8Strings(value, depth = 0) {
+  if (depth > 64) throw new Error("UTF-8 validation depth exceeded");
+  if (typeof value === "string") { utf8ByteLength(value); return; }
+  if (value === null || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    for (const item of value) assertValidUtf8Strings(item, depth + 1);
+    return;
+  }
+  for (const key of Object.keys(value)) {
+    utf8ByteLength(key);
+    assertValidUtf8Strings(value[key], depth + 1);
+  }
+}
+
+function jsonUtf8ByteLength(value) {
+  // JSON.stringify escapes lone surrogates, so validate the parsed strings
+  // before measuring the canonical display payload.
+  assertValidUtf8Strings(value);
+  return utf8ByteLength(JSON.stringify(value));
+}
+
 function readJson(operation, selectedExport) {
   return new Promise((resolve, reject) => {
     let command;
@@ -68,22 +108,32 @@ function readJson(operation, selectedExport) {
       finish();
       const responseLimit = operation === "preview" || operation === "preview-context" ? 262144 :
         (operation === "gateway" ? 65536 : 16384);
-      if (code !== 0 || typeof output !== "string" || output.length > responseLimit ||
-          new TextEncoder().encode(output).length > responseLimit) {
+      if (code !== 0 || typeof output !== "string") {
+        reject(new Error("Module operation refused"));
+        return;
+      }
+      let outputBytes;
+      try { outputBytes = utf8ByteLength(output); }
+      catch (error) {
+        reject(new Error("Module operation refused"));
+        return;
+      }
+      if (output.length > responseLimit || outputBytes > responseLimit) {
         reject(new Error("Module operation refused"));
         return;
       }
       try {
         const value = JSON.parse(output);
+        assertValidUtf8Strings(value);
         // The CLI pretty-prints native control JSON. Its display whitespace
         // does not enlarge the existing 4096-byte native protocol allowance.
         if (!["gateway", "preview-context", "preview"].includes(operation) &&
-            new TextEncoder().encode(JSON.stringify(value)).length > 4096) {
+            jsonUtf8ByteLength(value) > 4096) {
           throw new Error("Native control response exceeds its bound");
         }
         if ((operation === "preview" || (operation === "preview-context" && Array.isArray(value.spaces))) &&
             (!output.endsWith("\n") ||
-            value.output_bytes_including_lf !== new TextEncoder().encode(output).length)) {
+            value.output_bytes_including_lf !== outputBytes)) {
           throw new Error("Preview wire response differs");
         }
         resolve(value);
@@ -204,8 +254,10 @@ function showRestoreContext(value) {
 }
 
 function validRestorePath(path) {
-  if (typeof path !== "string" || !path.length || new TextEncoder().encode(path).length > 4096 ||
-      /[\u0000-\u001f<>:"\\|?*]/.test(path)) return false;
+  if (typeof path !== "string" || !path.length) return false;
+  let bytes;
+  try { bytes = utf8ByteLength(path); } catch (error) { return false; }
+  if (bytes > 4096 || /[\u0000-\u001f<>:"\\|?*]/.test(path)) return false;
   return path.split("/").every((part) => part && part !== "." && part !== ".." && !/[. ]$/.test(part));
 }
 
@@ -220,7 +272,7 @@ function restoreRequest(context) {
     const paths = fields["restore-paths"].value.split(/\r?\n/).filter((path) => path.length);
     if (!paths.length || paths.length > 64 || paths.some((path) => !validRestorePath(path)) ||
         new Set(paths).size !== paths.length || paths.reduce((total, path) =>
-          total + new TextEncoder().encode(path).length, 0) > 16384 ||
+          total + utf8ByteLength(path), 0) > 16384 ||
         (mode !== "paths" && paths.length !== 1)) throw new Error("Invalid portable source paths");
     if (mode === "paths") selection.paths = paths; else selection.path = paths[0];
   }
@@ -474,7 +526,7 @@ function showWorkspaceEntries(local) {
   const fragment = document.createDocumentFragment();
   for (const entry of local.entries) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry) ||
-        typeof entry.path !== "string" || !entry.path.length || entry.path.length > 4096 ||
+        typeof entry.path !== "string" || !entry.path.length || utf8ByteLength(entry.path) > 4096 ||
         entry.path.includes("\u0000") || !["file", "directory"].includes(entry.kind)) {
       throw new Error("Invalid workspace entry");
     }
@@ -517,7 +569,7 @@ function showRecovery(local, age) {
   const seen = new Set();
   function snapshotText(snapshot, pruned) {
     if (!object(snapshot) || !identifier(snapshot.snapshot_id, 64) ||
-        typeof snapshot.state !== "string" || snapshot.state.length < 1 || snapshot.state.length > 64 ||
+        typeof snapshot.state !== "string" || !snapshot.state.length || utf8ByteLength(snapshot.state) > 64 ||
         snapshot.state.includes("\0") || !flag(snapshot.current) || seen.has(snapshot.snapshot_id)) {
       throw new Error("Invalid recovery snapshot");
     }
@@ -605,7 +657,8 @@ function showRecovery(local, age) {
 }
 
 function validSocket(value) {
-  if (typeof value !== "string" || value.length > 128) return false;
+  if (typeof value !== "string") return false;
+  try { if (utf8ByteLength(value) > 128) return false; } catch (error) { return false; }
   const match = /^(\[[0-9a-fA-F:.]+\]|(?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})$/.exec(value);
   if (!match || Number(match[2]) < 1 || Number(match[2]) > 65535) return false;
   try {
@@ -753,7 +806,7 @@ function showNativeHistoryAudit(value, expectedSpace) {
       tables.sample.length > tables.sample_limit || typeof tables.truncated !== "boolean" ||
       tables.truncated !== (tables.sample.length < tables.count) ||
       tables.sample.some((row) => !exactFields(row, ["table", "rows", "logical_bytes"]) ||
-        typeof row.table !== "string" || row.table.length < 1 || row.table.length > 64 ||
+        typeof row.table !== "string" || !row.table.length || utf8ByteLength(row.table) > 64 ||
         !count(row.rows) || !count(row.logical_bytes))) {
     throw new Error("Invalid native history audit table summary");
   }
@@ -767,8 +820,8 @@ function showNativeHistoryAudit(value, expectedSpace) {
       projection.truncated !== (projection.sample.length < projection.root_columns) ||
       projection.root_columns > 64 ||
       projection.sample.some((row) => !exactFields(row, ["table", "column"]) ||
-        typeof row.table !== "string" || row.table.length < 1 || row.table.length > 64 ||
-        typeof row.column !== "string" || row.column.length < 1 || row.column.length > 64)) {
+        typeof row.table !== "string" || !row.table.length || utf8ByteLength(row.table) > 64 ||
+        typeof row.column !== "string" || !row.column.length || utf8ByteLength(row.column) > 64)) {
     throw new Error("Invalid native history audit projection");
   }
   const limits = value.limits;
@@ -781,7 +834,7 @@ function showNativeHistoryAudit(value, expectedSpace) {
       limits.max_query_secs < 1 || limits.max_query_secs > 300) {
     throw new Error("Invalid native history audit limits");
   }
-  if (new TextEncoder().encode(JSON.stringify(value)).length > 3072) {
+  if (jsonUtf8ByteLength(value) > 3072) {
     throw new Error("Native history audit exceeds the display budget");
   }
   showSummary("native-audit", [
@@ -815,7 +868,7 @@ function showDashboard(owner) {
   }
   if (!ownerReady || owner.dashboard_state !== "available" ||
       value.dashboard_format_version !== 1 || value.remote_backup_complete !== false ||
-      new TextEncoder().encode(JSON.stringify(value)).length > 3072) {
+      jsonUtf8ByteLength(value) > 3072) {
     throw new Error("Invalid owner dashboard");
   }
   if (value.observation) {
@@ -897,7 +950,7 @@ function showDashboard(owner) {
     requireCounts(gateway, ["export_count"]);
     if (gateway.listening !== true || gateway.authenticated !== true ||
         !["http", "https"].includes(gateway.scheme) || typeof gateway.address !== "string" ||
-        gateway.address.length > 128) throw new Error("Invalid live gateway summary");
+        utf8ByteLength(gateway.address) > 128) throw new Error("Invalid live gateway summary");
     liveGateway = gateway;
   }
   showConnection(value.connection);
@@ -1073,8 +1126,8 @@ fields["restore-preview"].addEventListener("click", async () => {
   clearRestorePreview("正在读取当前 owner 的同事务历史元数据…");
   try {
     const request = restoreRequest(context);
+    if (jsonUtf8ByteLength(request) > 65536) throw new Error("Preview request exceeds byte limit");
     const bytes = new TextEncoder().encode(JSON.stringify(request));
-    if (bytes.length > 65536) throw new Error("Preview request exceeds byte limit");
     const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
     const value = await readJson("preview", hex);
     if (!ownerReady || restoreContext?.owner_generation !== context.owner_generation) {
