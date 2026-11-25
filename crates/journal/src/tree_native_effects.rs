@@ -57,6 +57,7 @@ fn row_values(row: &JournalStoredRow) -> Result<Vec<Value>> {
                 JournalStorageColumnValue::Integer(value) => {
                     Value::Integer(crate::sql_integer(*value)?)
                 }
+                JournalStorageColumnValue::Bytes(value) => Value::Blob(value.clone()),
                 JournalStorageColumnValue::Null => Value::Null,
             })
         })

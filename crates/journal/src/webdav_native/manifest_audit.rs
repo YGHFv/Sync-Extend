@@ -99,6 +99,7 @@ fn map(rows: &[OriginalMainRow]) -> Result<MainMap> {
                 Value::Text(value) => Ok(value.clone()),
                 Value::Integer(value) => Ok(value.to_string()),
                 Value::Null => Err(invalid()),
+                Value::Bytes(_) => Err(invalid()),
             })
             .collect::<Result<_>>()?;
         if derived != row.primary_key

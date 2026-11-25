@@ -76,6 +76,7 @@ fn key_value(row: &JournalStoredRow, name: &str) -> Result<String> {
         JournalStorageColumnValue::Text(value) => Ok(value.clone()),
         JournalStorageColumnValue::Integer(value) => Ok(value.to_string()),
         JournalStorageColumnValue::Null => Err(invalid("native history owner key is null")),
+        JournalStorageColumnValue::Bytes(_) => Err(invalid("native history owner key is blob")),
     }
 }
 
@@ -167,6 +168,7 @@ fn column_layout(connection: &Connection, specs: &[TableSpec]) -> Result<()> {
             let declared = match expected.kind {
                 ColumnKind::Integer => "INTEGER",
                 ColumnKind::Text(_) | ColumnKind::Utf8 { .. } => "TEXT",
+                ColumnKind::Blob { .. } => "BLOB",
             };
             if row.get::<_, i64>(0)? != index as i64
                 || row.get::<_, String>(1)? != expected.name

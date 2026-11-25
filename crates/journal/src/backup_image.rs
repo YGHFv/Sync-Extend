@@ -209,6 +209,7 @@ pub use readonly::NodeInspectionBounds;
 mod native_history_family_registry;
 mod native_history_source_audit;
 mod native_history_source_proof;
+pub(crate) mod native_history_persistence;
 pub use native_history_family_registry::{
     NativeHistoryCatalogDefinition, NativeHistoryColumnKind, NativeHistoryColumnSpec,
     NativeHistoryFamilyRegistry, NativeHistorySliceSpec, NativeHistoryTableRule,

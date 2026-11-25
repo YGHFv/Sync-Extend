@@ -1031,6 +1031,7 @@ impl Journal {
                     crate::JournalStorageColumnValue::Text(s) => s.len() as u64,
                     crate::JournalStorageColumnValue::Integer(_) => 8,
                     crate::JournalStorageColumnValue::Null => 0,
+                    crate::JournalStorageColumnValue::Bytes(bytes) => bytes.len() as u64,
                 })
                 .sum();
             let prior = before.report.accounted_total();

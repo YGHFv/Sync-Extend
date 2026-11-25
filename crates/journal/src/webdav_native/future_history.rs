@@ -50,6 +50,7 @@ fn bytes(values: &[Value]) -> Result<u64> {
                 Value::Null => 0,
                 Value::Integer(_) => 8,
                 Value::Text(value) => value.len() as u64,
+                Value::Bytes(value) => value.len() as u64,
             },
         )
     })
