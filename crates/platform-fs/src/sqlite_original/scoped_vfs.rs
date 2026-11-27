@@ -2916,7 +2916,7 @@ unsafe fn open_held_original(
     Ok(())
 }
 
-pub(in super::super) fn execute_fresh_planned_history(
+pub fn execute_fresh_planned_history(
     connection: &rusqlite::Connection,
     statements: &[OriginalSqliteStatement],
     queries: &[OriginalSqliteQuery],
@@ -2927,7 +2927,7 @@ pub(in super::super) fn execute_fresh_planned_history(
     execute_fresh_metadata(connection, statements, queries, before, after, budget, None)
 }
 
-pub(in super::super) fn execute_fresh_retention_metadata(
+pub fn execute_fresh_retention_metadata(
     connection: &rusqlite::Connection,
     statements: &[OriginalSqliteStatement],
     queries: &[OriginalSqliteQuery],

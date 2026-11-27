@@ -763,8 +763,8 @@ pub use fresh_native_sqlite::FreshNativeSqliteConnection;
 #[path = "fresh_native_wal.rs"]
 mod fresh_native_wal;
 pub use fresh_native_wal::{
-    FreshNativeRetentionLease, FreshNativeWalCloseFailure, FreshNativeWalConnection,
-    FreshNativeWalOpenFailure, FRESH_NATIVE_WAL_SHM_CAPACITY,
+    FreshNativeRetentionLease, FreshNativeWalIoCloseFailure, FreshNativeWalIo,
+    FreshNativeWalIoOpenFailure, FRESH_NATIVE_WAL_SHM_CAPACITY,
 };
 
 pub use owned_file::FreshRecoveredMutationFile;
@@ -775,3 +775,5 @@ pub use sqlite_payload_allocation::{
     OriginalSqlitePayloadAllocation, OriginalSqlitePayloadAllocationBounds,
     OriginalSqlitePayloadAllocationFailure,
 };
+
+pub use sqlite_original::{execute_fresh_planned_history, execute_fresh_retention_metadata};

@@ -28,5 +28,9 @@ sync-extend-platform-fs = { path = "../platform-fs" }
 fs2.workspace = true
 sync-extend-platform-fs = { path = "../platform-fs" }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+undocumented_unsafe_blocks = "deny"

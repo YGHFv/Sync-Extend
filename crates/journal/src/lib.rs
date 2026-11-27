@@ -46,6 +46,15 @@ pub enum JournalError {
 
 pub type Result<T> = std::result::Result<T, JournalError>;
 
+#[cfg(any(windows, target_os = "linux"))]
+#[allow(unsafe_code)]
+mod raw_open;
+
+#[cfg(windows)]
+mod fresh_native_wal;
+#[cfg(windows)]
+pub use fresh_native_wal::{FreshNativeWalConnection, FreshNativeWalOpenFailure, FreshNativeWalCloseFailure};
+
 /// Pure-memory initialization accounting, not a writer or native certificate.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug, serde::Serialize)]

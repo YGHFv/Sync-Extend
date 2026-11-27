@@ -17,5 +17,5 @@ pub use scoped_vfs::{
     OriginalSqliteStatement, OriginalSqliteValue,
 };
 
-pub(super) use scoped_vfs::execute_fresh_planned_history;
-pub(super) use scoped_vfs::execute_fresh_retention_metadata;
+pub use scoped_vfs::execute_fresh_planned_history;
+pub use scoped_vfs::execute_fresh_retention_metadata;

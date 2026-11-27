@@ -3300,7 +3300,7 @@ impl super::VerifiedNodeStateArchive {
 // Explicit freshly locked closed-node WAL protocol; no historical owner issuance.
 pub struct FreshRecoveredNodeWalSession {
     read: ReacquiredClosedNodeLockedReadScope,
-    native: sync_extend_platform_fs::FreshNativeWalConnection,
+    native: sync_extend_journal::FreshNativeWalConnection,
     frames: OwnedFileCreation,
     owner: OwnedFileCreation,
     path: PathBuf,
@@ -3599,7 +3599,7 @@ impl super::VerifiedNodeStateArchive {
             .get_mut(data)
             .ok_or(ReconcileError::Invariant("recovered WAL membership absent"))?
             .insert("journal.sqlite-shm".into());
-        let native = sync_extend_platform_fs::FreshNativeWalConnection::open(
+        let native = sync_extend_journal::FreshNativeWalConnection::open(
             &data.join("journal.sqlite"),
             native_files
                 .try_into()
@@ -3897,7 +3897,7 @@ struct RecoveredVerificationKey {
 pub struct FreshRecoveredNodeWalV2Session {
     separated_deployment_configs: Option<crate::SeparatedDeploymentNodeConfigs>,
     read: ReacquiredClosedNodeLockedReadScope,
-    native: sync_extend_platform_fs::FreshNativeWalConnection,
+    native: sync_extend_journal::FreshNativeWalConnection,
     frames: OwnedFileCreation,
     owner: OwnedFileCreation,
     path: PathBuf,
@@ -4392,7 +4392,7 @@ impl super::VerifiedNodeStateArchive {
             .get_mut(data)
             .ok_or(ReconcileError::Invariant("recovered WAL membership absent"))?
             .insert("journal.sqlite-shm".into());
-        let native = sync_extend_platform_fs::FreshNativeWalConnection::open(
+        let native = sync_extend_journal::FreshNativeWalConnection::open(
             &data.join("journal.sqlite"),
             native_files
                 .try_into()
@@ -4777,7 +4777,7 @@ impl super::VerifiedNodeStateArchive {
             };
             files.push(file);
         }
-        let native = sync_extend_platform_fs::FreshNativeWalConnection::open(
+        let native = sync_extend_journal::FreshNativeWalConnection::open(
             &data.join("journal.sqlite"),
             files
                 .try_into()
@@ -7107,7 +7107,7 @@ impl super::VerifiedNodeStateArchive {
             return Err(ReconcileError::Invariant("exact prior held SHM bytes"));
         }
         let native =
-            sync_extend_platform_fs::FreshNativeWalConnection::open_after_explicit_shm_epoch(
+            sync_extend_journal::FreshNativeWalConnection::open_after_explicit_shm_epoch(
                 &data.join("journal.sqlite"),
                 files
                     .try_into()
@@ -9714,7 +9714,7 @@ impl super::VerifiedNodeStateArchive {
             ));
         }
         let native =
-            sync_extend_platform_fs::FreshNativeWalConnection::open_after_explicit_shm_epoch(
+            sync_extend_journal::FreshNativeWalConnection::open_after_explicit_shm_epoch(
                 &data.join("journal.sqlite"),
                 files
                     .try_into()

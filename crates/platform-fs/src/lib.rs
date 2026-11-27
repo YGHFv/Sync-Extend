@@ -90,6 +90,9 @@ mod unix_descriptor_io;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows;
+
+#[cfg(any(windows, target_os = "linux"))]
+mod original_sqlite_dispatch;
 #[cfg(target_os = "linux")]
 pub use protected_artifact_unix::{
     ClosedUnixOriginalResources, UnixOriginalCloseAttempt, UnixOriginalResourceCloseFailure,
@@ -214,7 +217,7 @@ pub use windows::FreshNativeSqliteConnection;
 pub use windows::FreshNativeRetentionLease;
 #[cfg(windows)]
 pub use windows::{
-    FreshNativeWalCloseFailure, FreshNativeWalConnection, FreshNativeWalOpenFailure,
+    FreshNativeWalIoCloseFailure, FreshNativeWalIo, FreshNativeWalIoOpenFailure,
     FRESH_NATIVE_WAL_SHM_CAPACITY,
 };
 
@@ -236,3 +239,6 @@ pub use linux_guardian::{
     OutsideHelperExitObservation, OutsideHelperProgram, OutsideHelperSession,
     OutsidePreparationGate, OutsidePreparationPair, OutsideSupervisor, ThawObservation,
 };
+
+#[cfg(windows)]
+pub use windows::{execute_fresh_planned_history, execute_fresh_retention_metadata};

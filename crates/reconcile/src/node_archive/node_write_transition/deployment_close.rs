@@ -6,8 +6,9 @@ use super::{
     RecoveredFileProtection,
 };
 use crate::ReconcileError;
+use sync_extend_journal::FreshNativeWalCloseFailure;
 use sync_extend_platform_fs::{
-    ClosedWindowsOriginalResources, FreshNativeWalCloseFailure, WindowsOriginalCloseAttempt,
+    ClosedWindowsOriginalResources, WindowsOriginalCloseAttempt,
     WindowsOriginalResourceCloseFailure,
 };
 

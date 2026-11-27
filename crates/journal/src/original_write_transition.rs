@@ -1239,7 +1239,7 @@ pub struct RecoveredLocalHistoryPlan {
 impl RecoveredLocalHistoryPlan {
     pub fn execute(
         self,
-        native: &mut sync_extend_platform_fs::FreshNativeWalConnection,
+        native: &mut crate::FreshNativeWalConnection,
     ) -> Result<sync_extend_core_model::SnapshotId> {
         if sync_extend_core_model::ContentId::hash(&native.exact_main_bytes()?) != self.before_image
         {
@@ -1462,7 +1462,7 @@ pub struct RecoveredRetentionPlan {
 impl RecoveredRetentionPlan {
     pub fn execute(
         self,
-        native: &mut sync_extend_platform_fs::FreshNativeWalConnection,
+        native: &mut crate::FreshNativeWalConnection,
     ) -> Result<RecoveredMetadataOutcome> {
         native.verify_retention_lease(&self.lease)?;
         if ContentId::hash(&native.exact_main_bytes()?) != self.before_image {
