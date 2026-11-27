@@ -65,6 +65,14 @@ fn combine<T>(operation: Result<T>, closed: Result<()>) -> Result<T> {
     }
 }
 
+fn at_native_step<T>(step: &'static str, result: Result<T>) -> Result<T> {
+    result.map_err(|error| {
+        JournalError::Io(std::io::Error::other(format!(
+            "Unix native retirement {step}: {error}"
+        )))
+    })
+}
+
 fn close_resources(
     coordination: CasAccessGuard,
     boundary: Option<Boundary>,
@@ -534,11 +542,11 @@ impl Journal {
             return Err(invalid());
         }
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let current = audit(&tx)?
+        let current = at_native_step("event prior durable audit", audit(&tx))?
             .into_iter()
             .find(|state| state.activation == *activation)
             .ok_or_else(invalid)?;
-        super::super::scope(&tx, &current.request.request, config, device)?;
+        at_native_step("event retained scope", super::super::scope(&tx, &current.request.request, config, device))?;
         if current.release.is_some()
             || current.sequence() + 1 != kind.sequence()
             || time
@@ -548,22 +556,22 @@ impl Journal {
                     .map_or(activation.activated_at_ms, |event| event.observed_at_ms)
             || (kind.request() && time >= current.request.request.expires_at_ms)
         {
-            return Err(invalid());
+            return Err(JournalError::Invariant("Unix native event sequence, release or time differs"));
         }
         let deleted = if kind.sequence() == 4 {
             kind.deleted_branch()
         } else {
             current.deleted_branch()
         };
-        evidence.validate(activation, kind, deleted)?;
-        let event = Event::new(activation, kind, current.previous_hash(), time, evidence)?;
-        let values = event.values()?;
+        at_native_step("event evidence validation", evidence.validate(activation, kind, deleted))?;
+        let event = at_native_step("event fingerprint", Event::new(activation, kind, current.previous_hash(), time, evidence))?;
+        let values = at_native_step("event durable values", event.values())?;
         let actual_width = width(&values)?;
         if actual_width > EVENT_PEAK_BYTES {
-            return Err(invalid());
+            return Err(JournalError::Invariant("Unix native event exceeds reserved width"));
         }
-        let before = self.native_capacity(config)?;
-        self.native_clock(&tx, time)?;
+        let before = at_native_step("event before capacity", self.native_capacity(config))?;
+        at_native_step("event monotonic clock", self.native_clock(&tx, time))?;
         self.unix_storage_retirement_native_gates.event.issue(event.event_fingerprint.to_string(), time, || {
             if tx.execute(
                 "INSERT INTO main.unix_storage_retirement_native_v1_events VALUES(?1,?2,?3,?4,?5,?6,?7)",
@@ -571,8 +579,8 @@ impl Journal {
             )? != 1 { return Err(invalid()); }
             Ok(())
         })?;
-        let after = self.native_capacity(config)?;
-        collateral(&before, &after)?;
+        let after = at_native_step("event after capacity", self.native_capacity(config))?;
+        at_native_step("event collateral comparison", collateral(&before, &after))?;
         if after.report.accounted_total().rows != before.report.accounted_total().rows
             || after.report.accounted_total().logical_bytes
                 != before
@@ -583,9 +591,9 @@ impl Journal {
                     .and_then(|bytes| bytes.checked_add(actual_width))
                     .ok_or_else(invalid)?
         {
-            return Err(invalid());
+            return Err(JournalError::Invariant("Unix native event accounted capacity delta differs"));
         }
-        let state = audit(&tx)?
+        let state = at_native_step("event new durable audit", audit(&tx))?
             .into_iter()
             .find(|state| state.activation == *activation)
             .ok_or_else(invalid)?;
@@ -747,11 +755,11 @@ impl Journal {
                 }
             }
             let evidence = |live: &Boundary| {
-                let context = self.unix_storage_retirement_inventory_context(
+                let context = at_native_step("physical evidence inventory context", self.unix_storage_retirement_inventory_context(
                     live.layout_observation(&exclusive)?.expected_layout,
-                )?;
+                ))?;
                 live.inventory_with_retirement_prefixes(&exclusive, &context)?;
-                physical_evidence(&activation, &admission.request.content_id, &exclusive, live)
+                at_native_step("physical evidence original payload", physical_evidence(&activation, &admission.request.content_id, &exclusive, live))
             };
             self.native_event(
                 &activation,
@@ -811,18 +819,18 @@ impl Journal {
                 device,
                 now()?,
             )?;
-            self.native_event(
+            at_native_step("record restored/deleted payload close request", self.native_event(
                 &activation,
                 if delete {
                     Kind::PayloadCloseRequested
                 } else {
                     Kind::RestoredCloseRequested
                 },
-                evidence(live)?,
+                at_native_step("observe restored/deleted payload before close request", evidence(live))?,
                 config,
                 device,
                 now()?,
-            )?;
+            ))?;
             self.native_pre_effect(&activation, config, now()?)?;
             if delete {
                 live.close_unlinked_payload(&exclusive)?;
