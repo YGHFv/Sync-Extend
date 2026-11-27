@@ -86,6 +86,15 @@ pub struct OriginalUnixRestoredJournal<'namespace> {
     next_local_turn: u32,
 }
 
+/// An audited observation of the current original session. Numeric keys and
+/// hashes describe that session; they cannot reconstruct a Connection or loan.
+pub struct OriginalUnixJournalObservation {
+    pub keys: [sync_extend_platform_fs::UnixProtectedArtifactKey; 7],
+    pub root: sync_extend_core_model::SnapshotId,
+    pub rows: sync_extend_core_model::ContentId,
+    pub local_turns: u32,
+}
+
 pub struct OriginalUnixRestoredJournalFailure<'namespace> {
     pub error: JournalError,
     original: Option<OriginalUnixRestoredJournal<'namespace>>,
@@ -315,6 +324,37 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
             ));
         }
         Ok(())
+    }
+
+    pub fn observe_original_session(&mut self) -> Result<OriginalUnixJournalObservation> {
+        self.verify()?;
+        let connection = &mut self
+            .journal
+            .as_mut()
+            .expect("verified original Journal")
+            .connection;
+        let call = OriginalInspectionCall::begin(connection, self.bounds)?;
+        let current = JournalReadView {
+            connection: &call.connection,
+            dav_read_charge_cache: None,
+        }
+        .current(&self.space);
+        let current = call.finish(current)?.ok_or(JournalError::Invariant(
+            "original Unix generation requires a current manifest",
+        ))?;
+        self.verify()?;
+        let keys = self
+            .io
+            .as_ref()
+            .expect("verified original IO")
+            .session_loan()?
+            .observed_keys()?;
+        Ok(OriginalUnixJournalObservation {
+            keys,
+            root: current.root()?,
+            rows: local_commit::rows_digest(&self.expected),
+            local_turns: self.next_local_turn,
+        })
     }
 
     fn audit_rows(&mut self) -> Result<Vec<JournalStoredRow>> {

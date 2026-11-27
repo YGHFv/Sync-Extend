@@ -9,15 +9,15 @@ use super::{namespace::NamespaceLoan, OriginalUnixNamespace};
 use std::{ffi::OsStr, io, os::fd::AsRawFd, path::Path, sync::Arc};
 
 pub struct OriginalUnixNativeRoot<'namespace> {
-    namespace: NamespaceLoan<'namespace>,
-    original: UnixProtectedArtifactParent,
+    pub(super) namespace: NamespaceLoan<'namespace>,
+    pub(super) original: UnixProtectedArtifactParent,
 }
 
-/// mkdirat does not return an original descriptor. This type proves only the
-/// directory actually acquired and checked after mkdirat, not atomic creation.
+/// An actual acquired directory. Fresh admission may call mkdirat first, but
+/// this type proves acquisition only; existing admission never calls mkdirat.
 pub struct AcquiredUnixChildDirectory<'namespace> {
-    namespace: NamespaceLoan<'namespace>,
-    original: UnixProtectedArtifactParent,
+    pub(super) namespace: NamespaceLoan<'namespace>,
+    pub(super) original: UnixProtectedArtifactParent,
 }
 
 pub struct AcquiredUnixChildDirectoryFailure<'namespace> {
@@ -113,6 +113,14 @@ impl OriginalUnixWriterLock<'_> {
     pub fn verify(&self) -> io::Result<()> {
         self.original.verify()
     }
+    pub fn key(&self) -> io::Result<UnixProtectedArtifactKey> {
+        self.verify()?;
+        self.original.original.key()
+    }
+    pub fn parent_key(&self) -> io::Result<UnixProtectedArtifactKey> {
+        self.verify()?;
+        self.original.original.original.parent_key()
+    }
     pub fn close_retaining(
         self,
     ) -> Result<ClosedUnixOriginalResources, UnixOriginalResourceCloseFailure> {
@@ -183,6 +191,7 @@ fn acquire_child<'namespace>(
     namespace: &NamespaceLoan<'namespace>,
     parent: &UnixProtectedArtifactParent,
     child: &str,
+    create: bool,
 ) -> Result<AcquiredUnixChildDirectory<'namespace>, AcquiredUnixChildDirectoryFailure<'namespace>> {
     let mut mkdir_succeeded = false;
     let mut directories = Vec::new();
@@ -194,10 +203,13 @@ fn acquire_child<'namespace>(
         let fd = parent.original.fd()?;
         // SAFETY: the actual parent FD and normalized NUL-terminated component
         // remain live. Success proves mkdir occurred, not atomic FD creation.
-        if unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) } != 0 {
-            return Err(io::Error::last_os_error());
+        if create {
+            // SAFETY: the retained parent and checked component remain live.
+            if unsafe { libc::mkdirat(fd, name.as_ptr(), 0o700) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            mkdir_succeeded = true;
         }
-        mkdir_succeeded = true;
         pending = Some(open_child(fd, &name, libc::O_RDONLY | libc::O_DIRECTORY)?);
         let file = pending.as_ref().expect("acquired directory descriptor");
         let observed = observe_fd(file.as_raw_fd())?;
@@ -260,10 +272,13 @@ fn acquire_child<'namespace>(
         namespace: namespace.clone(),
         original,
     };
-    if let Err(error) = result
-        .verify()
-        .and_then(|()| result.original.require_empty())
-    {
+    if let Err(error) = result.verify().and_then(|()| {
+        if create {
+            result.original.require_empty()
+        } else {
+            Ok(())
+        }
+    }) {
         return Err(AcquiredUnixChildDirectoryFailure {
             error,
             mkdir_succeeded,
@@ -274,7 +289,39 @@ fn acquire_child<'namespace>(
     Ok(result)
 }
 
+fn observed_kind(
+    namespace: &NamespaceLoan<'_>,
+    parent: &UnixProtectedArtifactParent,
+    name: &str,
+) -> io::Result<bool> {
+    namespace.verify_current()?;
+    parent.verify_original()?;
+    let name = component(OsStr::new(name))?;
+    let value = observe_slot(parent.original.fd()?, &name)?;
+    let result = match value.mode & libc::S_IFMT {
+        libc::S_IFDIR => true,
+        libc::S_IFREG => false,
+        _ => {
+            return Err(refuse(
+                "Unix observed child must be a regular file or directory",
+            ))
+        }
+    };
+    namespace.verify_current()?;
+    parent.verify_original()?;
+    Ok(result)
+}
+
 impl<'namespace> OriginalUnixNativeRoot<'namespace> {
+    pub fn child_is_directory(&self, name: &str) -> io::Result<bool> {
+        observed_kind(&self.namespace, &self.original, name)
+    }
+    pub fn observed_child_names(&self, maximum: usize) -> io::Result<Vec<String>> {
+        self.verify()?;
+        let names = super::super::directory_entries::names(self.original.original.fd()?, maximum)?;
+        self.verify()?;
+        Ok(names)
+    }
     pub fn acquire_private(
         namespace: &'namespace OriginalUnixNamespace,
         path: &Path,
@@ -324,7 +371,14 @@ impl<'namespace> OriginalUnixNativeRoot<'namespace> {
         name: &str,
     ) -> Result<AcquiredUnixChildDirectory<'namespace>, AcquiredUnixChildDirectoryFailure<'namespace>>
     {
-        acquire_child(&self.namespace, &self.original, name)
+        acquire_child(&self.namespace, &self.original, name, true)
+    }
+    pub fn acquire_existing_child(
+        &self,
+        name: &str,
+    ) -> Result<AcquiredUnixChildDirectory<'namespace>, AcquiredUnixChildDirectoryFailure<'namespace>>
+    {
+        acquire_child(&self.namespace, &self.original, name, false)
     }
     pub fn create_cas_sentinel(
         &self,
@@ -346,6 +400,28 @@ impl<'namespace> OriginalUnixNativeRoot<'namespace> {
 }
 
 impl<'namespace> AcquiredUnixChildDirectory<'namespace> {
+    pub fn parent_key(&self) -> io::Result<UnixProtectedArtifactKey> {
+        self.verify()?;
+        let anchors = &self.original.original.directories;
+        let parent = anchors
+            .get(
+                anchors
+                    .len()
+                    .checked_sub(2)
+                    .ok_or_else(|| super::super::refuse("acquired Unix child parent absent"))?,
+            )
+            .ok_or_else(|| super::super::refuse("acquired Unix child parent absent"))?;
+        Ok(parent.key)
+    }
+    pub fn child_is_directory(&self, name: &str) -> io::Result<bool> {
+        observed_kind(&self.namespace, &self.original, name)
+    }
+    pub fn observed_child_names(&self, maximum: usize) -> io::Result<Vec<String>> {
+        self.verify()?;
+        let names = super::super::directory_entries::names(self.original.original.fd()?, maximum)?;
+        self.verify()?;
+        Ok(names)
+    }
     pub fn create_writer_lock(
         &self,
     ) -> Result<OriginalUnixWriterLock<'namespace>, FreshUnixNativeFileFailure<'namespace>> {
@@ -375,7 +451,14 @@ impl<'namespace> AcquiredUnixChildDirectory<'namespace> {
         name: &str,
     ) -> Result<AcquiredUnixChildDirectory<'namespace>, AcquiredUnixChildDirectoryFailure<'namespace>>
     {
-        acquire_child(&self.namespace, &self.original, name)
+        acquire_child(&self.namespace, &self.original, name, true)
+    }
+    pub fn acquire_existing_child(
+        &self,
+        name: &str,
+    ) -> Result<AcquiredUnixChildDirectory<'namespace>, AcquiredUnixChildDirectoryFailure<'namespace>>
+    {
+        acquire_child(&self.namespace, &self.original, name, false)
     }
     pub fn close_retaining(
         self,

@@ -8293,45 +8293,7 @@ struct HistoryChain8Record {
     wal2: Option<HistoryRestartObject>,
 }
 fn history_chain8_records(bytes: &[u8]) -> Result<HistoryChain8Record> {
-    const HEADER: &[u8] = b"SYNC-HISTORY-CHAIN8\n";
-    if !bytes.starts_with(HEADER) || bytes.len() > 1024 * 1024 {
-        return Err(ReconcileError::Invariant(
-            "history restart exact bounded header",
-        ));
-    }
-    let mut offset = HEADER.len();
-    let mut payloads: Vec<&[u8]> = Vec::new();
-    for _ in 0..2 {
-        let length = u32::from_le_bytes(
-            bytes
-                .get(offset..offset + 4)
-                .ok_or(ReconcileError::Invariant("history restart size"))?
-                .try_into()
-                .map_err(|_| ReconcileError::Invariant("history restart size encoding"))?,
-        ) as usize;
-        offset += 4;
-        if length > 384 * 1024 {
-            return Err(ReconcileError::ResourceLimit(
-                "history restart record bytes",
-            ));
-        }
-        if let Some(previous) = payloads.first() {
-            let digest = bytes
-                .get(offset..offset + 64)
-                .ok_or(ReconcileError::Invariant("history restart chain"))?;
-            if digest != ContentId::hash(previous).as_str().as_bytes() {
-                return Err(ReconcileError::Invariant(
-                    "history restart intended chain changed",
-                ));
-            }
-            offset += 64;
-        }
-        let payload = bytes
-            .get(offset..offset + length)
-            .ok_or(ReconcileError::Invariant("history restart truncated"))?;
-        payloads.push(payload);
-        offset += length;
-    }
+    let payloads = super::completion_frames::closed_payloads(b"SYNC-HISTORY-CHAIN8\n", bytes)?;
     let first: HistoryChain8Record = serde_json::from_slice(payloads[0])?;
     let terminal: HistoryChain8Record = serde_json::from_slice(payloads[1])?;
     for object in &terminal.current_objects {
@@ -8343,8 +8305,7 @@ fn history_chain8_records(bytes: &[u8]) -> Result<HistoryChain8Record> {
             }
         }
     }
-    if offset != bytes.len()
-        || first.version != 8
+    if first.version != 8
         || first.index != 0
         || first.phase != "close_intended"
         || first.wal2.is_some()
@@ -8623,11 +8584,9 @@ impl FreshRecoveredNodeWalV2Session {
                 .and_then(|n| n.to_str())
                 .ok_or(ReconcileError::Invariant("history restart frame name"))?,
         )?;
-        evidence.writer().write_all(b"SYNC-HISTORY-CHAIN8\n")?;
-        evidence
-            .writer()
-            .write_all(&(intended.len() as u32).to_le_bytes())?;
-        evidence.writer().write_all(&intended)?;
+        evidence.writer().write_all(&super::completion_frames::intended(
+            b"SYNC-HISTORY-CHAIN8\n", &intended,
+        )?)?;
         evidence.writer().sync_all()?;
         crate::fault::checkpoint("history_chain8_intended_before_native_close");
         self.poisoned = false;
@@ -8677,13 +8636,9 @@ impl FreshRecoveredNodeWalV2Session {
                     "history restart terminal bound",
                 ));
             }
-            evidence
-                .writer()
-                .write_all(&(terminal.len() as u32).to_le_bytes())?;
-            evidence
-                .writer()
-                .write_all(ContentId::hash(&intended).as_str().as_bytes())?;
-            evidence.writer().write_all(&terminal)?;
+            evidence.writer().write_all(&super::completion_frames::terminal(
+                &intended, &terminal,
+            )?)?;
             evidence.writer().sync_all()?;
             self.retain_history_creation(evidence, 1024 * 1024)?;
             self.verify()?;

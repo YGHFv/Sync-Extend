@@ -138,6 +138,7 @@ pub(super) fn components<'de, D: Deserializer<'de>>(
     let values = d.deserialize_seq(BoundedSequence::<TextValue, 128>(PhantomData))?;
     Ok(values.into_iter().map(|value| value.0).collect())
 }
+#[cfg(windows)]
 pub(super) fn objects<'de, D: Deserializer<'de>>(
     d: D,
 ) -> std::result::Result<Vec<super::completion::ObjectEvidence>, D::Error> {

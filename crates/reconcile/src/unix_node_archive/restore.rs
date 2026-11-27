@@ -10,6 +10,7 @@ use sync_extend_platform_fs::{
     OriginalUnixNativeRoot, OriginalUnixWriterLock, SealedUnixNativeFile,
     UnixNativeFileSealFailure, UnixOriginalCloseAttempt, UnixOriginalResourceCloseFailure,
 };
+mod generation;
 
 pub struct OriginalUnixRestoredNode<'archive, 'namespace> {
     plan: PreparedUnixNodeRestore<'archive>,
@@ -28,6 +29,7 @@ pub struct OriginalUnixRestoredNode<'archive, 'namespace> {
     seal_failures: Vec<UnixNativeFileSealFailure<'namespace>>,
     intent: Option<SealedUnixNativeFile<'namespace>>,
     intent_bytes: Vec<u8>,
+    generation_frames: Option<sync_extend_platform_fs::OriginalUnixCloseFrames<'namespace>>,
     completed: bool,
 }
 
@@ -50,6 +52,7 @@ impl std::fmt::Debug for OriginalUnixRestoreFailure<'_, '_> {
 pub struct ClosedOriginalUnixRestore {
     resources: ClosedUnixOriginalResources,
     archive_digest: sync_extend_core_model::ContentId,
+    generation: Option<(std::path::PathBuf, sync_extend_core_model::ContentId)>,
 }
 impl ClosedOriginalUnixRestore {
     pub fn actual_closed_descriptors(&self) -> usize {
@@ -58,14 +61,24 @@ impl ClosedOriginalUnixRestore {
     pub fn archive_digest(&self) -> &sync_extend_core_model::ContentId {
         &self.archive_digest
     }
+    /// Describes the record written after actual runtime closure. Reading this
+    /// record alone never grants a new session or restart permission.
+    pub fn generation_record(
+        &self,
+    ) -> Option<(&std::path::Path, &sync_extend_core_model::ContentId)> {
+        self.generation
+            .as_ref()
+            .map(|(path, digest)| (path.as_path(), digest))
+    }
 }
 
 impl OriginalUnixRestoreFailure<'_, '_> {
     pub fn has_retained_originals(&self) -> bool {
         self.original.is_some()
-            || self.original_close.as_ref().is_some_and(|failure| {
-                failure.retained_parent_scopes() != 0
-            })
+            || self
+                .original_close
+                .as_ref()
+                .is_some_and(|failure| failure.retained_parent_scopes() != 0)
     }
     pub fn close_remaining(mut self) -> Self {
         if let Some(mut original) = self.original.take() {
@@ -140,6 +153,7 @@ impl<'archive> PreparedUnixNodeRestore<'archive> {
             seal_failures: Vec::new(),
             intent: None,
             intent_bytes: Vec::new(),
+            generation_frames: None,
             completed: false,
         };
         let restored = (|| -> Result<()> {
@@ -459,6 +473,9 @@ impl<'archive, 'namespace> OriginalUnixRestoredNode<'archive, 'namespace> {
             // complete native prefix until that same connection/IO ends.
             return;
         }
+        if let Some(frames) = self.generation_frames.take() {
+            close.append_result(frames.close_retaining());
+        }
         for (_, file) in std::mem::take(&mut self.files) {
             close.append_result(file.close_retaining());
         }
@@ -524,6 +541,7 @@ impl<'archive, 'namespace> OriginalUnixRestoredNode<'archive, 'namespace> {
             Ok(resources) if first.is_none() => Ok(ClosedOriginalUnixRestore {
                 resources,
                 archive_digest: self.plan.archive.digest().clone(),
+                generation: None,
             }),
             result => Err(OriginalUnixRestoreFailure {
                 error: first.unwrap_or(ReconcileError::Invariant(
@@ -552,6 +570,7 @@ impl Drop for OriginalUnixRestoredNode<'_, '_> {
         keep!(worktree);
         keep!(cas);
         keep!(intent);
+        keep!(generation_frames);
         macro_rules! keep_all {
             ($field:ident) => {
                 if !self.$field.is_empty() {

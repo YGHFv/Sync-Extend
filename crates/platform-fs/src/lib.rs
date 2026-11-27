@@ -105,6 +105,8 @@ pub use protected_artifact_unix::fresh_native::{
     AcquiredUnixChildDirectory, AcquiredUnixChildDirectoryFailure, FailedUnixNativeFileCreation, FreshUnixNativeFile, FreshUnixNativeFileFailure,
     FreshUnixNativeSqliteIo, FreshUnixNativeSqliteIoFailure, FreshUnixSqliteOpenScope,
     OriginalUnixSqliteSessionBinding, OriginalUnixSqliteSessionLoan,
+    ObservedUnixNativeFile,
+    OriginalUnixCloseFrames, OriginalUnixCloseFramesFailure,
     OriginalUnixCasSentinel, OriginalUnixNamespace, OriginalUnixNamespaceCloseFailure, OriginalUnixNativeRoot,
     SealedUnixNativeFile, UnixNativeFileSealFailure,
     OriginalUnixWriterLock,

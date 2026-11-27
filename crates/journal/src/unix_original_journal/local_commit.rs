@@ -22,7 +22,7 @@ impl PreparedOriginalUnixLocalCommit {
     }
 }
 
-fn rows_digest(rows: &[JournalStoredRow]) -> ContentId {
+pub(super) fn rows_digest(rows: &[JournalStoredRow]) -> ContentId {
     let mut hash = blake3::Hasher::new();
     hash.update(b"sync-extend.actual-unix-session-complete-rows.v1");
     hash.update(&(rows.len() as u64).to_le_bytes());
@@ -50,17 +50,29 @@ fn mutable_table(table: &str) -> bool {
 fn local_sql(context: AuthContext<'_>) -> Authorization {
     match context.action {
         AuthAction::Insert { table_name }
-            if context.database_name == Some("main") && mutable_table(table_name)
+            if context.database_name == Some("main")
+                && mutable_table(table_name)
                 && !matches!(table_name, "rename_observations" | "gc_invalidations") =>
         {
             Authorization::Allow
         }
-        AuthAction::Insert { table_name: "gc_invalidations" }
-            if context.database_name == Some("main")
-                && context.accessor == Some("gc_snapshot_pin_insert") => Authorization::Allow,
-        AuthAction::Delete { table_name: "rename_observations" }
-            if context.database_name == Some("main") && matches!(context.accessor,
-                Some("rename_observation_current_insert" | "rename_observation_current_update")) => Authorization::Allow,
+        AuthAction::Insert {
+            table_name: "gc_invalidations",
+        } if context.database_name == Some("main")
+            && context.accessor == Some("gc_snapshot_pin_insert") =>
+        {
+            Authorization::Allow
+        }
+        AuthAction::Delete {
+            table_name: "rename_observations",
+        } if context.database_name == Some("main")
+            && matches!(
+                context.accessor,
+                Some("rename_observation_current_insert" | "rename_observation_current_update")
+            ) =>
+        {
+            Authorization::Allow
+        }
         AuthAction::Update { table_name, .. }
             if context.database_name == Some("main")
                 && matches!(
@@ -76,17 +88,29 @@ fn local_sql(context: AuthContext<'_>) -> Authorization {
 
 fn configure_trusted_schema(context: AuthContext<'_>) -> Authorization {
     match context.action {
-        AuthAction::Pragma { pragma_name, .. } if pragma_name.eq_ignore_ascii_case("trusted_schema") => Authorization::Allow,
+        AuthAction::Pragma { pragma_name, .. }
+            if pragma_name.eq_ignore_ascii_case("trusted_schema") =>
+        {
+            Authorization::Allow
+        }
         _ => restricted(context),
     }
 }
 
 fn set_trusted_schema(journal: &mut Journal, enabled: bool) -> Result<()> {
-    journal.connection.authorizer(Some(configure_trusted_schema))?;
-    journal.connection.pragma_update(None, "trusted_schema", enabled)?;
-    let observed: bool = journal.connection.pragma_query_value(None, "trusted_schema", |row| row.get(0))?;
+    journal
+        .connection
+        .authorizer(Some(configure_trusted_schema))?;
+    journal
+        .connection
+        .pragma_update(None, "trusted_schema", enabled)?;
+    let observed: bool = journal
+        .connection
+        .pragma_query_value(None, "trusted_schema", |row| row.get(0))?;
     if observed != enabled {
-        return Err(JournalError::Invariant("original Unix trusted schema mode differs"));
+        return Err(JournalError::Invariant(
+            "original Unix trusted schema mode differs",
+        ));
     }
     Ok(())
 }
@@ -159,7 +183,8 @@ impl OriginalUnixRestoredJournal<'_> {
         self.verify()?;
         crate::sql_integer(timestamp)?;
         manifest.validate()?;
-        if self.next_local_turn >= 4096 || manifest.space_id != self.space
+        if self.next_local_turn >= 4096
+            || manifest.space_id != self.space
             || operations.len() > self.bounds.max_entries
             || manifest.entries.len() > self.bounds.max_entries
         {
@@ -211,7 +236,9 @@ impl OriginalUnixRestoredJournal<'_> {
             intent,
         };
         if started.elapsed() >= self.bounds.max_query_time {
-            return Err(JournalError::Invariant("original Unix local preparation completed late"));
+            return Err(JournalError::Invariant(
+                "original Unix local preparation completed late",
+            ));
         }
         Ok(prepared)
     }

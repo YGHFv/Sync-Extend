@@ -2,7 +2,11 @@
 //! Directory acquisition and actual O_EXCL file creation have distinct types.
 mod namespace;
 mod originals;
+mod observed;
+pub use observed::ObservedUnixNativeFile;
 mod sealed;
+mod frames;
+pub use frames::{OriginalUnixCloseFrames, OriginalUnixCloseFramesFailure};
 pub use sealed::{SealedUnixNativeFile, UnixNativeFileSealFailure};
 mod sqlite;
 pub use namespace::{OriginalUnixNamespace, OriginalUnixNamespaceCloseFailure};

@@ -60,7 +60,7 @@ pub use fresh_native_wal::{FreshNativeWalConnection, FreshNativeWalOpenFailure, 
 #[cfg(target_os = "linux")]
 mod unix_original_journal;
 #[cfg(target_os = "linux")]
-pub use unix_original_journal::{OriginalUnixRestoredJournal, OriginalUnixRestoredJournalFailure};
+pub use unix_original_journal::{OriginalUnixJournalObservation, OriginalUnixRestoredJournal, OriginalUnixRestoredJournalFailure};
 
 /// Pure-memory initialization accounting, not a writer or native certificate.
 #[cfg(target_os = "linux")]

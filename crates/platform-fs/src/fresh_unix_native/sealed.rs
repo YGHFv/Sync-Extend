@@ -154,6 +154,10 @@ impl SealedUnixNativeFile<'_> {
         self.verify()?;
         Ok(self.captured.key)
     }
+    pub fn parent_key(&self) -> io::Result<UnixProtectedArtifactKey> {
+        self.verify()?;
+        self.original.original.parent_key()
+    }
     pub fn metadata(&self) -> io::Result<PortableMetadataCapture> {
         self.verify()?;
         Ok(self.metadata)

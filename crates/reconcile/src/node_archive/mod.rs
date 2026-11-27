@@ -65,6 +65,7 @@ pub use ledger::OriginalNodeCompletionEvidence;
 pub use restart_classification::OriginalNodeRestartClassification;
 
 mod completion_codec;
+mod completion_frames;
 
 mod restart_evidence;
 

@@ -8,6 +8,11 @@ mod file_content;
 mod verifier;
 #[path = "node_archive/current_manifest.rs"]
 mod current_manifest;
+#[path = "node_archive/completion_codec.rs"]
+mod completion_codec;
+#[path = "node_archive/completion_frames.rs"]
+mod completion_frames;
+mod generation_budget;
 pub use layout::{ArchiveBounds, ArchiveRole, FramedNodeArchive};
 pub use verifier::VerifiedNodeStateArchive;
 mod plan;
