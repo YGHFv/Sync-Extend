@@ -85,6 +85,8 @@ mod linux_write_lease;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 mod protected_artifact_unix;
+#[cfg(target_os = "linux")]
+mod unix_descriptor_io;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows;
@@ -94,6 +96,12 @@ pub use protected_artifact_unix::{
     SealedUnixProtectedArtifact, UnixFailedArtifactCreation, UnixProtectedArtifactCreateFailure,
     UnixProtectedArtifactCreator, UnixProtectedArtifactKey, UnixProtectedArtifactParent,
     UnixProtectedArtifactSealFailure, UnixProtectedArtifactSource,
+};
+#[cfg(target_os = "linux")]
+pub use protected_artifact_unix::fresh_native::{
+    AcquiredUnixChildDirectory, AcquiredUnixChildDirectoryFailure, FailedUnixNativeFileCreation, FreshUnixNativeFile, FreshUnixNativeFileFailure,
+    FreshUnixNativeSqlite, FreshUnixNativeSqliteFailure,
+    OriginalUnixCasSentinel, OriginalUnixNamespace, OriginalUnixNamespaceCloseFailure, OriginalUnixNativeRoot,
 };
 #[cfg(windows)]
 pub use windows::{

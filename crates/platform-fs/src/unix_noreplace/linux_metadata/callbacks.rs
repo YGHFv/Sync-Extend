@@ -293,18 +293,7 @@ unsafe extern "C" fn read(
             output.fill(0);
             let logical = slot.logical_bytes.load(Ordering::Acquire);
             let available = logical.saturating_sub(offset).min(amount as u64) as usize;
-            let mut read = 0usize;
-            while read < available {
-                match slot
-                    .file
-                    .read_at(&mut output[read..available], offset + read as u64)
-                {
-                    Ok(0) => break,
-                    Ok(count) => read += count,
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(error) => return Err(error),
-                }
-            }
+            let read = crate::unix_descriptor_io::read_until_eof(&slot.file, &mut output[..available], offset)?;
             Ok(if read == amount { OK } else { IOERR_SHORT_READ })
         })
     }
@@ -325,23 +314,7 @@ unsafe extern "C" fn write(
             let (offset, amount) = range(offset, amount, slot.capacity)?;
             // SAFETY: SQLite supplies this readable counted xWrite input.
             let input = std::slice::from_raw_parts(input.cast::<u8>(), amount);
-            let mut written = 0usize;
-            while written < amount {
-                match slot
-                    .file
-                    .write_at(&input[written..], offset + written as u64)
-                {
-                    Ok(0) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "metadata write stopped",
-                        ))
-                    }
-                    Ok(count) => written += count,
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(error) => return Err(error),
-                }
-            }
+            crate::unix_descriptor_io::write_all(&slot.file, input, offset)?;
             slot.logical_bytes
                 .fetch_max(offset + amount as u64, Ordering::AcqRel);
             Ok(OK)

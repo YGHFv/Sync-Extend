@@ -17,6 +17,8 @@ use std::{
 mod directory_entries;
 mod mount_identity;
 mod resource_close;
+#[path = "fresh_unix_native/mod.rs"]
+pub mod fresh_native;
 pub use resource_close::{
     ClosedUnixOriginalResources, UnixOriginalCloseAttempt, UnixOriginalResourceCloseFailure,
 };
