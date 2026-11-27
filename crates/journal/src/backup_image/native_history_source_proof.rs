@@ -202,6 +202,7 @@ impl NativeHistoryProjectionPlan {
 // This representation is not itself a source proof. Only the private fields
 // of AuditedNativeHistorySource can seal a successfully checked generation.
 pub(super) struct NativeHistoryProofParts {
+    pub(super) registry: NativeHistoryFamilyRegistry,
     pub(super) image: Vec<u8>,
     pub(super) space: SpaceId,
     pub(super) image_digest: ContentId,
@@ -230,7 +231,7 @@ impl ImmutableNativeHistorySourceProof {
         }
     }
     pub fn source_schema(&self) -> u32 {
-        NativeHistoryFamilyRegistry::SOURCE_SCHEMA
+        self.source.registry.source_schema()
     }
     pub fn space(&self) -> &SpaceId {
         &self.source.space
@@ -269,7 +270,7 @@ impl ImmutableNativeHistorySourceProof {
         self.source.bounds
     }
     pub fn registry(&self) -> NativeHistoryFamilyRegistry {
-        NativeHistoryFamilyRegistry::schema69()
+        self.source.registry
     }
     pub(super) fn proof_parts(&self) -> &NativeHistoryProofParts {
         &self.source

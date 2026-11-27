@@ -42,8 +42,7 @@ fn invalid(message: &'static str) -> JournalError {
 
 fn key(row: &JournalStoredRow) -> Result<NativeHistoryRowKey> {
     Ok(NativeHistoryRowKey {
-        table: NativeHistoryFamilyRegistry::schema69()
-            .table(row.table())?
+        table: NativeHistoryFamilyRegistry::known_table(row.table())?
             .table,
         primary_key: row.primary_key().to_vec(),
     })
@@ -93,26 +92,27 @@ fn required_state<'a>(rows: &'a [JournalStoredRow], name: &str) -> Result<&'a st
 
 fn catalog(connection: &Connection, registry: NativeHistoryFamilyRegistry) -> Result<ContentId> {
     let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version != NativeHistoryFamilyRegistry::SOURCE_SCHEMA {
-        return Err(invalid("native history requires exact original schema69"));
+    if version != registry.source_schema() {
+        return Err(invalid("native history requires exact registered source schema"));
     }
+    let expected_catalog = registry.catalog()?;
     let mut query = connection.prepare(
         "SELECT type,name,tbl_name,sql FROM main.sqlite_schema ORDER BY type,name LIMIT ?1",
     )?;
-    let mut rows = query.query([registry.catalog().len() as i64 + 1])?;
-    for expected in registry.catalog() {
+    let mut rows = query.query([expected_catalog.len() as i64 + 1])?;
+    for expected in &expected_catalog {
         let row = rows
             .next()?
             .ok_or(invalid("native history original catalog object absent"))?;
         // Borrow original SQLite text. An oversized malicious catalog value is
         // rejected against the compiled length before copying into Rust.
-        for (index, expected) in [(0, expected.kind), (1, expected.name), (2, expected.table)] {
+        for (index, expected) in [(0, expected.kind.as_str()), (1, expected.name.as_str()), (2, expected.table.as_str())] {
             match row.get_ref(index)? {
                 rusqlite::types::ValueRef::Text(value) if value == expected.as_bytes() => (),
                 _ => return Err(invalid("native history original catalog identity differs")),
             }
         }
-        match (row.get_ref(3)?, expected.sql) {
+        match (row.get_ref(3)?, expected.sql.as_deref()) {
             (rusqlite::types::ValueRef::Null, None) => (),
             (rusqlite::types::ValueRef::Text(value), Some(expected))
                 if value == expected.as_bytes() => {}
@@ -128,8 +128,8 @@ fn catalog(connection: &Connection, registry: NativeHistoryFamilyRegistry) -> Re
     }
     hash(&(
         "sync-extend.native-history-source-catalog.v1",
-        NativeHistoryFamilyRegistry::SOURCE_SCHEMA,
-        registry.catalog(),
+        registry.source_schema(),
+        expected_catalog,
     ))
 }
 
@@ -656,7 +656,7 @@ fn owner_anchor(
 ) -> Result<(NativeHistoryRowKey, &'static str)> {
     let mut current = row;
     let mut visited = BTreeSet::new();
-    for _ in 0..NativeHistoryFamilyRegistry::TABLE_COUNT {
+    for _ in 0..registry.table_count() {
         let current_key = key(current)?;
         if !visited.insert(current_key.clone()) {
             return Err(invalid("native history compiled original owner cycle"));
@@ -821,6 +821,21 @@ fn references(
     let mut remaining = max;
     for row in rows {
         let rule = registry.table(row.table())?;
+        if row.table() == "native_history_hold_objects" {
+            let kind = match text(row, "kind")? {
+                "cas_chunk" => NativeHistoryReferenceKind::CasChunk,
+                "file_content_digest" => NativeHistoryReferenceKind::FileContentDigest,
+                "native_marker_digest" => NativeHistoryReferenceKind::NativeMarkerDigest,
+                _ => return Err(invalid("native history nested reference kind")),
+            };
+            let content_id = text(row, "content_id")?.parse::<ContentId>()?;
+            let length = integer(row, "length")?;
+            remaining = remaining.checked_sub(1).ok_or(invalid("native history nested reference count"))?;
+            if kind.is_cas_object() { insert_length(&mut lengths, content_id.clone(), length)?; }
+            result.entry(key(row)?).or_default().push(NativeHistoryCasReference {
+                kind, content_id, length, source: key(row)?, source_column: "content_id".into(),
+            });
+        }
         let mut embedded = rule.audited_embedded_columns.to_vec();
         if row.table() == "local_state" {
             let name = text(row, "key")?;
@@ -1261,6 +1276,82 @@ pub(super) fn audit(
     roots: &[NativeHistoryRootMapping],
     bounds: NodeInspectionBounds,
 ) -> Result<AuditedNativeHistorySource> {
+    let mut budget = NestedBudget { sources: 0, bytes: 0 };
+    budget.reserve(1, image.len())?;
+    audit_inner(image, expected_digest, max_image_bytes, space, roots, bounds, 1, &mut budget)
+}
+
+struct NestedBudget { sources: usize, bytes: usize }
+impl NestedBudget {
+    fn reserve(&mut self, count: usize, bytes: usize) -> Result<()> {
+        self.sources = self.sources.checked_add(count)
+            .filter(|n| *n <= NativeHistoryFamilyRegistry::MAX_NESTED_SOURCE_COUNT)
+            .ok_or(invalid("native history aggregate nested source count"))?;
+        self.bytes = self.bytes.checked_add(bytes)
+            .filter(|n| *n <= NativeHistoryFamilyRegistry::MAX_AGGREGATE_IMAGE_BYTES)
+            .ok_or(invalid("native history aggregate nested image bytes"))?;
+        Ok(())
+    }
+}
+
+fn nested_sources(
+    database: &Connection,
+    registry: NativeHistoryFamilyRegistry,
+    space: &SpaceId,
+    depth: usize,
+    budget: &mut NestedBudget,
+) -> Result<()> {
+    if registry.source_schema() == 69 { return Ok(()); }
+    // Inspect only keys and lengths first. Reserve every sibling before any
+    // embedded image is copied or deserialized. Recursion has a hard depth cap.
+    let mut query = database.prepare(
+        "SELECT source_digest,length(image) FROM native_history_sources ORDER BY source_digest LIMIT ?1",
+    )?;
+    let headers = query.query_map([NativeHistoryFamilyRegistry::MAX_NESTED_SOURCE_COUNT as i64 + 1],
+        |row| Ok((row.get::<_, String>(0)?, crate::sql_u64(row, 1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if headers.is_empty() { return Ok(()); }
+    if depth >= NativeHistoryFamilyRegistry::MAX_NESTING_DEPTH {
+        return Err(invalid("native history nested source depth"));
+    }
+    let total = headers.iter().try_fold(0usize, |total, (_, length)| {
+        let length = usize::try_from(*length).map_err(|_| invalid("native history nested length overflow"))?;
+        if !(512..=NativeHistoryFamilyRegistry::MAX_AGGREGATE_IMAGE_BYTES).contains(&length) {
+            return Err(invalid("native history nested image length"));
+        }
+        total.checked_add(length).ok_or(invalid("native history nested byte overflow"))
+    })?;
+    budget.reserve(headers.len(), total)?;
+    let device: DeviceId = database.query_row(
+        "SELECT value FROM local_state WHERE key='device_id'", [], |row| row.get::<_, String>(0),
+    )?.parse()?;
+    for (digest, _) in headers {
+        let digest = digest.parse::<ContentId>()?;
+        let stored = super::native_history_persistence::inspect_source(database, &digest)?;
+        if stored.space() != space { return Err(invalid("native history nested source space")); }
+        let roots = stored.projection().root_columns().iter().map(|mapping|
+            NativeHistoryRootMapping::worktree(mapping.original().into(), mapping.projected().into()))
+            .collect::<Vec<_>>();
+        let audited = audit_inner(
+            stored.source_image().to_vec(), stored.source_image_digest().as_str(),
+            NativeHistoryFamilyRegistry::MAX_AGGREGATE_IMAGE_BYTES, space, &roots,
+            stored.inspection_bounds(), depth + 1, budget,
+        )?;
+        if audited.parts.source_digest != *stored.source_digest()
+            || audited.parts.catalog_digest != *stored.source_catalog_digest()
+            || audited.parts.rows_digest != *stored.source_rows_digest()
+            || audited.parts.registry_digest != *stored.registry_digest()
+        { return Err(invalid("native history nested original proof differs")); }
+        super::native_history_persistence::audit_nested_writers(database, &stored, space, &device)?;
+    }
+    Ok(())
+}
+
+fn audit_inner(
+    image: Vec<u8>, expected_digest: &str, max_image_bytes: usize,
+    space: &SpaceId, roots: &[NativeHistoryRootMapping], bounds: NodeInspectionBounds,
+    depth: usize, budget: &mut NestedBudget,
+) -> Result<AuditedNativeHistorySource> {
     bounds.validate()?;
     super::limit(max_image_bytes)?;
     if image.len() < super::MIN_IMAGE_BYTES
@@ -1280,16 +1371,17 @@ pub(super) fn audit(
     if image_digest.as_str() != expected_digest {
         return Err(invalid("native history original image digest differs"));
     }
-    let registry = NativeHistoryFamilyRegistry::schema69();
-    registry.verify_complete()?;
     let mut database = Connection::open_in_memory()?;
     database.deserialize_read_exact(MAIN_DB, std::io::Cursor::new(&image), image.len(), true)?;
     configure_inspection(&mut database, bounds)?;
     database.busy_timeout(std::time::Duration::ZERO)?;
     let transaction = Transaction::new_unchecked(&database, TransactionBehavior::Deferred)?;
     let before_changes = database.total_changes();
+    let version:u32=database.pragma_query_value(None,"user_version",|row|row.get(0))?;
+    let registry=NativeHistoryFamilyRegistry::for_schema(version)?;
+    registry.verify_complete()?;
     let catalog_digest = catalog(&database, registry)?;
-    let specs = NativeHistoryFamilyRegistry::row_specs();
+    let specs = registry.row_specs();
     column_layout(&database, &specs)?;
     integrity(&database)?;
     let table_counts = preflight(
@@ -1298,6 +1390,7 @@ pub(super) fn audit(
         bounds.capacity.inventory.max_rows,
         bounds.capacity.inventory.max_logical_bytes,
     )?;
+    nested_sources(&database, registry, space, depth, budget)?;
     let mut rows = Vec::new();
     let mut tables = Vec::new();
     let mut total_bytes = 0;
@@ -1323,7 +1416,7 @@ pub(super) fn audit(
     }
     if rows.len() as u64 > bounds.capacity.max_rows
         || total_bytes > bounds.capacity.max_logical_bytes
-        || tables.len() != NativeHistoryFamilyRegistry::TABLE_COUNT
+        || tables.len() != registry.table_count()
     {
         return Err(invalid(
             "native history complete original source capacity exceeded",
@@ -1338,23 +1431,17 @@ pub(super) fn audit(
     let projection = projection(&rows, registry, roots, bounds)?;
     let rows_digest = hash(&(
         "sync-extend.native-history-all-original-rows.v1",
-        NativeHistoryFamilyRegistry::SOURCE_SCHEMA,
+        registry.source_schema(),
         space,
         &tables,
         rows.iter()
             .map(JournalStoredRow::fingerprint)
             .collect::<Vec<_>>(),
     ))?;
-    let registry_digest = hash(&(
-        "sync-extend.native-history-compiled-schema69-registry.v1",
-        registry.families(),
-        registry.slices(),
-        registry.tables(),
-        registry.catalog(),
-    ))?;
+    let registry_digest = registry.digest()?;
     let source_digest = hash(&(
         "sync-extend.immutable-native-history-source-proof.v1",
-        NativeHistoryFamilyRegistry::SOURCE_SCHEMA,
+        registry.source_schema(),
         space,
         &image_digest,
         &catalog_digest,
@@ -1383,6 +1470,7 @@ pub(super) fn audit(
         .map_err(|(_, error)| JournalError::from(error))?;
     Ok(AuditedNativeHistorySource {
         parts: NativeHistoryProofParts {
+            registry,
             image,
             space: space.clone(),
             image_digest,
