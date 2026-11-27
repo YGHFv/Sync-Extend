@@ -76,6 +76,9 @@ impl DeploymentClosedNodeRuntime {
 }
 
 impl RecoveredLocalSpace {
+    pub(crate) fn deployment_polling_limits(&self) -> Option<serde_json::Value> {
+        self.session.polling_limits()
+    }
     pub(crate) fn enable_deployment_polling(&mut self, limits: sync_extend_core_model::limits::LocalLimits) -> Result<()> {
         self.session.enable_deployment_polling(limits)
     }

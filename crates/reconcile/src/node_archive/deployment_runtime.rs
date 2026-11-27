@@ -256,7 +256,7 @@ impl DeploymentRun<'_> {
         let config = self.deployment_configuration()?;
         let (interval, ids) = match config.role {
             DeploymentRole::LocalPolling { data_dir, scan_interval_secs } => {
-                let ids = self.original_fresh_bindings.iter().filter(|(_, binding)| binding.data_dir == data_dir)
+                let ids = self.original_fresh_bindings.iter().filter(|(_, binding)| crate::node_archive::portable_source::path_equal(&binding.data_dir, &data_dir))
                     .map(|(id, _)| *id).collect::<Vec<_>>();
                 if ids.len() != 1 { return Err(ReconcileError::Invariant("polling requires the exact configured node")); }
                 (scan_interval_secs, ids)
@@ -269,14 +269,14 @@ impl DeploymentRun<'_> {
             }
             _ => return Ok(()),
         };
-        if interval == 0 || self.polling_interval.is_some() { return Err(ReconcileError::Invariant("explicit finite original polling interval")); }
+        if !(1..=86_400).contains(&interval) || self.polling_interval.is_some() { return Err(ReconcileError::Invariant("explicit finite original polling interval")); }
         self.polling_interval = Some(std::time::Duration::from_secs(interval));
         for id in ids {
             let node = self.nodes.get_mut(&id).ok_or(ReconcileError::Unstable)?;
             node.enable_deployment_polling(limits.clone())?;
             node.scan_deployment_polling(crate::now_ms()?)?;
             node.release_polling_observation()?;
-            self.polling.insert(id, std::time::Instant::now() + std::time::Duration::from_secs(interval));
+            self.polling.insert(id, std::time::Instant::now().checked_add(std::time::Duration::from_secs(interval)).ok_or(ReconcileError::ResourceLimit("polling deadline overflow"))?);
         }
         self.verify()
     }
@@ -291,7 +291,7 @@ impl DeploymentRun<'_> {
         let node = self.nodes.get_mut(&id).ok_or(ReconcileError::Unstable)?;
         let result = node.scan_deployment_polling(crate::now_ms()?)?;
         node.release_polling_observation()?;
-        self.polling.insert(id, std::time::Instant::now() + interval);
+        self.polling.insert(id, std::time::Instant::now().checked_add(interval).ok_or(ReconcileError::ResourceLimit("polling deadline overflow"))?);
         self.verify()?;
         Ok(Some(result))
     }
@@ -386,6 +386,7 @@ impl DeploymentRun<'_> {
                 "node_id": id,
                 "fresh_session_id": self.original_fresh_bindings[id].fresh_session_id,
                 "status": local.status()?,
+                "polling_limits": local.deployment_polling_limits(),
             }));
         }
         self.verify()?;

@@ -936,6 +936,10 @@ impl<'authority> DeploymentOwner<'authority> {
                 "runtime": run.status()?,
                 "gateway": gateway.status()?,
             })),
+            (Some(run), None, OwnerState::Running) => Ok(serde_json::json!({
+                "runtime": run.status()?,
+                "gateway": null,
+            })),
             (None, None, OwnerState::Installed) => Ok(serde_json::json!({
                 "root_deployment": self.files.root_deployment_path(),
                 "native_files_verified": true,
