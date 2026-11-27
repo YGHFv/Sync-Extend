@@ -797,7 +797,8 @@ impl LocalSpace {
         let baseline = old.as_ref().map(Manifest::root).transpose()?;
         let previous = old.unwrap_or_else(|| Manifest::empty(self.space_id.clone()));
         let candidates = self.persisted_rename_candidates(&previous, second)?;
-        let mut manifest = build_manifest(&previous, second, &candidates)?;
+        let (logical_scan, metadata_replacements) = self.scan_with_logical_metadata(&previous, second)?;
+        let mut manifest = build_manifest(&previous, &logical_scan, &candidates)?;
         if let Some(intent) = publication {
             let observed = second
                 .get(&intent.target_path)
@@ -837,6 +838,7 @@ impl LocalSpace {
                     if old.kind != entry.kind
                         || old.content != entry.content
                         || old.metadata != entry.metadata
+                        || metadata_replacements.contains(&entry.entry_id)
                     {
                         changes.push(Change::Put {
                             entry: entry.clone(),

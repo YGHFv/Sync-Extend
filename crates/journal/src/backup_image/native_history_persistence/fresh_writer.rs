@@ -12,9 +12,8 @@ use crate::{
     Result,
 };
 use rusqlite::{
-    params,
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params,
     types::{Value, ValueRef},
-    Connection, OptionalExtension, Transaction, TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -750,6 +749,32 @@ pub(super) fn inspect_writer_connection(
     verify_event_chain(writer_id, &stored, &source, &events)
 }
 
+/// Validate historical chains against a source already inspected by the bounded
+/// nesting walker. This performs no admission and does not inspect a live target.
+pub(super) fn audit_nested_writers(
+    connection: &Connection,
+    source: &PersistedNativeHistorySource,
+    space: &SpaceId,
+    device: &DeviceId,
+) -> Result<()> {
+    let ids = connection.prepare(
+        "SELECT writer_id FROM native_history_fresh_writers WHERE source_digest=?1 ORDER BY writer_id",
+    )?.query_map([source.source_digest().as_str()], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in ids {
+        let id = id.parse::<EntryId>()?;
+        let stored = load_writer(connection, &id)?;
+        let events = load_events(connection, &id)?;
+        let observed = verify_event_chain(&id, &stored, source, &events)?;
+        if observed.space() != space || observed.device() != device {
+            return Err(JournalError::Invariant(
+                "nested native history writer identity differs",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn fresh_writer_id(
     request: &NativeHistoryFreshWriterAdmissionRequest,
     admitted_at_ms: i64,
@@ -1179,6 +1204,7 @@ fn target_tables(source: &PersistedNativeHistorySource) -> Vec<&'static str> {
         .registry()
         .tables()
         .iter()
+        .filter(|table| !table.table.starts_with("native_history_"))
         .map(|table| table.table)
         .collect();
     tables.sort_unstable();
@@ -1186,9 +1212,8 @@ fn target_tables(source: &PersistedNativeHistorySource) -> Vec<&'static str> {
 }
 
 fn row_key(row: &JournalStoredRow) -> Result<NativeHistoryRowKey> {
-    let registry = NativeHistoryFamilyRegistry::schema69();
     Ok(NativeHistoryRowKey {
-        table: registry.table(row.table())?.table,
+        table: NativeHistoryFamilyRegistry::known_table(row.table())?.table,
         primary_key: row.primary_key().to_vec(),
     })
 }

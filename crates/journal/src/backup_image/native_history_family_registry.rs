@@ -1,5 +1,6 @@
 //! Complete compiled schema-69 family registry, independent of writable schema upgrades.
 //! The catalog is frozen from the registered original SQL; caller input cannot extend it.
+mod current;
 use crate::storage_inventory::reader::{ColumnKind, ColumnSpec, TableSpec};
 use crate::{JournalError, Result};
 use serde::Serialize;
@@ -11,6 +12,7 @@ pub enum NativeHistoryColumnKind {
     Utf8 { min: usize, max: usize },
     NonnegativeInteger,
     BoundedJson(usize),
+    BoundedBlob { min: usize, max: usize },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct NativeHistoryColumnSpec {
@@ -69,9 +71,14 @@ pub struct NativeHistoryTableRule {
 }
 #[derive(Clone, Copy)]
 pub struct NativeHistoryFamilyRegistry {
-    _compiled: (),
+    version: u32,
 }
 impl NativeHistoryFamilyRegistry {
+    /// Limits include the outer source and every occurrence of a nested source.
+    /// Repeated images are charged repeatedly; deduplication cannot bypass them.
+    pub const MAX_NESTING_DEPTH: usize = 4;
+    pub const MAX_NESTED_SOURCE_COUNT: usize = 16;
+    pub const MAX_AGGREGATE_IMAGE_BYTES: usize = 268_435_456;
     pub const SOURCE_SCHEMA: u32 = 69;
     pub const TABLE_COUNT: usize = 141;
     pub const INDEX_COUNT: usize = 170;
@@ -79,30 +86,92 @@ impl NativeHistoryFamilyRegistry {
     pub const FAMILY_COUNT: usize = 22;
     pub const SLICE_COUNT: usize = 27;
     pub fn schema69() -> Self {
-        Self { _compiled: () }
+        Self { version: 69 }
+    }
+    pub fn for_schema(version: u32) -> Result<Self> {
+        match version {
+            69 | 70 | 71 | 72 | 73 => Ok(Self { version }),
+            _ => Err(JournalError::Invariant(
+                "native history unregistered source schema",
+            )),
+        }
+    }
+    pub fn source_schema(self) -> u32 {
+        self.version
+    }
+    pub fn table_count(self) -> usize {
+        if self.version == 69 { 141 } else { 151 }
     }
     pub fn tables(self) -> &'static [NativeHistoryTableRule] {
-        TABLE_RULES
+        if self.version == 69 {
+            TABLE_RULES
+        } else {
+            current::tables()
+        }
     }
     pub fn families(self) -> &'static [&'static str] {
-        FAMILIES
+        if self.version == 69 {
+            FAMILIES
+        } else {
+            current::families()
+        }
     }
     pub fn slices(self) -> &'static [NativeHistorySliceSpec] {
-        SLICES
+        if self.version == 69 {
+            SLICES
+        } else {
+            current::slices()
+        }
     }
-    pub fn catalog(self) -> &'static [NativeHistoryCatalogDefinition] {
-        CATALOG
+    pub fn catalog(self) -> Result<Vec<current::CatalogDefinition>> {
+        if self.version == 69 {
+            Ok(CATALOG
+                .iter()
+                .map(|d| current::CatalogDefinition {
+                    kind: d.kind.into(),
+                    name: d.name.into(),
+                    table: d.table.into(),
+                    sql: d.sql.map(str::to_owned),
+                })
+                .collect())
+        } else {
+            Ok(current::catalog(self.version)?.to_vec())
+        }
+    }
+    pub(crate) fn digest(self) -> Result<sync_extend_core_model::ContentId> {
+        let catalog = self.catalog()?;
+        if self.version == 69 {
+            crate::storage_inventory::reader::hash(&(
+                "sync-extend.native-history-compiled-schema69-registry.v1",
+                self.families(),
+                self.slices(),
+                self.tables(),
+                catalog,
+            ))
+        } else {
+            crate::storage_inventory::reader::hash(&(
+                "sync-extend.native-history-compiled-versioned-registry.v1",
+                self.version,
+                self.families(),
+                self.slices(),
+                self.tables(),
+                catalog,
+            ))
+        }
+    }
+    pub(crate) fn known_table(name: &str) -> Result<&'static NativeHistoryTableRule> {
+        Self { version: 73 }.table(name)
     }
     pub(crate) fn table(self, name: &str) -> Result<&'static NativeHistoryTableRule> {
-        TABLE_RULES
+        self.tables()
             .iter()
             .find(|table| table.table == name)
             .ok_or(JournalError::Invariant(
                 "native history unknown compiled family table",
             ))
     }
-    pub(crate) fn row_specs() -> Vec<TableSpec> {
-        [
+    pub(crate) fn row_specs(self) -> Vec<TableSpec> {
+        let mut specs = [
             slice_00::TABLES,
             slice_01::TABLES,
             slice_02::TABLES,
@@ -131,30 +200,58 @@ impl NativeHistoryFamilyRegistry {
             slice_25::TABLES,
             slice_26::TABLES,
         ]
-        .concat()
+        .concat();
+        if self.version != 69 {
+            specs.extend_from_slice(super::native_history_persistence::schema::TABLES);
+        }
+        specs
     }
     pub(crate) fn verify_complete(self) -> Result<()> {
-        let specs = Self::row_specs();
+        let specs = self.row_specs();
+        let tables = self.tables();
+        let slices = self.slices();
+        let catalog = self.catalog()?;
         let names: BTreeSet<_> = specs.iter().map(|spec| spec.name).collect();
-        let rules: BTreeSet<_> = TABLE_RULES.iter().map(|rule| rule.table).collect();
-        let families: BTreeSet<_> = TABLE_RULES.iter().map(|rule| rule.family).collect();
-        let sliced: Vec<_> = SLICES
+        let rules: BTreeSet<_> = tables.iter().map(|rule| rule.table).collect();
+        let families: BTreeSet<_> = tables.iter().map(|rule| rule.family).collect();
+        let sliced: Vec<_> = slices
             .iter()
             .flat_map(|slice| slice.tables.iter().copied())
             .collect();
-        if specs.len() != Self::TABLE_COUNT
-            || names.len() != Self::TABLE_COUNT
-            || TABLE_RULES.len() != Self::TABLE_COUNT
+        if specs.len() != self.table_count()
+            || names.len() != self.table_count()
+            || tables.len() != self.table_count()
             || names != rules
-            || families.len() != Self::FAMILY_COUNT
-            || families != FAMILIES.iter().copied().collect()
-            || SLICES.len() != Self::SLICE_COUNT
-            || sliced.len() != Self::TABLE_COUNT
+            || families.len() != self.families().len()
+            || families != self.families().iter().copied().collect()
+            || slices.len()
+                != if self.version == 69 {
+                    Self::SLICE_COUNT
+                } else {
+                    28
+                }
+            || sliced.len() != self.table_count()
             || sliced.iter().copied().collect::<BTreeSet<_>>() != names
-            || CATALOG.len() != Self::TABLE_COUNT + Self::INDEX_COUNT + Self::TRIGGER_COUNT
-            || CATALOG.iter().filter(|item| item.kind == "table").count() != Self::TABLE_COUNT
-            || CATALOG.iter().filter(|item| item.kind == "index").count() != Self::INDEX_COUNT
-            || CATALOG.iter().filter(|item| item.kind == "trigger").count() != Self::TRIGGER_COUNT
+            || catalog.len()
+                != self.table_count()
+                    + if self.version == 69 {
+                        Self::INDEX_COUNT + Self::TRIGGER_COUNT
+                    } else {
+                        191 + 869
+                    }
+            || catalog.iter().filter(|item| item.kind == "table").count() != self.table_count()
+            || catalog.iter().filter(|item| item.kind == "index").count()
+                != if self.version == 69 {
+                    Self::INDEX_COUNT
+                } else {
+                    191
+                }
+            || catalog.iter().filter(|item| item.kind == "trigger").count()
+                != if self.version == 69 {
+                    Self::TRIGGER_COUNT
+                } else {
+                    869
+                }
         {
             return Err(JournalError::Invariant(
                 "native history compiled registry incomplete",
@@ -163,7 +260,7 @@ impl NativeHistoryFamilyRegistry {
         for spec in &specs {
             let rule = self.table(spec.name)?;
             if spec.columns.len() != rule.columns.len()
-                || !SLICES[rule.slice].tables.contains(&spec.name)
+                || !slices[rule.slice].tables.contains(&spec.name)
             {
                 return Err(JournalError::Invariant(
                     "native history compiled slice or column differs",
@@ -177,10 +274,8 @@ impl NativeHistoryFamilyRegistry {
                     ColumnKind::Text(n) => NativeHistoryColumnKind::HexText(n),
                     ColumnKind::Utf8 { min, max } => NativeHistoryColumnKind::Utf8 { min, max },
                     ColumnKind::Integer => NativeHistoryColumnKind::NonnegativeInteger,
-                    ColumnKind::Blob { .. } => {
-                        return Err(JournalError::Invariant(
-                            "native history compiled blob column",
-                        ));
+                    ColumnKind::Blob { min, max } => {
+                        NativeHistoryColumnKind::BoundedBlob { min, max }
                     }
                 };
                 if physical.name != public.name

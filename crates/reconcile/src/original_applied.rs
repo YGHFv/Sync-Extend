@@ -85,6 +85,7 @@ impl LocalSpace {
             }
         }
         let observed = self.stable_scan()?;
+        let (logical_observed, replaced) = self.scan_with_logical_metadata(&manifest, &observed)?;
         if observed.len() != manifest.entries.len() {
             return Err(ReconcileError::Invariant(
                 "original applied whole native membership differs",
@@ -97,6 +98,10 @@ impl LocalSpace {
             if actual.kind != entry.kind
                 || actual.content != entry.content
                 || (entry.kind == EntryKind::File && !actual.single_link)
+                || replaced.contains(&entry.entry_id)
+                || entry.metadata.as_ref().is_some_and(|_| {
+                    logical_observed.get(&entry.path).is_none_or(|logical| logical.metadata != entry.metadata)
+                })
             {
                 return Err(ReconcileError::Invariant(
                     "original applied native content or alias differs",

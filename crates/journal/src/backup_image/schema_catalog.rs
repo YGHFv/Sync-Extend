@@ -3,7 +3,7 @@
 use super::{JournalError, Result};
 use rusqlite::Connection;
 
-type Definition = (String, String, String, Option<String>);
+pub(super) type Definition = (String, String, String, Option<String>);
 
 fn definitions(database: &Connection, max_count: usize) -> Result<Vec<Definition>> {
     let mut query = database.prepare(
@@ -18,6 +18,17 @@ fn definitions(database: &Connection, max_count: usize) -> Result<Vec<Definition
 }
 
 pub(super) fn validate_schema(database: &Connection, version: u32) -> Result<()> {
+    let expected = compiled_definitions(version)?;
+    let observed = definitions(database, expected.len() + 1)?;
+    if observed != expected {
+        return Err(JournalError::Invariant(
+            "backup complete Journal schema differs",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn compiled_definitions(version: u32) -> Result<Vec<Definition>> {
     let reference = Connection::open_in_memory()?;
     reference.execute_batch(SCHEMA_SCRIPTS[0])?;
     let count = usize::try_from(version)
@@ -43,13 +54,7 @@ pub(super) fn validate_schema(database: &Connection, version: u32) -> Result<()>
             "backup schema object budget exceeded",
         ));
     }
-    let observed = definitions(database, expected.len() + 1)?;
-    if observed != expected {
-        return Err(JournalError::Invariant(
-            "backup complete Journal schema differs",
-        ));
-    }
-    Ok(())
+    Ok(expected)
 }
 
 const SCHEMA_SCRIPTS: &[&str] = &[
@@ -124,4 +129,6 @@ const SCHEMA_SCRIPTS: &[&str] = &[
     include_str!("../migration-069.sql"),
     include_str!("../migration-070.sql"),
     include_str!("../migration-071.sql"),
+    include_str!("../migration-072.sql"),
+    include_str!("../migration-073.sql"),
 ];

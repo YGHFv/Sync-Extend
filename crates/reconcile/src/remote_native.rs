@@ -26,6 +26,9 @@ impl LocalSpace {
                 "remote native supports file Put only",
             ));
         };
+        if let Some(metadata) = &entry.metadata {
+            crate::filesystem::projected_metadata(metadata)?;
+        }
         let content = self.import_source(source)?;
         if entry.content.as_ref() != Some(&content) {
             return Err(ReconcileError::Invariant(
@@ -58,6 +61,11 @@ impl LocalSpace {
             ));
         }
         self.verify_root()?;
+        if let Change::Put { entry } = &signed.operation.payload.change {
+            if let Some(metadata) = &entry.metadata {
+                crate::filesystem::projected_metadata(metadata)?;
+            }
+        }
         let proof = RemotePublicationProof {
             public_key: peer.public_key,
             operation: signed.operation.clone(),

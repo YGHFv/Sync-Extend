@@ -13,7 +13,7 @@ use crate::{
     Journal, JournalCapacityLimits, JournalError, JournalStorageColumn, JournalStorageColumnValue,
     JournalStoredRow, NodeInspectionBounds, Result, TreeRestoreInventoryLimits,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -29,6 +29,10 @@ pub use fresh_writer::{
 
 const FORMAT_VERSION: u32 = 1;
 const MAX_SOURCE_ROWS: usize = 100_000;
+
+pub(crate) fn migrate_schema73(connection: &mut Connection) -> Result<()> {
+    super::native_history_source_audit::migrate_schema73(connection)
+}
 
 /// The complete native-history persistence inventory. Storage-role capacity
 /// audits may accept these rows only when the exact fresh-writer/source
@@ -88,6 +92,7 @@ impl NativeHistorySourceBinding {
 /// Exact values reconstructed from immutable schema-70 source rows.
 /// This is an inspection result, not a newly sealed issuer or access token.
 pub struct PersistedNativeHistorySource {
+    registry: NativeHistoryFamilyRegistry,
     source_digest: ContentId,
     image: Vec<u8>,
     image_digest: ContentId,
@@ -105,7 +110,7 @@ pub struct PersistedNativeHistorySource {
 
 impl PersistedNativeHistorySource {
     pub fn source_schema(&self) -> u32 {
-        NativeHistoryFamilyRegistry::SOURCE_SCHEMA
+        self.registry.source_schema()
     }
     pub fn source_digest(&self) -> &ContentId {
         &self.source_digest
@@ -147,7 +152,7 @@ impl PersistedNativeHistorySource {
         self.logical_bytes
     }
     pub fn registry(&self) -> NativeHistoryFamilyRegistry {
-        NativeHistoryFamilyRegistry::schema69()
+        self.registry
     }
     pub fn binding(&self) -> NativeHistorySourceBinding {
         NativeHistorySourceBinding {
@@ -293,7 +298,7 @@ fn source_table_digest(
 fn source_digest(parts: &PersistedNativeHistorySource) -> Result<ContentId> {
     Ok(hash(&(
         "sync-extend.immutable-native-history-source-proof.v1",
-        NativeHistoryFamilyRegistry::SOURCE_SCHEMA,
+        parts.registry.source_schema(),
         &parts.space,
         &parts.image_digest,
         &parts.catalog_digest,
@@ -311,29 +316,19 @@ fn source_digest(parts: &PersistedNativeHistorySource) -> Result<ContentId> {
 }
 
 fn rows_digest(
+    registry: NativeHistoryFamilyRegistry,
     space: &SpaceId,
     tables: &[NativeHistorySourceTable],
     rows: &[JournalStoredRow],
 ) -> Result<ContentId> {
     hash(&(
         "sync-extend.native-history-all-original-rows.v1",
-        NativeHistoryFamilyRegistry::SOURCE_SCHEMA,
+        registry.source_schema(),
         space,
         tables,
         rows.iter()
             .map(JournalStoredRow::fingerprint)
             .collect::<Vec<_>>(),
-    ))
-}
-
-fn registry_digest() -> Result<ContentId> {
-    let registry = NativeHistoryFamilyRegistry::schema69();
-    hash(&(
-        "sync-extend.native-history-compiled-schema69-registry.v1",
-        registry.families(),
-        registry.slices(),
-        registry.tables(),
-        registry.catalog(),
     ))
 }
 
@@ -346,9 +341,9 @@ impl Journal {
     ) -> Result<NativeHistorySourceBinding> {
         let parts = proof.proof_parts();
         parts.bounds.validate()?;
-        let registry = NativeHistoryFamilyRegistry::schema69();
+        let registry = parts.registry;
         registry.verify_complete()?;
-        if parts.tables.len() != NativeHistoryFamilyRegistry::TABLE_COUNT
+        if parts.tables.len() != registry.table_count()
             || parts.rows.len() > MAX_SOURCE_ROWS
             || parts.rows.len() as u64 > parts.bounds.capacity.max_rows
             || parts.rows.len() > parts.bounds.capacity.inventory.max_rows
@@ -375,8 +370,8 @@ impl Journal {
                 "native history persisted source logical bytes",
             ));
         }
-        let key_ordinals = key_ordinals(&parts.rows)?;
-        let row_specs = NativeHistoryFamilyRegistry::row_specs();
+        let key_ordinals = key_ordinals(registry, &parts.rows)?;
+        let row_specs = registry.row_specs();
         for (index, table) in parts.tables.iter().enumerate() {
             let spec = row_specs.get(index).ok_or(JournalError::Invariant(
                 "native history persisted table order",
@@ -427,7 +422,7 @@ impl Journal {
             params![
                 parts.source_digest.as_str(),
                 FORMAT_VERSION,
-                NativeHistoryFamilyRegistry::SOURCE_SCHEMA,
+                registry.source_schema(),
                 parts.space.as_str(),
                 parts.image,
                 parts.image_digest.as_str(),
@@ -704,8 +699,10 @@ fn reference_source_table(reference: &NativeHistoryCasReference) -> &str {
     reference.source_table()
 }
 
-fn key_ordinals(rows: &[JournalStoredRow]) -> Result<BTreeMap<NativeHistoryRowKey, usize>> {
-    let registry = NativeHistoryFamilyRegistry::schema69();
+fn key_ordinals(
+    registry: NativeHistoryFamilyRegistry,
+    rows: &[JournalStoredRow],
+) -> Result<BTreeMap<NativeHistoryRowKey, usize>> {
     let mut result = BTreeMap::new();
     for (ordinal, row) in rows.iter().enumerate() {
         let key = NativeHistoryRowKey {
@@ -958,6 +955,20 @@ pub(super) fn inspect_source(
     connection: &Connection,
     expected: &ContentId,
 ) -> Result<PersistedNativeHistorySource> {
+    // Bound the blob before rusqlite allocates its owned representation. The
+    // recursive source auditor also reserves the complete sibling aggregate.
+    let image_length: u64 = connection.query_row(
+        "SELECT length(image) FROM native_history_sources WHERE source_digest=?1",
+        [expected.as_str()],
+        |row| crate::sql_u64(row, 0),
+    )?;
+    if !(512..=NativeHistoryFamilyRegistry::MAX_AGGREGATE_IMAGE_BYTES as u64)
+        .contains(&image_length)
+    {
+        return Err(JournalError::Invariant(
+            "persisted native history image length bound",
+        ));
+    }
     let header = connection
         .query_row(
             "SELECT format_version,source_schema,space_id,image,image_digest,catalog_digest,
@@ -997,12 +1008,13 @@ pub(super) fn inspect_source(
         .ok_or(JournalError::Invariant(
             "persisted native history source absent",
         ))?;
-    if header.0 != FORMAT_VERSION || header.1 != NativeHistoryFamilyRegistry::SOURCE_SCHEMA {
+    let registry = NativeHistoryFamilyRegistry::for_schema(header.1)?;
+    if header.0 != FORMAT_VERSION {
         return Err(JournalError::Invariant(
             "persisted native history source format or schema",
         ));
     }
-    if header.8 != NativeHistoryFamilyRegistry::TABLE_COUNT as u64
+    if header.8 != registry.table_count() as u64
         || header.9 > MAX_SOURCE_ROWS as u64
         || header.10 == 0
         || header.10 > MAX_SOURCE_ROWS as u64
@@ -1050,8 +1062,7 @@ pub(super) fn inspect_source(
         ));
     }
     let space = header.2.parse::<SpaceId>()?;
-    let registry = NativeHistoryFamilyRegistry::schema69();
-    let row_specs = NativeHistoryFamilyRegistry::row_specs();
+    let row_specs = registry.row_specs();
     let tables = connection
         .prepare(
             "SELECT ordinal,table_name,row_count,logical_bytes,digest
@@ -1067,7 +1078,7 @@ pub(super) fn inspect_source(
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    if tables.len() != NativeHistoryFamilyRegistry::TABLE_COUNT {
+    if tables.len() != registry.table_count() {
         return Err(JournalError::Invariant(
             "persisted native history table inventory count",
         ));
@@ -1466,8 +1477,8 @@ pub(super) fn inspect_source(
         root_columns: mappings,
         digest: projection_digest,
     };
-    let actual_rows_digest = rows_digest(&space, &source_tables, &source_rows)?;
-    let actual_registry_digest = registry_digest()?;
+    let actual_rows_digest = rows_digest(registry, &space, &source_tables, &source_rows)?;
+    let actual_registry_digest = registry.digest()?;
     if actual_rows_digest != expected_rows_digest
         || actual_registry_digest != expected_registry_digest
     {
@@ -1476,6 +1487,7 @@ pub(super) fn inspect_source(
         ));
     }
     let mut result = PersistedNativeHistorySource {
+        registry,
         source_digest: expected.clone(),
         image: header.3,
         image_digest,
@@ -1509,6 +1521,15 @@ pub(super) fn inspect_source(
     }
     result.bounds = bounds;
     Ok(result)
+}
+
+pub(super) fn audit_nested_writers(
+    connection: &Connection,
+    source: &PersistedNativeHistorySource,
+    space: &SpaceId,
+    device: &DeviceId,
+) -> Result<()> {
+    fresh_writer::audit_nested_writers(connection, source, space, device)
 }
 
 fn rule_for_row(
