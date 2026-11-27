@@ -312,7 +312,7 @@ mod windows {
             plan_tree_restore_identities, TreeNativeEntry, TreeNativeIdentity, TreeNativeInventory,
             TreeSlotBinding,
         },
-        ContentId, EntryKind, FileManifest, Manifest, PortablePath,
+        ContentId, EntryKind, FileManifest, Manifest, PortableEntryMetadata, PortablePath,
     };
     use sync_extend_journal::TreeRestorePreparationIntent;
     use sync_extend_platform_fs::{FileKey, GuardedReadFile, LockedDirectory};
@@ -335,6 +335,7 @@ mod windows {
         guard: GuardedReadFile,
         key: FileKey,
         content: FileManifest,
+        metadata: Option<PortableEntryMetadata>,
     }
 
     struct Guards {
@@ -465,6 +466,14 @@ mod windows {
             || !filesystem::same_metadata(&before, &fs::symlink_metadata(&file.path)?)
         {
             return Err(ReconcileError::Unstable);
+        }
+        if let Some(expected) = &file.metadata {
+            let observed = filesystem::portable_metadata(file.guard.reader())?.ok_or(
+                ReconcileError::Invariant("tree observation portable metadata unavailable"),
+            )?;
+            if !filesystem::metadata_matches_observed(expected, &observed) {
+                return Err(ReconcileError::Unstable);
+            }
         }
         Ok(())
     }
@@ -623,6 +632,7 @@ mod windows {
                         guard,
                         key,
                         content,
+                        metadata: entry.metadata.clone(),
                     };
                     verify_file(&file)?;
                     files.push(file);
@@ -806,6 +816,7 @@ mod windows {
                         guard,
                         key,
                         content: entry.content.clone().ok_or(ReconcileError::Unstable)?,
+                        metadata: entry.metadata.clone(),
                     };
                     verify_file(&captured)?;
                     files.push(captured);
@@ -877,6 +888,7 @@ mod windows {
                         length,
                     }],
                 },
+                metadata: None,
             };
             verify_file(&captured)?;
             files.push(captured);

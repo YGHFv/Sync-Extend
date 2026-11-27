@@ -59,7 +59,6 @@ impl LocalSpace {
         ];
         let mut implementation_gaps = vec![
             "readonly_selective_directory_restore_preview",
-            "portable_metadata_in_tree_restore_and_reconcile_native_publish",
             "general_portable_restore_of_root_bound_native_history",
             "history_snapshot_time_window_merging",
             "automatic_retention_and_bulk_gc",
@@ -183,10 +182,10 @@ impl LocalSpace {
             portable_metadata_timestamp_precision_ns: metadata_capability.timestamp_precision_ns,
             portable_metadata_unsupported_fields: unsupported_fields,
             portable_metadata_certification: certification,
-            portable_tree_restore_metadata_preserved: false,
-            portable_native_publish_metadata_preserved: false,
+            portable_tree_restore_metadata_preserved: cfg!(windows),
+            portable_native_publish_metadata_preserved: cfg!(windows),
             portable_metadata_capability: metadata_capability,
-            metadata_fidelity_disclosure: "Where the capability matrix reports support, portable modified time, readonly and platform-supported creation/executable fields are captured and applied through the already-open file handle, then re-observed. Unknown or unsupported fields are not claimed. Single-file new-operation restore carries captured metadata. TREE restore and the reconcile native-publish path do not yet carry portable metadata. Windows ACLs and alternate data streams are not captured or preserved, UID/GID and raw mode are not portable, and links/reparse points are rejected. FAT/exFAT, emulated volumes, KernelSU and ACL/ADS fidelity are not certified from NTFS/ext4 results; D5 remains open.",
+            metadata_fidelity_disclosure: "Where the capability matrix reports support, portable modified time, readonly and platform-supported creation/executable fields are captured and applied through the already-open file handle, then re-observed. Unknown or unsupported fields are not claimed. Single-file new-operation restore carries captured metadata. On Windows, reconcile native publish and TREE restore carry captured metadata; directories do not receive synthesized metadata. Windows ACLs and alternate data streams are not captured or preserved, UID/GID and raw mode are not portable, and links/reparse points are rejected. FAT/exFAT, emulated volumes, KernelSU and ACL/ADS fidelity are not certified from NTFS/ext4 results; D5 remains open.",
             production_safety_certified: false,
         })
     }

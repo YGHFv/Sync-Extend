@@ -458,7 +458,16 @@ pub fn plan_tree_restore(
     });
     for (path, e) in additions {
         let previous = old.get(&path).copied().filter(|old| old.kind == e.kind);
-        if previous.is_some_and(|old| old.content == e.content) {
+        // Directories never receive portable metadata. Files with equal bytes
+        // but different captured metadata are still a real replacement.
+        // A target without captured metadata is not a request to rewrite
+        // metadata; equal content stays unchanged as before.
+        if previous.is_some_and(|old| {
+            old.content == e.content
+                && (e.kind == EntryKind::Directory
+                    || e.metadata.is_none()
+                    || old.metadata == e.metadata)
+        }) {
             continue;
         }
         let mut dependencies = Vec::new();

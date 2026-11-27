@@ -1,19 +1,19 @@
 //! Native owner creation uses original handles and durable one-shot attempts.
 use super::*;
 use crate::{CasAccessGuard, Journal, TreeCoordinatorAdmissionInspection};
-use rusqlite::{Transaction, TransactionBehavior, params_from_iter};
+use rusqlite::{params_from_iter, Transaction, TransactionBehavior};
 use std::{
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 use sync_extend_core_model::{
-    EntryKind, FileManifest, SpaceId, tree_native_action_layout::TreeNativeActionObservation,
-    tree_restore_identity::TreeNativeIdentity,
+    tree_native_action_layout::TreeNativeActionObservation,
+    tree_restore_identity::TreeNativeIdentity, EntryKind, FileManifest, SpaceId,
 };
 use sync_extend_platform_fs::{
-    FileKey, GuardedReadFile, LockedDirectory, LockedDirectoryMutation, LockedFile,
-    OwnedFileCreation, regular_file_matches_path,
+    regular_file_matches_path, FileKey, GuardedReadFile, LockedDirectory, LockedDirectoryMutation,
+    LockedFile, OwnedFileCreation,
 };
 
 #[path = "executor.rs"]
@@ -112,6 +112,7 @@ impl TreeNativeOwnerFileView<'_> {
         let key = FileKey::from_file(file)?;
         Ok(Some(crate::NativePublicationFileObservation {
             metadata: file.metadata()?,
+            portable: None,
             physical_identity: ContentId::hash(
                 format!("windows:{}:{}", key.volume, key.id).as_bytes(),
             ),

@@ -1,13 +1,11 @@
 //! Close original writers before receipt-backed, mutation-excluding reads.
 use super::{
-    Header, Key,
-    creation::{Base, key},
-    physical,
+    creation::{key, Base},
+    physical, Header, Key,
 };
 use crate::{
-    CasAccessGuard, Journal, NativePublicationCreation, Result,
     storage_inventory::reader::{hash, invalid},
-    storage_policy,
+    storage_policy, CasAccessGuard, Journal, NativePublicationCreation, Result,
 };
 use rusqlite::{Transaction, TransactionBehavior};
 use std::{
@@ -105,6 +103,26 @@ impl NativePublicationReadiness {
             || before.modified()? != payload.metadata()?.modified()?
         {
             return Err(invalid("native readiness full content changed"));
+        }
+        if let Some(expected) = self
+            .header
+            .intent
+            .completion
+            .as_ref()
+            .and_then(|completion| {
+                completion
+                    .manifest
+                    .entries
+                    .get(&self.header.intent.entry_id)
+            })
+            .and_then(|entry| entry.metadata.as_ref())
+        {
+            let observed = crate::portable_file_metadata::capture(payload)
+                .map_err(|_| invalid("native readiness portable metadata capture"))?
+                .ok_or_else(|| invalid("native readiness portable metadata unavailable"))?;
+            if !expected.matches_observed(&observed) {
+                return Err(invalid("native readiness portable metadata differs"));
+            }
         }
         Ok(())
     }

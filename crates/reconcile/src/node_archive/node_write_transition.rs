@@ -2400,6 +2400,21 @@ impl RecoveredFileProtection {
             )),
         }
     }
+    fn portable_metadata(
+        &self,
+    ) -> std::io::Result<sync_extend_platform_fs::PortableMetadataCapture> {
+        match self {
+            Self::Mutation(file) => file.portable_metadata(),
+            Self::Created(file) => {
+                file.verify_original()?;
+                sync_extend_platform_fs::capture_portable_file_metadata(file.reader())
+            }
+            Self::Read(file) => file.portable_metadata(),
+            Self::Sqlite(_) => Err(std::io::Error::other(
+                "native SQLite not ordinary scan file",
+            )),
+        }
+    }
     fn acquire_fresh_coordination_lock(
         &self,
         shared: bool,
@@ -5326,6 +5341,16 @@ impl crate::native_file_view::NativeFileView for RecoveredSessionScanView<'_> {
         Ok(Some(
             sync_extend_journal::NativePublicationFileObservation {
                 metadata: file.file.metadata()?,
+                portable: Some(
+                    crate::filesystem::portable_metadata_from_capture(
+                        file.file.portable_metadata()?,
+                    )
+                    .map_err(|_| {
+                        sync_extend_journal::JournalError::Invariant(
+                            "recovered scan portable metadata",
+                        )
+                    })?,
+                ),
                 physical_identity: ContentId::hash(
                     format!("windows:{}:{}", key.volume, key.id).as_bytes(),
                 ),

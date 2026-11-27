@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use sync_extend_core_model::conflict_native_layout::{
-    ConflictNativeLayout, ConflictNativeLayoutLimits, plan_conflict_native_layout,
+    plan_conflict_native_layout, ConflictNativeLayout, ConflictNativeLayoutLimits,
 };
 use sync_extend_platform_fs::{FileKey, GuardedReadFile, LockedDirectory, LockedFile};
 
@@ -254,6 +254,7 @@ impl ConflictNativeBaseline {
         }
         Ok(Some(NativePublicationFileObservation {
             metadata: original.held.reader().metadata()?,
+            portable: crate::portable_file_metadata::capture(original.held.reader())?,
             physical_identity: physical(original.key),
             content: original.entry.content.clone(),
         }))

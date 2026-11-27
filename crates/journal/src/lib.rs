@@ -3210,6 +3210,7 @@ fn promote_pending(
     }
     Ok(())
 }
+mod portable_file_metadata;
 mod publication;
 pub use publication::{Publication, PublicationCompletion, PublicationIntent, PublicationState};
 mod mutation;

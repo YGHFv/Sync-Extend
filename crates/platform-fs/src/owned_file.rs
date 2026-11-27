@@ -1145,6 +1145,10 @@ impl FreshRecoveredMutationFile {
         self.verify()?;
         self.acquired.file.metadata()
     }
+
+    pub fn portable_metadata(&self) -> io::Result<crate::PortableMetadataCapture> {
+        self.acquired.portable_metadata()
+    }
 }
 
 impl FreshRecoveredMutationFile {
@@ -1237,6 +1241,15 @@ impl ReacquiredNodeFile {
     pub fn metadata(&self) -> io::Result<std::fs::Metadata> {
         self.verify()?;
         self.file.metadata()
+    }
+
+    /// Observe metadata through this retained read handle without granting
+    /// callers a new handle or metadata-writing authority.
+    pub fn portable_metadata(&self) -> io::Result<crate::PortableMetadataCapture> {
+        self.verify()?;
+        let captured = crate::capture_portable_file_metadata(&self.file)?;
+        self.verify()?;
+        Ok(captured)
     }
 }
 

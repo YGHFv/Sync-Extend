@@ -179,7 +179,7 @@ fn visit(
                     ScannedEntry {
                         kind: EntryKind::File,
                         content: Some(content),
-                        metadata: None,
+                        metadata: native.portable,
                         physical_identity: native.physical_identity,
                         single_link: true,
                     },

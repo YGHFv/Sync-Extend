@@ -183,12 +183,15 @@ pub fn verify_file_resolution_projection(
     }
     for (id, frontier) in &reduced.entries {
         if let Some(entry) = plan.projected.entries.get(id) {
-            let actual_metadata = frontier
-                .contents
-                .first()
-                .and_then(|alternative| alternative.operations.first())
-                .and_then(|operation| by_id.get(operation))
-                .and_then(|operation| operation_metadata(operation));
+            let actual_metadata = frontier.contents.first().and_then(|alternative| {
+                alternative.metadata.clone().or_else(|| {
+                    alternative
+                        .operations
+                        .first()
+                        .and_then(|operation| by_id.get(operation))
+                        .and_then(|operation| operation_metadata(operation))
+                })
+            });
             if frontier.deleted
                 || frontier.delete_conflict
                 || frontier.paths.len() != 1
@@ -218,8 +221,23 @@ fn charge(bytes: &mut usize, value: &impl Serialize, limit: usize) -> Result<()>
         .ok_or(invalid("resolution byte budget"))?;
     Ok(())
 }
-fn copy_id(space: &SpaceId, source: &EntryId, content: &FileManifest) -> Result<EntryId> {
-    let encoded = serde_json::to_vec(&("SyncExtend conflict file v1", space, source, content))?;
+fn copy_id(
+    space: &SpaceId,
+    source: &EntryId,
+    content: &FileManifest,
+    metadata: Option<&PortableEntryMetadata>,
+) -> Result<EntryId> {
+    // Absent metadata keeps the historical derived identity byte-identical.
+    let encoded = match metadata {
+        Some(metadata) => serde_json::to_vec(&(
+            "SyncExtend conflict file v1",
+            space,
+            source,
+            content,
+            metadata,
+        ))?,
+        None => serde_json::to_vec(&("SyncExtend conflict file v1", space, source, content))?,
+    };
     ContentId::hash(&encoded).as_str()[..32].parse()
 }
 fn collision_id(space: &SpaceId, source: &EntryId, path: &PortablePath) -> Result<EntryId> {
@@ -241,6 +259,18 @@ fn operation_metadata(operation: &Operation) -> Option<PortableEntryMetadata> {
         Change::Put { entry } => entry.metadata.clone(),
         _ => None,
     }
+}
+
+/// The reduced alternative is authoritative for new reductions; provenance is
+/// consulted only when an older serialized alternative omitted the field.
+fn alternative_metadata(
+    alternative: &ContentAlternative,
+    operation: &Operation,
+) -> Option<PortableEntryMetadata> {
+    alternative
+        .metadata
+        .clone()
+        .or_else(|| operation_metadata(operation))
 }
 
 // Reserve every requested name, including alternate Renames and future primaries.
@@ -403,6 +433,7 @@ pub fn plan_file_resolution(
             primary_names.insert(primary_path.collision_key(), source.clone());
         }
         let primary = provenance(selected)?;
+        let selected_metadata = alternative_metadata(selected, primary);
         push_file(
             &mut files,
             ResolutionFile {
@@ -411,7 +442,7 @@ pub fn plan_file_resolution(
                     path: primary_path.clone(),
                     kind: EntryKind::File,
                     content: Some(content(selected)?.clone()),
-                    metadata: operation_metadata(primary),
+                    metadata: selected_metadata.clone(),
                 },
                 source_entry_id: source.clone(),
                 content_operations: selected.operations.clone(),
@@ -423,11 +454,12 @@ pub fn plan_file_resolution(
         )?;
         for alternative in alternatives.into_iter().skip(1) {
             let file = content(alternative)?;
-            let id = copy_id(space, source, file)?;
+            let original = provenance(alternative)?;
+            let preserved_metadata = alternative_metadata(alternative, original);
+            let id = copy_id(space, source, file, preserved_metadata.as_ref())?;
             if !ids.insert(id.clone()) {
                 return Err(invalid("resolution derived identity collision"));
             }
-            let original = provenance(alternative)?;
             let path = conflict_path(
                 &selected_path.path,
                 &id,
@@ -443,7 +475,7 @@ pub fn plan_file_resolution(
                         path,
                         kind: EntryKind::File,
                         content: Some(file.clone()),
-                        metadata: operation_metadata(original),
+                        metadata: preserved_metadata,
                     },
                     source_entry_id: source.clone(),
                     content_operations: alternative.operations.clone(),

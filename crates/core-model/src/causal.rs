@@ -1,7 +1,7 @@
 //! Bounded logical frontiers only: no filesystem, snapshot or receipt authority.
 use crate::{
-    Change, EntryId, EntryKind, FileManifest, ModelError, Operation, OperationId, PortablePath,
-    Result, SpaceId, VersionVector,
+    Change, EntryId, EntryKind, FileManifest, ModelError, Operation, OperationId,
+    PortableEntryMetadata, PortablePath, Result, SpaceId, VersionVector,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +17,9 @@ pub struct ContentAlternative {
     pub operations: Vec<OperationId>,
     pub kind: EntryKind,
     pub content: Option<FileManifest>,
+    /// Absent for old payloads that predate portable metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<PortableEntryMetadata>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -335,13 +338,14 @@ pub fn reduce_operations(
                 let Change::Put { entry } = &operations[index].payload.change else {
                     return Err(invalid("content register has no put"));
                 };
-                let key = serde_json::to_vec(&(entry.kind, &entry.content))?;
+                let key = serde_json::to_vec(&(entry.kind, &entry.content, &entry.metadata))?;
                 contents
                     .entry(key)
                     .or_insert_with(|| ContentAlternative {
                         operations: Vec::new(),
                         kind: entry.kind,
                         content: entry.content.clone(),
+                        metadata: entry.metadata.clone(),
                     })
                     .operations
                     .push(operations[index].op_id.clone());
