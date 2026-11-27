@@ -165,6 +165,7 @@ struct OriginalSessionResources {
     history_retained_directories:
         Vec<(std::path::PathBuf, sync_extend_platform_fs::LockedDirectory)>,
     new_cas_buckets: std::collections::BTreeMap<std::path::PathBuf, super::RecoveredCasBucket>,
+    polling: Option<super::polling::RecoveredPollingState>,
     created_work_directories: std::collections::BTreeMap<
         std::path::PathBuf,
         sync_extend_platform_fs::LockedDirectoryMutation,
@@ -172,7 +173,7 @@ struct OriginalSessionResources {
 }
 
 impl RecoveredFileProtection {
-    fn close_into_attempt(self, attempt: &mut WindowsOriginalCloseAttempt) {
+    pub(super) fn close_into_attempt(self, attempt: &mut WindowsOriginalCloseAttempt) {
         match self {
             Self::Mutation(original) => original.close_into_attempt(attempt),
             Self::Created(original) => original.close_into_attempt(attempt),
@@ -283,6 +284,7 @@ impl FreshRecoveredNodeWalV2Session {
             new_cas_objects,
             new_cas_buckets,
             verified_main,
+            polling,
         } = self;
         let ReacquiredClosedNodeLockedReadScope {
             read,
@@ -350,6 +352,7 @@ impl FreshRecoveredNodeWalV2Session {
             history_retained_directories,
             new_cas_buckets,
             created_work_directories,
+            polling,
         };
         // The native terminal must really finish before the original owner
         // locks and retained surrounding scope can be released.
@@ -405,8 +408,12 @@ impl OriginalSessionResources {
             history_retained_directories,
             new_cas_buckets,
             created_work_directories,
+            polling,
         } = self;
         let mut attempt = WindowsOriginalCloseAttempt::new();
+        if let Some(polling) = polling {
+            polling.close_into_attempt(&mut attempt);
+        }
         for original in files {
             close_file(original, &mut attempt, context);
         }

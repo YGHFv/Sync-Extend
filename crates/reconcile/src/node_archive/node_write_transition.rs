@@ -10,6 +10,7 @@ use sync_extend_core_model::{ContentId, SpaceId};
 use sync_extend_platform_fs::{FileKey, OriginalFileCreation, OwnedFileCreation};
 
 mod deployment_close;
+mod polling;
 pub use deployment_close::DeploymentFreshNodeResourceCloseFailure;
 mod runtime_budget;
 pub use runtime_budget::DeploymentNativeRuntimeLiability;
@@ -3927,6 +3928,7 @@ pub struct FreshRecoveredNodeWalV2Session {
     new_cas_objects: usize,
     new_cas_buckets: std::collections::BTreeMap<PathBuf, RecoveredCasBucket>,
     verified_main: std::cell::RefCell<Option<RecoveredVerificationKey>>,
+    polling: Option<polling::RecoveredPollingState>,
 }
 impl FreshRecoveredNodeWalV2Session {
     fn verify_objects(&self) -> Result<()> {
@@ -4435,6 +4437,7 @@ impl super::VerifiedNodeStateArchive {
             new_cas_objects: 0,
             new_cas_buckets: std::collections::BTreeMap::new(),
             verified_main: std::cell::RefCell::new(None),
+            polling: None,
         };
         result.record("intended", None)?;
         result.verify()?;
@@ -4817,6 +4820,7 @@ impl super::VerifiedNodeStateArchive {
             new_cas_objects: 0,
             new_cas_buckets: std::collections::BTreeMap::new(),
             verified_main: std::cell::RefCell::new(None),
+            polling: None,
         };
         result.record("intended", None)?;
         result.verify()?;
@@ -7139,6 +7143,7 @@ impl super::VerifiedNodeStateArchive {
             new_content_bytes: 0,
             new_cas_buckets: std::collections::BTreeMap::new(),
             verified_main: std::cell::RefCell::new(None),
+            polling: None,
             new_file_bytes: 0,
             new_cas_bytes: 0,
             new_cas_objects: 0,
@@ -9702,6 +9707,7 @@ impl super::VerifiedNodeStateArchive {
             new_content_bytes: 0,
             new_cas_buckets: std::collections::BTreeMap::new(),
             verified_main: std::cell::RefCell::new(None),
+            polling: None,
             new_file_bytes: 0,
             new_cas_bytes: 0,
             new_cas_objects: 0,

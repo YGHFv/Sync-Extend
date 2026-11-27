@@ -1757,11 +1757,13 @@ impl RecoveredLocalSpace {
         timestamp: u64,
     ) -> Result<SnapshotId> {
         self.verify()?;
+        self.session.polling_mutation_observation()?;
         self.session
             .replace_recovered_file_from_existing_content(path, source, timestamp)
     }
     pub fn delete_file(&mut self, path: &PortablePath, timestamp: u64) -> Result<SnapshotId> {
         self.verify()?;
+        self.session.polling_mutation_observation()?;
         self.session.delete_recovered_file(path, timestamp)
     }
     pub fn create_directory(&mut self, path: &PortablePath, timestamp: u64) -> Result<SnapshotId> {
@@ -1775,6 +1777,7 @@ impl RecoveredLocalSpace {
         timestamp: u64,
     ) -> Result<SnapshotId> {
         self.verify()?;
+        self.session.polling_mutation_observation()?;
         self.session
             .move_recovered_file(source, destination, timestamp)
     }
@@ -1785,6 +1788,7 @@ impl RecoveredLocalSpace {
         timestamp: u64,
     ) -> Result<SnapshotId> {
         self.verify()?;
+        self.session.polling_mutation_observation()?;
         self.session
             .replace_recovered_file_from_bytes(path, bytes, timestamp)
     }

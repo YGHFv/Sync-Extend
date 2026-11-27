@@ -76,6 +76,18 @@ impl DeploymentClosedNodeRuntime {
 }
 
 impl RecoveredLocalSpace {
+    pub(crate) fn deployment_polling_limits(&self) -> Option<serde_json::Value> {
+        self.session.polling_limits()
+    }
+    pub(crate) fn enable_deployment_polling(&mut self, limits: sync_extend_core_model::limits::LocalLimits) -> Result<()> {
+        self.session.enable_deployment_polling(limits)
+    }
+    pub(crate) fn scan_deployment_polling(&mut self, timestamp: u64) -> Result<crate::ScanResult> {
+        self.session.scan_deployment_polling(timestamp)
+    }
+    pub(crate) fn release_polling_observation(&mut self) -> Result<()> {
+        self.session.release_polling_observation()
+    }
     /// Explicit resource terminal for an owned failed runtime. It grants no
     /// usable closure/history receipt or restart path, and changes no pathname.
     /// Failure leaves the same actual object with its owning child.
@@ -121,7 +133,8 @@ impl RecoveredLocalSpace {
     pub fn close_deployment_runtime(
         mut self,
     ) -> std::result::Result<DeploymentClosedNodeRuntime, DeploymentNodeRuntimeCloseFailure> {
-        let mut first_error = self.verify().err();
+        let mut first_error = self.session.finish_deployment_polling().err();
+        if first_error.is_none() { first_error = self.verify().err(); }
         let evidence = (|| -> Result<_> {
             let actual = self.session.deployment_runtime_binding()?;
             Ok((
