@@ -668,9 +668,9 @@ impl crate::Journal {
 
 /// One owner connection, one Deferred transaction, and a temporary bounded VM
 /// guard shared by preview and pure context observations.
-#[cfg(windows)]
-type PreviewOwnerConnection = crate::original_readonly_close::JournalConnectionOwner;
-#[cfg(not(windows))]
+#[cfg(any(windows, target_os = "linux"))]
+type PreviewOwnerConnection = crate::journal_connection_owner::JournalConnectionOwner;
+#[cfg(not(any(windows, target_os = "linux")))]
 type PreviewOwnerConnection = rusqlite::Connection;
 
 fn with_live_preview_reader<T>(

@@ -285,9 +285,9 @@ pub enum ReceiveOutcome {
 }
 
 pub struct Journal {
-    #[cfg(windows)]
-    connection: original_readonly_close::JournalConnectionOwner,
-    #[cfg(not(windows))]
+    #[cfg(any(windows, target_os = "linux"))]
+    connection: journal_connection_owner::JournalConnectionOwner,
+    #[cfg(not(any(windows, target_os = "linux")))]
     connection: Connection,
     webdav_native_read_charges: webdav_native::DavReadChargeCache,
     #[cfg(target_os = "linux")]
@@ -3675,8 +3675,10 @@ pub use recovered_history_tables::{
 #[cfg(windows)]
 mod original_coordination;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 mod original_observation_budget;
+#[cfg(any(windows, target_os = "linux"))]
+mod journal_connection_owner;
 
 #[cfg(windows)]
 mod original_observation_terminal;
@@ -3716,7 +3718,7 @@ pub use backup_image::{
     OriginalNodeHistoryMappingEvidence, RetainedOriginalNodeHistory,
 };
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl Journal {
     pub(crate) fn from_original_planning_memory(
         connection: rusqlite::Connection,
@@ -3742,7 +3744,7 @@ impl Journal {
     ) -> std::result::Result<
         Self,
         (
-            original_readonly_close::JournalConnectionOwner,
+            journal_connection_owner::JournalConnectionOwner,
             JournalError,
         ),
     > {
@@ -3756,13 +3758,13 @@ impl Journal {
     /// Complete schema and callback preparation borrows the same owning slot.
     /// An original readonly connection never separates from its native IO.
     pub(crate) fn from_original_planning_connection_owner_retaining(
-        connection: original_readonly_close::JournalConnectionOwner,
+        connection: journal_connection_owner::JournalConnectionOwner,
         path: &std::path::Path,
         max_storage_entries: usize,
     ) -> std::result::Result<
         Self,
         (
-            original_readonly_close::JournalConnectionOwner,
+            journal_connection_owner::JournalConnectionOwner,
             JournalError,
         ),
     > {
@@ -3812,8 +3814,9 @@ impl Journal {
             )?;
             let webdav_original_final_row_issue =
                 webdav_native::final_row_gate::Gate::register(&connection)?;
-            // Non-Windows retains registration's callback-owned rejecting gate.
-            // There is no Windows native issuer on these targets.
+            // Non-Windows keeps each callback's rejecting state but drops the
+            // issuer: catalog/trigger inspection can resolve its function,
+            // while no Windows native execution capability is retained.
             #[cfg(not(windows))]
             let _ = (
                 webdav_native_execution_template_issue,
@@ -3920,6 +3923,10 @@ impl Journal {
                 connection: original_connection
                     .take()
                     .expect("prepared original planning connection"),
+                #[cfg(target_os = "linux")]
+                linux_metadata_vfs: None,
+                #[cfg(target_os = "linux")]
+                original_linux_cas_coordination: None,
                 webdav_native_read_charges: webdav_native::DavReadChargeCache::default(),
                 original_local_history_issuer: std::sync::Arc::new(()),
                 #[cfg(windows)]

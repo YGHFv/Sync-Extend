@@ -213,8 +213,8 @@ impl InspectionConnection for Connection {
     }
 }
 
-#[cfg(windows)]
-impl InspectionConnection for crate::original_readonly_close::JournalConnectionOwner {
+#[cfg(any(windows, target_os = "linux"))]
+impl InspectionConnection for crate::journal_connection_owner::JournalConnectionOwner {
     fn inspection_connection(&self) -> Result<&Connection> {
         self.original_ref().ok_or(JournalError::Invariant(
             "original inspection connection has already ended",
