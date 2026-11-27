@@ -120,10 +120,38 @@ pub(crate) fn local_dashboard() -> (Option<serde_json::Value>, &'static str) {
         "connection": connection, "easytier": easytier, "route": null, "traffic": null,
         "remote_backup_complete": false,
     });
-    match serde_json::to_vec(&value) {
-        Ok(bytes) if bytes.len() <= MAX_LOCAL_DASHBOARD => (Some(value), "available"),
-        Ok(_) => (None, "over_limit"),
-        Err(_) => (None, "unavailable"),
+    fit_local_dashboard(value)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn fit_local_dashboard(mut value: serde_json::Value) -> (Option<serde_json::Value>, &'static str) {
+    loop {
+        match serde_json::to_vec(&value) {
+            Ok(bytes) if bytes.len() <= MAX_LOCAL_DASHBOARD => {
+                return (Some(value), "available");
+            }
+            Ok(_) => {
+                // Charge the final UTF-8 response, including the other owner
+                // observations. Preserve capabilities and inventory totals
+                // when a file sample must shrink to fit the control protocol.
+                let Some(local) = value
+                    .get_mut("observation")
+                    .and_then(|observation| observation.get_mut("local"))
+                else {
+                    return (None, "over_limit");
+                };
+                let removed = local
+                    .get_mut("entries")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .and_then(Vec::pop)
+                    .is_some();
+                if !removed {
+                    return (None, "over_limit");
+                }
+                local["entries_truncated"] = true.into();
+            }
+            Err(_) => return (None, "unavailable"),
+        }
     }
 }
 
@@ -269,6 +297,27 @@ pub fn observe_local_space(local: &LocalSpace) {
     if collecting_local() {
         if let Ok(mut slot) = LOCAL_OBSERVATION.lock() {
             *slot = observation.as_ref().map(|value| {
+                // A bounded prefix of the same owner's actual source values.
+                // Measure serialized bytes: a long or escaped path must not
+                // turn a small inventory into an oversized native response.
+                let mut entries = Vec::new();
+                let mut entry_bytes = 2usize;
+                for entry in value.entries.iter().take(8) {
+                    let Ok(entry) = serde_json::to_value(entry) else {
+                        break;
+                    };
+                    let Ok(bytes) = serde_json::to_vec(&entry) else {
+                        break;
+                    };
+                    let next_bytes = entry_bytes + bytes.len() + usize::from(!entries.is_empty());
+                    if next_bytes > 1024 {
+                        break;
+                    }
+                    entry_bytes = next_bytes;
+                    entries.push(entry);
+                }
+                let entries_truncated =
+                    value.entries_truncated || entries.len() < value.total_entries;
                 (
                     Instant::now(),
                     serde_json::json!({
@@ -277,7 +326,9 @@ pub fn observe_local_space(local: &LocalSpace) {
                         "total_snapshots": value.total_snapshots,
                         "outstanding_mutations": value.outstanding_mutations,
                         "outstanding_publications": value.outstanding_publications,
-                        "entries_truncated": value.entries_truncated,
+                        "entries": entries,
+                        "entries_truncated": entries_truncated,
+                        "metadata_capabilities": value.metadata_capabilities,
                         "snapshots_truncated": value.snapshots_truncated,
                         "conflict_admissions_count": value.conflict_admissions.len(),
                         "conflict_admissions_truncated": value.conflict_admissions_truncated,
