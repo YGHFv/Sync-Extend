@@ -3646,6 +3646,7 @@ fn sql_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     sql_nonnegative(row.get::<_, i64>(index)?, index)
 }
 
+mod archived_windows_path;
 mod backup_image;
 mod recovered_history_tables;
 #[cfg(windows)]

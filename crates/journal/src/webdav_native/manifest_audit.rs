@@ -148,6 +148,32 @@ pub(super) fn audit(
     descriptions: &[WebDavNativeAdmission],
     executions: &[WebDavDurableExecution],
 ) -> Result<Vec<CompleteManifest>> {
+    audit_with_origin(connection, descriptions, executions, DatabaseOrigin::Live)
+}
+
+/// Inert original descriptions only. An archived database has no live pathname;
+/// its exact captured DataRoot remains a description, never a reopened handle.
+pub(super) fn audit_archived(
+    connection: &Connection,
+    descriptions: &[WebDavNativeAdmission],
+    executions: &[WebDavDurableExecution],
+) -> Result<()> {
+    audit_with_origin(connection, descriptions, executions, DatabaseOrigin::Archived)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum DatabaseOrigin {
+    Live,
+    Archived,
+}
+
+fn audit_with_origin(
+    connection: &Connection,
+    descriptions: &[WebDavNativeAdmission],
+    executions: &[WebDavDurableExecution],
+    origin: DatabaseOrigin,
+) -> Result<Vec<CompleteManifest>> {
     let rows: Vec<CompleteManifestRow> = connection
         .prepare_cached(
             "SELECT transaction_id,manifest_hash,template_count,binding_count,max_receipts,
@@ -321,14 +347,32 @@ pub(super) fn audit(
             }
             bindings.push(binding);
         }
+        let expected_data = match origin {
+            DatabaseOrigin::Live => std::fs::canonicalize(
+                connection.path().ok_or_else(invalid)?,
+            )?
+            .parent()
+            .ok_or_else(invalid)?
+            .to_owned(),
+            DatabaseOrigin::Archived => {
+                let mut roots = bindings.iter().filter(|binding| {
+                    matches!(binding.role, super::initial_binding::InitialBindingRole::DataRoot)
+                });
+                let root = roots.next().ok_or_else(invalid)?;
+                if roots.next().is_some() {
+                    return Err(invalid());
+                }
+                crate::archived_windows_path::ArchivedWindowsPath::parse(&root.absolute_path)?;
+                let path = std::path::Path::new(&root.absolute_path);
+                path.to_owned()
+            }
+        };
         super::binding_audit::audit(
             &baseline,
             &plan,
             &manifest.original_main,
             &bindings,
-            std::fs::canonicalize(connection.path().ok_or_else(invalid)?)?
-                .parent()
-                .ok_or_else(invalid)?,
+            &expected_data,
         )?;
         let history = future_history::plan(
             &baseline.space_id,

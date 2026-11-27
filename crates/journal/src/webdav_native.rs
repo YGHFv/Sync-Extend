@@ -273,6 +273,14 @@ pub(crate) fn audit(connection: &Connection) -> Result<Vec<WebDavNativeAdmission
     Ok(descriptions)
 }
 
+/// Validate the complete original DAV ledger as inert archived evidence.
+/// No native admission, binding, projection or execution token escapes.
+pub(crate) fn audit_archived(connection: &Connection) -> Result<()> {
+    let descriptions = audit_descriptions(connection)?;
+    let executions = execution::audit(connection)?;
+    manifest_audit::audit_archived(connection, &descriptions, &executions)
+}
+
 pub(crate) fn execution_outstanding(
     connection: &Connection,
 ) -> Result<sync_extend_core_model::tree_storage_capacity::TreeStorageCharge> {

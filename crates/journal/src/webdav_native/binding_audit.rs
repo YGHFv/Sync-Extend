@@ -6,7 +6,6 @@ use super::{
 use crate::{JournalError, JournalStorageColumnValue as Value, Result};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::{Path, PathBuf},
 };
 use sync_extend_core_model::{
     ContentId, EntryKind, Manifest,
@@ -23,8 +22,11 @@ pub(super) fn audit(
     plan: &WebDavNativePlan,
     original: &[OriginalMainRow],
     bindings: &[InitialHeldBinding],
-    expected_data: &Path,
+    expected_data: &std::path::Path,
 ) -> Result<()> {
+    let expected_data = crate::archived_windows_path::ArchivedWindowsPath::parse(
+        expected_data.to_str().ok_or_else(invalid)?,
+    )?;
     let root = original
         .iter()
         .find(|row| row.table == "local_state" && row.primary_key == ["worktree"])
@@ -35,18 +37,18 @@ pub(super) fn audit(
     if key != "worktree" {
         return Err(invalid());
     }
-    let root = Path::new(root);
-    if !root.is_absolute() || bindings.is_empty() {
+    let root = crate::archived_windows_path::ArchivedWindowsPath::parse(root)?;
+    if bindings.is_empty() {
         return Err(invalid());
     }
-    let marker_dir = root.join(".sync-extend");
-    let marker_file = marker_dir.join("space-id");
+    let marker_dir = root.join_portable(".sync-extend")?;
+    let marker_file = marker_dir.join_portable("space-id")?;
     let mut by_path = BTreeMap::new();
     let mut identities = BTreeSet::<TreeNativeIdentity>::new();
     let mut role_keys = BTreeSet::new();
     let mut baseline_entries = BTreeSet::new();
     let mut actual_chunks = BTreeMap::new();
-    let mut cas_base: Option<PathBuf> = None;
+    let mut cas_base = None;
     let quarantine: BTreeSet<_> = plan
         .steps()
         .iter()
@@ -60,14 +62,13 @@ pub(super) fn audit(
         })
         .collect();
     for (index, binding) in bindings.iter().enumerate() {
-        let path = Path::new(&binding.absolute_path);
+        let path = crate::archived_windows_path::ArchivedWindowsPath::parse(&binding.absolute_path)?;
         binding.identity.validate()?;
         if binding.index != index
             || binding.plan_hash != *plan.fingerprint()
             || binding.baseline_hash != baseline.root()?
-            || !path.is_absolute()
             || !identities.insert(binding.identity.clone())
-            || by_path.insert(path.to_owned(), binding).is_some()
+            || by_path.insert(path.clone(), binding).is_some()
         {
             return Err(invalid());
         }
@@ -78,7 +79,7 @@ pub(super) fn audit(
                 }
             }
             InitialBindingRole::DataAncestor => {
-                if path == expected_data || !expected_data.starts_with(path) {
+                if path == expected_data || !expected_data.starts_with(&path) {
                     return Err(invalid());
                 }
             }
@@ -114,7 +115,7 @@ pub(super) fn audit(
                 if entry.kind != EntryKind::Directory
                     || *mutation_handle != quarantine.contains(&entry.entry_id)
                     || baseline.entries.get(&entry.entry_id) != Some(entry)
-                    || path != root.join(entry.path.as_str())
+                    || path != root.join_portable(entry.path.as_str())?
                     || plan
                         .inventory()
                         .entries
@@ -132,7 +133,7 @@ pub(super) fn audit(
             InitialBindingRole::BaselineFile { entry } => {
                 if entry.kind != EntryKind::File
                     || baseline.entries.get(&entry.entry_id) != Some(entry)
-                    || path != root.join(entry.path.as_str())
+                    || path != root.join_portable(entry.path.as_str())?
                     || plan
                         .inventory()
                         .entries
@@ -151,13 +152,13 @@ pub(super) fn audit(
                 let parent = path.parent().ok_or_else(invalid)?;
                 let objects = parent.parent().ok_or_else(invalid)?;
                 let base = objects.parent().ok_or_else(invalid)?;
-                if path.file_name().and_then(|name| name.to_str()) != Some(content_id.as_str())
-                    || parent.file_name().and_then(|name| name.to_str())
+                if path.file_name() != Some(content_id.as_str())
+                    || parent.file_name()
                         != Some(&content_id.as_str()[..2])
-                    || objects.file_name().and_then(|name| name.to_str()) != Some("objects")
-                    || base.file_name().and_then(|name| name.to_str()) != Some("cas")
-                    || cas_base.as_ref().is_some_and(|old| old != base)
-                    || base != expected_data.join("cas")
+                    || objects.file_name() != Some("objects")
+                    || base.file_name() != Some("cas")
+                    || cas_base.as_ref().is_some_and(|old| old != &base)
+                    || base != expected_data.join_portable("cas")?
                     || actual_chunks.insert(content_id.clone(), *length).is_some()
                 {
                     return Err(invalid());
@@ -165,7 +166,7 @@ pub(super) fn audit(
                 cas_base = Some(base.to_owned());
             }
             InitialBindingRole::WorktreeAncestor => {
-                if path == root || !root.starts_with(path) {
+                if path == root || !root.starts_with(&path) {
                     return Err(invalid());
                 }
             }
@@ -199,7 +200,9 @@ pub(super) fn audit(
         if let InitialBindingRole::CasAncestor = &binding.role {
             if !bindings.iter().any(|chunk| {
                 matches!(chunk.role, InitialBindingRole::CasChunk { .. })
-                    && Path::new(&chunk.absolute_path).starts_with(path)
+                    && crate::archived_windows_path::ArchivedWindowsPath::parse(
+                        &chunk.absolute_path,
+                    ).is_ok_and(|chunk| chunk.starts_with(path))
             }) {
                 return Err(invalid());
             }
@@ -208,7 +211,7 @@ pub(super) fn audit(
             .parent()
             .map(|parent| {
                 by_path
-                    .get(parent)
+                    .get(&parent)
                     .map(|binding| binding.identity.clone())
                     .ok_or_else(invalid)
             })

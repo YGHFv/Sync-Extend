@@ -242,7 +242,7 @@ fn original_identity(rows: &[JournalStoredRow], space: &SpaceId) -> Result<()> {
         }
     }
     match (state(rows, "worktree")?, state(rows, "storage_role")?) {
-        (Some(worktree), None) => absolute_root(worktree)?,
+        (Some(worktree), None) => original_absolute_root(worktree, rows)?,
         (None, Some("storage-v1")) => {
             let actual: Vec<_> = rows
                 .iter()
@@ -278,6 +278,18 @@ fn absolute_root(value: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn original_absolute_root(value: &str, rows: &[JournalStoredRow]) -> Result<()> {
+    // A complete DAV native binding set is issued only by the Windows native
+    // adapter. Its original root uses that source grammar on every audit host.
+    // A projected fresh writer root continues to use the current host grammar.
+    if rows.iter().any(|row| row.table() == "webdav_native_execution_bindings") {
+        crate::archived_windows_path::ArchivedWindowsPath::parse(value)?;
+        Ok(())
+    } else {
+        absolute_root(value)
+    }
 }
 
 fn singleton_clocks(rows: &[JournalStoredRow]) -> Result<()> {
@@ -399,7 +411,7 @@ fn typed_families(
     };
     singleton_clocks(rows)?;
     crate::deletion_retention::audit(connection, space, bounds.max_entries)?;
-    crate::webdav_native::audit(connection)?;
+    crate::webdav_native::audit_archived(connection)?;
     tree_preflight(connection, bounds.max_entries)?;
     view.snapshot_audit(space)?;
     view.current(space)?;
@@ -1115,7 +1127,7 @@ fn projection(
     match worktree {
         Some(original) if roots.len() == 1 => {
             let mapping = &roots[0];
-            absolute_root(mapping.original_worktree())?;
+            original_absolute_root(mapping.original_worktree(), rows)?;
             absolute_root(mapping.projected_worktree())?;
             if mapping.original_worktree() != original
                 || mapping.original_worktree() == mapping.projected_worktree()

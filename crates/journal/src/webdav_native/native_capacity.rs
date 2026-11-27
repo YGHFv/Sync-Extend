@@ -104,26 +104,24 @@ impl NativeHandles {
         admission_limit: usize,
     ) -> Result<Self> {
         use super::initial_binding::InitialBindingRole as R;
-        let find = |role: fn(&R) -> bool| -> Result<&std::path::Path> {
+        let find = |role: fn(&R) -> bool| -> Result<crate::archived_windows_path::ArchivedWindowsPath> {
             let mut found = bindings.iter().filter(|binding| role(&binding.role));
             let first = found.next().ok_or_else(invalid)?;
             if found.next().is_some() {
                 return Err(invalid());
             }
-            Ok(std::path::Path::new(&first.absolute_path))
+            crate::archived_windows_path::ArchivedWindowsPath::parse(&first.absolute_path)
         };
         let data = find(|role| matches!(role, R::DataRoot))?;
         let worktree_owner = find(|role| matches!(role, R::MarkerDirectory))?;
-        if !data.is_absolute()
-            || !worktree_owner.is_absolute()
-            || admission_limit == 0
+        if admission_limit == 0
             || admission_limit > crate::limits::MAX_ENTRIES
         {
             return Err(invalid());
         }
         // WriterOwner holds its lock file plus every actual absolute ancestor.
-        let process_owner_handles = (data.ancestors().count() as u64)
-            .checked_add(worktree_owner.ancestors().count() as u64)
+        let process_owner_handles = (data.ancestor_count() as u64)
+            .checked_add(worktree_owner.ancestor_count() as u64)
             .and_then(|count| count.checked_add(2))
             .ok_or_else(invalid)?;
         let original_objects = bindings.len() as u64;
