@@ -40,7 +40,7 @@ pub(crate) fn validate(connection: &Connection) -> Result<()> {
             CREATE TABLE storage_retirement_payload_events(request_id TEXT);
             CREATE TABLE storage_retirement_cancellations(request_id TEXT);",
         )?;
-        expected.execute_batch(include_str!("../migration-062.sql"))?;
+        expected.execute_batch(journal_sql!("migration-062.sql"))?;
         let definitions = objects(&expected)?;
         // The reference uses only this candidate's compiled SQL. A concurrent
         // builder computes the same immutable definitions; actual schemas and

@@ -22,7 +22,7 @@ const FILE_NAME: &str = "storage-pull-attempt-budget.sqlite";
 const MAX_ENTRIES: u64 = 100_000;
 const MAX_RECORD_BYTES: usize = 2048;
 const MAX_POLICY_BYTES: usize = 16_384;
-const SCHEMA: &str = include_str!("storage-pull-attempt-budget-schema.sql");
+const SCHEMA: &str = journal_sql!("storage-pull-attempt-budget-schema.sql");
 
 /// Every field is explicit; quota, period and route exemptions have no defaults.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

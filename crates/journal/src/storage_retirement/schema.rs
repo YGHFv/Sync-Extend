@@ -80,7 +80,7 @@ pub(crate) fn validate(connection: &Connection) -> Result<()> {
     if EXPECTED.get().is_none() {
         let expected = Connection::open_in_memory()?;
         expected.execute_batch("CREATE TABLE snapshot_objects(content_id TEXT); CREATE TABLE publication_objects(content_id TEXT); CREATE TABLE mutation_objects(content_id TEXT); CREATE TABLE read_lease_objects(content_id TEXT); CREATE TABLE reference_reservation_objects(content_id TEXT); CREATE TABLE tree_restore_objects(content_id TEXT); CREATE TABLE tree_restore_original_objects(content_id TEXT); CREATE TABLE remote_replace_objects(content_id TEXT); CREATE TABLE conflict_resolution_objects(content_id TEXT); CREATE TABLE conflict_resolution_native_history_objects(content_id TEXT); CREATE TABLE gc_marks(content_id TEXT); CREATE TABLE gc_executions(content_id TEXT);")?;
-        expected.execute_batch(include_str!("../migration-059.sql"))?;
+        expected.execute_batch(journal_sql!("migration-059.sql"))?;
         let definitions = objects(&expected)?;
         // The reference uses only this candidate's compiled SQL. A concurrent
         // builder computes the same immutable definitions; actual schemas and

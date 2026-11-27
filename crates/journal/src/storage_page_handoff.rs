@@ -55,7 +55,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
              CREATE TRIGGER reference_reservation_pin_no_delete BEFORE DELETE
              ON reference_reservation_objects BEGIN SELECT 1; END;",
         )?;
-        expected.execute_batch(include_str!("migration-057.sql"))?;
+        expected.execute_batch(journal_sql!("migration-057.sql"))?;
         let definitions = objects(&expected)?;
         let _ = EXPECTED.set(definitions);
     }

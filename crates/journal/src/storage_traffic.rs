@@ -225,7 +225,7 @@ impl StorageTrafficLedger {
         )?;
         if create {
             let tx = connection.unchecked_transaction()?;
-            tx.execute_batch(include_str!("storage-traffic-schema.sql"))?;
+            tx.execute_batch(journal_sql!("storage-traffic-schema.sql"))?;
             tx.execute(
                 "INSERT INTO owner VALUES(?1,?2,?3,?4,?5)",
                 params![

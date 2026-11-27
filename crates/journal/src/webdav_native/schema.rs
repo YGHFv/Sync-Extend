@@ -82,8 +82,8 @@ pub(crate) fn validate(connection: &Connection) -> Result<()> {
             CREATE TABLE snapshot_prunings(snapshot_id TEXT);
             CREATE TABLE snapshot_objects(snapshot_id TEXT);",
         )?;
-        expected.execute_batch(include_str!("../migration-064.sql"))?;
-        expected.execute_batch(include_str!("../migration-065.sql"))?;
+        expected.execute_batch(journal_sql!("migration-064.sql"))?;
+        expected.execute_batch(journal_sql!("migration-065.sql"))?;
         let definitions = objects(&expected)?;
         // The reference uses only this candidate's compiled SQL. A concurrent
         // builder computes the same immutable definitions; actual schemas and

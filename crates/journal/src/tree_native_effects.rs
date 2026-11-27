@@ -107,10 +107,10 @@ pub(crate) fn preflight(connection: &Connection) -> Result<()> {
 
 pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     let triggers = [
-        include_str!("migration-052.sql"),
-        include_str!("migration-053.sql"),
-        include_str!("migration-054.sql"),
-        include_str!("migration-055.sql"),
+        journal_sql!("migration-052.sql"),
+        journal_sql!("migration-053.sql"),
+        journal_sql!("migration-054.sql"),
+        journal_sql!("migration-055.sql"),
     ]
     .join("\n");
     let mut expected_triggers = BTreeMap::new();

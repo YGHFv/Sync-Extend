@@ -393,8 +393,8 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
                 "CREATE TABLE {table}(snapshot_id TEXT PRIMARY KEY);"
             ))?;
         }
-        expected.execute_batch(include_str!("migration-041.sql"))?;
-        expected.execute_batch(include_str!("remote_replace_retirement_fences.sql"))?;
+        expected.execute_batch(journal_sql!("migration-041.sql"))?;
+        expected.execute_batch(journal_sql!("remote_replace_retirement_fences.sql"))?;
         for name in [
             "unix_storage_retirement_v1_fence_remote_replace_objects_insert",
             "unix_storage_retirement_v1_fence_remote_replace_objects_update",

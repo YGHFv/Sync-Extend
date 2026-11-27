@@ -534,11 +534,11 @@ pub(crate) fn validate_schema(connection: &rusqlite::Connection) -> Result<()> {
     static EXPECTED: std::sync::OnceLock<Objects> = std::sync::OnceLock::new();
     if EXPECTED.get().is_none() {
         let expected = rusqlite::Connection::open_in_memory()?;
-        expected.execute_batch(include_str!("migration-034.sql"))?;
-        expected.execute_batch(include_str!("migration-035.sql"))?;
-        expected.execute_batch(include_str!("migration-036.sql"))?;
-        expected.execute_batch(include_str!("migration-037.sql"))?;
-        expected.execute_batch(include_str!("migration-038.sql"))?;
+        expected.execute_batch(journal_sql!("migration-034.sql"))?;
+        expected.execute_batch(journal_sql!("migration-035.sql"))?;
+        expected.execute_batch(journal_sql!("migration-036.sql"))?;
+        expected.execute_batch(journal_sql!("migration-037.sql"))?;
+        expected.execute_batch(journal_sql!("migration-038.sql"))?;
         let definitions = objects(&expected)?;
         let _ = EXPECTED.set(definitions);
     }

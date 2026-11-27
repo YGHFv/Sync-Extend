@@ -287,8 +287,8 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
                 "CREATE TABLE {table}(snapshot_id TEXT PRIMARY KEY);"
             ))?;
         }
-        expected.execute_batch(include_str!("migration-040.sql"))?;
-        expected.execute_batch(include_str!("migration-067.sql"))?;
+        expected.execute_batch(journal_sql!("migration-040.sql"))?;
+        expected.execute_batch(journal_sql!("migration-067.sql"))?;
         let definitions = objects(&expected)?;
         let _ = EXPECTED.set(definitions);
     }

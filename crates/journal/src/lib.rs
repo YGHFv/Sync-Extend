@@ -1,3 +1,6 @@
+// Every actual and reference SQL execution uses the same trusted build bytes.
+include!(concat!(env!("OUT_DIR"), "/journal_sql_macros.rs"));
+
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::{path::Path, time::Duration};
 use sync_extend_core_model::*;
@@ -1034,7 +1037,7 @@ impl Journal {
         match version {
             0 => {
                 let tx = connection.transaction()?;
-                tx.execute_batch(include_str!("schema.sql"))?;
+                tx.execute_batch(journal_sql!("schema.sql"))?;
                 tx.commit()?;
             }
             1..=SCHEMA_VERSION => {}
@@ -1042,7 +1045,7 @@ impl Journal {
         }
         if version < 2 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-002.sql"))?;
+            tx.execute_batch(journal_sql!("migration-002.sql"))?;
             let retained: Vec<(String, String)> = {
                 let mut statement = tx.prepare("SELECT snapshot_id,manifest FROM snapshots")?;
                 let rows = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -1061,352 +1064,352 @@ impl Journal {
         }
         if version < 3 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-003.sql"))?;
+            tx.execute_batch(journal_sql!("migration-003.sql"))?;
             tx.commit()?;
         }
         if version < 4 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-004.sql"))?;
+            tx.execute_batch(journal_sql!("migration-004.sql"))?;
             tx.commit()?;
         }
         if version < 5 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-005.sql"))?;
+            tx.execute_batch(journal_sql!("migration-005.sql"))?;
             tx.commit()?;
         }
         if version < 6 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-006.sql"))?;
+            tx.execute_batch(journal_sql!("migration-006.sql"))?;
             tx.commit()?;
         }
         if version < 7 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-007.sql"))?;
+            tx.execute_batch(journal_sql!("migration-007.sql"))?;
             tx.commit()?;
         }
         if version < 8 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-008.sql"))?;
+            tx.execute_batch(journal_sql!("migration-008.sql"))?;
             tx.commit()?;
         }
         if version < 9 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-009.sql"))?;
+            tx.execute_batch(journal_sql!("migration-009.sql"))?;
             tx.commit()?;
         }
         if version < 10 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-010.sql"))?;
+            tx.execute_batch(journal_sql!("migration-010.sql"))?;
             tx.commit()?;
         }
         if version < 11 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-011.sql"))?;
+            tx.execute_batch(journal_sql!("migration-011.sql"))?;
             tx.commit()?;
         }
         if version < 12 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-012.sql"))?;
+            tx.execute_batch(journal_sql!("migration-012.sql"))?;
             tx.commit()?;
         }
         if version < 13 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-013.sql"))?;
+            tx.execute_batch(journal_sql!("migration-013.sql"))?;
             tx.commit()?;
         }
         if version < 14 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-014.sql"))?;
+            tx.execute_batch(journal_sql!("migration-014.sql"))?;
             tx.commit()?;
         }
         if version < 15 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-015.sql"))?;
+            tx.execute_batch(journal_sql!("migration-015.sql"))?;
             tx.commit()?;
         }
         if version < 16 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-016.sql"))?;
+            tx.execute_batch(journal_sql!("migration-016.sql"))?;
             tx.commit()?;
         }
         if version < 17 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-017.sql"))?;
+            tx.execute_batch(journal_sql!("migration-017.sql"))?;
             tx.commit()?;
         }
         if version < 18 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-018.sql"))?;
+            tx.execute_batch(journal_sql!("migration-018.sql"))?;
             tx.commit()?;
         }
         if version < 19 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-019.sql"))?;
+            tx.execute_batch(journal_sql!("migration-019.sql"))?;
             tx.commit()?;
         }
         if version < 20 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-020.sql"))?;
+            tx.execute_batch(journal_sql!("migration-020.sql"))?;
             tx.commit()?;
         }
         if version < 21 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-021.sql"))?;
+            tx.execute_batch(journal_sql!("migration-021.sql"))?;
             tx.commit()?;
         }
         if version < 22 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-022.sql"))?;
+            tx.execute_batch(journal_sql!("migration-022.sql"))?;
             tx.commit()?;
         }
         if version < 23 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-023.sql"))?;
+            tx.execute_batch(journal_sql!("migration-023.sql"))?;
             tx.commit()?;
         }
         if version < 24 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-024.sql"))?;
+            tx.execute_batch(journal_sql!("migration-024.sql"))?;
             tx.commit()?;
         }
         if version < 25 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-025.sql"))?;
+            tx.execute_batch(journal_sql!("migration-025.sql"))?;
             tx.commit()?;
         }
         if version < 26 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-026.sql"))?;
+            tx.execute_batch(journal_sql!("migration-026.sql"))?;
             tx.commit()?;
         }
         if version < 27 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-027.sql"))?;
+            tx.execute_batch(journal_sql!("migration-027.sql"))?;
             tx.commit()?;
         }
         if version < 28 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-028.sql"))?;
+            tx.execute_batch(journal_sql!("migration-028.sql"))?;
             tx.commit()?;
         }
         if version < 29 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-029.sql"))?;
+            tx.execute_batch(journal_sql!("migration-029.sql"))?;
             tx.commit()?;
         }
         if version < 30 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-030.sql"))?;
+            tx.execute_batch(journal_sql!("migration-030.sql"))?;
             tx.commit()?;
         }
         if version < 31 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-031.sql"))?;
+            tx.execute_batch(journal_sql!("migration-031.sql"))?;
             tx.commit()?;
         }
         if version < 32 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-032.sql"))?;
+            tx.execute_batch(journal_sql!("migration-032.sql"))?;
             tx.commit()?;
         }
         if version < 33 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-033.sql"))?;
+            tx.execute_batch(journal_sql!("migration-033.sql"))?;
             tx.commit()?;
         }
         if version < 34 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-034.sql"))?;
+            tx.execute_batch(journal_sql!("migration-034.sql"))?;
             tx.commit()?;
         }
         if version < 35 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-035.sql"))?;
+            tx.execute_batch(journal_sql!("migration-035.sql"))?;
             tx.commit()?;
         }
         if version < 36 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-036.sql"))?;
+            tx.execute_batch(journal_sql!("migration-036.sql"))?;
             tx.commit()?;
         }
         if version < 37 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-037.sql"))?;
+            tx.execute_batch(journal_sql!("migration-037.sql"))?;
             tx.commit()?;
         }
         if version < 38 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-038.sql"))?;
+            tx.execute_batch(journal_sql!("migration-038.sql"))?;
             tx.commit()?;
         }
         if version < 39 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-039.sql"))?;
+            tx.execute_batch(journal_sql!("migration-039.sql"))?;
             tx.commit()?;
         }
         if version < 40 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-040.sql"))?;
+            tx.execute_batch(journal_sql!("migration-040.sql"))?;
             tx.commit()?;
         }
         if version < 41 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-041.sql"))?;
+            tx.execute_batch(journal_sql!("migration-041.sql"))?;
             tx.commit()?;
         }
         if version < 42 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-042.sql"))?;
+            tx.execute_batch(journal_sql!("migration-042.sql"))?;
             tx.commit()?;
         }
         if version < 43 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-043.sql"))?;
+            tx.execute_batch(journal_sql!("migration-043.sql"))?;
             tx.commit()?;
         }
         if version < 44 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-044.sql"))?;
+            tx.execute_batch(journal_sql!("migration-044.sql"))?;
             tx.commit()?;
         }
         if version < 45 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-045.sql"))?;
+            tx.execute_batch(journal_sql!("migration-045.sql"))?;
             tx.commit()?;
         }
         if version < 46 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-046.sql"))?;
+            tx.execute_batch(journal_sql!("migration-046.sql"))?;
             tx.commit()?;
         }
         if version < 47 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-047.sql"))?;
+            tx.execute_batch(journal_sql!("migration-047.sql"))?;
             tx.commit()?;
         }
         if version < 48 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-048.sql"))?;
+            tx.execute_batch(journal_sql!("migration-048.sql"))?;
             tx.commit()?;
         }
         if version < 49 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-049.sql"))?;
+            tx.execute_batch(journal_sql!("migration-049.sql"))?;
             tx.commit()?;
         }
         if version < 50 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-050.sql"))?;
+            tx.execute_batch(journal_sql!("migration-050.sql"))?;
             tx.commit()?;
         }
         if version < 51 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-051.sql"))?;
+            tx.execute_batch(journal_sql!("migration-051.sql"))?;
             tx.commit()?;
         }
         if version < 52 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-052.sql"))?;
+            tx.execute_batch(journal_sql!("migration-052.sql"))?;
             tx.commit()?;
         }
         if version < 53 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-053.sql"))?;
+            tx.execute_batch(journal_sql!("migration-053.sql"))?;
             tx.commit()?;
         }
         if version < 54 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-054.sql"))?;
+            tx.execute_batch(journal_sql!("migration-054.sql"))?;
             tx.commit()?;
         }
         if version < 55 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-055.sql"))?;
+            tx.execute_batch(journal_sql!("migration-055.sql"))?;
             tx.commit()?;
         }
         if version < 56 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-056.sql"))?;
+            tx.execute_batch(journal_sql!("migration-056.sql"))?;
             tx.commit()?;
         }
         if version < 57 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-057.sql"))?;
+            tx.execute_batch(journal_sql!("migration-057.sql"))?;
             tx.commit()?;
         }
         if version < 58 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-058.sql"))?;
+            tx.execute_batch(journal_sql!("migration-058.sql"))?;
             tx.commit()?;
         }
         if version < 59 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-059.sql"))?;
+            tx.execute_batch(journal_sql!("migration-059.sql"))?;
             tx.commit()?;
         }
         if version < 60 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-060.sql"))?;
+            tx.execute_batch(journal_sql!("migration-060.sql"))?;
             tx.commit()?;
         }
         if version < 61 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-061.sql"))?;
+            tx.execute_batch(journal_sql!("migration-061.sql"))?;
             tx.commit()?;
         }
         if version < 62 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-062.sql"))?;
+            tx.execute_batch(journal_sql!("migration-062.sql"))?;
             tx.commit()?;
         }
         if version < 63 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-063.sql"))?;
+            tx.execute_batch(journal_sql!("migration-063.sql"))?;
             tx.commit()?;
         }
         if version < 64 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-064.sql"))?;
+            tx.execute_batch(journal_sql!("migration-064.sql"))?;
             tx.commit()?;
         }
         if version < 65 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-065.sql"))?;
+            tx.execute_batch(journal_sql!("migration-065.sql"))?;
             tx.commit()?;
         }
         if version < 66 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-066.sql"))?;
+            tx.execute_batch(journal_sql!("migration-066.sql"))?;
             tx.commit()?;
         }
         if version < 67 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-067.sql"))?;
+            tx.execute_batch(journal_sql!("migration-067.sql"))?;
             tx.commit()?;
         }
         if version < 68 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-068.sql"))?;
+            tx.execute_batch(journal_sql!("migration-068.sql"))?;
             tx.commit()?;
         }
         if version < 69 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-069.sql"))?;
+            tx.execute_batch(journal_sql!("migration-069.sql"))?;
             tx.commit()?;
         }
         if version < 70 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-070.sql"))?;
+            tx.execute_batch(journal_sql!("migration-070.sql"))?;
             tx.commit()?;
         }
         if version < 71 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-071.sql"))?;
+            tx.execute_batch(journal_sql!("migration-071.sql"))?;
             tx.commit()?;
         }
         if version < 72 {
             let tx = connection.transaction()?;
-            tx.execute_batch(include_str!("migration-072.sql"))?;
+            tx.execute_batch(journal_sql!("migration-072.sql"))?;
             tx.commit()?;
         }
         if version < 73 {

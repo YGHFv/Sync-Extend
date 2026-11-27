@@ -205,7 +205,7 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     static EXPECTED: std::sync::OnceLock<Vec<Object>> = std::sync::OnceLock::new();
     if EXPECTED.get().is_none() {
         let expected = Connection::open_in_memory()?;
-        expected.execute_batch(include_str!("migration-049.sql"))?;
+        expected.execute_batch(journal_sql!("migration-049.sql"))?;
         let definitions = objects(&expected)?;
         let _ = EXPECTED.set(definitions);
     }

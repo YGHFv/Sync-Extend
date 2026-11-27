@@ -1778,7 +1778,7 @@ pub(super) fn migrate_schema73(database: &mut Connection) -> Result<()> {
         {
             return Err(invalid("native history migration page limits not applied"));
         }
-        transaction.execute_batch(include_str!("../migration-073.sql"))?;
+        transaction.execute_batch(journal_sql!("migration-073.sql"))?;
         integrity(&transaction)?;
         super::schema_catalog::validate_schema(&transaction, 73)?;
         budget.check_time()?;
@@ -2051,7 +2051,7 @@ pub(super) fn migrate_schema74(database: &mut Connection) -> Result<()> {
                 }
             }
         }
-        tx.execute_batch(include_str!("../migration-074.sql"))?;
+        tx.execute_batch(journal_sql!("migration-074.sql"))?;
         catalog(&tx, NativeHistoryFamilyRegistry::for_schema(74)?)?;
         integrity(&tx)?;
         let after = read_complete_rows(&tx, NativeHistoryFamilyRegistry::for_schema(74)?, bounds)?;

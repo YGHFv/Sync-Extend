@@ -387,7 +387,7 @@ impl StorageTrafficLedger {
             Ok(rows.collect::<rusqlite::Result<_>>()?)
         }
         let expected = Connection::open_in_memory()?;
-        expected.execute_batch(include_str!("../storage-traffic-schema.sql"))?;
+        expected.execute_batch(journal_sql!("storage-traffic-schema.sql"))?;
         let expected_schema = schema(&expected, 65)?;
         if expected_schema.is_empty()
             || expected_schema.len() > 64

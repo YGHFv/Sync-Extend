@@ -398,7 +398,7 @@ pub(crate) fn compiled_unix_retirement_trigger_sql(name: &str) -> Result<&'stati
         for table in crate::storage_retirement_unix::schema::REFERENCES {
             reference.execute_batch(&format!("CREATE TABLE {table}(content_id TEXT);"))?;
         }
-        reference.execute_batch(include_str!("migration-068.sql"))?;
+        reference.execute_batch(journal_sql!("migration-068.sql"))?;
         let definitions = reference
             .prepare("SELECT name,sql FROM main.sqlite_schema WHERE type='trigger' ORDER BY name")?
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -448,18 +448,18 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
                 "CREATE TABLE {table}(snapshot_id TEXT PRIMARY KEY);"
             ))?;
         }
-        expected.execute_batch(include_str!("migration-042.sql"))?;
-        expected.execute_batch(include_str!("migration-043.sql"))?;
-        expected.execute_batch(include_str!("migration-044.sql"))?;
-        expected.execute_batch(include_str!("migration-045.sql"))?;
+        expected.execute_batch(journal_sql!("migration-042.sql"))?;
+        expected.execute_batch(journal_sql!("migration-043.sql"))?;
+        expected.execute_batch(journal_sql!("migration-044.sql"))?;
+        expected.execute_batch(journal_sql!("migration-045.sql"))?;
         expected.execute_batch(
             "CREATE TABLE reference_reservation_objects(owner_id TEXT,content_id TEXT);
              CREATE TRIGGER reference_reservation_pin_no_delete BEFORE DELETE ON reference_reservation_objects BEGIN SELECT RAISE(ABORT,'reference reservation release is unavailable'); END;"
         )?;
-        expected.execute_batch(include_str!("migration-046.sql"))?;
-        expected.execute_batch(include_str!("migration-047.sql"))?;
-        expected.execute_batch(include_str!("migration-048.sql"))?;
-        expected.execute_batch(include_str!("conflict_resolution_retirement_fences.sql"))?;
+        expected.execute_batch(journal_sql!("migration-046.sql"))?;
+        expected.execute_batch(journal_sql!("migration-047.sql"))?;
+        expected.execute_batch(journal_sql!("migration-048.sql"))?;
+        expected.execute_batch(journal_sql!("conflict_resolution_retirement_fences.sql"))?;
         for name in [
             "unix_storage_retirement_v1_fence_conflict_resolution_objects_insert",
             "unix_storage_retirement_v1_fence_conflict_resolution_objects_update",

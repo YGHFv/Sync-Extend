@@ -41,7 +41,7 @@ pub(crate) fn validate(connection: &Connection) -> Result<()> {
             CREATE TABLE storage_retirement_disposal_events(request_id TEXT);
             CREATE TABLE storage_retirement_cancellations(request_id TEXT);
             CREATE TRIGGER storage_retirement_owner_cancel_refusal BEFORE INSERT ON storage_retirement_cancellations BEGIN SELECT 1; END;")?;
-        expected.execute_batch(include_str!("../migration-063.sql"))?;
+        expected.execute_batch(journal_sql!("migration-063.sql"))?;
         let definitions = objects(&expected)?;
         // The reference uses only this candidate's compiled SQL. A concurrent
         // builder computes the same immutable definitions; actual schemas and

@@ -97,8 +97,8 @@ pub(crate) fn validate(connection: &Connection) -> Result<()> {
         for table in REFERENCES {
             expected.execute_batch(&format!("CREATE TABLE {table}(content_id TEXT);"))?;
         }
-        expected.execute_batch(include_str!("../migration-068.sql"))?;
-        expected.execute_batch(include_str!("../migration-069.sql"))?;
+        expected.execute_batch(journal_sql!("migration-068.sql"))?;
+        expected.execute_batch(journal_sql!("migration-069.sql"))?;
         let _ = EXPECTED.set(objects(&expected)?);
     }
     let shadow: bool = connection.query_row(
