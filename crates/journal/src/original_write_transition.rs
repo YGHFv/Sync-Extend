@@ -866,7 +866,65 @@ fn original_history_diff(
     }
     let old: BTreeMap<_, _> = before.iter().map(|r| (key(r), r)).collect();
     let new: BTreeMap<_, _> = after.iter().map(|r| (key(r), r)).collect();
-    if old.keys().any(|k| !new.contains_key(k)) {
+    let text = |row: &crate::JournalStoredRow, name: &str| -> Result<String> {
+        match row.columns().iter().find(|column| column.name == name) {
+            Some(crate::JournalStorageColumn {
+                value: Value::Text(value),
+                ..
+            }) => Ok(value.clone()),
+            _ => Err(JournalError::Invariant(
+                "original rename observation text column",
+            )),
+        }
+    };
+    // Updating the exact current snapshot invokes the audited original
+    // rename_observation_current_update trigger. Its sole removable row is the
+    // old same-space observation cache; this grants no direct DELETE statement
+    // and leaves the archived source image and original physical IDs untouched.
+    let released_observation = before
+        .iter()
+        .find(|row| row.table() == "rename_observations")
+        .map(|row| -> Result<Option<(String, Vec<String>)>> {
+            if new.contains_key(&key(row)) {
+                return Ok(None);
+            }
+            let space = text(row, "space_id")?;
+            if row.primary_key() != [space.clone()] || row.columns().len() != 4 {
+                return Err(JournalError::Invariant(
+                    "original rename observation exact row",
+                ));
+            }
+            let current_key = ("current_manifests".to_owned(), vec![space.clone()]);
+            let prior = old.get(&current_key).ok_or(JournalError::Invariant(
+                "original rename observation prior current absent",
+            ))?;
+            let current = new.get(&current_key).ok_or(JournalError::Invariant(
+                "original rename observation new current absent",
+            ))?;
+            let root = text(row, "snapshot_id")?;
+            let raw = text(row, "observation")?;
+            let map: sync_extend_core_model::persisted_rename::RenameObservationMap =
+                serde_json::from_str(&raw)?;
+            if text(prior, "snapshot_id")? != root
+                || text(current, "space_id")? != space
+                || text(current, "snapshot_id")? == root
+                || map.scope.space_id.as_str() != space
+                || map.scope.prior_snapshot.as_str() != root
+                || crate::rename_observation::serialize_observation(&map)? != raw.as_bytes()
+                || ContentId::hash(raw.as_bytes()).as_str() != text(row, "observation_hash")?
+            {
+                return Err(JournalError::Invariant(
+                    "original rename observation current invalidation",
+                ));
+            }
+            Ok(Some(key(row)))
+        })
+        .transpose()?
+        .flatten();
+    if old
+        .keys()
+        .any(|k| !new.contains_key(k) && released_observation.as_ref() != Some(k))
+    {
         return Err(JournalError::Invariant(
             "original history cannot remove old rows",
         ));
