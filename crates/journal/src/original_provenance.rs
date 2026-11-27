@@ -112,6 +112,69 @@ fn columns(proof: &RemotePublicationProof) -> Result<Vec<Value>> {
     ])
 }
 
+/// Copy already authenticated historical provenance only beside the identical
+/// materialized operation selected by an admitted fresh-history projection.
+/// The one-use permit cannot approve reception, pending replay, or a new key.
+pub(crate) fn permit_archived_materialized(
+    gate: &Gate,
+    connection: &Connection,
+    space: &SpaceId,
+    device: &DeviceId,
+    stored: &[crate::JournalStorageColumn],
+) -> Result<Permit> {
+    if stored.len() != TABLES[0].columns.len()
+        || stored
+            .iter()
+            .zip(TABLES[0].columns)
+            .any(|(value, expected)| value.name != expected.name)
+    {
+        return Err(JournalError::Invariant(
+            "archived provenance exact column layout",
+        ));
+    }
+    let raw = match &stored[5].value {
+        crate::JournalStorageColumnValue::Text(value) => value,
+        _ => {
+            return Err(JournalError::Invariant(
+                "archived provenance original proof text",
+            ));
+        }
+    };
+    let proof: RemotePublicationProof = serde_json::from_str(raw)?;
+    let values = columns(&proof)?;
+    for (actual, expected) in stored.iter().zip(&values) {
+        let matches = match (&actual.value, expected) {
+            (crate::JournalStorageColumnValue::Text(a), Value::Text(b)) => a == b,
+            (crate::JournalStorageColumnValue::Integer(a), Value::Integer(b)) => {
+                i64::try_from(*a).ok() == Some(*b)
+            }
+            _ => false,
+        };
+        if !matches {
+            return Err(JournalError::Invariant(
+                "archived provenance original exact cells",
+            ));
+        }
+    }
+    let operation = &proof.operation;
+    if &operation.payload.space_id != space || &operation.payload.origin_device_id == device {
+        return Err(JournalError::Invariant(
+            "archived provenance independent receiver identity",
+        ));
+    }
+    let (state, payload): (String, String) = connection.query_row(
+        "SELECT state,payload FROM operations WHERE op_id=?1 AND space_id=?2 AND origin_device_id=?3 AND origin_seq=?4",
+        params![operation.op_id.as_str(), space.as_str(), operation.payload.origin_device_id.as_str(), crate::sql_integer(operation.payload.origin_seq)?],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if state != "materialized" || payload != serde_json::to_string(operation)? {
+        return Err(JournalError::Invariant(
+            "archived provenance identical materialized operation required",
+        ));
+    }
+    gate.permit(values)
+}
+
 pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     type Object = (String, String, String, Option<String>);
     fn objects(connection: &Connection) -> Result<Vec<Object>> {

@@ -453,6 +453,17 @@ impl Journal {
             ))?;
             let mut columns = row.columns().to_vec();
             apply_root_mapping(&key, &mut columns, mapping)?;
+            let _provenance = if row.table() == "original_operation_provenance" {
+                Some(crate::original_provenance::permit_archived_materialized(
+                    &self.original_operation_issuance,
+                    &tx,
+                    source.space(),
+                    &writer.device,
+                    &columns,
+                )?)
+            } else {
+                None
+            };
             insert_row(&tx, row.table(), &columns)?;
         }
         let snapshot = target_snapshot(&tx, &target_tables(&source), &source)?;
