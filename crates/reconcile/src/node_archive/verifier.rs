@@ -83,7 +83,7 @@ impl FramedNodeArchive {
             ));
         }
         let mut original_worktree = None;
-        let mut original_config_data = None;
+        let mut original_config_data: Option<std::path::PathBuf> = None;
         let mut audited_image_rows = None;
         let mut protected = std::collections::BTreeSet::new();
         let mut files = FileClosure::new(
@@ -383,10 +383,17 @@ impl FramedNodeArchive {
                             "node config references require separately captured protected artifacts",
                         ));
                     }
-                    if config.worktree.as_ref() != original_worktree.as_ref()
+                    let worktree_scope_matches = config
+                        .worktree
+                        .as_deref()
+                        .zip(original_worktree.as_deref())
+                        .is_some_and(|(worktree, original)| {
+                            super::portable_source::path_equal(worktree, original)
+                        });
+                    if !worktree_scope_matches
                         || config.worktree.as_ref().is_none_or(|worktree| {
-                            config.data_dir.starts_with(worktree)
-                                || worktree.starts_with(&config.data_dir)
+                            super::portable_source::path_within(&config.data_dir, worktree)
+                                || super::portable_source::path_within(worktree, &config.data_dir)
                         })
                     {
                         return Err(ReconcileError::Invariant(
@@ -394,7 +401,9 @@ impl FramedNodeArchive {
                         ));
                     }
                     match &original_config_data {
-                        Some(data) if *data != config.data_dir => {
+                        Some(data)
+                            if !super::portable_source::path_equal(data, &config.data_dir) =>
+                        {
                             return Err(ReconcileError::Invariant(
                                 "node original config data roots disagree",
                             ));

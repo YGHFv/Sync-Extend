@@ -32,7 +32,7 @@ pub use marker::CreatedNodeWorktreeMarker;
 mod directories;
 mod files;
 mod layout_mapping;
-mod portable_source;
+pub(crate) mod portable_source;
 pub use directories::CreatedNodeDirectorySet;
 pub use files::CreatedNodeFileSet;
 pub use layout_mapping::{NodeRestoreMappedLayout, NodeRestoreSlot, NodeTargetRoot};

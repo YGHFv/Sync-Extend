@@ -72,6 +72,8 @@ struct OriginalSqliteVfsContext {
 
 fn normalized(path: &CStr) -> Vec<u8> {
     path.to_bytes()
+        .strip_prefix(b"\\\\?\\")
+        .unwrap_or_else(|| path.to_bytes())
         .iter()
         .map(|byte| {
             if *byte == b'/' {

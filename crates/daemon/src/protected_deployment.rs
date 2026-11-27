@@ -791,7 +791,11 @@ impl<'authority> DeploymentOwner<'authority> {
             );
             match opened {
                 Ok(original) => acquired.push((id, original)),
-                Err(DeploymentNodeRuntimeOpenFailure { original_node, .. }) => {
+                Err(DeploymentNodeRuntimeOpenFailure {
+                    error: _,
+                    original_node,
+                    ..
+                }) => {
                     if let Some(original) = original_node {
                         self.retain_failed_node(id, original);
                     }
@@ -967,7 +971,7 @@ impl<'authority> DeploymentOwner<'authority> {
         }
     }
 
-    fn decode_request(&mut self, bytes: &[u8]) -> Result<OwnerRequest> {
+    fn decode_request(&mut self, bytes: &[u8]) -> Result<(OwnerRequest, bool)> {
         self.input_frames = self
             .input_frames
             .checked_add(1)
@@ -985,14 +989,14 @@ impl<'authority> DeploymentOwner<'authority> {
             || !lowercase_hex(&request.request_id, 16)
             || !lowercase_hex(&request.bundle_sha256, 32)
             || !lowercase_hex(&request.mapping_sha256, 32)
-            || request.bundle_sha256 != self.bundle_sha256
-            || request.mapping_sha256 != self.mapping_sha256
             || !self.request_ids.insert(request.request_id.clone())
         {
             return Err("unique original request and exact installed bindings required".into());
         }
         self.last_activity = Instant::now();
-        Ok(request)
+        let binding_matches = request.bundle_sha256 == self.bundle_sha256
+            && request.mapping_sha256 == self.mapping_sha256;
+        Ok((request, binding_matches))
     }
 
     fn command(&mut self, request: OwnerRequest, output: &mut ProtocolOutput) -> Option<OwnerEnd> {
@@ -1120,14 +1124,36 @@ impl<'authority> DeploymentOwner<'authority> {
                     for byte in &available[..count] {
                         if *byte == b'\n' {
                             let frame = std::mem::take(&mut self.input_frame);
-                            let request = match self.decode_request(&frame) {
+                            let (request, binding_matches) = match self.decode_request(&frame) {
                                 Ok(request) => request,
                                 Err(_) => {
                                     return self.end("input_protocol_error", None, None, true)
                                 }
                             };
-                            if let Some(ended) = self.command(request, output) {
-                                return ended;
+                            if binding_matches {
+                                if let Some(ended) = self.command(request, output) {
+                                    return ended;
+                                }
+                            } else {
+                                let running = self.state == OwnerState::Running;
+                                let mut refused = request;
+                                refused.bundle_sha256 = self.bundle_sha256.clone();
+                                refused.mapping_sha256 = self.mapping_sha256.clone();
+                                if output
+                                    .send(&response(
+                                        &refused,
+                                        self.state,
+                                        false,
+                                        running,
+                                        running,
+                                        self.generation,
+                                        None,
+                                        Some("stale_binding"),
+                                    ))
+                                    .is_err()
+                                {
+                                    return self.end("runtime_failed", None, None, true);
+                                }
                             }
                         } else {
                             if *byte == b'\r' || self.input_frame.len() >= REQUEST_WIRE_LIMIT - 1 {

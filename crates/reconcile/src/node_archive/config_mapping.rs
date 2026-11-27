@@ -1,4 +1,5 @@
 //! Explicit offline configuration mapping; no credentials, ACL adoption or listener activation.
+use super::portable_source::{path_equal, path_within};
 use super::{ArchiveRole, VerifiedNodeStateArchive};
 use crate::{ReconcileError, Result};
 use std::path::{Component, Path};
@@ -43,11 +44,13 @@ impl VerifiedNodeStateArchive {
         root(original_data)?;
         root(new_data)?;
         root(new_worktree)?;
-        if new_data.starts_with(new_worktree)
-            || new_worktree.starts_with(new_data)
+        if path_within(new_data, new_worktree)
+            || path_within(new_worktree, new_data)
             || max_combined_bytes == 0
             || max_combined_bytes > 2 * 1024 * 1024
-            || self.original_config_data() != Some(original_data)
+            || !self
+                .original_config_data()
+                .is_some_and(|data| path_equal(data, original_data))
         {
             return Err(ReconcileError::Invariant(
                 "explicit original config scope and aggregate budget",
@@ -72,8 +75,11 @@ impl VerifiedNodeStateArchive {
         let mut config: Config = serde_json::from_slice(source)
             .map_err(|_| ReconcileError::Invariant("original config encoding"))?;
         config.validate()?;
-        if config.data_dir != original_data
-            || config.worktree.as_deref() != Some(self.original_worktree())
+        if !path_equal(&config.data_dir, original_data)
+            || config
+                .worktree
+                .as_deref()
+                .is_none_or(|worktree| !path_equal(worktree, self.original_worktree()))
             || config.webdav.credential_ref.is_some()
             || config.webdav.tls_certificate.is_some()
             || config.webdav.tls_key.is_some()

@@ -246,6 +246,22 @@ impl VerifiedNodeStateArchive {
             let section = self.archive.section(role).ok_or(ReconcileError::Invariant(
                 "node layout original role bytes absent",
             ))?;
+            if let ArchiveRole::ExplicitConfig { name } = role {
+                let Some(configs) = configs else {
+                    return Err(ReconcileError::Invariant(
+                        "node layout requires separate explicit original config mapping",
+                    ));
+                };
+                configs.verify_excluded_original_config(self, name, section)?;
+                if !separated_names.insert(name.as_str()) {
+                    return Err(ReconcileError::Invariant(
+                        "separated node layout duplicate original config",
+                    ));
+                }
+                // The deployment CREATE plan owns this verified mapped config
+                // file. It is never a node-restore file slot.
+                continue;
+            }
             required_file_bytes = required_file_bytes
                 .checked_add(section.len() as u64)
                 .filter(|count| *count <= max_file_bytes)
@@ -267,23 +283,7 @@ impl VerifiedNodeStateArchive {
                         device_id: device_id.clone(),
                     }
                 }
-                ArchiveRole::ExplicitConfig { name } => {
-                    let Some(configs) = configs else {
-                        return Err(ReconcileError::Invariant(
-                            "node layout requires separate explicit original config mapping",
-                        ));
-                    };
-                    configs.verify_excluded_original_config(self, name, section)?;
-                    if !separated_names.insert(name.as_str()) {
-                        return Err(ReconcileError::Invariant(
-                            "separated node layout duplicate original config",
-                        ));
-                    }
-                    // Its exact bytes remain in the whole source and byte
-                    // budget. The deployment CREATE plan independently owns
-                    // this verified mapped config file.
-                    continue;
-                }
+                ArchiveRole::ExplicitConfig { .. } => continue,
             };
             files.push(file);
             if files.len() + directories.len() > max_creations {

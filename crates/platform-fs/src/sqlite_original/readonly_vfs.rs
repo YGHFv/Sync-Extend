@@ -8,10 +8,48 @@ use crate::{
 use rusqlite::{ffi, Connection, Transaction, TransactionBehavior};
 use std::{
     ffi::{CStr, CString},
+    fmt::Write as _,
     io,
     path::Path,
     ptr,
 };
+
+fn immutable_readonly_uri(path: &Path) -> io::Result<CString> {
+    let raw = path
+        .to_str()
+        .ok_or_else(|| io::Error::other("readonly SQLite path encoding"))?;
+    let value = raw.strip_prefix("\\\\?\\").unwrap_or(raw);
+    let bytes = value.as_bytes();
+    if !path.is_absolute()
+        || !(3..=4096).contains(&bytes.len())
+        || value.starts_with("\\\\")
+        || value.starts_with("//")
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+        || path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(io::Error::other(
+            "normalized local drive SQLite readonly path required",
+        ));
+    }
+    let mut output = String::from("file:/");
+    for byte in value.replace('\\', "/").bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+            output.push(byte as char);
+        } else {
+            write!(output, "%{byte:02X}")
+                .map_err(|_| io::Error::other("SQLite readonly URI encoding"))?;
+        }
+    }
+    output.push_str("?mode=ro&immutable=1");
+    CString::new(output).map_err(|_| io::Error::other("readonly SQLite URI contains NUL"))
+}
 
 enum OriginalDatabase {
     /// The same Connection lives only inside OriginalReadonlySqliteConnection.
@@ -181,11 +219,16 @@ impl OriginalReadonlySqliteConnection {
             },
         };
         let prepared = (|| -> io::Result<CString> {
-            let filename = CString::new(
-                path.to_str()
-                    .ok_or_else(|| io::Error::other("readonly SQLite path encoding"))?,
-            )
-            .map_err(|_| io::Error::other("readonly SQLite path contains NUL"))?;
+            let immutable = stopped_capture && existing_wal.is_none();
+            let filename = if immutable {
+                immutable_readonly_uri(path)?
+            } else {
+                CString::new(
+                    path.to_str()
+                        .ok_or_else(|| io::Error::other("readonly SQLite path encoding"))?,
+                )
+                .map_err(|_| io::Error::other("readonly SQLite path contains NUL"))?
+            };
             original.original.registration = Some(OriginalSqliteVfs::register_readonly(
                 path,
                 expected_main,
@@ -224,8 +267,14 @@ impl OriginalReadonlySqliteConnection {
             }
         };
         let mut database = ptr::null_mut();
-        let flags =
-            ffi::SQLITE_OPEN_READONLY | ffi::SQLITE_OPEN_NOMUTEX | ffi::SQLITE_OPEN_PRIVATECACHE;
+        let flags = ffi::SQLITE_OPEN_READONLY
+            | ffi::SQLITE_OPEN_NOMUTEX
+            | ffi::SQLITE_OPEN_PRIVATECACHE
+            | if stopped_capture && existing_wal.is_none() {
+                ffi::SQLITE_OPEN_URI
+            } else {
+                0
+            };
         // SAFETY: the same first scoped registration and every exact filename
         // remain owned across this single original open_v2 call.
         let opened = unsafe {

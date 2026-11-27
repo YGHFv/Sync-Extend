@@ -5,7 +5,10 @@ use super::protected_artifact::{
     normalized, DeploymentProtectionProvider, OriginalProtectedArtifact, ProtectedArtifactBinding,
     ProtectedArtifactRole, ProtectionScope, VerifiedProtectedArtifact,
 };
-use crate::{ReconcileError, Result};
+use crate::{
+    node_archive::portable_source::{path_components, path_equal, path_within},
+    ReconcileError, Result,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -218,7 +221,9 @@ impl CapturedDeploymentNode {
         if id == 0
             || artifact_id == 0
             || !normalized(archive_path)
-            || archive_path.parent() != Some(local.data_dir.as_path())
+            || !archive_path
+                .parent()
+                .is_some_and(|parent| path_equal(parent, &local.data_dir))
             || configs.is_empty()
         {
             return Err(ReconcileError::Invariant(
@@ -252,10 +257,14 @@ impl CapturedDeploymentNode {
             archive_bounds,
         )?
         .verify_node_state(archive_bounds, inspection, max_content_hash_bytes)?;
+        let worktree_matches = path_equal(verified.original_worktree(), local.worktree_path());
+        let data_matches = verified
+            .original_config_data()
+            .is_some_and(|data| path_equal(data, &local.data_dir));
         if verified.space() != &local.space_id
             || verified.device() != &local.device_id
-            || verified.original_worktree() != local.worktree_path()
-            || verified.original_config_data() != Some(local.data_dir.as_path())
+            || !worktree_matches
+            || !data_matches
         {
             return Err(ReconcileError::Invariant(
                 "actual captured node identity/root mismatch",
@@ -435,13 +444,12 @@ fn path_alias(path: &Path, platform: DeploymentPlatform) -> Result<String> {
             "deployment normalized exact path",
         ));
     }
-    let value = path
-        .to_str()
-        .ok_or(ReconcileError::Invariant("deployment path encoding"))?;
     Ok(if platform == DeploymentPlatform::Windows {
-        value.replace('/', "\\").to_uppercase()
+        path_components(path).join("\\")
     } else {
-        value.to_owned()
+        path.to_str()
+            .ok_or(ReconcileError::Invariant("deployment path encoding"))?
+            .to_owned()
     })
 }
 
@@ -513,8 +521,8 @@ pub(crate) fn derive_graph(
             || artifact.digest != node.archive_digest
             || artifact.bytes != node.archive_bytes
             || node.source_schema == 0
-            || node.data_dir.starts_with(&node.worktree)
-            || node.worktree.starts_with(&node.data_dir)
+            || path_within(&node.data_dir, &node.worktree)
+            || path_within(&node.worktree, &node.data_dir)
             || !roots.insert(path_alias(&node.data_dir, graph.platform)?)
             || !roots.insert(path_alias(&node.worktree, graph.platform)?)
             || node.captured_configs.is_empty()
@@ -720,7 +728,7 @@ pub(crate) fn derive_graph(
         let matching: Vec<_> = graph
             .nodes
             .iter()
-            .filter(|node| node.data_dir == data)
+            .filter(|node| path_equal(&node.data_dir, data))
             .collect();
         if matching.len() != 1 {
             return Err(ReconcileError::Invariant(
@@ -750,11 +758,14 @@ pub(crate) fn derive_graph(
                 let id = node_data(*owner, "data_dir", &value.data_dir)?;
                 let node = graph.node(id)?;
                 let config_path = &graph.artifact(*owner)?.path;
-                if value.worktree.as_deref() != Some(node.worktree.as_path())
+                if value
+                    .worktree
+                    .as_deref()
+                    .is_none_or(|worktree| !path_equal(worktree, &node.worktree))
                     || !node
                         .captured_configs
                         .values()
-                        .any(|path| path == config_path)
+                        .any(|path| path_equal(path, config_path))
                 {
                     return Err(ReconcileError::Invariant(
                         "selected Config original captured worktree scope",
@@ -774,7 +785,9 @@ pub(crate) fn derive_graph(
                         let node_config = documents
                             .values()
                             .find_map(|document| match document {
-                                DeploymentDocument::Node(config) if &config.data_dir == data => {
+                                DeploymentDocument::Node(config)
+                                    if path_equal(&config.data_dir, data) =>
+                                {
                                     Some(config)
                                 }
                                 _ => None,
@@ -1735,10 +1748,15 @@ impl FramedDeploymentBundle {
                     inspection,
                     max_content_hash_bytes,
                 )?;
+                let worktree_matches =
+                    path_equal(archive.original_worktree(), &node.worktree);
+                let data_matches = archive
+                    .original_config_data()
+                    .is_some_and(|data| path_equal(data, &node.data_dir));
                 if archive.space() != &node.space_id
                     || archive.device() != &node.device_id
-                    || archive.original_worktree() != node.worktree
-                    || archive.original_config_data() != Some(node.data_dir.as_path())
+                    || !worktree_matches
+                    || !data_matches
                     || archive.schema() != node.source_schema
                 {
                     return Err(ReconcileError::Invariant(
@@ -1997,13 +2015,13 @@ impl SeparatedDeploymentNodeConfigs {
         data: &Path,
     ) -> Result<()> {
         if archive != &self.archive_digest
-            || worktree != self.target_worktree
-            || data != self.target_data
+            || !path_equal(worktree, &self.target_worktree)
+            || !path_equal(data, &self.target_data)
             || !normalized(&self.original_data)
             || !normalized(&self.target_data)
             || !normalized(&self.target_worktree)
-            || self.target_data.starts_with(&self.target_worktree)
-            || self.target_worktree.starts_with(&self.target_data)
+            || path_within(&self.target_data, &self.target_worktree)
+            || path_within(&self.target_worktree, &self.target_data)
             || self.mappings.is_empty()
             || self.bundle_digest.as_str().bytes().all(|byte| byte == b'0')
             || self.mapping_digest.as_str().bytes().all(|byte| byte == b'0')
@@ -2034,7 +2052,10 @@ impl SeparatedDeploymentNodeConfigs {
         data: &Path,
     ) -> Result<()> {
         self.verify_acquired_scope(archive.digest(), worktree, data)?;
-        if archive.original_config_data() != Some(self.original_data.as_path()) {
+        if !archive
+            .original_config_data()
+            .is_some_and(|data| path_equal(data, &self.original_data))
+        {
             return Err(ReconcileError::Invariant("original separated deployment config scope"));
         }
         for (name, expected) in &self.mappings {
@@ -2254,7 +2275,7 @@ impl VerifiedDeploymentBundle {
             new_roots
                 .iter()
                 .skip(index + 1)
-                .any(|other| path.starts_with(other) || other.starts_with(path))
+                .any(|other| path_within(path, other) || path_within(other, path))
         }) {
             return Err(ReconcileError::Invariant("mapped deployment roots overlap"));
         }
@@ -2264,7 +2285,7 @@ impl VerifiedDeploymentBundle {
             if !slots.insert(path_alias(path, original_graph.platform)?)
                 || new_roots
                     .iter()
-                    .any(|root| path.starts_with(root) || root.starts_with(path))
+                    .any(|root| path_within(path, root) || path_within(root, path))
             {
                 return Err(ReconcileError::Invariant(
                     "runtime directory aliases installed node roots",
@@ -2277,10 +2298,10 @@ impl VerifiedDeploymentBundle {
             if !slots.insert(path_alias(path, original_graph.platform)?)
                 || new_roots
                     .iter()
-                    .any(|root| path.starts_with(root) || root.starts_with(path))
+                    .any(|root| path_within(path, root) || path_within(root, path))
                 || directories
                     .iter()
-                    .any(|directory| path.starts_with(directory) || directory.starts_with(path))
+                    .any(|directory| path_within(path, directory) || path_within(directory, path))
             {
                 return Err(ReconcileError::Invariant(
                     "config/artifact slot aliases node/runtime membership",
@@ -2447,7 +2468,7 @@ impl VerifiedDeploymentBundle {
                         let node = original_graph
                             .nodes
                             .iter()
-                            .find(|node| node.data_dir == original.policy.data_root)
+                            .find(|node| path_equal(&node.data_dir, &original.policy.data_root))
                             .ok_or(ReconcileError::Invariant(
                                 "mapped signed policy actual source node",
                             ))?;
@@ -2670,7 +2691,7 @@ impl RestrictedPathMapper<'_> {
             .graph
             .artifacts
             .iter()
-            .find(|row| row.path == path && row.role == role)
+            .find(|row| path_equal(&row.path, path) && row.role == role)
             .ok_or(ReconcileError::Invariant(
                 "restricted artifact exact original role/path",
             ))?;
@@ -2687,7 +2708,7 @@ impl RestrictedPathMapper<'_> {
             .graph
             .nodes
             .iter()
-            .find(|node| node.data_dir == path)
+            .find(|node| path_equal(&node.data_dir, path))
             .ok_or(ReconcileError::Invariant(
                 "restricted node original data root",
             ))?;
@@ -2698,7 +2719,7 @@ impl RestrictedPathMapper<'_> {
             .graph
             .nodes
             .iter()
-            .find(|node| node.worktree == path)
+            .find(|node| path_equal(&node.worktree, path))
             .ok_or(ReconcileError::Invariant(
                 "restricted node original worktree root",
             ))?;
@@ -2756,7 +2777,8 @@ impl RestrictedDeploymentMapping {
             let mut config_mappings = BTreeMap::new();
             for (name, path) in &node.captured_configs {
                 let original = self.original.graph.artifacts.iter().find(|artifact| {
-                    artifact.role == DeploymentArtifactRole::NodeConfig && &artifact.path == path
+                    artifact.role == DeploymentArtifactRole::NodeConfig
+                        && path_equal(&artifact.path, path)
                 }).ok_or(ReconcileError::Invariant(
                     "every original node config must be selected in the full deployment",
                 ))?;

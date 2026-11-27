@@ -5,7 +5,10 @@ use super::{
     protected_artifact::{normalized, DeploymentProtectionProvider},
     NativeCreator, NativeFailedCreate, NativeParent, NativeSealed,
 };
-use crate::{ReconcileError, Result};
+use crate::{
+    node_archive::portable_source::{path_equal, path_within},
+    ReconcileError, Result,
+};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use sync_extend_core_model::ContentId;
@@ -60,9 +63,14 @@ impl VerifiedDeploymentBundle {
         let preflight = (|| -> Result<&str> {
             attempt.bundle.reverify_provider(provider)?;
             if !normalized(target)
-                || attempt.bundle.graph().artifacts.iter().any(|row| row.path == target)
+                || attempt
+                    .bundle
+                    .graph()
+                    .artifacts
+                    .iter()
+                    .any(|row| path_equal(&row.path, target))
                 || attempt.bundle.graph().nodes.iter().any(|node| {
-                    target.starts_with(&node.data_dir) || target.starts_with(&node.worktree)
+                    path_within(target, &node.data_dir) || path_within(target, &node.worktree)
                 })
             {
                 return Err(ReconcileError::Invariant("exact external new deployment bundle target"));
