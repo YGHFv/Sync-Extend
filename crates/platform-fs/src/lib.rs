@@ -103,8 +103,10 @@ pub use protected_artifact_unix::{
 #[cfg(target_os = "linux")]
 pub use protected_artifact_unix::fresh_native::{
     AcquiredUnixChildDirectory, AcquiredUnixChildDirectoryFailure, FailedUnixNativeFileCreation, FreshUnixNativeFile, FreshUnixNativeFileFailure,
-    FreshUnixNativeSqlite, FreshUnixNativeSqliteFailure,
+    FreshUnixNativeSqliteIo, FreshUnixNativeSqliteIoFailure, FreshUnixSqliteOpenScope,
     OriginalUnixCasSentinel, OriginalUnixNamespace, OriginalUnixNamespaceCloseFailure, OriginalUnixNativeRoot,
+    SealedUnixNativeFile, UnixNativeFileSealFailure,
+    OriginalUnixWriterLock,
 };
 #[cfg(windows)]
 pub use windows::{

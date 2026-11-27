@@ -1588,6 +1588,13 @@ fn create_private_directory(path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 mod node_archive;
+#[cfg(target_os = "linux")]
+mod unix_node_archive;
+#[cfg(target_os = "linux")]
+pub use unix_node_archive::{ArchiveBounds, ArchiveRole, FramedNodeArchive, VerifiedNodeStateArchive};
+#[cfg(target_os = "linux")]
+pub use unix_node_archive::{ClosedOriginalUnixRestore, OriginalUnixRestoredNode, OriginalUnixRestoreFailure,
+    PreparedUnixNodeRestore, UnixNodeRestoreBounds};
 #[cfg(windows)]
 pub use node_archive::{
     ArchiveBounds, ArchiveRole, CapturedNodeArchive, CreatedNodeCurrentFile, CreatedNodeDataLocks,
@@ -1605,7 +1612,7 @@ pub use node_archive::{
     OriginalRestoredLocalSpace, PreparedOriginalNodeRestore, VerifiedNodeStateArchive,
 };
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl From<rusqlite::Error> for ReconcileError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Journal(sync_extend_journal::JournalError::Sql(error))

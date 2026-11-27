@@ -388,12 +388,12 @@ impl FramedNodeArchive {
                         .as_deref()
                         .zip(original_worktree.as_deref())
                         .is_some_and(|(worktree, original)| {
-                            super::portable_source::path_equal(worktree, original)
+                            crate::path_comparison::path_equal(worktree, original)
                         });
                     if !worktree_scope_matches
                         || config.worktree.as_ref().is_none_or(|worktree| {
-                            super::portable_source::path_within(&config.data_dir, worktree)
-                                || super::portable_source::path_within(worktree, &config.data_dir)
+                            crate::path_comparison::path_within(&config.data_dir, worktree)
+                                || crate::path_comparison::path_within(worktree, &config.data_dir)
                         })
                     {
                         return Err(ReconcileError::Invariant(
@@ -402,7 +402,7 @@ impl FramedNodeArchive {
                     }
                     match &original_config_data {
                         Some(data)
-                            if !super::portable_source::path_equal(data, &config.data_dir) =>
+                            if !crate::path_comparison::path_equal(data, &config.data_dir) =>
                         {
                             return Err(ReconcileError::Invariant(
                                 "node original config data roots disagree",

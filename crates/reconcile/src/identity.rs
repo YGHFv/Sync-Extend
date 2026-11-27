@@ -96,7 +96,7 @@ fn unprotect(stored: &[u8]) -> Result<[u8; 32]> {
         .map_err(|_| ReconcileError::Invariant("invalid device secret"))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 // Insert into existing identity module; delegates actual original platform unprotect.
 pub(crate) fn decode_stored_backup(stored: &[u8]) -> crate::Result<[u8; 32]> {
     if stored.is_empty() || stored.len() > 4096 {

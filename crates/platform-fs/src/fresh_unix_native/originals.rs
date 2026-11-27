@@ -105,6 +105,21 @@ pub struct OriginalUnixCasSentinel<'namespace> {
     pub(super) original: FreshUnixNativeFile<'namespace>,
 }
 
+pub struct OriginalUnixWriterLock<'namespace> {
+    original: OriginalUnixCasSentinel<'namespace>,
+}
+
+impl OriginalUnixWriterLock<'_> {
+    pub fn verify(&self) -> io::Result<()> {
+        self.original.verify()
+    }
+    pub fn close_retaining(
+        self,
+    ) -> Result<ClosedUnixOriginalResources, UnixOriginalResourceCloseFailure> {
+        self.original.close_retaining()
+    }
+}
+
 fn close_parent(
     namespace: &NamespaceLoan<'_>,
     original: UnixProtectedArtifactParent,
@@ -290,6 +305,13 @@ impl<'namespace> OriginalUnixNativeRoot<'namespace> {
         self.original.require_empty()?;
         self.verify()
     }
+    pub fn path(&self) -> &Path {
+        self.original.path()
+    }
+    pub fn key(&self) -> io::Result<UnixProtectedArtifactKey> {
+        self.verify()?;
+        self.original.key()
+    }
     pub fn create_file(
         &self,
         name: &str,
@@ -310,6 +332,12 @@ impl<'namespace> OriginalUnixNativeRoot<'namespace> {
         let original = self.create_file("cas.lock", 4096)?;
         OriginalUnixCasSentinel::acquire(original)
     }
+    pub fn create_writer_lock(
+        &self,
+    ) -> Result<OriginalUnixWriterLock<'namespace>, FreshUnixNativeFileFailure<'namespace>> {
+        OriginalUnixCasSentinel::acquire(self.create_file("writer.lock", 4096)?)
+            .map(|original| OriginalUnixWriterLock { original })
+    }
     pub fn close_retaining(
         self,
     ) -> Result<ClosedUnixOriginalResources, UnixOriginalResourceCloseFailure> {
@@ -318,9 +346,22 @@ impl<'namespace> OriginalUnixNativeRoot<'namespace> {
 }
 
 impl<'namespace> AcquiredUnixChildDirectory<'namespace> {
+    pub fn create_writer_lock(
+        &self,
+    ) -> Result<OriginalUnixWriterLock<'namespace>, FreshUnixNativeFileFailure<'namespace>> {
+        OriginalUnixCasSentinel::acquire(self.create_file("writer.lock", 4096)?)
+            .map(|original| OriginalUnixWriterLock { original })
+    }
     pub fn verify(&self) -> io::Result<()> {
         self.namespace.verify_current()?;
         self.original.verify_original()
+    }
+    pub fn path(&self) -> &Path {
+        self.original.path()
+    }
+    pub fn key(&self) -> io::Result<UnixProtectedArtifactKey> {
+        self.verify()?;
+        self.original.key()
     }
     pub fn create_file(
         &self,

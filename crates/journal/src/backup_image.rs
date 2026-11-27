@@ -74,7 +74,7 @@ fn limit(max_bytes: usize) -> Result<()> {
     Ok(())
 }
 
-fn validate(database: &Connection) -> Result<u32> {
+pub(crate) fn validate(database: &Connection) -> Result<u32> {
     let version: u32 = database.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if !(1..=SCHEMA_VERSION).contains(&version) {
         return Err(JournalError::Invariant("backup schema version unsupported"));

@@ -26,16 +26,10 @@ unsafe fn state<'a>(vfs: *mut ffi::sqlite3_vfs) -> Option<&'a State<'a>> {
     // SAFETY: published tables and their inert dispatches stay alive within the
     // permanent bounded pool, even after SQLite caches a global table lookup.
     let dispatch = unsafe { &*(*vfs).pAppData.cast::<Dispatch>() };
-    if !dispatch.on_original_thread() {
-        return None;
-    }
-    let original = dispatch.state.load(Ordering::Acquire);
-    if original.is_null() {
-        return None;
-    }
+    let original = dispatch.original_state()?;
     // SAFETY: only the original owning thread can load/dereference live state.
     // That same thread nulls it after unregister before the state is released.
-    Some(unsafe { &*original.cast::<State<'a>>() })
+    Some(unsafe { &*original.as_ptr().cast::<State<'a>>() })
 }
 
 unsafe fn native<'a>(file: *mut ffi::sqlite3_file) -> io::Result<&'a mut NativeFile> {
@@ -153,10 +147,13 @@ unsafe extern "C" fn open(
         {
             return Err(refuse("original SQLite class/access/URI differs"));
         }
-        if class == 0 && owner.main_opened.replace(true) {
+        if class == 0 && (!owner.main_open_permitted.get() || owner.main_opened.replace(true)) {
             return Err(refuse(
                 "original Unix SQLite main already acquired by its sole connection",
             ));
+        }
+        if class != 0 && !owner.main_active.get() {
+            return Err(refuse("original Unix SQLite sidecar requires its active main"));
         }
         let count = owner
             .active_files
@@ -183,6 +180,9 @@ unsafe extern "C" fn open(
             }
         }
         owner.active_files.set(count);
+        if class == 0 {
+            owner.main_active.set(true);
+        }
         Ok(ffi::SQLITE_OK)
     })
 }
@@ -200,6 +200,7 @@ unsafe extern "C" fn close(file: *mut ffi::sqlite3_file) -> c_int {
         return ffi::SQLITE_IOERR_CLOSE;
     }
     let unmap = if native.class == 0 {
+        owner.main_active.set(false);
         owner.unmap()
     } else {
         Ok(())

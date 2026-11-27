@@ -55,6 +55,11 @@ mod fresh_native_wal;
 #[cfg(windows)]
 pub use fresh_native_wal::{FreshNativeWalConnection, FreshNativeWalOpenFailure, FreshNativeWalCloseFailure};
 
+#[cfg(target_os = "linux")]
+mod unix_original_journal;
+#[cfg(target_os = "linux")]
+pub use unix_original_journal::{OriginalUnixRestoredJournal, OriginalUnixRestoredJournalFailure};
+
 /// Pure-memory initialization accounting, not a writer or native certificate.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug, serde::Serialize)]
