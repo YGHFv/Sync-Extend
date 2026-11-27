@@ -316,14 +316,31 @@ impl DeploymentRun<'_> {
         self.verify()?;
         Ok(Some(result))
     }
-    pub fn prepare_gateway_observation(&mut self) -> Result<()> {
-        let ids = self.polling.keys().copied().collect::<Vec<_>>();
-        for id in ids { self.nodes.get_mut(&id).ok_or(ReconcileError::Unstable)?.scan_deployment_polling(crate::now_ms()?)?; }
-        self.verify()
+    /// The same retained account/export policy selects exactly one observation.
+    /// Rejected accounts or targets cannot trigger scans of unrelated spaces.
+    pub fn prepare_gateway_observation(
+        &mut self,
+        account: &str,
+        target: &str,
+        write: bool,
+    ) -> Result<SpaceId> {
+        self.verify()?;
+        let gateway = self.gateway_configuration()?;
+        let authorized = gateway.listener.authorize(account, target, write)?;
+        let id = self.node_id(&authorized.space_id)?;
+        if self.polling.contains_key(&id) {
+            self.nodes.get_mut(&id).ok_or(ReconcileError::Unstable)?
+                .scan_deployment_polling(crate::now_ms()?)?;
+        }
+        self.verify()?;
+        Ok(authorized.space_id)
     }
-    pub fn release_gateway_observation(&mut self) -> Result<()> {
-        let ids = self.polling.keys().copied().collect::<Vec<_>>();
-        for id in ids { self.nodes.get_mut(&id).ok_or(ReconcileError::Unstable)?.release_polling_observation()?; }
+    pub fn release_gateway_observation(&mut self, space: &SpaceId) -> Result<()> {
+        let id = self.node_id(space)?;
+        if self.polling.contains_key(&id) {
+            self.nodes.get_mut(&id).ok_or(ReconcileError::Unstable)?
+                .release_polling_observation()?;
+        }
         self.verify()
     }
     pub fn verify(&self) -> Result<()> {

@@ -209,9 +209,13 @@ impl ActiveRecoveredGateway {
             peer,
             self.tls.as_ref(),
             |account, request, connection| {
-                run.prepare_gateway_observation().map_err(core_status)?;
+                let write = !matches!(request.method.as_str(), "GET" | "HEAD" | "PROPFIND" | "OPTIONS");
+                // Fast refusal uses the same held configuration; the core then
+                // independently rederives this grant before scanning its node.
+                runtime.listener.authorize(account, &request.target, write).map_err(|_| 403u16)?;
+                let space = run.prepare_gateway_observation(account, &request.target, write).map_err(core_status)?;
                 let response = dispatch_recovered(runtime, limits, locks, run, account, request, connection);
-                let released = run.release_gateway_observation().map_err(core_status);
+                let released = run.release_gateway_observation(&space).map_err(core_status);
                 response.and(released)
             },
         ) {
