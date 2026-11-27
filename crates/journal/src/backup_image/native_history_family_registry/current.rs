@@ -287,7 +287,8 @@ pub(super) fn catalog(version: u32) -> Result<&'static [CatalogDefinition]> {
     };
     if cell.get().is_none() {
         let compiled = super::super::schema_catalog::compiled_definitions(version)?
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|(kind, name, table, sql)| CatalogDefinition {
                 kind,
                 name,

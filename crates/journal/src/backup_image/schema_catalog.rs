@@ -2,6 +2,7 @@
 //! Migration SQL is supplied by the actual candidate's original Journal loader.
 use super::{JournalError, Result};
 use rusqlite::Connection;
+use std::sync::OnceLock;
 
 pub(super) type Definition = (String, String, String, Option<String>);
 
@@ -28,7 +29,31 @@ pub(super) fn validate_schema(database: &Connection, version: u32) -> Result<()>
     Ok(())
 }
 
-pub(super) fn compiled_definitions(version: u32) -> Result<Vec<Definition>> {
+pub(super) fn compiled_definitions(version: u32) -> Result<&'static [Definition]> {
+    // Only the immutable compiled migration result is cached. Every observed
+    // database catalog and every typed source audit is still read and checked.
+    static CATALOGS: [OnceLock<Vec<Definition>>; SCHEMA_SCRIPTS.len()] =
+        [const { OnceLock::new() }; SCHEMA_SCRIPTS.len()];
+    let index = usize::try_from(version)
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .filter(|n| *n < CATALOGS.len())
+        .ok_or(JournalError::Invariant(
+            "backup schema catalog version absent",
+        ))?;
+    let cached = &CATALOGS[index];
+    if cached.get().is_none() {
+        let _ = cached.set(build_compiled_definitions(version)?);
+    }
+    cached
+        .get()
+        .map(Vec::as_slice)
+        .ok_or(JournalError::Invariant(
+            "backup compiled schema cache absent",
+        ))
+}
+
+fn build_compiled_definitions(version: u32) -> Result<Vec<Definition>> {
     let reference = Connection::open_in_memory()?;
     reference.execute_batch(SCHEMA_SCRIPTS[0])?;
     let count = usize::try_from(version)
