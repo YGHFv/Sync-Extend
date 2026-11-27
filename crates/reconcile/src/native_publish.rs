@@ -1,6 +1,6 @@
 use crate::{
     fault::checkpoint,
-    filesystem::{apply_portable_metadata, metadata_matches_observed},
+    filesystem::{apply_portable_metadata, metadata_matches_observed, projected_metadata, projected_metadata_matches},
     scan, LocalSpace, ReconcileError, Result,
 };
 use serde::Serialize;
@@ -88,7 +88,10 @@ impl LocalSpace {
         // applied; the final sync below then preserves that exact state.
         creation.payload_writer().sync_all()?;
         if let Some(metadata) = &expected_metadata {
-            apply_portable_metadata(creation.payload_reader(), metadata)?;
+            let selected = if publication.intent.remote.is_some() {
+                projected_metadata(metadata)?
+            } else { metadata.clone() };
+            apply_portable_metadata(creation.payload_reader(), &selected)?;
         }
         checkpoint("after_native_payload");
         creation.payload_writer().sync_all()?;
@@ -145,7 +148,9 @@ impl LocalSpace {
                         || seen.content != entry.content
                         || entry.metadata.as_ref().is_some_and(|expected| {
                             seen.metadata.as_ref().is_none_or(|observed| {
-                                !metadata_matches_observed(expected, observed)
+                                if intent.remote.is_some() {
+                                    !projected_metadata_matches(expected, observed).unwrap_or(false)
+                                } else { !metadata_matches_observed(expected, observed) }
                             })
                         })
                 })

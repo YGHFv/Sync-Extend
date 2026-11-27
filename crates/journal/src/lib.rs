@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 71;
+const SCHEMA_VERSION: u32 = 72;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -1383,6 +1383,11 @@ impl Journal {
         if version < 71 {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-071.sql"))?;
+            tx.commit()?;
+        }
+        if version < 72 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-072.sql"))?;
             tx.commit()?;
         }
         backup_image::native_history_persistence::schema::validate(&connection)?;

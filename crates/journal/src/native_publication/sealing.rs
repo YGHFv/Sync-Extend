@@ -120,7 +120,10 @@ impl NativePublicationReadiness {
             let observed = crate::portable_file_metadata::capture(payload)
                 .map_err(|_| invalid("native readiness portable metadata capture"))?
                 .ok_or_else(|| invalid("native readiness portable metadata unavailable"))?;
-            if !expected.matches_observed(&observed) {
+            let matches = if self.header.intent.remote.is_some() {
+                expected.matches_local_projection(&observed, sync_extend_core_model::PortableMetadataProjectionPlatform::Windows)?
+            } else { expected.matches_observed(&observed) };
+            if !matches {
                 return Err(invalid("native readiness portable metadata differs"));
             }
         }

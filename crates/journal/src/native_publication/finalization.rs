@@ -1,16 +1,77 @@
 //! One atomic exact admitted history and original guarded native final receipt.
 use super::NativePublicationObservation;
 use crate::{
-    Completion, Journal, JournalStorageColumn, JournalStorageColumnValue as ColumnValue,
-    PublicationState, Result,
     native_publication::{issuance, physical, schema},
     storage_inventory::reader::{hash, invalid},
     storage_policy::{self, local_commit},
+    Completion, Journal, JournalStorageColumn, JournalStorageColumnValue as ColumnValue,
+    PublicationState, Result,
 };
-use rusqlite::{Transaction, TransactionBehavior, params_from_iter, types::Value};
+use rusqlite::{params_from_iter, types::Value, Transaction, TransactionBehavior};
 use sync_extend_core_model::{EntryId, SnapshotId};
 
 impl Journal {
+    /// Exact immutable native Final keys for logical remote entries. This is
+    /// observation evidence only: callers must still re-observe bytes, metadata,
+    /// single-link status and the full physical key on the current stable scan.
+    pub fn remote_metadata_final_identities(
+        &self,
+        space: &sync_extend_core_model::SpaceId,
+        root: &sync_extend_core_model::ContentId,
+    ) -> Result<
+        Vec<(
+            sync_extend_core_model::Entry,
+            sync_extend_core_model::ContentId,
+        )>,
+    > {
+        if !self.connection.is_autocommit() {
+            return Err(invalid(
+                "remote metadata evidence requires owned read snapshot",
+            ));
+        }
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
+        let bounds = storage_policy::capacity_limits(self.max_storage_entries)?;
+        let snapshot = self
+            .read_view()
+            .audit_local_commit_capacity(space, bounds)?;
+        let final_rows: std::collections::BTreeMap<_, _> = snapshot
+            .rows
+            .iter()
+            .filter(|row| {
+                row.table() == "native_publication_phases"
+                    && row.primary_key().len() == 3
+                    && row.primary_key()[1] == "0"
+                    && row.primary_key()[2] == "final"
+            })
+            .map(|row| (row.primary_key()[0].clone(), row))
+            .collect();
+        let mut result = Vec::new();
+        for publication in self.read_view().publications(space)? {
+            let intent = &publication.intent;
+            if publication.state != PublicationState::Committed
+                || intent.remote.is_none()
+                || intent.root_identity.as_ref() != Some(root)
+            {
+                continue;
+            }
+            let Some(row) = final_rows.get(intent.transaction_id.as_str()) else {
+                continue;
+            };
+            let entry = intent
+                .completion
+                .as_ref()
+                .and_then(|completion| completion.manifest.entries.get(&intent.entry_id))
+                .ok_or(invalid("remote metadata final entry missing"))?;
+            let identity = crate::native_publication::field(row, "identity_hash")?
+                .parse()
+                .map_err(|_| invalid("remote metadata final identity"))?;
+            result.push((entry.clone(), identity));
+        }
+        transaction.rollback()?;
+        Ok(result)
+    }
+
     /// Read-only original final receipt replay. Later native edits do not renew
     /// mutation, cleanup or history authority and are never rewritten here.
     pub fn native_publication_final_snapshot(&self, id: &EntryId) -> Result<SnapshotId> {

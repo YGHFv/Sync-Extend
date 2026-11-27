@@ -6,7 +6,7 @@ use super::{
     NativeCreator, NativeFailedCreate, NativeParent, NativeSealed,
 };
 use crate::{
-    node_archive::portable_source::{path_equal, path_within},
+    path_comparison::{path_equal, path_within},
     ReconcileError, Result,
 };
 use serde::Serialize;

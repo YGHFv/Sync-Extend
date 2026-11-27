@@ -26,6 +26,39 @@ pub struct RenamePathObservation {
     pub content: Option<FileManifest>,
     pub physical_identity: ContentId,
     pub single_link: bool,
+    /// Actual stable native capture, separate from the signed logical Entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_metadata: Option<crate::PortableEntryMetadata>,
+}
+
+/// A local observation can preserve signed logical metadata only while the
+/// exact physical file and its complete previously captured metadata survive.
+/// Path may change (a real rename); content/identity/metadata may not.
+pub fn preserves_logical_metadata(
+    logical: &crate::Entry,
+    previous: &RenamePathObservation,
+    actual: &RenamePathObservation,
+    platform: crate::PortableMetadataProjectionPlatform,
+) -> Result<bool> {
+    let (Some(expected), Some(before), Some(observed)) = (
+        &logical.metadata,
+        &previous.local_metadata,
+        &actual.local_metadata,
+    ) else {
+        return Ok(false);
+    };
+    before.validate()?;
+    observed.validate()?;
+    Ok(logical.kind == EntryKind::File
+        && previous.kind == logical.kind
+        && actual.kind == logical.kind
+        && previous.content == logical.content
+        && actual.content == logical.content
+        && previous.single_link
+        && actual.single_link
+        && previous.physical_identity == actual.physical_identity
+        && before == observed
+        && expected.matches_local_projection(observed, platform)?)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -202,6 +235,14 @@ fn validate_layout<'a>(
     let mut files = BTreeMap::new();
     let mut bytes = 0u64;
     for observed in entries {
+        if let Some(metadata) = &observed.local_metadata {
+            metadata.validate()?;
+            if observed.kind != EntryKind::File {
+                return Err(ModelError::InvalidData(
+                    "directory local metadata observation",
+                ));
+            }
+        }
         if paths.len() >= max_entries
             || paths
                 .insert(observed.path.collision_key(), &observed.path)
