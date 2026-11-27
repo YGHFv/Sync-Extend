@@ -335,6 +335,12 @@ impl VerifiedNodeStateArchive {
             .collect();
         original_files.sort_by(|left, right| left.path.cmp(&right.path));
         for entry in original_files {
+            // Pure source preflight runs before any destination root/file
+            // CREATE. Deterministically unrepresentable mandatory metadata must
+            // fail here; native apply failures later retain their real prefix.
+            if let Some(metadata) = &entry.metadata {
+                crate::filesystem::projected_metadata(metadata)?;
+            }
             let content = entry.content.as_ref().ok_or(ReconcileError::Invariant(
                 "node layout original file content absent",
             ))?;
