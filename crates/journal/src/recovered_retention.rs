@@ -274,6 +274,7 @@ pub(crate) fn no_pending(
         "tree_restore_objects",
         "remote_replace_objects",
         "conflict_resolution_objects",
+        "native_history_hold_objects",
     ] {
         if connection.query_row(
             &format!("SELECT count(*) FROM main.\"{table}\""),

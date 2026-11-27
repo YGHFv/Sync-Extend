@@ -133,6 +133,15 @@ mod managed_rpc;
 pub use managed_rpc::{ManagedRpcBinding, ManagedRpcOwner};
 
 #[allow(unsafe_code)]
+mod portable_metadata;
+pub use portable_metadata::{
+    apply as apply_portable_file_metadata, capture as capture_portable_file_metadata,
+    CapturedFileMetadata, CapturedFlag, CapturedTime, PortableMetadataApplication,
+    PortableMetadataCapabilities, PortableMetadataCapture, PortableTime, UnsupportedReason,
+    UNIX_NANOSECOND_TIME_RESOLUTION_NANOS, WINDOWS_NTFS_TIME_RESOLUTION_NANOS,
+};
+
+#[allow(unsafe_code)]
 mod pinned_program;
 pub use pinned_program::PinnedProgram;
 

@@ -256,6 +256,7 @@ fn exchange(path: &Path, action: Action<'_>) -> Result<serde_json::Value> {
             .as_str()
             .ok_or("dashboard owner generation absent")?
             .parse::<EntryId>()?;
+        validate_dashboard_metadata_disclosure(&value)?;
         return Ok(value);
     }
     let object = value
@@ -307,6 +308,171 @@ const MAX_PREVIEW_RESPONSE: usize = 262_144;
 const MAX_PREVIEW_OWNER_SPACES: usize = 64;
 const CONTEXT_MAX_AGE_MS: u64 = 10_000;
 const CONTEXT_REFRESH_MS: u64 = 5_000;
+
+const METADATA_STATES: [&str; 3] = ["supported", "unsupported", "unknown"];
+const METADATA_UNSUPPORTED_REASONS: [&str; 4] = ["platform", "filesystem", "permission", "api"];
+const METADATA_CERTIFICATIONS: [&str; 3] = [
+    "windows_ntfs_actual_grouped_acceptance",
+    "unix_implemented_not_verified_in_this_release",
+    "unsupported_platform",
+];
+
+fn validate_metadata_capability(value: &serde_json::Value) -> Result<()> {
+    let object = value
+        .as_object()
+        .ok_or("local metadata capability object absent")?;
+    if object.len() < 3 || object.len() > 7 {
+        return Err("local metadata capability fields differ".into());
+    }
+    for key in object.keys() {
+        if ![
+            "format_version",
+            "capture",
+            "apply",
+            "verify",
+            "timestamp_precision_ns",
+            "unsupported",
+            "certification",
+        ]
+        .contains(&key.as_str())
+        {
+            return Err("local metadata capability field differs".into());
+        }
+    }
+    if object
+        .get("format_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+    {
+        return Err("local metadata capability version differs".into());
+    }
+    for phase in ["capture", "apply", "verify"] {
+        let stage = object
+            .get(phase)
+            .and_then(serde_json::Value::as_object)
+            .ok_or("local metadata capability stage absent")?;
+        if stage.len() < 2 || stage.len() > 4 {
+            return Err("local metadata capability stage fields differ".into());
+        }
+        for (name, state) in stage {
+            if !["modified", "creation", "readonly", "unix_executable"].contains(&name.as_str())
+                || !state
+                    .as_str()
+                    .is_some_and(|state| METADATA_STATES.contains(&state))
+            {
+                return Err("local metadata capability stage state differs".into());
+            }
+        }
+        if !stage.contains_key("modified") || !stage.contains_key("readonly") {
+            return Err("local metadata capability required field absent".into());
+        }
+    }
+    match object.get("timestamp_precision_ns") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(value) => {
+            if !value
+                .as_u64()
+                .is_some_and(|precision| (1..=1_000_000_000).contains(&precision))
+            {
+                return Err("local metadata timestamp precision differs".into());
+            }
+        }
+    }
+    match object.get("unsupported") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(value) => {
+            let reasons = value
+                .as_object()
+                .ok_or("local metadata unsupported reasons absent")?;
+            if reasons.len() > 2 {
+                return Err("local metadata unsupported reasons exceed bound".into());
+            }
+            for (name, reason) in reasons {
+                if !["creation", "unix_executable"].contains(&name.as_str())
+                    || !reason
+                        .as_str()
+                        .is_some_and(|reason| METADATA_UNSUPPORTED_REASONS.contains(&reason))
+                {
+                    return Err("local metadata unsupported reason differs".into());
+                }
+            }
+        }
+    }
+    match object.get("certification") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(value) => {
+            if !value
+                .as_str()
+                .is_some_and(|certification| METADATA_CERTIFICATIONS.contains(&certification))
+            {
+                return Err("local metadata certification differs".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_entry_metadata(value: &serde_json::Value) -> Result<()> {
+    let object = value
+        .as_object()
+        .ok_or("local entry metadata object absent")?;
+    if object.len() != 3
+        || !["format_version", "modified", "readonly"]
+            .iter()
+            .all(|field| object.contains_key(*field))
+    {
+        return Err("local entry metadata fields differ".into());
+    }
+    if object["format_version"].as_u64() != Some(1) || !object["readonly"].is_boolean() {
+        return Err("local entry metadata format differs".into());
+    }
+    let modified = object["modified"]
+        .as_object()
+        .ok_or("local entry modified timestamp absent")?;
+    if modified.len() != 2
+        || !["seconds", "nanoseconds"]
+            .iter()
+            .all(|field| modified.contains_key(*field))
+    {
+        return Err("local entry modified timestamp fields differ".into());
+    }
+    modified["seconds"]
+        .as_i64()
+        .ok_or("local entry modified seconds differ")?;
+    if !modified["nanoseconds"]
+        .as_u64()
+        .is_some_and(|nanoseconds| nanoseconds < 1_000_000_000)
+    {
+        return Err("local entry modified nanoseconds differ".into());
+    }
+    Ok(())
+}
+
+fn validate_dashboard_metadata_disclosure(value: &serde_json::Value) -> Result<()> {
+    let Some(local) = value["observation"]["local"].as_object() else {
+        return Ok(());
+    };
+    if let Some(capabilities) = local.get("metadata_capabilities") {
+        if !capabilities.is_null() {
+            validate_metadata_capability(capabilities)?;
+        }
+    }
+    let Some(entries) = local.get("entries") else {
+        return Ok(());
+    };
+    let entries = entries.as_array().ok_or("local dashboard entries absent")?;
+    if entries.len() > 128 {
+        return Err("local dashboard entries exceed bound".into());
+    }
+    for entry in entries {
+        if let Some(metadata) = entry.get("metadata") {
+            if !metadata.is_null() {
+                validate_entry_metadata(metadata)?;
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

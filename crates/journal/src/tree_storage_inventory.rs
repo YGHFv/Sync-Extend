@@ -151,6 +151,9 @@ fn tree_row(row: JournalStoredRow) -> Result<TreeRestoreStoredRow> {
                 JournalStorageColumnValue::Null => {
                     return Err(invalid("tree inventory null value"));
                 }
+                JournalStorageColumnValue::Bytes(_) => {
+                    return Err(invalid("tree inventory blob value"));
+                }
             };
             Ok(TreeStorageColumn {
                 name: column.name.clone(),

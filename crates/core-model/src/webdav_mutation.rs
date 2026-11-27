@@ -201,6 +201,7 @@ pub fn plan_webdav_mutation(
                 path: destination.clone(),
                 kind: EntryKind::Directory,
                 content: None,
+                metadata: None,
             };
             manifest
                 .entries

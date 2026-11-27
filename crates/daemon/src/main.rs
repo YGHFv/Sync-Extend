@@ -14,10 +14,11 @@ mod linux_namespace;
 mod local_control;
 mod management;
 mod management_credentials;
-#[cfg(windows)]
-mod recovery;
+mod native_history_audit;
 #[cfg(windows)]
 mod protected_deployment;
+#[cfg(windows)]
+mod recovery;
 mod restore_preview_cli;
 mod shutdown;
 mod storage;
@@ -944,6 +945,11 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Audit one explicit complete original schema-69 image in bounded, read-only mode.
+    NativeHistoryAudit {
+        #[arg(long)]
+        request: PathBuf,
+    },
     /// Reserve immutable expected content locally; no import, release or worker.
     ReserveContent {
         #[arg(long)]
@@ -1414,7 +1420,33 @@ fn print(value: &impl serde::Serialize) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn main() -> ExitCode {
+    // The Linux storage-only owner must run before any ordinary thread is
+    // started, so keep the whole entrypoint on the main thread there.
+    run()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() -> ExitCode {
+    // Building the bounded daemon CLI surface exceeds the default Windows
+    // main-thread stack in debug builds, before `Cli::parse()` can return.
+    // Run the complete entrypoint on an explicit large worker stack.
+    let runner = std::thread::Builder::new()
+        .name("syncd-main".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(run);
+    match runner {
+        Ok(runner) => runner.join().unwrap_or(ExitCode::FAILURE),
+        Err(error) => {
+            eprintln!("syncd: main thread failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[inline(never)]
+fn run() -> ExitCode {
     let parsed = Cli::parse();
     if let Err(error) = tree_restore_selection_cli::precheck(&parsed) {
         eprintln!("syncd: {error}");
@@ -3097,6 +3129,9 @@ async fn execute(
         }
         Command::StorageReport { data_dir } => {
             print(&open(&data_dir)?.storage_report()?)?;
+        }
+        Command::NativeHistoryAudit { request } => {
+            native_history_audit::run(&request)?;
         }
         Command::ReserveContent { data_dir, intent } => {
             let mut bytes = Vec::new();

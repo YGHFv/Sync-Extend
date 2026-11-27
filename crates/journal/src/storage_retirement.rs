@@ -263,7 +263,8 @@ pub(crate) fn audit(connection: &Connection) -> Result<Vec<StorageRetirementAdmi
                  OR EXISTS(SELECT 1 FROM main.snapshot_objects WHERE content_id=?1)
                  OR EXISTS(SELECT 1 FROM main.publication_objects WHERE content_id=?1)
                  OR EXISTS(SELECT 1 FROM main.mutation_objects WHERE content_id=?1)
-                 OR EXISTS(SELECT 1 FROM main.read_lease_objects WHERE content_id=?1)",
+                 OR EXISTS(SELECT 1 FROM main.read_lease_objects WHERE content_id=?1)
+                 OR EXISTS(SELECT 1 FROM main.native_history_hold_objects WHERE content_id=?1)",
                 [request.content_id.as_str()], |r| r.get(0),
             )?;
             if pinned {

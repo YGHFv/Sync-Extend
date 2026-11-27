@@ -8,7 +8,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use sync_extend_core_model::{
-    ContentId, Entry, EntryKind, PortablePath, tree_restore_identity::TreeNativeIdentity,
+    tree_restore_identity::TreeNativeIdentity, ContentId, Entry, EntryKind, PortableEntryMetadata,
+    PortableMetadataUnsupportedReason, PortablePath, PortableTimestamp, PortableUnixExecutable,
 };
 use sync_extend_platform_fs::{
     FileKey, GuardedReadFile, LockedDirectory, LockedDirectoryMutation, LockedFile,
@@ -498,6 +499,8 @@ impl CreatedFile {
             return Err(invalid());
         };
         self.held = Some(Payload::Published(held.release_creation_parent()?));
+        apply_entry_metadata(self.reader()?, &self.entry)?;
+        super::checkpoint(&format!("webdav_action_{}_metadata_applied", self.action));
         self.verify()
     }
     pub(super) fn key(&self) -> FileKey {
@@ -577,9 +580,144 @@ impl CreatedFile {
             }
         } else {
             verify_content(reader, &self.entry)?;
+            if matches!(&self.held, Some(Payload::Published(_))) {
+                verify_entry_metadata(reader, &self.entry)?;
+            }
         }
         Ok(())
     }
+}
+
+fn platform_unsupported(
+    reason: PortableMetadataUnsupportedReason,
+) -> sync_extend_platform_fs::UnsupportedReason {
+    match reason {
+        PortableMetadataUnsupportedReason::Platform => {
+            sync_extend_platform_fs::UnsupportedReason::Platform
+        }
+        PortableMetadataUnsupportedReason::Filesystem => {
+            sync_extend_platform_fs::UnsupportedReason::Filesystem
+        }
+        PortableMetadataUnsupportedReason::Permission => {
+            sync_extend_platform_fs::UnsupportedReason::Permission
+        }
+        PortableMetadataUnsupportedReason::Api => sync_extend_platform_fs::UnsupportedReason::Api,
+    }
+}
+
+fn platform_time(value: PortableTimestamp) -> Result<sync_extend_platform_fs::PortableTime> {
+    let (seconds, nanos) = value.captured_value().ok_or_else(invalid)?;
+    Ok(sync_extend_platform_fs::PortableTime { seconds, nanos })
+}
+
+fn platform_captured_time(
+    value: PortableTimestamp,
+) -> Result<sync_extend_platform_fs::CapturedTime> {
+    match value {
+        PortableTimestamp::Captured { .. } => Ok(sync_extend_platform_fs::CapturedTime::Value(
+            platform_time(value)?,
+        )),
+        PortableTimestamp::Unsupported { reason } => Ok(
+            sync_extend_platform_fs::CapturedTime::Unsupported(platform_unsupported(reason)),
+        ),
+        PortableTimestamp::Unknown => Err(invalid()),
+    }
+}
+
+fn platform_captured_flag(value: PortableUnixExecutable) -> sync_extend_platform_fs::CapturedFlag {
+    match value {
+        PortableUnixExecutable::Captured { executable } => {
+            sync_extend_platform_fs::CapturedFlag::Value(executable)
+        }
+        PortableUnixExecutable::Unsupported { .. } => {
+            sync_extend_platform_fs::CapturedFlag::Unsupported(
+                sync_extend_platform_fs::UnsupportedReason::Api,
+            )
+        }
+        PortableUnixExecutable::Unknown => sync_extend_platform_fs::CapturedFlag::Unsupported(
+            sync_extend_platform_fs::UnsupportedReason::Api,
+        ),
+    }
+}
+
+fn platform_metadata(
+    metadata: &PortableEntryMetadata,
+) -> Result<sync_extend_platform_fs::CapturedFileMetadata> {
+    metadata.validate().map_err(|_| invalid())?;
+    Ok(sync_extend_platform_fs::CapturedFileMetadata {
+        modified: platform_time(metadata.modified)?,
+        readonly: metadata.readonly.value().ok_or_else(invalid)?,
+        creation: metadata
+            .creation
+            .map(platform_captured_time)
+            .transpose()?
+            .unwrap_or(sync_extend_platform_fs::CapturedTime::Unsupported(
+                sync_extend_platform_fs::UnsupportedReason::Api,
+            )),
+        unix_executable: metadata
+            .unix_executable
+            .map(platform_captured_flag)
+            .unwrap_or(sync_extend_platform_fs::CapturedFlag::Unsupported(
+                sync_extend_platform_fs::UnsupportedReason::Api,
+            )),
+    })
+}
+
+fn apply_entry_metadata(reader: &std::fs::File, entry: &Entry) -> Result<()> {
+    let Some(metadata) = entry.metadata.as_ref() else {
+        return Ok(());
+    };
+    let requested = platform_metadata(metadata)?;
+    sync_extend_platform_fs::apply_portable_file_metadata(reader, &requested)?;
+    Ok(())
+}
+
+fn verify_entry_metadata(reader: &std::fs::File, entry: &Entry) -> Result<()> {
+    let Some(metadata) = entry.metadata.as_ref() else {
+        return Ok(());
+    };
+    let requested = platform_metadata(metadata)?;
+    let observed = sync_extend_platform_fs::capture_portable_file_metadata(reader)?;
+    let resolution = observed.capabilities.modified_resolution_nanos;
+    let quantize =
+        |time: sync_extend_platform_fs::PortableTime| sync_extend_platform_fs::PortableTime {
+            seconds: time.seconds,
+            nanos: time.nanos / resolution * resolution,
+        };
+    if quantize(observed.metadata.modified) != quantize(requested.modified)
+        || observed.metadata.readonly != requested.readonly
+    {
+        return Err(invalid());
+    }
+    match requested.creation {
+        sync_extend_platform_fs::CapturedTime::Value(expected) => {
+            let creation_resolution = observed
+                .capabilities
+                .creation_resolution_nanos
+                .ok_or_else(invalid)?;
+            let expected = sync_extend_platform_fs::PortableTime {
+                seconds: expected.seconds,
+                nanos: expected.nanos / creation_resolution * creation_resolution,
+            };
+            if observed.metadata.creation != sync_extend_platform_fs::CapturedTime::Value(expected)
+            {
+                return Err(invalid());
+            }
+        }
+        sync_extend_platform_fs::CapturedTime::Unsupported(_) => {}
+    }
+    match requested.unix_executable {
+        sync_extend_platform_fs::CapturedFlag::Value(expected) => {
+            if !observed.capabilities.unix_executable_supported
+                || observed.metadata.unix_executable
+                    != sync_extend_platform_fs::CapturedFlag::Value(expected)
+            {
+                return Err(invalid());
+            }
+        }
+        sync_extend_platform_fs::CapturedFlag::Unsupported(_) => {}
+    }
+    Ok(())
 }
 
 fn require_absent(path: &Path) -> Result<()> {

@@ -126,6 +126,7 @@ pub(crate) fn admit_pruning(
                 JournalStorageColumnValue::Null => 0,
                 JournalStorageColumnValue::Integer(_) => 8,
                 JournalStorageColumnValue::Text(value) => value.len() as u64,
+                JournalStorageColumnValue::Bytes(value) => value.len() as u64,
             };
             sum.checked_add(length)
                 .ok_or(JournalError::Invariant("pruning clock charge overflow"))

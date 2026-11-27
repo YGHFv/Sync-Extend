@@ -120,7 +120,10 @@ impl PublicationCompletion {
                             path: observed.path.clone(),
                         });
                     }
-                    if old.kind != observed.kind || old.content != observed.content {
+                    if old.kind != observed.kind
+                        || old.content != observed.content
+                        || old.metadata != observed.metadata
+                    {
                         changes.push(Change::Put {
                             entry: observed.clone(),
                         });
@@ -203,6 +206,13 @@ impl PublicationCompletion {
             "publication completion operation missing",
         ))?;
         operation.validate()?;
+        let completion_entry =
+            self.manifest
+                .entries
+                .get(&intent.entry_id)
+                .ok_or(JournalError::Invariant(
+                    "publication completion entry missing",
+                ))?;
         if self.timestamp_ms > i64::MAX as u64
             || self.timestamp_ms != intent.created_at_ms
             || operation.payload.created_at_ms != self.timestamp_ms
@@ -216,6 +226,7 @@ impl PublicationCompletion {
                         path: intent.target_path.clone(),
                         kind: EntryKind::File,
                         content: Some(intent.content.clone()),
+                        metadata: completion_entry.metadata.clone(),
                     },
                 })
         {
@@ -245,7 +256,7 @@ impl PublicationCompletion {
             &self.baseline,
             &operation.payload.origin_device_id,
             observed,
-            self.manifest.entries[&intent.entry_id].clone(),
+            completion_entry.clone(),
             self.timestamp_ms,
         )?;
         if rebuilt

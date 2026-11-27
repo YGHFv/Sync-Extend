@@ -4,7 +4,7 @@
 function Assert-SyncExtendRestorePath($Value) {
     Assert-SyncExtendViewText $Value 4096
     if ($Value -cmatch '[\x00-\x1f<>:"\\|?*]' -or
-        [Text.Encoding]::UTF8.GetByteCount($Value) -gt 4096) { throw 'Invalid portable restore path.' }
+        (Get-SyncExtendUtf8ByteCount $Value) -gt 4096) { throw 'Invalid portable restore path.' }
     foreach ($part in $Value.Split('/')) {
         if (!$part -or $part -ceq '.' -or $part -ceq '..' -or $part.EndsWith('.') -or $part.EndsWith(' ')) {
             throw 'Invalid portable restore path component.'
@@ -80,7 +80,7 @@ function New-SyncExtendRestoreRequest {
         $bytes = 0
         foreach ($name in $names) {
             Assert-SyncExtendRestorePath $name
-            $bytes += [Text.Encoding]::UTF8.GetByteCount($name)
+            $bytes += Get-SyncExtendUtf8ByteCount $name
             if (!$seen.Add($name)) { throw 'Duplicate restore source path.' }
         }
         if ($bytes -gt 16384) { throw 'Restore source paths exceed their byte limit.' }
@@ -104,13 +104,13 @@ function New-SyncExtendRestoreRequest {
 
 function Get-SyncExtendRestoreRequestHex($Request) {
     $json = $Request | ConvertTo-Json -Depth 24 -Compress
-    $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+    $bytes = Get-SyncExtendUtf8Bytes $json
     # Keep the native Windows command line below its 32767-character bound.
     if ($bytes.Length -gt 8192) { throw 'Restore request exceeds the Windows client command limit.' }
     return [Convert]::ToHexString($bytes).ToLowerInvariant()
 }
 
-function New-SyncExtendRestorePreviewView($Response, $Request) {
+function New-SyncExtendRestorePreviewView($Response, $Request, $Capabilities = $null) {
     Assert-SyncExtendViewObject $Response
     Assert-SyncExtendViewId $Response.owner_generation 32
     if ($Response.preview_format_version -ne 2 -or $Response.owner_generation -cne $Request.owner_generation -or
@@ -202,6 +202,10 @@ function New-SyncExtendRestorePreviewView($Response, $Request) {
     }
     $details = "只读描述，尚未恢复。选中 $($Response.counts.selected_target_entries) 项；保留当前 $($Response.counts.preserved_current_paths) 项；冲突 $($Response.counts.reported_conflicts) 项。"
     $details += "`r`n逻辑暂存：$staging；原内容估计：$original。CAS 内容、原生路径冲突、可用空间和实际物理分配均未验证。"
+    $capabilityView = New-SyncExtendMetadataCapabilitiesView $Capabilities
+    if ($capabilityView.Declared) {
+        $details += "`r`n预览所用平台的元数据能力：$($capabilityView.Capabilities)；认证：$($capabilityView.Certification)；时间精度：$($capabilityView.Precision)。这是能力披露，不代表所选历史项已应用或已校验。"
+    }
     if ($Response.entries_truncated -or $Response.cas_references_truncated) {
         $details += "`r`n结果表或块引用已按显示预算截断；完整选中数量仍保留。"
     }
@@ -249,7 +253,7 @@ function Assert-SyncExtendRestoreRequest($Value) {
             foreach ($path in $selection.paths) {
                 Assert-SyncExtendRestorePath $path
                 if (!$seen.Add($path)) { throw 'Duplicate historical path.' }
-                $bytes += [Text.Encoding]::UTF8.GetByteCount($path)
+                $bytes += Get-SyncExtendUtf8ByteCount $path
             }
             if ($bytes -gt 16384) { throw 'Selected historical paths exceed their byte limit.' }
         }
@@ -293,7 +297,7 @@ function ConvertTo-SyncExtendRestoreCanonicalValue($Value) {
 function Get-SyncExtendRestoreObjectDigest($Value) {
     $canonical = ConvertTo-SyncExtendRestoreCanonicalValue $Value
     $json = ConvertTo-Json -InputObject $canonical -Depth 32 -Compress
-    return Get-SyncExtendRestoreByteDigest ([Text.Encoding]::UTF8.GetBytes($json))
+    return Get-SyncExtendRestoreByteDigest (Get-SyncExtendUtf8Bytes $json)
 }
 
 function ConvertFrom-SyncExtendRestoreRequestHex([string]$Hex) {
@@ -455,7 +459,7 @@ function New-SyncExtendPendingRestoreView($Pending) {
     $phase = if ($phaseNames.ContainsKey($Pending.phase)) { $phaseNames[$Pending.phase] } else { '需要核对持久事务' }
     $summary = "恢复事务 $($Pending.transaction_id)`r`n$phase。普通启动、版本切换和 WebDAV 更改已暂停。"
     if ($Pending.refusal_reason) {
-        Assert-SyncExtendViewText $Pending.refusal_reason 512
+        Assert-SyncExtendViewTextCharacters $Pending.refusal_reason 512
         $summary += "`r`n拒绝原因：$($Pending.refusal_reason)"
     }
     return @{
@@ -467,6 +471,184 @@ function New-SyncExtendPendingRestoreView($Pending) {
             ,@('原属主已退出', $(if ($Pending.original_process_exit_verified) { '已由实际进程 wait 验证' } else { '尚待核实；不会执行原生恢复' }))
             ,@('Final 与清理', $(if ($Pending.native_final_verified) { '已核新 Final、精确清理和独立重开' } else { '尚未完成' }))
             ,@('继续入口', '继续原事务；原生 lineage 无法验证时仍会拒绝，失败保持 pending')
+        )
+    }
+}
+
+function Test-SyncExtendVerifiedStopStatus($Status) {
+    # manage-user records stopped only after its original retained process
+    # exits with zero. A ManagementStatus reply or failed health read is not
+    # that record. Also honour an explicit future exit-verification field.
+    if ($null -eq $Status -or $Status.state -cne 'stopped' -or
+        $Status.process_active -isnot [bool] -or $Status.process_active -cne $false) { return $false }
+    $hasExit = if ($Status -is [Collections.IDictionary]) { $Status.Contains('process_exit_verified') } else {
+        $null -ne $Status.PSObject.Properties['process_exit_verified']
+    }
+    # A stopped state without an explicit verified-exit receipt is not enough
+    # to open a new window or restore from that owner. Older observations are
+    # unknown, not an implicit success.
+    return [bool]($hasExit -and $Status.process_exit_verified -is [bool] -and
+        $Status.process_exit_verified -ceq $true)
+}
+
+function Assert-SyncExtendNativeHistoryAuditRequest($Request) {
+    Assert-SyncExtendRestoreKeys $Request @('image', 'image_digest', 'space', 'roots',
+        'max_image_bytes', 'bounds')
+    Assert-SyncExtendViewText $Request.image 4096
+    if ([IO.Path]::IsPathRooted($Request.image) -eq $false -or
+        $Request.image.IndexOf([char]0) -ge 0) {
+        throw 'Native history audit image must be an absolute local path.'
+    }
+    Assert-SyncExtendViewId $Request.image_digest
+    Assert-SyncExtendViewId $Request.space 32
+    Assert-SyncExtendViewList $Request.roots 64
+    if (!$Request.roots.Count) { throw 'Native history audit requires a root mapping.' }
+    foreach ($root in $Request.roots) {
+        Assert-SyncExtendRestoreKeys $root @('original_worktree', 'projected_worktree')
+        foreach ($name in @('original_worktree', 'projected_worktree')) {
+            Assert-SyncExtendViewText $root[$name] 4096
+            if ([IO.Path]::IsPathRooted($root[$name]) -eq $false -or
+                $root[$name].IndexOf([char]0) -ge 0) {
+                throw 'Native history audit root mappings must be absolute.'
+            }
+        }
+    }
+    $imageLimit = Get-SyncExtendViewInteger $Request.max_image_bytes
+    if ($imageLimit -lt 1 -or $imageLimit -gt 256MB) {
+        throw 'Native history audit image bound is outside the client limit.'
+    }
+    Assert-SyncExtendRestoreKeys $Request.bounds @('max_entries', 'inventory_max_rows',
+        'inventory_max_logical_bytes', 'max_rows', 'max_logical_bytes',
+        'max_vm_instructions', 'max_query_secs')
+    foreach ($name in @('max_entries', 'inventory_max_rows', 'inventory_max_logical_bytes',
+            'max_rows', 'max_logical_bytes', 'max_vm_instructions', 'max_query_secs')) {
+        $null = Get-SyncExtendViewInteger $Request.bounds[$name]
+    }
+    if ($Request.bounds.max_entries -lt 1 -or $Request.bounds.max_entries -gt 1000000 -or
+        $Request.bounds.inventory_max_rows -lt 1 -or $Request.bounds.inventory_max_rows -gt 1000000 -or
+        $Request.bounds.max_rows -lt 1 -or $Request.bounds.max_rows -gt 1000000 -or
+        $Request.bounds.inventory_max_logical_bytes -lt 1 -or
+        $Request.bounds.max_logical_bytes -lt 1 -or
+        $Request.bounds.max_vm_instructions -lt 1000 -or
+        $Request.bounds.max_vm_instructions -gt 250000000 -or
+        $Request.bounds.max_query_secs -lt 1 -or $Request.bounds.max_query_secs -gt 300) {
+        throw 'Native history audit bounds are outside the client limit.'
+    }
+}
+
+function New-SyncExtendNativeHistoryAuditView($Audit, $Request) {
+    Assert-SyncExtendNativeHistoryAuditRequest $Request
+    Assert-SyncExtendRestoreKeys $Audit @('audit', 'status', 'request_sha256', 'schema', 'space',
+        'image_digest', 'catalog_digest', 'rows_digest', 'source_digest', 'registry_digest',
+        'tables', 'owners', 'projection', 'limits', 'read_only', 'native_authority',
+        'raw_rows_included', 'host_paths_included')
+    if ($Audit.audit -cne 'native_history_source' -or $Audit.status -cne 'ok' -or
+        (Get-SyncExtendViewInteger $Audit.schema) -ne 69) {
+        throw 'Native history audit identity is not the schema-69 source audit.'
+    }
+    Assert-SyncExtendViewId $Audit.request_sha256
+    Assert-SyncExtendViewId $Audit.space 32
+    foreach ($name in @('image_digest', 'catalog_digest', 'rows_digest', 'source_digest',
+            'registry_digest')) {
+        Assert-SyncExtendViewId $Audit[$name]
+    }
+    if ($Audit.space -cne $Request.space -or $Audit.image_digest -cne $Request.image_digest) {
+        throw 'Native history audit response does not match the explicit request.'
+    }
+    foreach ($name in @('read_only', 'native_authority', 'raw_rows_included', 'host_paths_included')) {
+        Assert-SyncExtendViewFlag $Audit[$name]
+    }
+    if (!$Audit.read_only -or $Audit.native_authority -or
+        $Audit.raw_rows_included -or $Audit.host_paths_included) {
+        throw 'Native history audit cannot grant write, native, row or host-path output authority.'
+    }
+    Assert-SyncExtendRestoreKeys $Audit.tables @('count', 'families', 'slices', 'rows',
+        'logical_bytes', 'sample_limit', 'truncated', 'sample')
+    foreach ($name in @('count', 'families', 'slices', 'rows', 'logical_bytes', 'sample_limit')) {
+        $null = Get-SyncExtendViewInteger $Audit.tables[$name]
+    }
+    Assert-SyncExtendViewFlag $Audit.tables.truncated
+    Assert-SyncExtendViewList $Audit.tables.sample 4
+    if ($Audit.tables.count -ne 141 -or $Audit.tables.families -ne 22 -or
+        $Audit.tables.slices -ne 27 -or $Audit.tables.sample_limit -gt 4 -or
+        $Audit.tables.sample.Count -gt $Audit.tables.sample_limit -or
+        $Audit.tables.truncated -ne ($Audit.tables.sample.Count -lt $Audit.tables.count)) {
+        throw 'Native history audit table summary is inconsistent.'
+    }
+    foreach ($table in $Audit.tables.sample) {
+        Assert-SyncExtendRestoreKeys $table @('table', 'rows', 'logical_bytes')
+        Assert-SyncExtendViewText $table.table 64
+        $null = Get-SyncExtendViewInteger $table.rows
+        $null = Get-SyncExtendViewInteger $table.logical_bytes
+    }
+    $owners = Get-SyncExtendViewInteger $Audit.owners
+    if ($owners -lt 1) { throw 'Native history audit owner summary is empty.' }
+    Assert-SyncExtendRestoreKeys $Audit.projection @('portable_rows', 'root_columns',
+        'sample_limit', 'truncated', 'sample')
+    foreach ($name in @('portable_rows', 'root_columns', 'sample_limit')) {
+        $null = Get-SyncExtendViewInteger $Audit.projection[$name]
+    }
+    Assert-SyncExtendViewFlag $Audit.projection.truncated
+    Assert-SyncExtendViewList $Audit.projection.sample 4
+    if ($Audit.projection.root_columns -gt $Request.roots.Count -or
+        $Audit.projection.sample_limit -gt 4 -or
+        $Audit.projection.sample.Count -gt $Audit.projection.sample_limit -or
+        $Audit.projection.truncated -ne
+        ($Audit.projection.sample.Count -lt $Audit.projection.root_columns)) {
+        throw 'Native history audit projection summary is inconsistent.'
+    }
+    foreach ($mapping in $Audit.projection.sample) {
+        Assert-SyncExtendRestoreKeys $mapping @('table', 'column')
+        Assert-SyncExtendViewText $mapping.table 64
+        Assert-SyncExtendViewText $mapping.column 64
+    }
+    Assert-SyncExtendRestoreKeys $Audit.limits @('max_image_bytes', 'max_entries',
+        'inventory_max_rows', 'inventory_max_logical_bytes', 'max_rows', 'max_logical_bytes',
+        'max_vm_instructions', 'max_query_secs')
+    foreach ($name in @('max_image_bytes', 'max_entries', 'inventory_max_rows',
+            'inventory_max_logical_bytes', 'max_rows', 'max_logical_bytes',
+            'max_vm_instructions', 'max_query_secs')) {
+        $null = Get-SyncExtendViewInteger $Audit.limits[$name]
+    }
+    if ($Audit.limits.max_image_bytes -ne $Request.max_image_bytes -or
+        $Audit.limits.max_entries -ne $Request.bounds.max_entries -or
+        $Audit.limits.inventory_max_rows -ne $Request.bounds.inventory_max_rows -or
+        $Audit.limits.inventory_max_logical_bytes -ne $Request.bounds.inventory_max_logical_bytes -or
+        $Audit.limits.max_rows -ne $Request.bounds.max_rows -or
+        $Audit.limits.max_logical_bytes -ne $Request.bounds.max_logical_bytes -or
+        $Audit.limits.max_vm_instructions -ne $Request.bounds.max_vm_instructions -or
+        $Audit.limits.max_query_secs -ne $Request.bounds.max_query_secs) {
+        throw 'Native history audit limits do not match the explicit request.'
+    }
+    if ((Get-SyncExtendCanonicalJsonByteCount $Audit 12) -gt 3072) {
+        throw 'Native history audit exceeds the client display budget.'
+    }
+    $tableText = $Audit.tables.sample | ForEach-Object {
+        "$($_.table): $($_.rows) 行 / $(Format-SyncExtendViewBytes $_.logical_bytes)"
+    }
+    $rootText = $Audit.projection.sample | ForEach-Object { "$($_.table).$($_.column)" }
+    return @{
+        Summary = "原生 schema-69 历史源只读审计通过。`r`n" +
+            "摘要仅含聚合计数与摘要值；不含原始行、secret 或主机绝对路径。"
+        Rows = @(
+            ,@('审计状态', '只读 SELECT 通过；未执行恢复、写入或 native 授权')
+            ,@('空间 / schema', "$($Audit.space) / $($Audit.schema)")
+            ,@('镜像摘要', $Audit.image_digest)
+            ,@('catalog / rows 摘要', "$($Audit.catalog_digest) / $($Audit.rows_digest)")
+            ,@('source / registry 摘要', "$($Audit.source_digest) / $($Audit.registry_digest)")
+            ,@('表摘要', "$($Audit.tables.count) 表 / $($Audit.tables.families) 家族 / " +
+                "$($Audit.tables.slices) 切片；$($Audit.tables.rows) 行；" +
+                "$(Format-SyncExtendViewBytes $Audit.tables.logical_bytes)")
+            ,@('表样本', $(if ($tableText) { $tableText -join '；' } else { '无' }) +
+                $(if ($Audit.tables.truncated) { '（仅显示前 4 项）' } else { '' }))
+            ,@('owner / 投影', "$($Audit.owners) owner；$($Audit.projection.portable_rows) 可移植行；" +
+                "$($Audit.projection.root_columns) root 列")
+            ,@('root 列样本', $(if ($rootText) { $rootText -join '；' } else { '无' }) +
+                $(if ($Audit.projection.truncated) { '（仅显示前 4 项）' } else { '' }))
+            ,@('显式预算', "镜像 $(Format-SyncExtendViewBytes $Audit.limits.max_image_bytes)；" +
+                "行/字节 $($Audit.limits.max_rows) / $(Format-SyncExtendViewBytes $Audit.limits.max_logical_bytes)；" +
+                "VM $($Audit.limits.max_vm_instructions)；查询 $($Audit.limits.max_query_secs)s")
+            ,@('输出边界', '无原始行内容、secret 或绝对 host 路径；未知或超限时清除旧结果')
         )
     }
 }
@@ -493,9 +675,19 @@ function Assert-SyncExtendViewId($Value, [int]$Length = 64) {
     }
 }
 
-function Assert-SyncExtendViewText($Value, [int]$MaxLength = 4096) {
-    if ($Value -isnot [string] -or $Value.Length -eq 0 -or $Value.Length -gt $MaxLength -or
+function Assert-SyncExtendViewText($Value, [int]$MaxBytes = 4096) {
+    if ($Value -isnot [string] -or $Value.Length -eq 0 -or
+        $Value.IndexOf([char]0) -ge 0 -or (Get-SyncExtendUtf8ByteCount $Value) -gt $MaxBytes) {
+        throw 'The local observation has invalid text.'
+    }
+}
+
+function Assert-SyncExtendViewTextCharacters($Value, [int]$MaxCharacters = 512) {
+    # A few producer fields (the pending refusal reason) are bounded by
+    # characters, not bytes. Reject invalid UTF-16 without changing that bound.
+    if ($Value -isnot [string] -or $Value.Length -eq 0 -or $Value.Length -gt $MaxCharacters -or
         $Value.IndexOf([char]0) -ge 0) { throw 'The local observation has invalid text.' }
+    $null = Get-SyncExtendUtf8ByteCount $Value
 }
 
 function Assert-SyncExtendViewList($Value, [int]$Maximum) {
@@ -534,32 +726,75 @@ function Get-SyncExtendMetadataPrecisionText($Value) {
 function New-SyncExtendMetadataCapabilitiesView($Capabilities) {
     $view = @{
         Capabilities = '捕获未知 / 应用未知 / 校验未知'
-        Precision = '未知'; Declared = $false
+        Precision = '未知'; Certification = '未知'; Declared = $false
     }
     if ($null -eq $Capabilities) { return $view }
     try {
         Assert-SyncExtendViewObject $Capabilities
-        $fields = @('capture', 'apply', 'verify', 'timestamp_precision_ns')
-        if ($Capabilities.Count -lt 3 -or $Capabilities.Count -gt 4 -or
+        $fields = @('format_version', 'capture', 'apply', 'verify', 'timestamp_precision_ns', 'unsupported', 'certification')
+        if ($Capabilities.Count -lt 3 -or $Capabilities.Count -gt $fields.Count -or
             @($Capabilities.Keys | Where-Object { $_ -cnotin $fields }).Count) {
             throw 'The optional metadata capability shape cannot be verified.'
         }
+        if ($null -ne $Capabilities.format_version -and
+            ((Get-SyncExtendViewInteger $Capabilities.format_version) -ne 1)) {
+            throw 'The optional metadata capability version cannot be verified.'
+        }
         $states = @{ supported = '支持'; unsupported = '不支持'; unknown = '未知' }
+        $reasons = @{ platform = '平台'; filesystem = '文件系统'; permission = '权限'; api = '接口' }
+        $fieldNames = [ordered]@{
+            modified = '时间'; creation = '创建时间'; readonly = '只读'; unix_executable = '可执行位'
+        }
         $labels = [ordered]@{ capture = '捕获'; apply = '应用'; verify = '校验' }
         $segments = [Collections.Generic.List[string]]::new()
         $allUnknown = $true
         foreach ($phase in $labels.Keys) {
             $stage = $Capabilities[$phase]
             Assert-SyncExtendViewObject $stage
-            if ($stage.Count -ne 2 -or
-                @($stage.Keys | Where-Object { $_ -cnotin @('modified', 'readonly') }).Count -or
-                $stage.modified -isnot [string] -or $stage.readonly -isnot [string] -or
-                $stage.modified -cnotin @('supported', 'unsupported', 'unknown') -or
-                $stage.readonly -cnotin @('supported', 'unsupported', 'unknown')) {
+            if ($stage.Count -lt 2 -or $stage.Count -gt $fieldNames.Count -or
+                @($stage.Keys | Where-Object { $_ -cnotin @($fieldNames.Keys) }).Count -or
+                -not (@($stage.Keys) -ccontains 'modified') -or
+                -not (@($stage.Keys) -ccontains 'readonly')) {
                 throw 'The optional metadata capability stage cannot be verified.'
             }
-            if ($stage.modified -cne 'unknown' -or $stage.readonly -cne 'unknown') { $allUnknown = $false }
-            [void]$segments.Add("$($labels[$phase]) 时间$($states[$stage.modified])、只读$($states[$stage.readonly])")
+            $parts = [Collections.Generic.List[string]]::new()
+            foreach ($field in $fieldNames.Keys) {
+                if (!(@($stage.Keys) -ccontains $field)) { continue }
+                $state = $stage[$field]
+                if ($state -isnot [string] -or $state -cnotin $states.Keys) {
+                    throw 'The optional metadata capability stage state cannot be verified.'
+                }
+                if ($state -cne 'unknown') { $allUnknown = $false }
+                [void]$parts.Add("$($fieldNames[$field])$($states[$state])")
+            }
+            [void]$segments.Add("$($labels[$phase]) $($parts -join '、')")
+        }
+        $reasonSegments = [Collections.Generic.List[string]]::new()
+        if ($null -ne $Capabilities.unsupported) {
+            Assert-SyncExtendViewObject $Capabilities.unsupported
+            if (@($Capabilities.unsupported.Keys | Where-Object { $_ -cnotin @('creation', 'unix_executable') }).Count) {
+                throw 'The optional metadata unsupported reasons cannot be verified.'
+            }
+            foreach ($field in @('creation', 'unix_executable')) {
+                if ($null -eq $Capabilities.unsupported[$field]) { continue }
+                $reason = $Capabilities.unsupported[$field]
+                if ($reason -isnot [string] -or !$reasons.ContainsKey($reason)) {
+                    throw 'The optional metadata unsupported reason cannot be verified.'
+                }
+                [void]$reasonSegments.Add("$($fieldNames[$field])=$($reasons[$reason])")
+            }
+        }
+        $certification = '未知'
+        if ($null -ne $Capabilities.certification) {
+            if ($Capabilities.certification -isnot [string]) {
+                throw 'The optional metadata certification cannot be verified.'
+            }
+            $certification = switch -CaseSensitive ($Capabilities.certification) {
+                'windows_ntfs_actual_grouped_acceptance' { 'Windows NTFS 实际分组验收' }
+                'unix_implemented_not_verified_in_this_release' { 'Unix 已实现，本版本未实测' }
+                'unsupported_platform' { '当前平台不支持' }
+                default { throw 'The optional metadata certification cannot be verified.' }
+            }
         }
         $precision = '未知'
         if ($null -ne $Capabilities.timestamp_precision_ns) {
@@ -573,8 +808,13 @@ function New-SyncExtendMetadataCapabilitiesView($Capabilities) {
                 $precision = Get-SyncExtendMetadataPrecisionText $value
             }
         }
-        if (!$allUnknown) { $view.Capabilities = $segments -join ' / ' }
+        if (!$allUnknown) {
+            $text = $segments -join ' / '
+            if ($reasonSegments.Count) { $text += "（未支持原因：$($reasonSegments -join '、')）" }
+            $view.Capabilities = $text
+        }
         $view.Precision = $precision
+        $view.Certification = $certification
         $view.Declared = $true
     } catch {
         # Optional fields from older or malformed observations remain unknown.
@@ -906,12 +1146,15 @@ function New-SyncExtendClientView($Dashboard) {
         Summary = if ($Dashboard.resources_ready) { '本机资源已就绪。' } else { '本机资源尚未就绪。' }
     }
     foreach ($tab in @('Status', 'Files', 'History', 'Conflicts', 'Unavailable chunks', 'WebDAV',
-            'Storage', 'Storage snapshots', 'Network', 'Pull budget', 'Recovery', 'Pruned history')) {
+            'Storage', 'Storage snapshots', 'Network', 'Pull budget', 'Recovery', 'Pruned history',
+            'Native audit')) {
         $view.Rows[$tab] = [Collections.Generic.List[object]]::new()
     }
     $view.Summary += "`r`n远端备份状态尚未确认。"
     Add-SyncExtendViewRow $view 'Status' @('本机资源', $(if ($Dashboard.resources_ready) { '已就绪' } else { '尚未就绪' }))
     Add-SyncExtendViewRow $view 'Status' @('远端备份', '尚未确认')
+    Add-SyncExtendViewRow $view 'Native audit' @('原生历史只读审计', '未读取；需要显式 schema69 image、摘要、space 与 root 映射请求')
+    Add-SyncExtendViewRow $view 'Native audit' @('限制', '仅只读 SELECT；不授权恢复或清理；成功结果也不包含原始行、secret 或主机绝对路径')
 
     if ($null -ne $Dashboard.observation) {
         $observation = $Dashboard.observation
@@ -944,7 +1187,8 @@ function New-SyncExtendClientView($Dashboard) {
         Add-SyncExtendViewRow $view 'Status' @('待处理文件 / 发布', "$($local.outstanding_mutations) / $($local.outstanding_publications)")
         $metadataCapabilities = New-SyncExtendMetadataCapabilitiesView $local.metadata_capabilities
         if ($metadataCapabilities.Declared) {
-            Add-SyncExtendViewRow $view 'Status' @('元数据能力说明', '捕获、应用、校验分别声明支持能力；支持不代表该文件已应用或已校验。')
+            Add-SyncExtendViewRow $view 'Status' @('元数据能力说明',
+                "捕获、应用、校验分别声明支持能力；支持不代表该文件已应用或已校验。认证：$($metadataCapabilities.Certification)；时间精度：$($metadataCapabilities.Precision)。")
         }
         foreach ($entry in $local.entries) {
             Assert-SyncExtendViewObject $entry

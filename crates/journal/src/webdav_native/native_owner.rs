@@ -6,7 +6,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
-use sync_extend_core_model::{ContentId, tree_restore_identity::TreeNativeIdentity};
+use sync_extend_core_model::{tree_restore_identity::TreeNativeIdentity, ContentId};
 use sync_extend_platform_fs::{
     FileKey, LockedDirectory, LockedDirectoryMutation, OwnedFileCreation, SealedOriginalFile,
 };
@@ -89,6 +89,7 @@ impl InitialNativeOwner {
         let key = FileKey::from_file(reader)?;
         Ok(Some(crate::NativePublicationFileObservation {
             metadata: reader.metadata()?,
+            portable: None,
             physical_identity: ContentId::hash(
                 format!("windows:{}:{}", key.volume, key.id).as_bytes(),
             ),

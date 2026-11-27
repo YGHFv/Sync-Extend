@@ -1,14 +1,14 @@
-use super::{Header, physical};
+use super::{physical, Header};
 use crate::{
-    NativePublicationCreation, NativePublicationObservation, NativePublicationReadiness, Result,
-    storage_inventory::reader::invalid,
+    storage_inventory::reader::invalid, NativePublicationCreation, NativePublicationObservation,
+    NativePublicationReadiness, Result,
 };
 use std::{
     fs::{File, Metadata},
     path::{Path, PathBuf},
 };
-use sync_extend_core_model::{ContentId, FileManifest};
-use sync_extend_platform_fs::{FileKey, regular_file_matches_path};
+use sync_extend_core_model::{ContentId, FileManifest, PortableEntryMetadata};
+use sync_extend_platform_fs::{regular_file_matches_path, FileKey};
 
 enum Held<'a> {
     Creation(&'a NativePublicationCreation),
@@ -24,6 +24,7 @@ pub struct NativePublicationFileView<'a> {
 
 pub struct NativePublicationFileObservation {
     pub metadata: Metadata,
+    pub portable: Option<PortableEntryMetadata>,
     pub physical_identity: ContentId,
     pub content: Option<FileManifest>,
 }
@@ -119,8 +120,14 @@ impl NativePublicationFileView<'_> {
         self.verify()?;
         let (header, marker, payload, observed) = self.files();
         let file = if path == marker_path { marker } else { payload };
+        let portable = if observed && path == payload_path {
+            crate::portable_file_metadata::capture(file)?
+        } else {
+            None
+        };
         Ok(Some(NativePublicationFileObservation {
             metadata: file.metadata()?,
+            portable,
             physical_identity: physical(&super::creation::key(FileKey::from_file(file)?))?,
             content: (observed && path == payload_path).then(|| header.intent.content.clone()),
         }))

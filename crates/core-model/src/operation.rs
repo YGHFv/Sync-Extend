@@ -86,10 +86,15 @@ pub struct Entry {
     pub path: PortablePath,
     pub kind: EntryKind,
     pub content: Option<FileManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<PortableEntryMetadata>,
 }
 
 impl Entry {
     pub fn validate(&self) -> Result<()> {
+        if let Some(metadata) = &self.metadata {
+            metadata.validate()?;
+        }
         match (self.kind, &self.content) {
             (EntryKind::File, Some(content)) => content.validate(),
             (EntryKind::Directory, None) => Ok(()),

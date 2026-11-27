@@ -2,8 +2,28 @@
 use crate::{LocalSpace, ReconcileError, Result};
 use serde::Serialize;
 use sync_extend_core_model::{
-    ContentId, DeviceId, EntryId, EntryKind, PortablePath, SnapshotId, SpaceId,
+    ContentId, DeviceId, EntryId, EntryKind, PortableEntryMetadata,
+    PortableMetadataCapabilityMatrix, PortableMetadataCertification,
+    PortableMetadataFieldCapability, PortableMetadataSupport, PortableMetadataUnsupportedFields,
+    PortableMetadataUnsupportedReason, PortablePath, SnapshotId, SpaceId,
+    PORTABLE_METADATA_CAPABILITY_VERSION,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct DashboardEntryTimestamp {
+    pub seconds: i64,
+    pub nanoseconds: u32,
+}
+
+/// Display projection of a captured source entry. Only fields with actual
+/// captured values are emitted; unknown/unsupported source fields stay absent
+/// so a client cannot mistake capability for a per-file result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct DashboardEntryMetadata {
+    pub format_version: u32,
+    pub modified: DashboardEntryTimestamp,
+    pub readonly: bool,
+}
 
 #[derive(Serialize)]
 pub struct DashboardEntry {
@@ -11,6 +31,7 @@ pub struct DashboardEntry {
     pub path: PortablePath,
     pub kind: EntryKind,
     pub logical_bytes: Option<u64>,
+    pub metadata: Option<DashboardEntryMetadata>,
 }
 
 #[derive(Serialize)]
@@ -100,6 +121,7 @@ pub struct DashboardObservation {
     pub outstanding_mutations: usize,
     pub chunks: DashboardChunkCheck,
     pub read_leases: DashboardReadLeases,
+    pub metadata_capabilities: PortableMetadataCapabilityMatrix,
     pub recovery: DashboardRecovery,
     pub remote_backup_complete: bool,
 }
@@ -270,6 +292,7 @@ impl LocalSpace {
                                 path: entry.path.clone(),
                                 kind: entry.kind,
                                 logical_bytes: entry.content.as_ref().map(|file| file.length),
+                                metadata: DashboardEntryMetadata::project(entry.metadata.as_ref()),
                             });
                         }
                         if let Some(file) = &entry.content {
@@ -331,11 +354,105 @@ impl LocalSpace {
                     outstanding_mutations: status.outstanding_mutations,
                     chunks,
                     read_leases,
+                    metadata_capabilities: portable_metadata_capability_matrix(),
                     recovery,
                     remote_backup_complete: false,
                 };
                 self.verify_root()?;
                 Ok(observation)
             })
+    }
+}
+
+impl DashboardEntryMetadata {
+    fn project(metadata: Option<&PortableEntryMetadata>) -> Option<Self> {
+        let metadata = metadata?;
+        let (seconds, nanoseconds, readonly) = metadata.captured_modified_and_readonly()?;
+        Some(Self {
+            format_version: metadata.format_version,
+            modified: DashboardEntryTimestamp {
+                seconds,
+                nanoseconds,
+            },
+            readonly,
+        })
+    }
+}
+
+fn supported(value: bool) -> PortableMetadataSupport {
+    if value {
+        PortableMetadataSupport::Supported
+    } else {
+        PortableMetadataSupport::Unsupported
+    }
+}
+
+/// Reports the exact implemented handle-based routine for this build. The
+/// certification names the grouped acceptance that backs it; an untested Unix
+/// build stays explicitly uncertified instead of borrowing Windows NTFS
+/// results. FAT/exFAT, emulated volumes, KernelSU, ACLs and ADS are never
+/// inferred from this matrix.
+pub(crate) fn portable_metadata_capability_matrix() -> PortableMetadataCapabilityMatrix {
+    #[cfg(windows)]
+    {
+        let fields = PortableMetadataFieldCapability {
+            modified: supported(true),
+            creation: supported(true),
+            readonly: supported(true),
+            unix_executable: supported(false),
+        };
+        return PortableMetadataCapabilityMatrix {
+            format_version: PORTABLE_METADATA_CAPABILITY_VERSION,
+            capture: fields,
+            apply: fields,
+            verify: fields,
+            timestamp_precision_ns: Some(
+                sync_extend_platform_fs::WINDOWS_NTFS_TIME_RESOLUTION_NANOS,
+            ),
+            unsupported: PortableMetadataUnsupportedFields {
+                creation: None,
+                unix_executable: Some(PortableMetadataUnsupportedReason::Platform),
+            },
+            certification: PortableMetadataCertification::WindowsNtfsActualGroupedAcceptance,
+        };
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let fields = PortableMetadataFieldCapability {
+            modified: PortableMetadataSupport::Unknown,
+            creation: supported(false),
+            readonly: PortableMetadataSupport::Unknown,
+            unix_executable: PortableMetadataSupport::Unknown,
+        };
+        return PortableMetadataCapabilityMatrix {
+            format_version: PORTABLE_METADATA_CAPABILITY_VERSION,
+            capture: fields,
+            apply: fields,
+            verify: fields,
+            timestamp_precision_ns: None,
+            unsupported: PortableMetadataUnsupportedFields {
+                creation: Some(PortableMetadataUnsupportedReason::Platform),
+                unix_executable: None,
+            },
+            certification: PortableMetadataCertification::UnixImplementedNotVerifiedInThisRelease,
+        };
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+    {
+        let fields = PortableMetadataFieldCapability {
+            modified: PortableMetadataSupport::Unknown,
+            creation: PortableMetadataSupport::Unknown,
+            readonly: PortableMetadataSupport::Unknown,
+            unix_executable: PortableMetadataSupport::Unknown,
+        };
+        PortableMetadataCapabilityMatrix {
+            format_version: PORTABLE_METADATA_CAPABILITY_VERSION,
+            capture: fields,
+            apply: fields,
+            verify: fields,
+            timestamp_precision_ns: None,
+            unsupported: PortableMetadataUnsupportedFields::none(),
+            certification: PortableMetadataCertification::UnsupportedPlatform,
+        }
     }
 }

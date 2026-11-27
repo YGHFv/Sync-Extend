@@ -15,6 +15,7 @@ const fields = {};
   "workspace-state", "workspace-detail", "workspace-summary",
   "workspace-files-detail", "workspace-files", "workspace-rows",
   "storage-state", "storage-detail", "storage-summary", "network-state", "network-detail", "network-summary",
+  "native-audit-state", "native-audit-detail", "native-audit-summary",
   "easytier-state", "easytier-detail", "easytier-summary",
   "recovery-state", "recovery-detail", "recovery-summary", "recovery-guide",
   "restore-space", "restore-snapshot", "restore-selection", "restore-paths", "restore-prefix", "restore-extra-policy",
@@ -35,6 +36,46 @@ let liveGateway = null;
 let restoreContext = null;
 const validExportName = (name) => typeof name === "string" && name.length >= 1 &&
   name.length <= 64 && !/[^A-Za-z0-9_-]/.test(name);
+
+function utf8ByteLength(value) {
+  if (typeof value !== "string") throw new Error("Expected UTF-8 text");
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (!(low >= 0xdc00 && low <= 0xdfff)) throw new Error("Unpaired high surrogate");
+      index += 1;
+      bytes += 4;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      throw new Error("Unpaired low surrogate");
+    } else if (unit <= 0x7f) bytes += 1;
+    else if (unit <= 0x7ff) bytes += 2;
+    else bytes += 3;
+  }
+  return bytes;
+}
+
+function assertValidUtf8Strings(value, depth = 0) {
+  if (depth > 64) throw new Error("UTF-8 validation depth exceeded");
+  if (typeof value === "string") { utf8ByteLength(value); return; }
+  if (value === null || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    for (const item of value) assertValidUtf8Strings(item, depth + 1);
+    return;
+  }
+  for (const key of Object.keys(value)) {
+    utf8ByteLength(key);
+    assertValidUtf8Strings(value[key], depth + 1);
+  }
+}
+
+function jsonUtf8ByteLength(value) {
+  // JSON.stringify escapes lone surrogates, so validate the parsed strings
+  // before measuring the canonical display payload.
+  assertValidUtf8Strings(value);
+  return utf8ByteLength(JSON.stringify(value));
+}
 
 function readJson(operation, selectedExport) {
   return new Promise((resolve, reject) => {
@@ -67,22 +108,32 @@ function readJson(operation, selectedExport) {
       finish();
       const responseLimit = operation === "preview" || operation === "preview-context" ? 262144 :
         (operation === "gateway" ? 65536 : 16384);
-      if (code !== 0 || typeof output !== "string" || output.length > responseLimit ||
-          new TextEncoder().encode(output).length > responseLimit) {
+      if (code !== 0 || typeof output !== "string") {
+        reject(new Error("Module operation refused"));
+        return;
+      }
+      let outputBytes;
+      try { outputBytes = utf8ByteLength(output); }
+      catch (error) {
+        reject(new Error("Module operation refused"));
+        return;
+      }
+      if (output.length > responseLimit || outputBytes > responseLimit) {
         reject(new Error("Module operation refused"));
         return;
       }
       try {
         const value = JSON.parse(output);
+        assertValidUtf8Strings(value);
         // The CLI pretty-prints native control JSON. Its display whitespace
         // does not enlarge the existing 4096-byte native protocol allowance.
         if (!["gateway", "preview-context", "preview"].includes(operation) &&
-            new TextEncoder().encode(JSON.stringify(value)).length > 4096) {
+            jsonUtf8ByteLength(value) > 4096) {
           throw new Error("Native control response exceeds its bound");
         }
         if ((operation === "preview" || (operation === "preview-context" && Array.isArray(value.spaces))) &&
             (!output.endsWith("\n") ||
-            value.output_bytes_including_lf !== new TextEncoder().encode(output).length)) {
+            value.output_bytes_including_lf !== outputBytes)) {
           throw new Error("Preview wire response differs");
         }
         resolve(value);
@@ -130,11 +181,13 @@ function clearRuntime(detail = "当前没有可验证的运行摘要。") {
   fields["workspace-rows"].textContent = "";
   fields["workspace-files"].hidden = true;
   fields["workspace-files-detail"].textContent = "文件修改时间、只读属性和元数据能力未知。";
-  for (const category of ["workspace", "storage", "network", "easytier", "recovery"]) {
+  for (const category of ["workspace", "storage", "network", "easytier", "recovery", "native-audit"]) {
     fields[`${category}-summary`].textContent = "";
     fields[`${category}-summary`].hidden = true;
     setStatus(category, "暂无观察", detail);
   }
+  setStatus("native-audit", "未知",
+    "没有当前 owner 的显式 schema69 镜像审计；旧结果已清除，未知不等于失败或通过。");
   fields["network-detail"].textContent = "当前没有已鉴权的连接样本；实际路径、外层 wire 和中继费用保持未知。";
   fields["easytier-detail"].textContent = "当前没有本机受管子进程与 RPC 属主绑定的样本。";
   fields["recovery-guide"].textContent = "没有可验证的当前历史来源。恢复须独立核对，不能使用旧观测执行。";
@@ -201,8 +254,10 @@ function showRestoreContext(value) {
 }
 
 function validRestorePath(path) {
-  if (typeof path !== "string" || !path.length || new TextEncoder().encode(path).length > 4096 ||
-      /[\u0000-\u001f<>:"\\|?*]/.test(path)) return false;
+  if (typeof path !== "string" || !path.length) return false;
+  let bytes;
+  try { bytes = utf8ByteLength(path); } catch (error) { return false; }
+  if (bytes > 4096 || /[\u0000-\u001f<>:"\\|?*]/.test(path)) return false;
   return path.split("/").every((part) => part && part !== "." && part !== ".." && !/[. ]$/.test(part));
 }
 
@@ -217,7 +272,7 @@ function restoreRequest(context) {
     const paths = fields["restore-paths"].value.split(/\r?\n/).filter((path) => path.length);
     if (!paths.length || paths.length > 64 || paths.some((path) => !validRestorePath(path)) ||
         new Set(paths).size !== paths.length || paths.reduce((total, path) =>
-          total + new TextEncoder().encode(path).length, 0) > 16384 ||
+          total + utf8ByteLength(path), 0) > 16384 ||
         (mode !== "paths" && paths.length !== 1)) throw new Error("Invalid portable source paths");
     if (mode === "paths") selection.paths = paths; else selection.path = paths[0];
   }
@@ -381,27 +436,62 @@ function showSummary(category, rows) {
 
 function metadataCapabilitiesView(capabilities) {
   const view = {
-    capabilities: "捕获未知 / 应用未知 / 校验未知", precision: "未知", declared: false,
+    capabilities: "捕获未知 / 应用未知 / 校验未知", precision: "未知",
+    certification: "未知", declared: false,
   };
   if (capabilities === undefined || capabilities === null) return view;
   const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
-  const names = ["capture", "apply", "verify", "timestamp_precision_ns"];
+  const names = ["format_version", "capture", "apply", "verify", "timestamp_precision_ns", "unsupported", "certification"];
   if (!object(capabilities) || Object.keys(capabilities).length < 3 ||
-      Object.keys(capabilities).length > 4 || Object.keys(capabilities).some((key) => !names.includes(key))) {
+      Object.keys(capabilities).length > names.length ||
+      Object.keys(capabilities).some((key) => !names.includes(key))) {
     return view;
   }
+  if (Object.hasOwn(capabilities, "format_version") && capabilities.format_version !== 1) return view;
   const labels = {capture: "捕获", apply: "应用", verify: "校验"};
   const states = {supported: "支持", unsupported: "不支持", unknown: "未知"};
+  const reasons = {platform: "平台", filesystem: "文件系统", permission: "权限", api: "接口"};
+  const fieldNames = {modified: "时间", creation: "创建时间", readonly: "只读", unix_executable: "可执行位"};
+  const fieldOrder = ["modified", "creation", "readonly", "unix_executable"];
   const segments = [];
   let allUnknown = true;
   for (const phase of ["capture", "apply", "verify"]) {
     const stage = capabilities[phase];
-    if (!object(stage) || Object.keys(stage).length !== 2 ||
-        Object.keys(stage).some((key) => !["modified", "readonly"].includes(key)) ||
-        !["supported", "unsupported", "unknown"].includes(stage.modified) ||
-        !["supported", "unsupported", "unknown"].includes(stage.readonly)) return view;
-    if (stage.modified !== "unknown" || stage.readonly !== "unknown") allUnknown = false;
-    segments.push(`${labels[phase]} 时间${states[stage.modified]}、只读${states[stage.readonly]}`);
+    if (!object(stage) || Object.keys(stage).length < 2 || Object.keys(stage).length > fieldOrder.length ||
+        Object.keys(stage).some((key) => !fieldOrder.includes(key)) ||
+        !Object.hasOwn(stage, "modified") || !Object.hasOwn(stage, "readonly")) return view;
+    const parts = [];
+    for (const field of fieldOrder) {
+      if (!Object.hasOwn(stage, field)) continue;
+      if (!["supported", "unsupported", "unknown"].includes(stage[field])) return view;
+      if (stage[field] !== "unknown") allUnknown = false;
+      parts.push(`${fieldNames[field]}${states[stage[field]]}`);
+    }
+    segments.push(`${labels[phase]} ${parts.join("、")}`);
+  }
+  const reasonSegments = [];
+  if (capabilities.unsupported !== undefined && capabilities.unsupported !== null) {
+    if (!object(capabilities.unsupported) || Object.keys(capabilities.unsupported).length > 2 ||
+        Object.keys(capabilities.unsupported).some((key) => !["creation", "unix_executable"].includes(key))) {
+      return view;
+    }
+    for (const field of ["creation", "unix_executable"]) {
+      if (!Object.hasOwn(capabilities.unsupported, field)) continue;
+      const reason = capabilities.unsupported[field];
+      if (typeof reason !== "string" || !Object.hasOwn(reasons, reason)) return view;
+      reasonSegments.push(`${fieldNames[field]}=${reasons[reason]}`);
+    }
+  }
+  let certification = "未知";
+  if (capabilities.certification !== undefined && capabilities.certification !== null) {
+    const certifications = {
+      windows_ntfs_actual_grouped_acceptance: "Windows NTFS 实际分组验收",
+      unix_implemented_not_verified_in_this_release: "Unix 已实现，本版本未实测",
+      unsupported_platform: "当前平台不支持",
+    };
+    if (typeof capabilities.certification !== "string" ||
+        !Object.hasOwn(certifications, capabilities.certification)) return view;
+    certification = certifications[capabilities.certification];
   }
   let precision = "未知";
   const value = capabilities.timestamp_precision_ns;
@@ -411,8 +501,13 @@ function metadataCapabilitiesView(capabilities) {
     }
     precision = Number.isSafeInteger(value) ? `${value} ns（后台声明）` : "未知（整数超出客户端精确范围）";
   }
-  if (!allUnknown) view.capabilities = segments.join(" / ");
+  if (!allUnknown) {
+    let text = segments.join(" / ");
+    if (reasonSegments.length) text += `（未支持原因：${reasonSegments.join("、")}）`;
+    view.capabilities = text;
+  }
   view.precision = precision;
+  view.certification = certification;
   view.declared = true;
   return view;
 }
@@ -459,8 +554,11 @@ function entryMetadataView(metadata, capabilities = undefined) {
 function showWorkspaceEntries(local) {
   fields["workspace-rows"].textContent = "";
   fields["workspace-files"].hidden = true;
+  const capabilityView = metadataCapabilitiesView(local.metadata_capabilities);
   if (local.entries === undefined || local.entries === null) {
-    fields["workspace-files-detail"].textContent = "后台尚未提供文件元数据列表；当前值未知。";
+    fields["workspace-files-detail"].textContent = "后台尚未提供文件元数据列表；当前值未知。" +
+      (capabilityView.declared ?
+        ` 元数据能力：${capabilityView.capabilities}；认证：${capabilityView.certification}；时间精度：${capabilityView.precision}。` : "");
     return;
   }
   if (!Array.isArray(local.entries) || local.entries.length > 128 ||
@@ -471,7 +569,7 @@ function showWorkspaceEntries(local) {
   const fragment = document.createDocumentFragment();
   for (const entry of local.entries) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry) ||
-        typeof entry.path !== "string" || !entry.path.length || entry.path.length > 4096 ||
+        typeof entry.path !== "string" || !entry.path.length || utf8ByteLength(entry.path) > 4096 ||
         entry.path.includes("\u0000") || !["file", "directory"].includes(entry.kind)) {
       throw new Error("Invalid workspace entry");
     }
@@ -488,11 +586,10 @@ function showWorkspaceEntries(local) {
   }
   fields["workspace-rows"].appendChild(fragment);
   fields["workspace-files"].hidden = false;
-  const capabilityView = metadataCapabilitiesView(local.metadata_capabilities);
   fields["workspace-files-detail"].textContent =
     `${local.entries.length} / ${local.total_entries} 个路径${local.entries_truncated ? "（已截取）" : ""}。` +
     (capabilityView.declared ?
-      "修改时间和只读属性来自源元数据；捕获、应用、校验分别声明支持能力，支持不代表已应用或已校验。" :
+      `修改时间和只读属性来自源元数据；捕获、应用、校验分别声明支持能力，支持不代表已应用或已校验。认证：${capabilityView.certification}；时间精度：${capabilityView.precision}。` :
       "修改时间和只读属性来自源元数据；捕获、应用、校验与文件系统时间精度尚未报告。");
 }
 
@@ -514,7 +611,7 @@ function showRecovery(local, age) {
   const seen = new Set();
   function snapshotText(snapshot, pruned) {
     if (!object(snapshot) || !identifier(snapshot.snapshot_id, 64) ||
-        typeof snapshot.state !== "string" || snapshot.state.length < 1 || snapshot.state.length > 64 ||
+        typeof snapshot.state !== "string" || !snapshot.state.length || utf8ByteLength(snapshot.state) > 64 ||
         snapshot.state.includes("\0") || !flag(snapshot.current) || seen.has(snapshot.snapshot_id)) {
       throw new Error("Invalid recovery snapshot");
     }
@@ -602,7 +699,8 @@ function showRecovery(local, age) {
 }
 
 function validSocket(value) {
-  if (typeof value !== "string" || value.length > 128) return false;
+  if (typeof value !== "string") return false;
+  try { if (utf8ByteLength(value) > 128) return false; } catch (error) { return false; }
   const match = /^(\[[0-9a-fA-F:.]+\]|(?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})$/.exec(value);
   if (!match || Number(match[2]) < 1 || Number(match[2]) > 65535) return false;
   try {
@@ -716,6 +814,87 @@ function showEasyTier(observation) {
     "overlay ID 不是 SyncExtend 设备身份，未关联到同步连接；不授予 P2P 费用豁免。外层 wire 和费用未知。");
 }
 
+const exactFields = (value, names) => value !== null && typeof value === "object" &&
+  !Array.isArray(value) && Object.keys(value).length === names.length &&
+  names.every((name) => Object.hasOwn(value, name));
+const auditDigests = ["image_digest", "catalog_digest", "rows_digest", "source_digest",
+  "registry_digest"];
+
+function showNativeHistoryAudit(value, expectedSpace) {
+  if (value === undefined || value === null) {
+    fields["native-audit-summary"].textContent = "";
+    fields["native-audit-summary"].hidden = true;
+    setStatus("native-audit", "未知",
+      "当前 owner 未提供显式 schema69 镜像审计。KSU 页面不自行读取任意主机路径，也不把未知当作通过。");
+    return;
+  }
+  if (!identifier(expectedSpace, 32) || !exactFields(value, ["audit", "status", "request_sha256",
+      "schema", "space", "image_digest", "catalog_digest", "rows_digest", "source_digest",
+      "registry_digest", "tables", "owners", "projection", "limits", "read_only",
+      "native_authority", "raw_rows_included", "host_paths_included"]) ||
+      value.audit !== "native_history_source" || value.status !== "ok" || value.schema !== 69 ||
+      value.space !== expectedSpace || !identifier(value.request_sha256, 64) ||
+      auditDigests.some((name) => !identifier(value[name], 64)) ||
+      value.read_only !== true || value.native_authority !== false ||
+      value.raw_rows_included !== false || value.host_paths_included !== false) {
+    throw new Error("Invalid native history audit");
+  }
+  const tables = value.tables;
+  if (!exactFields(tables, ["count", "families", "slices", "rows", "logical_bytes",
+      "sample_limit", "truncated", "sample"]) ||
+      tables.count !== 141 || tables.families !== 22 || tables.slices !== 27 ||
+      !count(tables.rows) || !count(tables.logical_bytes) || !count(tables.sample_limit) ||
+      tables.sample_limit > 4 || !Array.isArray(tables.sample) ||
+      tables.sample.length > tables.sample_limit || typeof tables.truncated !== "boolean" ||
+      tables.truncated !== (tables.sample.length < tables.count) ||
+      tables.sample.some((row) => !exactFields(row, ["table", "rows", "logical_bytes"]) ||
+        typeof row.table !== "string" || !row.table.length || utf8ByteLength(row.table) > 64 ||
+        !count(row.rows) || !count(row.logical_bytes))) {
+    throw new Error("Invalid native history audit table summary");
+  }
+  if (!count(value.owners) || value.owners < 1) throw new Error("Invalid native history owners");
+  const projection = value.projection;
+  if (!exactFields(projection, ["portable_rows", "root_columns", "sample_limit", "truncated", "sample"]) ||
+      !count(projection.portable_rows) || !count(projection.root_columns) ||
+      !count(projection.sample_limit) || projection.sample_limit > 4 ||
+      !Array.isArray(projection.sample) || projection.sample.length > projection.sample_limit ||
+      typeof projection.truncated !== "boolean" ||
+      projection.truncated !== (projection.sample.length < projection.root_columns) ||
+      projection.root_columns > 64 ||
+      projection.sample.some((row) => !exactFields(row, ["table", "column"]) ||
+        typeof row.table !== "string" || !row.table.length || utf8ByteLength(row.table) > 64 ||
+        typeof row.column !== "string" || !row.column.length || utf8ByteLength(row.column) > 64)) {
+    throw new Error("Invalid native history audit projection");
+  }
+  const limits = value.limits;
+  const limitFields = ["max_image_bytes", "max_entries", "inventory_max_rows",
+    "inventory_max_logical_bytes", "max_rows", "max_logical_bytes", "max_vm_instructions",
+    "max_query_secs"];
+  if (!exactFields(limits, limitFields) || !limitFields.every((name) => count(limits[name])) ||
+      limits.max_image_bytes < 1 || limits.max_image_bytes > 256 * 1024 * 1024 ||
+      limits.max_vm_instructions < 1000 || limits.max_vm_instructions > 250000000 ||
+      limits.max_query_secs < 1 || limits.max_query_secs > 300) {
+    throw new Error("Invalid native history audit limits");
+  }
+  if (jsonUtf8ByteLength(value) > 3072) {
+    throw new Error("Native history audit exceeds the display budget");
+  }
+  showSummary("native-audit", [
+    ["空间 / schema", `${value.space} / ${value.schema}`],
+    ["镜像摘要", value.image_digest],
+    ["catalog / rows", `${value.catalog_digest} / ${value.rows_digest}`],
+    ["source / registry", `${value.source_digest} / ${value.registry_digest}`],
+    ["表摘要", `${tables.count} 表 / ${tables.families} 家族 / ${tables.slices} 切片；` +
+      `${tables.rows} 行；${tables.logical_bytes} B；样本 ${tables.sample.length}/${tables.count}`],
+    ["owner / 投影", `${value.owners} owner；${projection.portable_rows} 可移植行；` +
+      `${projection.root_columns} root 列`],
+    ["显式预算", `镜像 ${limits.max_image_bytes} B；行 ${limits.max_rows}；` +
+      `字节 ${limits.max_logical_bytes} B；VM ${limits.max_vm_instructions}；查询 ${limits.max_query_secs}s`],
+  ]);
+  setStatus("native-audit", "只读审计通过",
+    "仅聚合计数与摘要；不含原始行、secret 或绝对主机路径。不授权恢复、清理或 native 写入。", "ready");
+}
+
 function showDashboard(owner) {
   clearRuntime();
   const value = owner.dashboard;
@@ -731,7 +910,7 @@ function showDashboard(owner) {
   }
   if (!ownerReady || owner.dashboard_state !== "available" ||
       value.dashboard_format_version !== 1 || value.remote_backup_complete !== false ||
-      new TextEncoder().encode(JSON.stringify(value)).length > 3072) {
+      jsonUtf8ByteLength(value) > 3072) {
     throw new Error("Invalid owner dashboard");
   }
   if (value.observation) {
@@ -813,11 +992,13 @@ function showDashboard(owner) {
     requireCounts(gateway, ["export_count"]);
     if (gateway.listening !== true || gateway.authenticated !== true ||
         !["http", "https"].includes(gateway.scheme) || typeof gateway.address !== "string" ||
-        gateway.address.length > 128) throw new Error("Invalid live gateway summary");
+        utf8ByteLength(gateway.address) > 128) throw new Error("Invalid live gateway summary");
     liveGateway = gateway;
   }
   showConnection(value.connection);
   showEasyTier(value.easytier);
+  showNativeHistoryAudit(value.native_history_audit,
+    value.observation ? value.observation.local.space_id : undefined);
   showGatewayAvailability();
 }
 
@@ -987,8 +1168,8 @@ fields["restore-preview"].addEventListener("click", async () => {
   clearRestorePreview("正在读取当前 owner 的同事务历史元数据…");
   try {
     const request = restoreRequest(context);
+    if (jsonUtf8ByteLength(request) > 65536) throw new Error("Preview request exceeds byte limit");
     const bytes = new TextEncoder().encode(JSON.stringify(request));
-    if (bytes.length > 65536) throw new Error("Preview request exceeds byte limit");
     const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
     const value = await readJson("preview", hex);
     if (!ownerReady || restoreContext?.owner_generation !== context.owner_generation) {

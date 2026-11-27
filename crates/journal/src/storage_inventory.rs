@@ -17,8 +17,9 @@ pub enum JournalStorageColumnValue {
     Null,
     Text(String),
     Integer(u64),
+    Bytes(Vec<u8>),
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 pub struct JournalStorageColumn {
     pub name: String,
     pub value: JournalStorageColumnValue,
@@ -32,6 +33,33 @@ pub struct JournalStoredRow {
     fingerprint: ContentId,
 }
 impl JournalStoredRow {
+    pub(crate) fn from_persisted(
+        table: &'static str,
+        primary_key: Vec<String>,
+        columns: Vec<JournalStorageColumn>,
+        logical_bytes: u64,
+        fingerprint: ContentId,
+    ) -> Result<Self> {
+        let actual = reader::hash(&(
+            "sync-extend.actual-journal-row-values.v1",
+            table,
+            &primary_key,
+            &columns,
+        ))?;
+        if actual != fingerprint || primary_key.is_empty() {
+            return Err(crate::JournalError::Invariant(
+                "persisted native history row values differ",
+            ));
+        }
+        Ok(Self {
+            table,
+            primary_key,
+            columns,
+            logical_bytes,
+            fingerprint,
+        })
+    }
+
     pub fn table(&self) -> &str {
         self.table
     }
@@ -122,6 +150,7 @@ pub(crate) fn tables() -> Vec<TableSpec> {
         crate::remote_replace::schema::TABLES,
         crate::conflict_resolution::schema::TABLES,
         crate::conflict_resolution::native_future_schema::TABLES,
+        crate::backup_image::native_history_persistence::schema::TABLES,
     ]
     .concat()
 }

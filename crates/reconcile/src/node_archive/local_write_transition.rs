@@ -1729,6 +1729,13 @@ impl crate::native_file_view::NativeFileView for OriginalSessionScanView<'_, '_>
         Ok(Some(
             sync_extend_journal::NativePublicationFileObservation {
                 metadata: content.original.reader().metadata()?,
+                portable: crate::filesystem::portable_metadata(content.original.reader()).map_err(
+                    |_| {
+                        sync_extend_journal::JournalError::Invariant(
+                            "original scan portable metadata",
+                        )
+                    },
+                )?,
                 physical_identity: ContentId::hash(
                     format!("windows:{}:{}", key.volume, key.id).as_bytes(),
                 ),

@@ -10,13 +10,14 @@ use std::{
 };
 use sync_extend_cas::{is_reparse, Cas};
 use sync_extend_core_model::{
-    limits::LocalLimits, ContentId, EntryKind, FileManifest, PortablePath,
+    limits::LocalLimits, ContentId, EntryKind, FileManifest, PortableEntryMetadata, PortablePath,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScannedEntry {
     pub kind: EntryKind,
     pub content: Option<FileManifest>,
+    pub metadata: Option<PortableEntryMetadata>,
     // Local observation only: identity is not part of the portable manifest.
     pub physical_identity: ContentId,
     pub single_link: bool,
@@ -151,6 +152,7 @@ fn visit(
             ScannedEntry {
                 kind: EntryKind::Directory,
                 content: None,
+                metadata: None,
                 physical_identity: identity.physical,
                 single_link: false,
             }
@@ -177,6 +179,7 @@ fn visit(
                     ScannedEntry {
                         kind: EntryKind::File,
                         content: Some(content),
+                        metadata: native.portable,
                         physical_identity: native.physical_identity,
                         single_link: true,
                     },
@@ -217,6 +220,7 @@ fn visit(
             ScannedEntry {
                 kind: EntryKind::File,
                 content: Some(content),
+                metadata: observed.portable.clone(),
                 physical_identity: observed.identity.physical,
                 single_link,
             }

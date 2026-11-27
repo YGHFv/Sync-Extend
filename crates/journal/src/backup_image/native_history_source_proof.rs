@@ -15,7 +15,7 @@ pub struct NativeHistoryRowKey {
 }
 
 impl NativeHistoryRowKey {
-    pub fn table(&self) -> &str {
+    pub fn table(&self) -> &'static str {
         self.table
     }
     pub fn primary_key(&self) -> &[String] {
@@ -270,6 +270,9 @@ impl ImmutableNativeHistorySourceProof {
     }
     pub fn registry(&self) -> NativeHistoryFamilyRegistry {
         NativeHistoryFamilyRegistry::schema69()
+    }
+    pub(super) fn proof_parts(&self) -> &NativeHistoryProofParts {
+        &self.source
     }
 }
 

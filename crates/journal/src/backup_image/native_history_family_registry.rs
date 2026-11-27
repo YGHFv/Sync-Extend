@@ -177,6 +177,11 @@ impl NativeHistoryFamilyRegistry {
                     ColumnKind::Text(n) => NativeHistoryColumnKind::HexText(n),
                     ColumnKind::Utf8 { min, max } => NativeHistoryColumnKind::Utf8 { min, max },
                     ColumnKind::Integer => NativeHistoryColumnKind::NonnegativeInteger,
+                    ColumnKind::Blob { .. } => {
+                        return Err(JournalError::Invariant(
+                            "native history compiled blob column",
+                        ));
+                    }
                 };
                 if physical.name != public.name
                     || kind != public.kind
@@ -2468,7 +2473,7 @@ const TABLE_RULES: &[NativeHistoryTableRule] = &[
         clock_columns: &[],
         signature_columns: &[],
         native_identity_columns: &[],
-        root_bound_columns: &[],
+        root_bound_columns: &["value"],
         owner: NativeHistoryOwnerRelation::LocalIdentityOrTypedHistory,
         direct_reference: NativeHistoryDirectReference::None,
         audited_embedded_columns: &[],

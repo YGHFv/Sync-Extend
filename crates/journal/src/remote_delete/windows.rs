@@ -763,6 +763,7 @@ impl Journal {
                     ColumnValue::Null => 0,
                     ColumnValue::Integer(_) => 8,
                     ColumnValue::Text(s) => s.len() as u64,
+                    ColumnValue::Bytes(bytes) => bytes.len() as u64,
                 })
                 .sum()
         };

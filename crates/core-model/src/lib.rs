@@ -14,6 +14,7 @@ pub mod operation_batch;
 pub mod original_retention;
 pub mod path;
 pub mod persisted_rename;
+pub mod portable_entry_metadata;
 pub mod reference_owner;
 pub mod remote_file;
 pub mod restore_selection;
@@ -55,6 +56,7 @@ pub mod webdav_partial_response;
 pub use ids::*;
 pub use operation::*;
 pub use path::PortablePath;
+pub use portable_entry_metadata::*;
 pub use restore_selection::{
     RestoreCurrentExtraPolicy, RestoreOccupiedTargetPolicy, RestoreSelection,
 };

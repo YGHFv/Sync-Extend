@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 69;
+const SCHEMA_VERSION: u32 = 71;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -395,7 +395,7 @@ impl ReadOnlyJournal {
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version != SCHEMA_VERSION {
             return Err(JournalError::Invariant(
-                "read-only Journal requires schema 67; an explicit writer open upgrades older schemas",
+                "read-only Journal requires the current schema; an explicit writer open upgrades older schemas",
             ));
         }
         let journal = Self {
@@ -1375,6 +1375,17 @@ impl Journal {
             tx.execute_batch(include_str!("migration-069.sql"))?;
             tx.commit()?;
         }
+        if version < 70 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-070.sql"))?;
+            tx.commit()?;
+        }
+        if version < 71 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(include_str!("migration-071.sql"))?;
+            tx.commit()?;
+        }
+        backup_image::native_history_persistence::schema::validate(&connection)?;
         deletion_retention::validate_schema(&connection)?;
         let deletion_retention_issuance =
             storage_retirement::gate::Gate::register(&connection, "sync_deletion_retention_issue")?;
@@ -3199,6 +3210,7 @@ fn promote_pending(
     }
     Ok(())
 }
+mod portable_file_metadata;
 mod publication;
 pub use publication::{Publication, PublicationCompletion, PublicationIntent, PublicationState};
 mod mutation;
@@ -3597,6 +3609,12 @@ pub use backup_image::{
     NativeHistoryRootMapping, NativeHistoryRowKey, NativeHistorySliceSpec,
     NativeHistorySourceTable, NativeHistoryTableRule, NodeInspectionBounds, PortableNodeImageScope,
 };
+pub use backup_image::native_history_persistence::{
+    NativeHistoryAuthorityObservation, NativeHistoryFreshWriter,
+    NativeHistoryFreshWriterAdmissionRequest, NativeHistoryFreshWriterAuthorityObservation,
+    NativeHistoryFreshWriterInspection, NativeHistoryFreshWriterState,
+    NativeHistorySourceBinding, PersistedNativeHistorySource,
+};
 pub use recovered_history_tables::{
     RecoveredArchiveTableSummaries, RecoveredHistoryTable, RecoveredHistoryTables,
     RecoveredMainTable, RecoveredMainTables,
@@ -3702,6 +3720,7 @@ impl Journal {
             if version != SCHEMA_VERSION {
                 return Err(JournalError::Invariant("original planning current schema"));
             }
+            backup_image::native_history_persistence::schema::validate(&connection)?;
             deletion_retention::validate_schema(&connection)?;
             let deletion_retention_issuance = storage_retirement::gate::Gate::register(
                 &connection,

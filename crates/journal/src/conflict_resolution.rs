@@ -1,17 +1,16 @@
 //! Immutable prospective local resolution, not a native execution or pin release.
 use crate::{
-    CasAccessGuard, Journal, JournalCapacityObligation, JournalStoredRow, Result,
     storage_inventory::reader::{hash, invalid, preflight},
-    storage_policy,
+    storage_policy, CasAccessGuard, Journal, JournalCapacityObligation, JournalStoredRow, Result,
 };
-use rusqlite::{Connection, Transaction, TransactionBehavior, params, types::Value};
+use rusqlite::{params, types::Value, Connection, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use sync_extend_core_model::{
-    ChunkRef, ContentId, EntryId, EntryKind, Manifest, Operation, SnapshotId, SpaceId,
-    VersionVector,
     causal::reduce_operations,
     conflict_resolution::{FileResolutionPlan, ResolutionLimits},
+    ChunkRef, ContentId, EntryId, EntryKind, Manifest, Operation, SnapshotId, SpaceId,
+    VersionVector,
 };
 
 mod equivalent;
@@ -125,6 +124,7 @@ fn flat_baseline(baseline: &Manifest, originals: &[Operation]) -> Result<()> {
                 || frontier.contents.len() != 1
                 || frontier.contents[0].kind != entry.kind
                 || frontier.contents[0].content != entry.content
+                || (entry.metadata.is_some() && frontier.contents[0].metadata != entry.metadata)
             {
                 return Err(invalid(
                     "conflict baseline differs from original applied projection",
@@ -1031,6 +1031,7 @@ impl Journal {
                     crate::JournalStorageColumnValue::Text(s) => s.len() as u64,
                     crate::JournalStorageColumnValue::Integer(_) => 8,
                     crate::JournalStorageColumnValue::Null => 0,
+                    crate::JournalStorageColumnValue::Bytes(bytes) => bytes.len() as u64,
                 })
                 .sum();
             let prior = before.report.accounted_total();
