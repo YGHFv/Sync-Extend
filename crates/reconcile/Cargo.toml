@@ -32,5 +32,8 @@ sync-extend-platform-fs = { path = "../platform-fs" }
 sync-extend-platform-fs = { path = "../platform-fs" }
 ring = "0.17.14"
 
+[target.'cfg(target_os = "android")'.dependencies]
+sync-extend-platform-fs = { path = "../platform-fs" }
+
 [lints]
 workspace = true
