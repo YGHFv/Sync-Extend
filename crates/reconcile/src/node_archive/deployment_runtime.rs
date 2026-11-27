@@ -49,6 +49,8 @@ pub struct DeploymentRun<'authority> {
     provider: &'authority DeploymentProtectionProvider,
     nodes: BTreeMap<u32, RecoveredLocalSpace>,
     original_fresh_bindings: BTreeMap<u32, DeploymentFreshRuntimeNodeReceipt>,
+    polling: BTreeMap<u32, std::time::Instant>,
+    polling_interval: Option<std::time::Duration>,
 }
 
 fn original_fresh_binding(
@@ -235,6 +237,8 @@ impl RetainedInstalledDeploymentFiles {
                 provider,
                 nodes: nodes.into_iter().collect(),
                 original_fresh_bindings,
+                polling: BTreeMap::new(),
+                polling_interval: None,
             }),
             Err(error) => Err(DeploymentRuntimeStartFailure {
                 error,
@@ -245,6 +249,62 @@ impl RetainedInstalledDeploymentFiles {
 }
 
 impl DeploymentRun<'_> {
+    /// Only the same retained configuration selects spaces and the interval.
+    /// There is no public path/identity based polling capability constructor.
+    pub fn start_configured_polling(&mut self, limits: sync_extend_core_model::limits::LocalLimits) -> Result<()> {
+        self.verify()?;
+        let config = self.deployment_configuration()?;
+        let (interval, ids) = match config.role {
+            DeploymentRole::LocalPolling { data_dir, scan_interval_secs } => {
+                let ids = self.original_fresh_bindings.iter().filter(|(_, binding)| binding.data_dir == data_dir)
+                    .map(|(id, _)| *id).collect::<Vec<_>>();
+                if ids.len() != 1 { return Err(ReconcileError::Invariant("polling requires the exact configured node")); }
+                (scan_interval_secs, ids)
+            }
+            DeploymentRole::WebdavClient { scan_interval_secs: Some(interval), .. } => {
+                let gateway = self.gateway_configuration()?;
+                let spaces: std::collections::BTreeSet<_> = gateway.listener.exports.iter().map(|export| &export.space_id).collect();
+                let ids = spaces.into_iter().map(|space| self.node_id(space)).collect::<Result<Vec<_>>>()?;
+                (interval, ids)
+            }
+            _ => return Ok(()),
+        };
+        if interval == 0 || self.polling_interval.is_some() { return Err(ReconcileError::Invariant("explicit finite original polling interval")); }
+        self.polling_interval = Some(std::time::Duration::from_secs(interval));
+        for id in ids {
+            let node = self.nodes.get_mut(&id).ok_or(ReconcileError::Unstable)?;
+            node.enable_deployment_polling(limits.clone())?;
+            node.scan_deployment_polling(crate::now_ms()?)?;
+            node.release_polling_observation()?;
+            self.polling.insert(id, std::time::Instant::now() + std::time::Duration::from_secs(interval));
+        }
+        self.verify()
+    }
+    /// At most one due space per owner turn. Scheduling starts after completion
+    /// so a slow scan never accumulates catch-up bursts.
+    pub fn poll_configured_space(&mut self) -> Result<Option<crate::ScanResult>> {
+        let Some(interval) = self.polling_interval else { return Ok(None); };
+        let now = std::time::Instant::now();
+        let next = self.polling.iter().filter(|(_, due)| **due <= now).min_by_key(|(_, due)| **due).map(|(id, _)| *id);
+        let Some(id) = next else { return Ok(None); };
+        self.verify()?;
+        let node = self.nodes.get_mut(&id).ok_or(ReconcileError::Unstable)?;
+        let result = node.scan_deployment_polling(crate::now_ms()?)?;
+        node.release_polling_observation()?;
+        self.polling.insert(id, std::time::Instant::now() + interval);
+        self.verify()?;
+        Ok(Some(result))
+    }
+    pub fn prepare_gateway_observation(&mut self) -> Result<()> {
+        let ids = self.polling.keys().copied().collect::<Vec<_>>();
+        for id in ids { self.nodes.get_mut(&id).ok_or(ReconcileError::Unstable)?.scan_deployment_polling(crate::now_ms()?)?; }
+        self.verify()
+    }
+    pub fn release_gateway_observation(&mut self) -> Result<()> {
+        let ids = self.polling.keys().copied().collect::<Vec<_>>();
+        for id in ids { self.nodes.get_mut(&id).ok_or(ReconcileError::Unstable)?.release_polling_observation()?; }
+        self.verify()
+    }
     pub fn verify(&self) -> Result<()> {
         self.files.verify(self.provider)?;
         if self.nodes.len() != self.original_fresh_bindings.len() {

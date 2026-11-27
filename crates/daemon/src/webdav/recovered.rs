@@ -84,9 +84,6 @@ impl PreparedRecoveredGateway {
         if !runtime.listener.enabled {
             return Err("the recovered deployment listener is disabled".into());
         }
-        if scan_interval_secs.is_some() {
-            return Err("recovered deployment polling requires its native scan contract".into());
-        }
         if let Some(policy) = &runtime.collection_limits {
             policy.validate(&limits)?;
         }
@@ -212,7 +209,10 @@ impl ActiveRecoveredGateway {
             peer,
             self.tls.as_ref(),
             |account, request, connection| {
-                dispatch_recovered(runtime, limits, locks, run, account, request, connection)
+                run.prepare_gateway_observation().map_err(core_status)?;
+                let response = dispatch_recovered(runtime, limits, locks, run, account, request, connection);
+                let released = run.release_gateway_observation().map_err(core_status);
+                response.and(released)
             },
         ) {
             if let Some(error) = failure.close_error {

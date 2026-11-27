@@ -727,17 +727,15 @@ impl<'authority> DeploymentOwner<'authority> {
             let config = self.files.deployment_configuration(self.provider)?;
             config.validate()?;
             let role_name = config.role_name();
-            let DeploymentRole::WebdavClient {
-                scan_interval_secs, ..
-            } = config.role
-            else {
-                return Err("the selected recovered runtime role is unavailable".into());
+            let gateway = match config.role {
+                DeploymentRole::WebdavClient { scan_interval_secs, .. } => Some(
+                    super::webdav::PreparedRecoveredGateway::new(
+                        self.files.gateway_configuration(self.provider)?,
+                        self.limits.clone(), scan_interval_secs,
+                    )?),
+                DeploymentRole::LocalPolling { .. } => None,
+                _ => return Err("the selected recovered runtime role is unavailable".into()),
             };
-            let gateway = super::webdav::PreparedRecoveredGateway::new(
-                self.files.gateway_configuration(self.provider)?,
-                self.limits.clone(),
-                scan_interval_secs,
-            )?;
             let management = self
                 .files
                 .management_configuration(self.provider)?
@@ -839,19 +837,22 @@ impl<'authority> DeploymentOwner<'authority> {
                 }
             }
         }
-        let run = self
-            .run
-            .as_ref()
-            .expect("same acquired native run retained");
-        match prepared_gateway.start(run) {
-            Ok(original) => self.gateway = Some(original),
-            Err(original) => {
-                self.gateway = original.original_gateway;
-                self.stop_runtime();
-                self.state = OwnerState::Uncertain;
-                return Err(OwnerStartFailure::OriginalAcquisition(
-                    "gateway_start_failed",
-                ));
+        if self.run.as_mut().expect("same acquired native run retained")
+            .start_configured_polling(self.limits.clone()).is_err() {
+            self.stop_runtime();
+            self.state = OwnerState::Uncertain;
+            return Err(OwnerStartFailure::OriginalAcquisition("polling_start_failed"));
+        }
+        if let Some(prepared_gateway) = prepared_gateway {
+            let run = self.run.as_ref().expect("same acquired native run retained");
+            match prepared_gateway.start(run) {
+                Ok(original) => self.gateway = Some(original),
+                Err(original) => {
+                    self.gateway = original.original_gateway;
+                    self.stop_runtime();
+                    self.state = OwnerState::Uncertain;
+                    return Err(OwnerStartFailure::OriginalAcquisition("gateway_start_failed"));
+                }
             }
         }
         if self
@@ -863,9 +864,7 @@ impl<'authority> DeploymentOwner<'authority> {
             || self
                 .gateway
                 .as_ref()
-                .expect("same gateway retained")
-                .status()
-                .is_err()
+                .is_some_and(|gateway| gateway.status().is_err())
             || self
                 .management
                 .as_ref()
@@ -1166,9 +1165,14 @@ impl<'authority> DeploymentOwner<'authority> {
                 Ok(None) => (),
                 Err(_) => return self.end("input_read_failed", None, None, true),
             }
-            if let (Some(run), Some(gateway)) = (self.run.as_mut(), self.gateway.as_mut()) {
-                if gateway.poll(run).is_err() {
-                    return self.end("runtime_failed", None, Some("runtime_failed"), true);
+            if let Some(run) = self.run.as_mut() {
+                if run.poll_configured_space().is_err() {
+                    return self.end("runtime_failed", None, Some("polling_failed"), true);
+                }
+                if let Some(gateway) = self.gateway.as_mut() {
+                    if gateway.poll(run).is_err() {
+                        return self.end("runtime_failed", None, Some("runtime_failed"), true);
+                    }
                 }
             }
             std::thread::sleep(OWNER_POLL);
