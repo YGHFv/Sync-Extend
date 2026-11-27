@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use sync_extend_core_model::{ContentId, DeviceId, EntryId, SpaceId};
 
+pub(crate) use super::native_history_source_audit::AuditedArchivedProjection;
 mod fresh_writer;
 pub(crate) mod schema;
 pub use fresh_writer::{
@@ -32,6 +33,10 @@ const MAX_SOURCE_ROWS: usize = 100_000;
 
 pub(crate) fn migrate_schema73(connection: &mut Connection) -> Result<()> {
     super::native_history_source_audit::migrate_schema73(connection)
+}
+
+pub(crate) fn migrate_schema74(connection: &mut Connection) -> Result<()> {
+    super::native_history_source_audit::migrate_schema74(connection)
 }
 
 /// The complete native-history persistence inventory. Storage-role capacity

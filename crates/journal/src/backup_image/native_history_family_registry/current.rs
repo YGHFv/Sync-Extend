@@ -274,11 +274,13 @@ pub(super) fn catalog(version: u32) -> Result<&'static [CatalogDefinition]> {
     static V71: OnceLock<Vec<CatalogDefinition>> = OnceLock::new();
     static V72: OnceLock<Vec<CatalogDefinition>> = OnceLock::new();
     static V73: OnceLock<Vec<CatalogDefinition>> = OnceLock::new();
+    static V74: OnceLock<Vec<CatalogDefinition>> = OnceLock::new();
     let cell = match version {
         70 => &V70,
         71 => &V71,
         72 => &V72,
         73 => &V73,
+        74 => &V74,
         _ => {
             return Err(JournalError::Invariant(
                 "native history current catalog version",

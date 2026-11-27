@@ -229,3 +229,14 @@ pub use detached_history::{
     DetachedOriginalNodeHistory, OriginalHistoryContentReference,
     OriginalNodeHistoryMappingEvidence, RetainedOriginalNodeHistory,
 };
+
+// Finite exact catalog selected by the retention reader, including frozen archives.
+pub(crate) fn retention_catalog(version: u32) -> Result<Vec<(String, String, Option<String>)>> {
+    Ok(schema_catalog::compiled_definitions(version)?.iter()
+        .filter(|(_, name, table, _)| name.starts_with("deletion_retention_") || table.starts_with("deletion_retention_"))
+        .map(|(kind, name, _, sql)| (kind.clone(), name.clone(), sql.clone())).collect())
+}
+
+pub(crate) fn validate_current_catalog(connection: &Connection) -> Result<()> {
+    schema_catalog::validate_schema(connection, SCHEMA_VERSION)
+}

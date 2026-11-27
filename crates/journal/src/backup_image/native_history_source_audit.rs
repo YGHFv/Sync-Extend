@@ -1781,7 +1781,6 @@ pub(super) fn migrate_schema73(database: &mut Connection) -> Result<()> {
         transaction.execute_batch(include_str!("../migration-073.sql"))?;
         integrity(&transaction)?;
         super::schema_catalog::validate_schema(&transaction, 73)?;
-        super::native_history_persistence::schema::validate(&transaction)?;
         budget.check_time()?;
         transaction.commit()?;
         Ok(())
@@ -1805,4 +1804,295 @@ pub(super) fn migrate_schema73(database: &mut Connection) -> Result<()> {
     restore_main?;
     restore_temp?;
     Ok(())
+}
+
+/// A borrowed witness created only by the complete original image audit.
+pub(crate) struct AuditedArchivedProjection<'a> {
+    source: &'a super::native_history_persistence::PersistedNativeHistorySource,
+}
+impl AuditedArchivedProjection<'_> {
+    pub(crate) fn source(
+        &self,
+    ) -> &super::native_history_persistence::PersistedNativeHistorySource {
+        self.source
+    }
+}
+
+/// Rebuild the original typed audit before issuing any archived projection row.
+pub(super) fn reaudit_persisted(
+    source: &super::native_history_persistence::PersistedNativeHistorySource,
+) -> Result<AuditedArchivedProjection<'_>> {
+    let roots = source
+        .projection()
+        .root_columns()
+        .iter()
+        .map(|mapping| {
+            NativeHistoryRootMapping::worktree(
+                mapping.original().into(),
+                mapping.projected().into(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let checked = audit(
+        source.source_image().to_vec(),
+        source.source_image_digest().as_str(),
+        source.source_image().len(),
+        source.space(),
+        &roots,
+        source.inspection_bounds(),
+    )?;
+    if checked.parts.source_digest != *source.source_digest()
+        || checked.parts.projection.digest() != source.projection().digest()
+    {
+        return Err(invalid("archived projection original typed proof differs"));
+    }
+    Ok(AuditedArchivedProjection { source })
+}
+
+fn read_complete_rows(
+    connection: &Connection,
+    registry: NativeHistoryFamilyRegistry,
+    bounds: NodeInspectionBounds,
+) -> Result<Vec<JournalStoredRow>> {
+    let specs = registry.row_specs();
+    column_layout(connection, &specs)?;
+    let counts = preflight(
+        connection,
+        &specs,
+        bounds.capacity.inventory.max_rows,
+        bounds.capacity.inventory.max_logical_bytes,
+    )?;
+    let mut rows = Vec::new();
+    for (spec, count) in specs.iter().zip(&counts) {
+        rows.extend(read_table(connection, spec, count)?);
+    }
+    if rows.len() as u64 > bounds.capacity.max_rows {
+        return Err(invalid("archived projection total row bound"));
+    }
+    Ok(rows)
+}
+
+/// Full typed target audit before the create transition commits. No current
+/// native authority is reconstructed from the descriptive source inventory.
+pub(super) fn audit_projected_target(
+    connection: &Connection,
+    space: &SpaceId,
+    bounds: NodeInspectionBounds,
+) -> Result<()> {
+    integrity(connection)?;
+    let registry = NativeHistoryFamilyRegistry::for_schema(crate::SCHEMA_VERSION)?;
+    let rows = read_complete_rows(connection, registry, bounds)?;
+    original_identity(&rows, space)?;
+    let finals = typed_families(connection, &rows, space, bounds)?;
+    typed_local_state(&rows, &finals)?;
+    Ok(())
+}
+
+/// No row rewriting: exact schema73/data audit, three trigger replacements and
+/// exact schema74/data comparison share a single rollback-capable transaction.
+pub(super) fn migrate_schema74(database: &mut Connection) -> Result<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    let bounds = NodeInspectionBounds {
+        max_entries: 100_000,
+        capacity: crate::JournalCapacityLimits {
+            inventory: crate::TreeRestoreInventoryLimits {
+                max_rows: 100_000,
+                max_logical_bytes: 100_000 * 1024,
+            },
+            max_rows: 100_000,
+            max_logical_bytes: 100_000 * 1024,
+        },
+        max_vm_instructions: 100_000_000,
+        max_query_time: std::time::Duration::from_secs(60),
+    };
+    use rusqlite::limits::Limit;
+    let sql_limits = [
+        (Limit::SQLITE_LIMIT_LENGTH, 32 * 1024 * 1024),
+        (Limit::SQLITE_LIMIT_SQL_LENGTH, 1024 * 1024),
+        (Limit::SQLITE_LIMIT_ATTACHED, 0),
+        (Limit::SQLITE_LIMIT_WORKER_THREADS, 0),
+    ];
+    let prior_limits = sql_limits
+        .iter()
+        .map(|(category, _)| database.limit(*category).map(|old| (*category, old)))
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let original_main: u64 =
+        database.pragma_query_value(Some("main"), "max_page_count", |r| crate::sql_u64(r, 0))?;
+    let original_temp: u64 =
+        database.pragma_query_value(Some("temp"), "max_page_count", |r| crate::sql_u64(r, 0))?;
+    let deadline = std::time::Instant::now() + bounds.max_query_time;
+    let vm = Arc::new(AtomicU64::new(bounds.max_vm_instructions));
+    let meter = vm.clone();
+    database.progress_handler(
+        1_000,
+        Some(move || {
+            std::time::Instant::now() >= deadline
+                || meter
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                        n.checked_sub(1_000)
+                    })
+                    .is_err()
+        }),
+    )?;
+    let result = (|| {
+        for (category, maximum) in sql_limits {
+            database.set_limit(category, maximum)?;
+            if database.limit(category)? > maximum {
+                return Err(invalid("retention migration SQL limit not applied"));
+            }
+        }
+        let tx = database.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let pages: u64 =
+            tx.pragma_query_value(Some("main"), "page_count", |r| crate::sql_u64(r, 0))?;
+        let page_size: u64 =
+            tx.pragma_query_value(Some("main"), "page_size", |r| crate::sql_u64(r, 0))?;
+        let temp_size: u64 =
+            tx.pragma_query_value(Some("temp"), "page_size", |r| crate::sql_u64(r, 0))?;
+        let registry = NativeHistoryFamilyRegistry::for_schema(73)?;
+        catalog(&tx, registry)?;
+        integrity(&tx)?;
+        let before = read_complete_rows(&tx, registry, bounds)?;
+        let mut budget = NestedBudget {
+            sources: 0,
+            bytes: 0,
+            rows: 0,
+            logical_bytes: 0,
+            max_rows: bounds.capacity.max_rows,
+            max_logical_bytes: bounds.capacity.max_logical_bytes,
+            deadline,
+            vm_remaining: vm,
+        };
+        budget.reserve_rows(
+            before.len() as u64,
+            before
+                .iter()
+                .try_fold(0u64, |n, r| add(n, r.logical_bytes()))?,
+        )?;
+        let copy_tables = super::native_history_persistence::schema::TABLES;
+        let copy_rows = before
+            .iter()
+            .filter(|row| copy_tables.iter().any(|table| table.name == row.table()))
+            .collect::<Vec<_>>();
+        let copy_bytes = copy_rows
+            .iter()
+            .try_fold(0u64, |n, row| add(n, row.logical_bytes()))?;
+        let copied = copy_bytes
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(copy_rows.len() as u64 * 4096))
+            .and_then(|n| n.checked_add(8 * 1024 * 1024))
+            .ok_or(invalid("retention migration copy bound"))?;
+        if page_size == 0 || temp_size == 0 {
+            return Err(invalid("retention migration page geometry"));
+        }
+        let main_limit = pages
+            .checked_add(copied.div_ceil(page_size))
+            .ok_or(invalid("retention migration page overflow"))?
+            .min(original_main);
+        let temp_limit = copied.div_ceil(temp_size).min(original_temp);
+        let peak = main_limit
+            .checked_mul(page_size)
+            .and_then(|n| n.checked_mul(2))
+            .and_then(|n| {
+                temp_limit
+                    .checked_mul(temp_size)
+                    .and_then(|t| n.checked_add(t))
+            })
+            .and_then(|n| {
+                pages
+                    .checked_add(main_limit)
+                    .and_then(|f| f.checked_mul(24))
+                    .and_then(|f| n.checked_add(f))
+            });
+        if main_limit < pages || temp_limit == 0 || peak.is_none_or(|n| n > 1024 * 1024 * 1024) {
+            return Err(invalid("retention migration peak page budget"));
+        }
+        tx.pragma_update(
+            Some("main"),
+            "max_page_count",
+            crate::sql_integer(main_limit)?,
+        )?;
+        tx.pragma_update(
+            Some("temp"),
+            "max_page_count",
+            crate::sql_integer(temp_limit)?,
+        )?;
+        if tx.pragma_query_value(Some("main"), "max_page_count", |r| crate::sql_u64(r, 0))?
+            > main_limit
+            || tx.pragma_query_value(Some("temp"), "max_page_count", |r| crate::sql_u64(r, 0))?
+                > temp_limit
+        {
+            return Err(invalid("retention migration page limits not applied"));
+        }
+        let space = state(&before, "space_id")?
+            .map(str::parse::<SpaceId>)
+            .transpose()?;
+        nested_sources(&tx, registry, space.as_ref(), 1, &mut budget)?;
+        if let Some(space) = &space {
+            original_identity(&before, space)?;
+            let finals = typed_families(&tx, &before, space, bounds)?;
+            typed_local_state(&before, &finals)?;
+        } else {
+            // A legitimate target may have only persisted sources/admitted
+            // writers before its first projection supplies the local identity.
+            // nested_sources above has already re-audited every source/chain.
+            for row in &before {
+                let pristine_clock = row.table() == "read_lease_clock"
+                    && row.primary_key() == ["1"]
+                    && integer(row, "observed_at_ms")? == 0;
+                let inert = copy_tables.iter().any(|table| table.name == row.table());
+                if (!pristine_clock && !inert)
+                    || (row.table() == "native_history_fresh_writers"
+                        && text(row, "state")? != "admitted")
+                {
+                    return Err(invalid("retention migration original identity absent"));
+                }
+            }
+        }
+        tx.execute_batch(include_str!("../migration-074.sql"))?;
+        catalog(&tx, NativeHistoryFamilyRegistry::for_schema(74)?)?;
+        integrity(&tx)?;
+        let after = read_complete_rows(&tx, NativeHistoryFamilyRegistry::for_schema(74)?, bounds)?;
+        if before.len() != after.len()
+            || before
+                .iter()
+                .zip(&after)
+                .any(|(a, b)| a.table() != b.table() || a.fingerprint() != b.fingerprint())
+        {
+            return Err(invalid("retention migration original typed rows changed"));
+        }
+        crate::deletion_retention::validate_schema(&tx)?;
+        if let Some(space) = &space {
+            crate::deletion_retention::audit(&tx, space, bounds.max_entries)?;
+        }
+        budget.check_time()?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let mut cleanup = database
+        .progress_handler(0, None::<fn() -> bool>)
+        .map_err(JournalError::from);
+    for (category, old) in prior_limits {
+        let restored = database
+            .set_limit(category, old)
+            .map(|_| ())
+            .map_err(JournalError::from);
+        if cleanup.is_ok() {
+            cleanup = restored;
+        }
+    }
+    for (schema, limit) in [("main", original_main), ("temp", original_temp)] {
+        let restored = database
+            .pragma_update(Some(schema), "max_page_count", limit as i64)
+            .map_err(JournalError::from);
+        if cleanup.is_ok() {
+            cleanup = restored;
+        }
+    }
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => cleanup,
+    }
 }

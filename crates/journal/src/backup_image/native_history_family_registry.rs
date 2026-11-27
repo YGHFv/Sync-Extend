@@ -90,7 +90,7 @@ impl NativeHistoryFamilyRegistry {
     }
     pub fn for_schema(version: u32) -> Result<Self> {
         match version {
-            69 | 70 | 71 | 72 | 73 => Ok(Self { version }),
+            69 | 70 | 71 | 72 | 73 | 74 => Ok(Self { version }),
             _ => Err(JournalError::Invariant(
                 "native history unregistered source schema",
             )),

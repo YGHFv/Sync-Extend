@@ -17,6 +17,7 @@ use sync_extend_core_model::{
     *,
 };
 
+pub(crate) mod archive;
 mod capacity;
 pub(crate) mod physical;
 pub(crate) mod schema;
@@ -105,9 +106,12 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?)
     }
-    let expected = Connection::open_in_memory()?;
-    expected.execute_batch(include_str!("migration-066.sql"))?;
-    if objects(connection)? != objects(&expected)? {
+    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !(66..=74).contains(&version) {
+        return Err(invalid("retention exact registered schema version"));
+    }
+    let expected = crate::backup_image::retention_catalog(version)?;
+    if objects(connection)? != expected {
         return Err(invalid("retention exact schema/immutable guards differ"));
     }
     Ok(())
@@ -619,11 +623,11 @@ impl JournalReadView<'_> {
                     && preparations.iter().any(|preparation| {
                         preparation.native_future_admission.is_none()
                             && matches!(preparation.state, "prepared" | "cancelled")
-                            && preparation.execution_records.as_ref().is_none_or(|records| {
-                                records.record_count == 0
-                            })
-                            && gap.owner_key
-                                == [preparation.intent.transaction_id.to_string()]
+                            && preparation
+                                .execution_records
+                                .as_ref()
+                                .is_none_or(|records| records.record_count == 0)
+                            && gap.owner_key == [preparation.intent.transaction_id.to_string()]
                     })
             };
             if !capacity.report.within_accounted_limits()

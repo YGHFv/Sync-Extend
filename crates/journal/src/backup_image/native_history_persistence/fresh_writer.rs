@@ -423,6 +423,8 @@ impl Journal {
         writer.require(NativeHistoryFreshWriterState::Admitted)?;
         let source = self.inspect_native_history_source(writer.source_digest.clone())?;
         verify_writer_source(writer, &source)?;
+        let audited_projection =
+            super::super::native_history_source_audit::reaudit_persisted(&source)?;
         let mapping = root_mapping(&source)?;
         if let Some(mapping) = mapping {
             if mapping.projected() != writer.worktree {
@@ -447,7 +449,28 @@ impl Journal {
         for row in source.rows() {
             rows.insert(row_key(row)?, row);
         }
-        for key in source.projection().portable_rows() {
+        // Retention anchors reference materialized operations/snapshots and its
+        // policy revisions must follow numeric sequence, not lexical row keys.
+        let mut projected = source
+            .projection()
+            .portable_rows()
+            .iter()
+            .collect::<Vec<_>>();
+        projected.sort_by_key(|key| {
+            let retention = crate::deletion_retention::schema::TABLES
+                .iter()
+                .position(|t| t.name == key.table());
+            let revision = rows
+                .get(key)
+                .and_then(|row| row.columns().iter().find(|c| c.name == "revision"))
+                .and_then(|c| match &c.value {
+                    JournalStorageColumnValue::Integer(n) => Some(*n),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            (retention.map_or(0, |index| index + 1), revision)
+        });
+        for key in projected {
             let row = rows.get(key).ok_or(JournalError::Invariant(
                 "native history fresh writer projection row absent",
             ))?;
@@ -464,8 +487,29 @@ impl Journal {
             } else {
                 None
             };
+            let retention = if crate::deletion_retention::schema::TABLES
+                .iter()
+                .any(|table| table.name == row.table())
+            {
+                Some(self.deletion_retention_archive.permit(
+                    &tx,
+                    &audited_projection,
+                    writer,
+                    row,
+                )?)
+            } else {
+                None
+            };
             insert_row(&tx, row.table(), &columns)?;
+            if let Some(permit) = retention {
+                permit.finish()?;
+            }
         }
+        super::super::native_history_source_audit::audit_projected_target(
+            &tx,
+            source.space(),
+            source.inspection_bounds(),
+        )?;
         let snapshot = target_snapshot(&tx, &target_tables(&source), &source)?;
         let at_ms = monotonic_now(stored.updated_at_ms)?;
         let changed = tx.execute(
@@ -1281,7 +1325,11 @@ fn insert_row(tx: &Transaction<'_>, table: &str, columns: &[JournalStorageColumn
         .iter()
         .map(|column| stored_value(&column.value))
         .collect::<Result<Vec<_>>>()?;
-    tx.execute(&sql, rusqlite::params_from_iter(values.iter()))?;
+    if tx.execute(&sql, rusqlite::params_from_iter(values.iter()))? != 1 {
+        return Err(JournalError::Invariant(
+            "native history exact projected insert count",
+        ));
+    }
     Ok(())
 }
 

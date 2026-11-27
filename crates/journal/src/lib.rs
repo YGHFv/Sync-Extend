@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 73;
+const SCHEMA_VERSION: u32 = 74;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -305,6 +305,7 @@ pub struct Journal {
     unix_storage_retirement_clock_issue: storage_retirement::gate::Gate,
     unix_storage_retirement_native_gates: storage_retirement_unix::native::Gates,
     deletion_retention_issuance: storage_retirement::gate::Gate,
+    deletion_retention_archive: deletion_retention::archive::Gate,
     webdav_native_description_issue: storage_retirement::gate::Gate,
     webdav_native_object_issue: storage_retirement::gate::Gate,
     webdav_native_cancel_issue: storage_retirement::gate::Gate,
@@ -1012,9 +1013,19 @@ impl Journal {
         // mode, so a refused schema-72 migration leaves original bytes intact.
         let opening_version: u32 =
             connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if opening_version > SCHEMA_VERSION {
+            return Err(JournalError::Invariant("unsupported schema version"));
+        }
         if opening_version == 72 {
             connection.pragma_update(None, "foreign_keys", true)?;
             backup_image::native_history_persistence::migrate_schema73(&mut connection)?;
+        }
+        if matches!(opening_version, 72 | 73) {
+            connection.pragma_update(None, "foreign_keys", true)?;
+            backup_image::native_history_persistence::migrate_schema74(&mut connection)?;
+        }
+        if opening_version == SCHEMA_VERSION {
+            backup_image::validate_current_catalog(&connection)?;
         }
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
@@ -1401,8 +1412,12 @@ impl Journal {
         if version < 73 {
             backup_image::native_history_persistence::migrate_schema73(&mut connection)?;
         }
+        if version < 74 {
+            backup_image::native_history_persistence::migrate_schema74(&mut connection)?;
+        }
         backup_image::native_history_persistence::schema::validate(&connection)?;
         deletion_retention::validate_schema(&connection)?;
+        let deletion_retention_archive = deletion_retention::archive::Gate::register(&connection)?;
         let deletion_retention_issuance =
             storage_retirement::gate::Gate::register(&connection, "sync_deletion_retention_issue")?;
         webdav_native::schema::validate(&connection)?;
@@ -1583,6 +1598,7 @@ impl Journal {
             unix_storage_retirement_clock_issue,
             unix_storage_retirement_native_gates,
             deletion_retention_issuance,
+            deletion_retention_archive,
             webdav_native_description_issue,
             webdav_native_object_issue,
             webdav_native_cancel_issue,
@@ -3738,6 +3754,7 @@ impl Journal {
             }
             backup_image::native_history_persistence::schema::validate(&connection)?;
             deletion_retention::validate_schema(&connection)?;
+            let deletion_retention_archive = deletion_retention::archive::Gate::register(&connection)?;
             let deletion_retention_issuance = storage_retirement::gate::Gate::register(
                 &connection,
                 "sync_deletion_retention_issue",
@@ -3906,6 +3923,7 @@ impl Journal {
                 unix_storage_retirement_clock_issue,
                 unix_storage_retirement_native_gates,
                 deletion_retention_issuance,
+                deletion_retention_archive,
                 webdav_native_description_issue,
                 webdav_native_object_issue,
                 webdav_native_cancel_issue,
