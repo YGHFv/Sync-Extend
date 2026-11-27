@@ -838,6 +838,12 @@ impl<'authority> DeploymentOwner<'authority> {
             }
         }
         if self.run.as_mut().expect("same acquired native run retained")
+            .start_configured_native_mutations().is_err() {
+            self.stop_runtime();
+            self.state = OwnerState::Uncertain;
+            return Err(OwnerStartFailure::OriginalAcquisition("native_mutation_start_failed"));
+        }
+        if self.run.as_mut().expect("same acquired native run retained")
             .start_configured_polling(self.limits.clone()).is_err() {
             self.stop_runtime();
             self.state = OwnerState::Uncertain;

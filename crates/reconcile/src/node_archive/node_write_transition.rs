@@ -3929,6 +3929,8 @@ pub struct FreshRecoveredNodeWalV2Session {
     new_cas_buckets: std::collections::BTreeMap<PathBuf, RecoveredCasBucket>,
     verified_main: std::cell::RefCell<Option<RecoveredVerificationKey>>,
     polling: Option<polling::RecoveredPollingState>,
+    mutation_observation_closed: Option<sync_extend_platform_fs::ClosedWindowsOriginalResources>,
+    mutation_observation_failed: Option<sync_extend_platform_fs::WindowsOriginalResourceCloseFailure>,
 }
 impl FreshRecoveredNodeWalV2Session {
     fn verify_objects(&self) -> Result<()> {
@@ -4438,6 +4440,8 @@ impl super::VerifiedNodeStateArchive {
             new_cas_buckets: std::collections::BTreeMap::new(),
             verified_main: std::cell::RefCell::new(None),
             polling: None,
+            mutation_observation_closed: None,
+            mutation_observation_failed: None,
         };
         result.record("intended", None)?;
         result.verify()?;
@@ -4821,6 +4825,8 @@ impl super::VerifiedNodeStateArchive {
             new_cas_buckets: std::collections::BTreeMap::new(),
             verified_main: std::cell::RefCell::new(None),
             polling: None,
+            mutation_observation_closed: None,
+            mutation_observation_failed: None,
         };
         result.record("intended", None)?;
         result.verify()?;
@@ -7144,6 +7150,8 @@ impl super::VerifiedNodeStateArchive {
             new_cas_buckets: std::collections::BTreeMap::new(),
             verified_main: std::cell::RefCell::new(None),
             polling: None,
+            mutation_observation_closed: None,
+            mutation_observation_failed: None,
             new_file_bytes: 0,
             new_cas_bytes: 0,
             new_cas_objects: 0,
@@ -9708,6 +9716,8 @@ impl super::VerifiedNodeStateArchive {
             new_cas_buckets: std::collections::BTreeMap::new(),
             verified_main: std::cell::RefCell::new(None),
             polling: None,
+            mutation_observation_closed: None,
+            mutation_observation_failed: None,
             new_file_bytes: 0,
             new_cas_bytes: 0,
             new_cas_objects: 0,

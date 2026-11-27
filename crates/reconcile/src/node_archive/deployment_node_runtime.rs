@@ -76,6 +76,9 @@ impl DeploymentClosedNodeRuntime {
 }
 
 impl RecoveredLocalSpace {
+    pub(crate) fn request_deployment_native_mutations(&mut self) -> Result<()> {
+        self.session.request_deployment_native_mutations()
+    }
     pub(crate) fn deployment_polling_limits(&self) -> Option<serde_json::Value> {
         self.session.polling_limits()
     }

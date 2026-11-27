@@ -137,11 +137,14 @@ impl FreshRecoveredNodeWalV2Session {
         self.verify()
     }
 
+    pub(crate) fn request_deployment_native_mutations(&mut self) -> Result<()> {
+        self.deployment_runtime_binding()?.verify()?;
+        self.mutation_requested = true;
+        self.verify()
+    }
+
     pub(crate) fn polling_mutation_observation(&mut self) -> Result<()> {
         self.verify()?;
-        if self.polling.is_none() {
-            return Ok(());
-        }
         if self.polling.as_ref().is_some_and(|state| state.detached) {
             return Err(ReconcileError::Invariant(
                 "authorized mutation requires a current stable observation",
@@ -186,15 +189,14 @@ impl FreshRecoveredNodeWalV2Session {
             let original = self.read.read.files.remove(index);
             let mut terminal = WindowsOriginalCloseAttempt::new();
             original.file.close_into_attempt(&mut terminal);
-            let state = self.polling.as_mut().ok_or(ReconcileError::Unstable)?;
-            if let Some(closed) = state.closed.take() {
+            if let Some(closed) = self.mutation_observation_closed.take() {
                 terminal.append_result(Ok(closed));
             }
             match terminal.finish() {
-                Ok(closed) => state.closed = Some(closed),
+                Ok(closed) => self.mutation_observation_closed = Some(closed),
                 Err(failed) => {
                     let message = failed.error.to_string();
-                    state.failed = Some(failed);
+                    self.mutation_observation_failed = Some(failed);
                     return Err(ReconcileError::Io(std::io::Error::other(message)));
                 }
             }

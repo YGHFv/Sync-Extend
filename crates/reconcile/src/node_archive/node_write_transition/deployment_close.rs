@@ -166,6 +166,8 @@ struct OriginalSessionResources {
         Vec<(std::path::PathBuf, sync_extend_platform_fs::LockedDirectory)>,
     new_cas_buckets: std::collections::BTreeMap<std::path::PathBuf, super::RecoveredCasBucket>,
     polling: Option<super::polling::RecoveredPollingState>,
+    mutation_observation_closed: Option<ClosedWindowsOriginalResources>,
+    mutation_observation_failed: Option<WindowsOriginalResourceCloseFailure>,
     created_work_directories: std::collections::BTreeMap<
         std::path::PathBuf,
         sync_extend_platform_fs::LockedDirectoryMutation,
@@ -285,6 +287,8 @@ impl FreshRecoveredNodeWalV2Session {
             new_cas_buckets,
             verified_main,
             polling,
+            mutation_observation_closed,
+            mutation_observation_failed,
         } = self;
         let ReacquiredClosedNodeLockedReadScope {
             read,
@@ -353,6 +357,8 @@ impl FreshRecoveredNodeWalV2Session {
             new_cas_buckets,
             created_work_directories,
             polling,
+            mutation_observation_closed,
+            mutation_observation_failed,
         };
         // The native terminal must really finish before the original owner
         // locks and retained surrounding scope can be released.
@@ -409,8 +415,16 @@ impl OriginalSessionResources {
             new_cas_buckets,
             created_work_directories,
             polling,
+            mutation_observation_closed,
+            mutation_observation_failed,
         } = self;
         let mut attempt = WindowsOriginalCloseAttempt::new();
+        if let Some(closed) = mutation_observation_closed {
+            attempt.append_result(Ok(closed));
+        }
+        if let Some(failed) = mutation_observation_failed {
+            attempt.append_result(Err(failed));
+        }
         if let Some(polling) = polling {
             polling.close_into_attempt(&mut attempt);
         }

@@ -249,6 +249,27 @@ impl RetainedInstalledDeploymentFiles {
 }
 
 impl DeploymentRun<'_> {
+    /// This intent derives only from this generation's still-held installation.
+    /// Actual WRITE/DELETE rights require fresh native acquisition on each actor
+    /// path; every actor separately verifies the original account and target.
+    pub fn start_configured_native_mutations(&mut self) -> Result<()> {
+        self.verify()?;
+        if !matches!(self.deployment_configuration()?.role, DeploymentRole::WebdavClient { .. }) {
+            return Ok(());
+        }
+        let gateway = self.gateway_configuration()?;
+        if !gateway.listener.enabled { return Ok(()); }
+        let spaces = gateway.listener.exports.iter()
+            .filter(|export| export.writable && export.allow_native_windows_writes
+                && gateway.listener.accounts.iter().any(|account| account.writable_exports.contains(&export.name)))
+            .map(|export| export.space_id.clone()).collect::<std::collections::BTreeSet<_>>();
+        for space in spaces {
+            let id = self.node_id(&space)?;
+            self.nodes.get_mut(&id).ok_or(ReconcileError::Unstable)?.request_deployment_native_mutations()?;
+        }
+        self.verify()
+    }
+
     /// Only the same retained configuration selects spaces and the interval.
     /// There is no public path/identity based polling capability constructor.
     pub fn start_configured_polling(&mut self, limits: sync_extend_core_model::limits::LocalLimits) -> Result<()> {
