@@ -14,6 +14,13 @@ use std::{
     sync::Arc,
 };
 
+mod directory_entries;
+mod mount_identity;
+mod resource_close;
+pub use resource_close::{
+    ClosedUnixOriginalResources, UnixOriginalCloseAttempt, UnixOriginalResourceCloseFailure,
+};
+
 const MAX_COMPONENTS: usize = 128;
 const MAX_PATH_BYTES: usize = 32_768;
 const MAX_ARTIFACT_BYTES: usize = 1024 * 1024 * 1024;
@@ -206,6 +213,7 @@ fn verify_file(value: FileObservation, private: bool, maximum: usize) -> io::Res
 struct DirectoryAnchor {
     file: File,
     key: UnixProtectedArtifactKey,
+    mount_id: u64,
     component: Option<CString>,
 }
 
@@ -218,40 +226,54 @@ impl AnchoredParent {
     fn open(path: &Path) -> io::Result<Self> {
         let components = normal_components(path)?;
         let component_count = components.len();
-        let root = open_root()?;
-        let root_observed = observe_fd(root.as_raw_fd())?;
-        verify_directory(root_observed, false)?;
-        let mut directories = vec![DirectoryAnchor {
-            file: root,
-            key: root_observed.key,
-            component: None,
-        }];
-        for (index, name) in components.into_iter().enumerate() {
-            let parent = directories
-                .last()
-                .ok_or_else(|| refuse("original root directory absent"))?;
-            let file = open_child(
-                parent.file.as_raw_fd(),
-                &name,
-                libc::O_RDONLY | libc::O_DIRECTORY,
-            )?;
-            let observed = observe_fd(file.as_raw_fd())?;
-            let slot = observe_slot(parent.file.as_raw_fd(), &name)?;
-            if !observed.same_object(slot) {
-                return Err(refuse("original deployment directory slot changed"));
-            }
-            verify_directory(observed, index + 1 == component_count)?;
+        let mut pending = Some(open_root()?);
+        let mut directories = Vec::new();
+        let opened = (|| -> io::Result<()> {
+            let root = pending.as_ref().expect("original root open");
+            let observed = observe_fd(root.as_raw_fd())?;
+            verify_directory(observed, false)?;
             directories.push(DirectoryAnchor {
-                file,
+                mount_id: mount_identity::mount_id(root.as_raw_fd())?,
+                file: pending.take().expect("verified original root"),
                 key: observed.key,
-                component: Some(name),
+                component: None,
             });
+            for (index, name) in components.into_iter().enumerate() {
+                let parent = directories.last().ok_or_else(|| refuse("original root directory absent"))?;
+                pending = Some(open_child(parent.file.as_raw_fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY)?);
+                let file = pending.as_ref().expect("original ancestor open");
+                let observed = observe_fd(file.as_raw_fd())?;
+                let slot = observe_slot(parent.file.as_raw_fd(), &name)?;
+                if !observed.same_object(slot) {
+                    return Err(refuse("original deployment directory slot changed"));
+                }
+                let mount_id = mount_identity::mount_id(file.as_raw_fd())?;
+                if mount_id != mount_identity::slot_mount_id(parent.file.as_raw_fd(), &name)? {
+                    return Err(refuse("original deployment directory mount changed"));
+                }
+                verify_directory(observed, index + 1 == component_count)?;
+                directories.push(DirectoryAnchor { mount_id, file: pending.take().expect("verified original ancestor"),
+                    key: observed.key, component: Some(name) });
+            }
+            Ok(())
+        })();
+        if let Err(error) = opened {
+            let mut close = UnixOriginalCloseAttempt::new();
+            close.note_error(error);
+            if let Some(file) = pending { close.close_file(file); }
+            for directory in directories.into_iter().rev() { close.close_file(directory.file); }
+            return Err(close.finish().err().expect("ancestor open first error retained").retain_and_report());
         }
         let result = Self {
             path: path.to_path_buf(),
             directories,
         };
-        result.verify()?;
+        if let Err(error) = result.verify() {
+            let mut close = UnixOriginalCloseAttempt::new();
+            close.note_error(error);
+            result.close_into_attempt(&mut close);
+            return Err(close.finish().err().expect("ancestor verify first error retained").retain_and_report());
+        }
         Ok(result)
     }
 
@@ -278,6 +300,9 @@ impl AnchoredParent {
             if observed.key != directory.key {
                 return Err(refuse("retained deployment ancestor identity changed"));
             }
+            if mount_identity::mount_id(directory.file.as_raw_fd())? != directory.mount_id {
+                return Err(refuse("retained deployment ancestor mount changed"));
+            }
             verify_directory(observed, index + 1 == self.directories.len())?;
             if index > 0 {
                 let name = directory
@@ -289,13 +314,18 @@ impl AnchoredParent {
                 if !observed.same_object(slot) {
                     return Err(refuse("retained deployment ancestor slot changed"));
                 }
+                if mount_identity::slot_mount_id(parent.file.as_raw_fd(), name)? != directory.mount_id {
+                    return Err(refuse("retained deployment ancestor slot mount changed"));
+                }
             }
         }
         Ok(())
     }
 
-    fn close(self) -> io::Result<()> {
-        close_files(self.directories.into_iter().rev().map(|item| item.file))
+    fn close_into_attempt(self, attempt: &mut UnixOriginalCloseAttempt) {
+        for directory in self.directories.into_iter().rev() {
+            attempt.close_file(directory.file);
+        }
     }
 }
 
@@ -307,16 +337,6 @@ fn close_file(file: File) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-fn close_files(files: impl IntoIterator<Item = File>) -> io::Result<()> {
-    let mut first_error = None;
-    for file in files {
-        if let Err(error) = close_file(file) {
-            first_error.get_or_insert(error);
-        }
-    }
-    first_error.map_or(Ok(()), Err)
 }
 
 /// Owns the original file and every original ancestor until explicit close.
@@ -341,24 +361,43 @@ impl UnixProtectedArtifactSource {
             .into_iter()
             .last()
             .ok_or_else(|| refuse("original deployment source component"))?;
-        let file = open_child(parent.fd()?, &name, libc::O_RDONLY)?;
-        let observed = observe_fd(file.as_raw_fd())?;
-        verify_file(observed, private, maximum)?;
-        let slot = observe_slot(parent.fd()?, &name)?;
-        if slot != observed {
-            return Err(refuse(
-                "original deployment source slot changed during open",
-            ));
-        }
+        // A foreign FIFO must be rejected by fstat instead of blocking this
+        // original-source acquisition before its regular-file check.
+        let mut file = None;
+        let checked = (|| {
+            file = Some(open_child(parent.fd()?, &name, libc::O_RDONLY | libc::O_NONBLOCK)?);
+            let observed = observe_fd(file.as_ref().expect("opened source descriptor").as_raw_fd())?;
+            verify_file(observed, private, maximum)?;
+            let slot = observe_slot(parent.fd()?, &name)?;
+            if slot != observed {
+                return Err(refuse("original deployment source slot changed during open"));
+            }
+            Ok(observed)
+        })();
+        let observed = match checked {
+            Ok(observed) => observed,
+            Err(error) => {
+                let mut close = UnixOriginalCloseAttempt::new();
+                close.note_error(error);
+                if let Some(file) = file { close.close_file(file); }
+                parent.close_into_attempt(&mut close);
+                return Err(close.finish().err().expect("source open first error retained").retain_and_report());
+            }
+        };
         let result = Self {
             parent,
             component: name,
-            file,
+            file: file.expect("checked original source descriptor"),
             observed,
             private,
             maximum,
         };
-        result.verify_original()?;
+        if let Err(error) = result.verify_original() {
+            let mut close = UnixOriginalCloseAttempt::new();
+            close.note_error(error);
+            close.append_result(result.close_retaining());
+            return Err(close.finish().err().expect("source verify first error retained").retain_and_report());
+        }
         Ok(result)
     }
 
@@ -380,6 +419,11 @@ impl UnixProtectedArtifactSource {
                 "original deployment source identity/length/times changed",
             ));
         }
+        if mount_identity::mount_id(self.file.as_raw_fd())?
+            != mount_identity::slot_mount_id(self.parent.fd()?, &self.component)?
+        {
+            return Err(refuse("original deployment source slot mount changed"));
+        }
         Ok(())
     }
 
@@ -400,9 +444,15 @@ impl UnixProtectedArtifactSource {
     }
 
     pub fn close(self) -> io::Result<()> {
-        let file_result = close_file(self.file);
-        let parent_result = self.parent.close();
-        file_result.and(parent_result)
+        self.close_retaining().map(|_| ()).map_err(UnixOriginalResourceCloseFailure::retain_and_report)
+    }
+
+    pub fn close_retaining(self) -> Result<ClosedUnixOriginalResources, UnixOriginalResourceCloseFailure> {
+        let mut attempt = UnixOriginalCloseAttempt::new();
+        if let Err(error) = self.verify_original() { attempt.note_error(error); }
+        attempt.close_file(self.file);
+        self.parent.close_into_attempt(&mut attempt);
+        attempt.finish()
     }
 }
 
@@ -434,11 +484,24 @@ impl UnixFailedArtifactCreation {
         if observe_slot(self.parent.fd()?, &self.component)? != observed {
             return Err(refuse("failed original deployment CREATE slot changed"));
         }
+        if mount_identity::mount_id(self.file.as_raw_fd())?
+            != mount_identity::slot_mount_id(self.parent.fd()?, &self.component)?
+        {
+            return Err(refuse("failed original deployment CREATE mount changed"));
+        }
         Ok(())
     }
 
     pub fn close(self) -> io::Result<()> {
-        close_file(self.file)
+        self.close_retaining().map(|_| ()).map_err(UnixOriginalResourceCloseFailure::retain_and_report)
+    }
+
+    pub fn close_retaining(self) -> Result<ClosedUnixOriginalResources, UnixOriginalResourceCloseFailure> {
+        let mut attempt = UnixOriginalCloseAttempt::new();
+        if let Err(error) = self.verify_original_slot() { attempt.note_error(error); }
+        attempt.close_file(self.file);
+        if let Ok(parent) = Arc::try_unwrap(self.parent) { parent.close_into_attempt(&mut attempt); }
+        attempt.finish()
     }
 }
 
@@ -518,16 +581,7 @@ impl UnixProtectedArtifactParent {
 
     pub fn require_empty(&self) -> io::Result<()> {
         self.original.verify()?;
-        if std::fs::read_dir(&self.original.path)?
-            .next()
-            .transpose()?
-            .is_some()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "deployment runtime directory is occupied",
-            ));
-        }
+        directory_entries::require_empty(self.original.fd()?)?;
         self.original.verify()
     }
 
@@ -594,9 +648,13 @@ impl UnixProtectedArtifactParent {
     }
 
     pub fn close(self) -> io::Result<()> {
-        Arc::try_unwrap(self.original)
-            .map_err(|_| refuse("deployment parent still has original creator loans"))?
-            .close()
+        self.close_retaining().map(|_| ()).map_err(UnixOriginalResourceCloseFailure::retain_and_report)
+    }
+
+    pub fn close_retaining(self) -> Result<ClosedUnixOriginalResources, UnixOriginalResourceCloseFailure> {
+        let mut attempt = UnixOriginalCloseAttempt::new();
+        attempt.close_artifact_parent(self);
+        attempt.finish()
     }
 }
 
@@ -642,6 +700,11 @@ impl UnixProtectedArtifactCreator {
         if observed.key != self.key || observe_slot(self.parent.fd()?, &self.component)? != observed
         {
             return Err(refuse("original deployment CREATE slot identity changed"));
+        }
+        if mount_identity::mount_id(self.file.as_raw_fd())?
+            != mount_identity::slot_mount_id(self.parent.fd()?, &self.component)?
+        {
+            return Err(refuse("original deployment CREATE slot mount changed"));
         }
         Ok(())
     }
@@ -710,7 +773,15 @@ impl UnixProtectedArtifactCreator {
     }
 
     pub fn close(self) -> io::Result<()> {
-        close_file(self.file)
+        self.close_retaining().map(|_| ()).map_err(UnixOriginalResourceCloseFailure::retain_and_report)
+    }
+
+    pub fn close_retaining(self) -> Result<ClosedUnixOriginalResources, UnixOriginalResourceCloseFailure> {
+        let mut attempt = UnixOriginalCloseAttempt::new();
+        if let Err(error) = self.verify_original() { attempt.note_error(error); }
+        attempt.close_file(self.file);
+        if let Ok(parent) = Arc::try_unwrap(self.parent) { parent.close_into_attempt(&mut attempt); }
+        attempt.finish()
     }
 }
 
@@ -738,5 +809,9 @@ impl SealedUnixProtectedArtifact {
 
     pub fn close(self) -> io::Result<()> {
         self.original.close()
+    }
+
+    pub fn close_retaining(self) -> Result<ClosedUnixOriginalResources, UnixOriginalResourceCloseFailure> {
+        self.original.close_retaining()
     }
 }

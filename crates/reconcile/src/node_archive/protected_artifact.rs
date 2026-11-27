@@ -166,12 +166,20 @@ impl OriginalProtectedArtifact {
         ));
         #[cfg(any(windows, target_os = "linux"))]
         {
-            let bytes = read_original(&source, maximum)?;
-            if bytes.is_empty() || bytes.len() > maximum {
-                return Err(ReconcileError::ResourceLimit(
-                    "original deployment artifact bytes",
-                ));
-            }
+            let observed = read_original(&source, maximum).and_then(|bytes| {
+                if bytes.is_empty() || bytes.len() > maximum {
+                    Err(ReconcileError::ResourceLimit("original deployment artifact bytes"))
+                } else {
+                    Ok(bytes)
+                }
+            });
+            let bytes = match observed {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    retain_failed_unix_close(source.close_retaining());
+                    return Err(error);
+                }
+            };
             let digest = ContentId::hash(&bytes);
             let result = Self {
                 path: path.to_path_buf(),
@@ -180,7 +188,10 @@ impl OriginalProtectedArtifact {
                 private,
                 source,
             };
-            result.verify_original()?;
+            if let Err(error) = result.verify_original() {
+                retain_failed_unix_close(result.close_retaining());
+                return Err(error);
+            }
             Ok(result)
         }
         }
@@ -367,8 +378,8 @@ impl OriginalProtectedArtifact {
         }
         #[cfg(target_os = "linux")]
         {
-            self.source.close()?;
-            Ok(())
+            self.close_retaining().map(|_| ())
+                .map_err(|failure| failure.retain_and_report().into())
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         Err(ReconcileError::Invariant("original deployment close unavailable"))
@@ -389,6 +400,21 @@ impl OriginalProtectedArtifact {
         for (_, directory, _) in self.source.ancestors {
             attempt.close_directory(directory);
         }
+        attempt.finish()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn close_retaining(
+        self,
+    ) -> std::result::Result<
+        sync_extend_platform_fs::ClosedUnixOriginalResources,
+        sync_extend_platform_fs::UnixOriginalResourceCloseFailure,
+    > {
+        let mut attempt = sync_extend_platform_fs::UnixOriginalCloseAttempt::new();
+        if let Err(error) = self.verify_original() {
+            attempt.note_error(std::io::Error::other(error.to_string()));
+        }
+        attempt.append_result(self.source.close_retaining());
         attempt.finish()
     }
 }
@@ -444,6 +470,20 @@ fn read_original(source: &WindowsSource, maximum: usize) -> Result<Vec<u8>> {
 }
 
 #[cfg(target_os = "linux")]
+fn retain_failed_unix_close(
+    closed: std::result::Result<
+        sync_extend_platform_fs::ClosedUnixOriginalResources,
+        sync_extend_platform_fs::UnixOriginalResourceCloseFailure,
+    >,
+) {
+    // Preserve the acquisition error at the call site. Any uncertain original
+    // close remains retained; a failed acquisition never issues a close witness.
+    if let Err(failure) = closed {
+        failure.retain_until_process_exit();
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn read_original(
     source: &sync_extend_platform_fs::UnixProtectedArtifactSource,
     maximum: usize,
@@ -478,7 +518,7 @@ impl DeploymentProtectionProvider {
         {
         let original_anchor = OriginalProtectedArtifact::capture(private_anchor, 65_536, true)?;
         #[cfg(target_os = "linux")]
-        let (scope, key) = {
+        let observed = (|| -> Result<_> {
             if original_anchor.original_bytes().len() != 32 {
                 return Err(ReconcileError::Invariant(
                     "independent Unix deployment wrapping key must be exactly 32 bytes",
@@ -498,7 +538,15 @@ impl DeploymentProtectionProvider {
                 original_anchor.original_bytes(),
             )
             .map_err(|_| ReconcileError::Invariant("Unix deployment AEAD key refused"))?;
-            (scope, ring::aead::LessSafeKey::new(key))
+            Ok((scope, ring::aead::LessSafeKey::new(key)))
+        })();
+        #[cfg(target_os = "linux")]
+        let (scope, key) = match observed {
+            Ok(observed) => observed,
+            Err(error) => {
+                retain_failed_unix_close(original_anchor.close_retaining());
+                return Err(error);
+            }
         };
         #[cfg(not(any(windows, target_os = "linux")))]
         return Err(ReconcileError::Invariant(
@@ -512,7 +560,10 @@ impl DeploymentProtectionProvider {
                 #[cfg(target_os = "linux")]
                 key,
             };
-            provider.verify_original()?;
+            if let Err(error) = provider.verify_original() {
+                retain_failed_unix_close(provider.close_retaining());
+                return Err(error);
+            }
             Ok(provider)
         }
         }
@@ -766,6 +817,16 @@ impl DeploymentProtectionProvider {
     ) -> std::result::Result<
         sync_extend_platform_fs::ClosedWindowsOriginalResources,
         sync_extend_platform_fs::WindowsOriginalResourceCloseFailure,
+    > {
+        self.original_anchor.close_retaining()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn close_retaining(
+        self,
+    ) -> std::result::Result<
+        sync_extend_platform_fs::ClosedUnixOriginalResources,
+        sync_extend_platform_fs::UnixOriginalResourceCloseFailure,
     > {
         self.original_anchor.close_retaining()
     }

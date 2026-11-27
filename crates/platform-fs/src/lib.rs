@@ -90,6 +90,7 @@ mod protected_artifact_unix;
 mod windows;
 #[cfg(target_os = "linux")]
 pub use protected_artifact_unix::{
+    ClosedUnixOriginalResources, UnixOriginalCloseAttempt, UnixOriginalResourceCloseFailure,
     SealedUnixProtectedArtifact, UnixFailedArtifactCreation, UnixProtectedArtifactCreateFailure,
     UnixProtectedArtifactCreator, UnixProtectedArtifactKey, UnixProtectedArtifactParent,
     UnixProtectedArtifactSealFailure, UnixProtectedArtifactSource,

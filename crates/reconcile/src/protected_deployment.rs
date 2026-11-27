@@ -11,6 +11,14 @@ mod deployment_export;
 mod deployment_runtime;
 #[path = "node_archive/protected_artifact.rs"]
 mod protected_artifact;
+#[cfg(target_os = "linux")]
+#[path = "node_archive/unix_owner.rs"]
+mod unix_owner;
+#[cfg(target_os = "linux")]
+pub use unix_owner::{
+    ClosedOriginalUnixDeploymentScope, OriginalUnixDeploymentScope,
+    OriginalUnixDeploymentScopeOpenFailure,
+};
 #[cfg(windows)]
 #[path = "node_archive/deployment_capture.rs"]
 mod deployment_capture;
