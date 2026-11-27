@@ -124,6 +124,21 @@ impl JournalConnectionOwner {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn authorizer<F>(&mut self, callback: Option<F>) -> rusqlite::Result<()>
+    where
+        F: for<'a> FnMut(rusqlite::hooks::AuthContext<'a>) -> rusqlite::hooks::Authorization
+            + Send
+            + 'static,
+    {
+        match &mut self.original {
+            JournalConnectionKind::Ordinary(original) => original
+                .as_mut()
+                .ok_or(rusqlite::Error::InvalidQuery)?
+                .authorizer(callback),
+        }
+    }
+
     pub(crate) fn install_inspection_budget(
         &mut self,
         bounds: crate::NodeInspectionBounds,
@@ -209,6 +224,20 @@ impl JournalConnectionOwner {
         match self.take_original() {
             Some(original) => Ok(original),
             None => Err(self),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn close_original_in_place(&mut self) -> rusqlite::Result<()> {
+        let Some(original) = self.take_original() else {
+            return Err(rusqlite::Error::InvalidQuery);
+        };
+        match original.close() {
+            Ok(()) => Ok(()),
+            Err((original, error)) => {
+                self.original = JournalConnectionKind::Ordinary(Some(original));
+                Err(error)
+            }
         }
     }
 

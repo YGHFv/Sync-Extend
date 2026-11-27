@@ -1,13 +1,13 @@
 //! One private Journal connection over the same consumed Unix original IO owner.
 //! No public Connection, SQL callback, native issuer, or pathname reopen exists.
 use crate::{
-    JournalBackupImage, JournalError, JournalReadView, JournalStoredRow, NodeInspectionBounds,
-    Result,
+    Journal, JournalBackupImage, JournalError, JournalReadView, JournalStoredRow,
+    NodeInspectionBounds, Result,
 };
 use rusqlite::{
     hooks::{AuthAction, AuthContext, Authorization},
     limits::Limit,
-    Connection, Transaction, TransactionBehavior,
+    Transaction, TransactionBehavior,
 };
 use std::time::Instant;
 use sync_extend_core_model::SpaceId;
@@ -16,13 +16,16 @@ use sync_extend_platform_fs::{
 };
 
 struct OriginalInspectionCall<'a> {
-    connection: &'a mut Connection,
+    connection: &'a mut crate::journal_connection_owner::JournalConnectionOwner,
     started: Instant,
     duration: std::time::Duration,
     cleared: bool,
 }
 impl<'a> OriginalInspectionCall<'a> {
-    fn begin(connection: &'a mut Connection, bounds: NodeInspectionBounds) -> Result<Self> {
+    fn begin(
+        connection: &'a mut crate::journal_connection_owner::JournalConnectionOwner,
+        bounds: NodeInspectionBounds,
+    ) -> Result<Self> {
         let started = Instant::now();
         let duration = bounds.max_query_time;
         let mut remaining = bounds.max_vm_instructions;
@@ -71,7 +74,8 @@ impl Drop for OriginalInspectionCall<'_> {
 }
 
 pub struct OriginalUnixRestoredJournal<'namespace> {
-    connection: Option<Connection>,
+    journal: Option<Journal>,
+    unprepared: Option<crate::journal_connection_owner::JournalConnectionOwner>,
     opening: Option<crate::raw_open::OriginalSqliteOpening>,
     io: Option<FreshUnixNativeSqliteIo<'namespace>>,
     space: SpaceId,
@@ -128,8 +132,13 @@ fn restricted(context: AuthContext<'_>) -> Authorization {
         AuthAction::Pragma { pragma_name, .. }
             if matches!(
                 pragma_name.to_ascii_lowercase().as_str(),
-                "table_list" | "table_info" | "table_xinfo" | "index_list" | "index_info"
-                    | "index_xinfo" | "foreign_key_list"
+                "table_list"
+                    | "table_info"
+                    | "table_xinfo"
+                    | "index_list"
+                    | "index_info"
+                    | "index_xinfo"
+                    | "foreign_key_list"
             ) =>
         {
             // These introspection pragmas take a table/index name as their
@@ -156,7 +165,10 @@ fn restricted(context: AuthContext<'_>) -> Authorization {
         }
         _ => {
             #[cfg(feature = "fault-injection")]
-            eprintln!("original Unix Journal denied SQL action: {:?}", context.action);
+            eprintln!(
+                "original Unix Journal denied SQL action: {:?}",
+                context.action
+            );
             Authorization::Deny
         }
     }
@@ -173,7 +185,8 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
         bounds: NodeInspectionBounds,
     ) -> std::result::Result<Self, OriginalUnixRestoredJournalFailure<'namespace>> {
         let mut original = Self {
-            connection: None,
+            journal: None,
+            unprepared: None,
             opening: None,
             io: Some(io),
             space: space.clone(),
@@ -201,7 +214,7 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
             let opened = crate::raw_open::open_retaining(&path, &name);
             drop(scope);
             match opened {
-                Ok(connection) => original.connection = Some(connection),
+                Ok(connection) => original.unprepared = Some(connection.into()),
                 Err(failure) => {
                     original.opening = failure.original;
                     return Err(failure.error.into());
@@ -209,7 +222,7 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
             }
             io.verify_connection_opened()?;
             let connection = original
-                .connection
+                .unprepared
                 .as_mut()
                 .expect("same original connection");
             connection.execute_batch("PRAGMA temp_store=MEMORY;PRAGMA mmap_size=0;PRAGMA synchronous=FULL;PRAGMA locking_mode=EXCLUSIVE;PRAGMA journal_mode=WAL;PRAGMA trusted_schema=OFF;")?;
@@ -232,6 +245,40 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
                     ));
                 }
             }
+            let path = std::path::Path::new(
+                std::str::from_utf8(path.as_bytes())
+                    .map_err(|_| JournalError::Invariant("actual Unix Journal path UTF8"))?,
+            );
+            // The constructor only validates/registers callbacks on this
+            // original. Its complete schema preparation shares one bounded
+            // operation; it never opens or initializes another database.
+            let budget = crate::original_observation_budget::OriginalObservationBudget::new(bounds);
+            let scope = budget.begin()?;
+            connection.progress_handler(1_000, Some(move || budget.interrupt()))?;
+            let connection = original
+                .unprepared
+                .take()
+                .expect("same actual opened connection");
+            match Journal::from_original_planning_connection_owner_retaining(
+                connection,
+                path,
+                bounds.max_entries,
+            ) {
+                Ok(journal) => original.journal = Some(journal),
+                Err((connection, error)) => {
+                    original.unprepared = Some(connection);
+                    return Err(error);
+                }
+            }
+            let connection = &mut original
+                .journal
+                .as_mut()
+                .expect("same original Journal")
+                .connection;
+            let bounded = scope.finish();
+            let cleared = connection.progress_handler(0, None::<fn() -> bool>);
+            bounded?;
+            cleared?;
             connection.authorizer(Some(restricted))?;
             original.verify()
         })();
@@ -252,9 +299,13 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
             .as_ref()
             .ok_or(JournalError::Invariant("original Unix Journal IO closed"))?;
         io.verify_connection_opened()?;
-        let connection = self.connection.as_mut().ok_or(JournalError::Invariant(
-            "original Unix Journal connection closed",
-        ))?;
+        let connection = &mut self
+            .journal
+            .as_mut()
+            .ok_or(JournalError::Invariant(
+                "original Unix Journal connection closed",
+            ))?
+            .connection;
         if !connection.is_autocommit() {
             return Err(JournalError::Invariant(
                 "original Unix Journal caller transaction present",
@@ -304,9 +355,19 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
         OriginalUnixRestoredJournalFailure<'namespace>,
     > {
         let first = self.verify().err();
-        if let Some(connection) = self.connection.take() {
+        if let Some(journal) = self.journal.as_mut() {
+            if let Err(error) = journal.connection.close_original_in_place() {
+                return Err(OriginalUnixRestoredJournalFailure {
+                    error: first.unwrap_or(error.into()),
+                    original: Some(self),
+                    original_io: None,
+                });
+            }
+        }
+        self.journal = None;
+        if let Some(connection) = self.unprepared.take() {
             if let Err((connection, error)) = connection.close() {
-                self.connection = Some(connection);
+                self.unprepared = Some(connection);
                 return Err(OriginalUnixRestoredJournalFailure {
                     error: first.unwrap_or(error.into()),
                     original: Some(self),
@@ -348,7 +409,10 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
 
 impl Drop for OriginalUnixRestoredJournal<'_> {
     fn drop(&mut self) {
-        if let Some(connection) = self.connection.take() {
+        if let Some(journal) = self.journal.take() {
+            let _ = Box::leak(Box::new(journal));
+        }
+        if let Some(connection) = self.unprepared.take() {
             let _ = Box::leak(Box::new(connection));
         }
         if let Some(opening) = self.opening.take() {
