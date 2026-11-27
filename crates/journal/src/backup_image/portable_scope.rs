@@ -52,6 +52,12 @@ fn other_owner_tables(
     // In particular, restoration never observes a new deletion time or resets
     // the clock watermark, and this exemption grants no native/GC authority.
     crate::deletion_retention::audit(database, space, max_entries)?;
+    // A local rename observation is a cache of historical physical identities,
+    // not a content pin or native action owner. Preserve its exact canonical
+    // bytes only after the typed audit binds it to the current source snapshot.
+    // Root mapping must not rewrite its old root/epoch/file identities: fresh
+    // scans reject that scope and establish their own observations instead.
+    crate::rename_observation::audit_observation(database, space, max_entries)?;
     // A mark's original physical observation is inert only after its immutable
     // cancellation or invalidation. Reuse the complete typed mark/clock audit;
     // never infer a terminal state from a table name or a descriptive phase.
@@ -92,6 +98,7 @@ fn other_owner_tables(
         "original_operation_provenance",
         "original_page_inbox",
         "forwarded_page_inbox",
+        "rename_observations",
     ];
     let mut other = Vec::new();
     for name in names {

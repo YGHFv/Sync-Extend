@@ -602,8 +602,36 @@ impl JournalReadView<'_> {
         crate::tree_native_effects::validate_all(self.connection, &preparations, max)?;
         if native_progress {
             let capacity = self.audit_local_commit_capacity(space, bounds)?;
+            // Completed native histories remain in the ledger. A later TREE
+            // must still be able to reserve its conservative preparation before
+            // it can obtain a future admission. Such metadata is fully charged
+            // below, but cannot authorize a native step. Keep the strict gap
+            // gate whenever any admitted native owner still needs cleanup.
+            let completed_native_history = preparations.iter().all(|preparation| {
+                preparation.native_future_admission.is_none()
+                    || preparation.state == "native_cleaned"
+            });
+            let permitted_preparation_gap = |gap: &crate::JournalCapacityGap| {
+                completed_native_history
+                    && gap.family == "tree_restore"
+                    && gap.missing_contract
+                        == "legacy-conservative-residual-not-native-future-admission"
+                    && preparations.iter().any(|preparation| {
+                        preparation.native_future_admission.is_none()
+                            && matches!(preparation.state, "prepared" | "cancelled")
+                            && preparation.execution_records.as_ref().is_none_or(|records| {
+                                records.record_count == 0
+                            })
+                            && gap.owner_key
+                                == [preparation.intent.transaction_id.to_string()]
+                    })
+            };
             if !capacity.report.within_accounted_limits()
-                || !capacity.report.coverage_gaps().is_empty()
+                || capacity
+                    .report
+                    .coverage_gaps()
+                    .iter()
+                    .any(|gap| !permitted_preparation_gap(gap))
             {
                 return Err(JournalError::Invariant(
                     "tree native exact capacity refused",
