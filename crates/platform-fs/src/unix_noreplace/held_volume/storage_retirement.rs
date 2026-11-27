@@ -739,7 +739,7 @@ impl LinuxStorageRetirementBoundary {
         exclusive: &LinuxStorageCasExclusiveCoordination<'_>,
     ) -> io::Result<LinuxStorageRetirementMoveObservation> {
         self.verify(exclusive)?;
-        self.require_named_creator()?;
+        self.require_receipted()?;
         if !matches!(
             self.slot,
             LinuxStorageRetirementPayloadSlot::Quarantine
@@ -747,6 +747,14 @@ impl LinuxStorageRetirementBoundary {
                 | LinuxStorageRetirementPayloadSlot::RestoredClosed
         ) {
             return Err(refuse("original native move has no immutable observation"));
+        }
+        // After the actual marker unlink, only the already-closed restored
+        // payload remains observable. verify() still checks that same held
+        // marker FD at nlink zero and its name absent; this grants no effect.
+        if self.marker.as_ref().is_some_and(|marker| marker.unlinked)
+            && self.slot != LinuxStorageRetirementPayloadSlot::RestoredClosed
+        {
+            return Err(refuse("unlinked marker requires closed restored payload observation"));
         }
         Ok(LinuxStorageRetirementMoveObservation {
             original: self.payload_observation(exclusive)?,
@@ -951,13 +959,20 @@ impl LinuxStorageRetirementBoundary {
         exclusive: &LinuxStorageCasExclusiveCoordination<'_>,
     ) -> io::Result<LinuxStorageRetirementUnlinkObservation> {
         self.verify(exclusive)?;
-        self.require_named_creator()?;
+        self.require_receipted()?;
         if !matches!(
             self.slot,
             LinuxStorageRetirementPayloadSlot::UnlinkedLive
                 | LinuxStorageRetirementPayloadSlot::Unlinked
         ) {
             return Err(refuse("original payload has no native unlink proof"));
+        }
+        // A removed marker may describe only the closed nlink-zero payload.
+        // Mutating entry points continue to require the still-named creator.
+        if self.marker.as_ref().is_some_and(|marker| marker.unlinked)
+            && self.slot != LinuxStorageRetirementPayloadSlot::Unlinked
+        {
+            return Err(refuse("unlinked marker requires closed deleted payload observation"));
         }
         if self.slot == LinuxStorageRetirementPayloadSlot::Unlinked {
             self.independent_payload_absence()?;

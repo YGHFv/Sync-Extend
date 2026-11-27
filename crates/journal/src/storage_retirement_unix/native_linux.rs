@@ -602,6 +602,7 @@ impl Journal {
         if !self.connection.is_autocommit() {
             return Err(invalid());
         }
+        let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
         let state = audit(&self.connection)?
             .into_iter()
             .find(|state| state.activation == *activation)
@@ -638,6 +639,7 @@ impl Journal {
             }
         }
         self.native_capacity(config)?;
+        tx.rollback()?;
         Ok(state)
     }
 
