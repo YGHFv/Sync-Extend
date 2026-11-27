@@ -9,7 +9,7 @@ use super::{
     protected_artifact::{DeploymentProtectionProvider, OriginalProtectedArtifact},
     NativeCreator, NativeFailedCreate, NativeParent, NativeSealed,
 };
-use crate::{node_archive::portable_source::path_equal, ReconcileError, Result};
+use crate::{path_comparison::path_equal, ReconcileError, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},

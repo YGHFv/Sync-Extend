@@ -6,7 +6,7 @@ use super::protected_artifact::{
     ProtectedArtifactRole, ProtectionScope, VerifiedProtectedArtifact,
 };
 use crate::{
-    node_archive::portable_source::{path_components, path_equal, path_within},
+    path_comparison::{path_components, path_equal, path_within},
     ReconcileError, Result,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
