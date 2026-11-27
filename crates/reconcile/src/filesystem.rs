@@ -10,6 +10,18 @@ use sync_extend_core_model::{
     PortableTimestamp, PortableUnixExecutable,
 };
 
+pub(crate) fn projected_metadata(metadata: &PortableEntryMetadata) -> Result<PortableEntryMetadata> {
+    #[cfg(windows)]
+    let platform = sync_extend_core_model::PortableMetadataProjectionPlatform::Windows;
+    #[cfg(not(windows))]
+    let platform = sync_extend_core_model::PortableMetadataProjectionPlatform::Unix;
+    metadata.local_projection(platform).map_err(Into::into)
+}
+
+pub(crate) fn projected_metadata_matches(expected: &PortableEntryMetadata, observed: &PortableEntryMetadata) -> Result<bool> {
+    Ok(projected_metadata(expected)?.matches_observed(observed))
+}
+
 #[cfg(any(windows, target_os = "linux", target_os = "android"))]
 fn portable_unsupported_reason(
     reason: sync_extend_platform_fs::UnsupportedReason,

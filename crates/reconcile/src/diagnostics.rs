@@ -40,6 +40,10 @@ pub struct Diagnostics {
     pub portable_tree_restore_metadata_preserved: bool,
     pub portable_native_publish_metadata_preserved: bool,
     pub portable_metadata_capability: PortableMetadataCapabilityMatrix,
+    pub remote_metadata_logical_values_preserved: bool,
+    pub remote_metadata_projection_identity_checked: bool,
+    pub remote_metadata_projection_scope: &'static str,
+    pub remote_metadata_optional_fields_not_applied: Vec<&'static str>,
     pub metadata_fidelity_disclosure: &'static str,
     pub production_safety_certified: bool,
 }
@@ -185,6 +189,12 @@ impl LocalSpace {
             portable_tree_restore_metadata_preserved: cfg!(windows),
             portable_native_publish_metadata_preserved: cfg!(windows),
             portable_metadata_capability: metadata_capability,
+            remote_metadata_logical_values_preserved: cfg!(windows),
+            remote_metadata_projection_identity_checked: cfg!(windows),
+            remote_metadata_projection_scope: "Windows explicit signed new-file native Put only; remote replacement projection is not implemented. Logical values remain immutable; locally supported fields are projected and verified at native timestamp precision, and complete local captures plus physical identity detect subsequent edits.",
+            remote_metadata_optional_fields_not_applied: if cfg!(windows) {
+                vec!["unix_executable"]
+            } else { vec!["creation"] },
             metadata_fidelity_disclosure: "Where the capability matrix reports support, portable modified time, readonly and platform-supported creation/executable fields are captured and applied through the already-open file handle, then re-observed. Unknown or unsupported fields are not claimed. Single-file new-operation restore carries captured metadata. On Windows, reconcile native publish and TREE restore carry captured metadata; directories do not receive synthesized metadata. Windows ACLs and alternate data streams are not captured or preserved, UID/GID and raw mode are not portable, and links/reparse points are rejected. FAT/exFAT, emulated volumes, KernelSU and ACL/ADS fidelity are not certified from NTFS/ext4 results; D5 remains open.",
             production_safety_certified: false,
         })

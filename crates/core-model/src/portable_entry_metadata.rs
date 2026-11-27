@@ -6,6 +6,14 @@ pub const PORTABLE_ENTRY_METADATA_VERSION: u32 = 1;
 pub const MAX_PORTABLE_ENTRY_METADATA_BYTES: usize = 4096;
 pub const PORTABLE_METADATA_CAPABILITY_VERSION: u32 = 1;
 
+/// Local application profile, separate from immutable signed metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortableMetadataProjectionPlatform {
+    Windows,
+    Unix,
+}
+
 /// A bounded, signed Unix timestamp. Negative seconds are real pre-epoch
 /// values, not an unknown marker.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -168,6 +176,68 @@ impl PortableUnixExecutable {
 }
 
 impl PortableEntryMetadata {
+    /// Preserve the logical Entry unchanged while selecting fields this platform
+    /// can apply. Unsupported optional fields remain logical, not applied claims.
+    pub fn local_projection(&self, platform: PortableMetadataProjectionPlatform) -> Result<Self> {
+        self.validate()?;
+        let (seconds, nanos) = self
+            .modified
+            .captured_value()
+            .ok_or(ModelError::InvalidData(
+                "local metadata projection requires captured modified time",
+            ))?;
+        if self.readonly.value().is_none() {
+            return Err(ModelError::InvalidData(
+                "local metadata projection requires captured readonly",
+            ));
+        }
+        let time = |seconds: i64, nanos: u32| -> Result<PortableTimestamp> {
+            let nanos = if platform == PortableMetadataProjectionPlatform::Windows {
+                seconds
+                    .checked_add(11_644_473_600)
+                    .and_then(|seconds| seconds.checked_mul(10_000_000))
+                    .and_then(|ticks| ticks.checked_add(i64::from(nanos / 100)))
+                    .filter(|ticks| *ticks >= 0)
+                    .ok_or(ModelError::InvalidData(
+                        "portable timestamp outside Windows range",
+                    ))?;
+                nanos / 100 * 100
+            } else {
+                nanos
+            };
+            PortableTimestamp::captured(seconds, nanos)
+        };
+        let mut result = Self::new(time(seconds, nanos)?, self.readonly);
+        result.creation = match (
+            platform,
+            self.creation.and_then(PortableTimestamp::captured_value),
+        ) {
+            (PortableMetadataProjectionPlatform::Windows, Some((seconds, nanos))) => {
+                Some(time(seconds, nanos)?)
+            }
+            _ => None,
+        };
+        result.unix_executable = match (
+            platform,
+            self.unix_executable.and_then(PortableUnixExecutable::value),
+        ) {
+            (PortableMetadataProjectionPlatform::Unix, Some(value)) => {
+                Some(PortableUnixExecutable::captured(value))
+            }
+            _ => None,
+        };
+        Ok(result)
+    }
+
+    pub fn matches_local_projection(
+        &self,
+        observed: &Self,
+        platform: PortableMetadataProjectionPlatform,
+    ) -> Result<bool> {
+        observed.validate()?;
+        Ok(self.local_projection(platform)?.matches_observed(observed))
+    }
+
     pub fn new(modified: PortableTimestamp, readonly: PortableReadonly) -> Self {
         Self {
             format_version: PORTABLE_ENTRY_METADATA_VERSION,
