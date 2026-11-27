@@ -142,6 +142,8 @@ pub use writer_owner::{
 #[allow(unsafe_code)]
 mod managed_process;
 pub use managed_process::{read_available, ManagedChild};
+#[cfg(windows)]
+pub use managed_process::ManagedChildCloseFailure;
 
 #[allow(unsafe_code)]
 mod managed_rpc;

@@ -237,6 +237,28 @@ pub struct LockedDirectory {
 }
 
 impl LockedDirectory {
+    /// Keep the same original directory object and its deletion exclusion.
+    pub fn duplicate_original(
+        &self,
+    ) -> Result<Self, crate::WindowsOriginalResourceOpenFailure> {
+        let expected = self.key().map_err(|error| crate::WindowsOriginalResourceOpenFailure {
+            error, original_resources: None,
+        })?;
+        let file = self.file.try_clone().map_err(|error| crate::WindowsOriginalResourceOpenFailure {
+            error, original_resources: None,
+        })?;
+        if let Err(error) = key(&file).and_then(|actual| {
+            if actual == expected { Ok(()) } else { Err(invalid("original directory duplicate differs")) }
+        }) {
+            let mut close = crate::WindowsOriginalCloseAttempt::new();
+            close.close_file(file);
+            return Err(crate::WindowsOriginalResourceOpenFailure {
+                error, original_resources: close.finish().err(),
+            });
+        }
+        Ok(Self { file })
+    }
+
     /// Consume only this original held directory HANDLE. Failed CloseHandle
     /// returns the same original directory; no replacement scope is issued.
     pub fn close_original(self) -> Result<(), (Self, io::Error)> {
@@ -421,6 +443,33 @@ pub struct GuardedReadFile {
 }
 
 impl GuardedReadFile {
+    /// Duplicate the same read-excluding file object. No pathname open occurs.
+    pub fn duplicate_original(
+        &self,
+    ) -> Result<Self, crate::WindowsOriginalResourceOpenFailure> {
+        let before = |error| crate::WindowsOriginalResourceOpenFailure {
+            error,
+            original_resources: None,
+        };
+        self.verify_single_link().map_err(before)?;
+        let expected = self.key().map_err(before)?;
+        let file = self.file.try_clone().map_err(before)?;
+        if let Err(error) = regular(&file, false).and_then(|_| {
+            if key(&file)? != expected || self.key()? != expected {
+                return Err(invalid("duplicated original program identity differs"));
+            }
+            Ok(())
+        }) {
+            let mut close = crate::WindowsOriginalCloseAttempt::new();
+            close.close_file(file);
+            return Err(crate::WindowsOriginalResourceOpenFailure {
+                error,
+                original_resources: close.finish().err(),
+            });
+        }
+        Ok(Self { file })
+    }
+
     /// Resource-only ending of this actual read HANDLE. It cannot mint any
     /// original reader, creator, target owner, permission or resumed scope.
     pub fn close_original(self) -> Result<(), (Self, io::Error)> {

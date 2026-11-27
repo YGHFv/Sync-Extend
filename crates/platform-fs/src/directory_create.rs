@@ -156,6 +156,7 @@ pub(super) enum NewChildKind {
     WorktreeMarkerDirectory,
     RetainedMutationDirectory,
     File,
+    SidecarFile,
 }
 
 fn create_new_directory_child(
@@ -229,6 +230,20 @@ pub(super) fn create_new_current_user_file_attempt(
             error,
             original_created: Some(created),
         });
+    }
+    Ok(created)
+}
+
+pub(super) fn create_original_sidecar_file_attempt(
+    file: &File,
+    name: &str,
+) -> Result<File, NativeChildCreateFailure> {
+    let security = super::current_user_file::CurrentUserSecurity::new()?;
+    let created = create_new_child_security_attempt(
+        file, name, NewChildKind::SidecarFile, true, Some(&security),
+    )?;
+    if let Err(error) = super::current_user_file::verify_current_user_private_file(&created) {
+        return Err(NativeChildCreateFailure { error, original_created: Some(created) });
     }
     Ok(created)
 }
@@ -317,6 +332,12 @@ fn create_new_child_security_attempt(
         NewChildKind::File => (
             GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE,
             0,
+            FILE_NON_DIRECTORY_FILE,
+            false,
+        ),
+        NewChildKind::SidecarFile => (
+            GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE,
+            FILE_SHARE_READ,
             FILE_NON_DIRECTORY_FILE,
             false,
         ),

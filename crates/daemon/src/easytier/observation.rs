@@ -183,6 +183,19 @@ pub(crate) fn clear() {
     }
 }
 
+/// Only a new retained recovered run calls this after the previous worker and
+/// all collector-owning threads ended. A live old collector cannot be revived.
+#[cfg(windows)]
+pub(super) fn begin_recovered_generation() -> std::io::Result<()> {
+    let mut slot = COLLECTOR.lock().map_err(|_| std::io::Error::other("EasyTier collector unavailable"))?;
+    if slot.upgrade().is_some() {
+        return Err(std::io::Error::other("original EasyTier collector still retained"));
+    }
+    *slot = Weak::new();
+    INVALIDATED.store(false, Ordering::Release);
+    Ok(())
+}
+
 /// A control refresh performs no process, socket, configuration or CLI reads.
 pub(crate) fn latest() -> Option<Observation> {
     let collector = COLLECTOR.try_lock().ok()?.upgrade()?;

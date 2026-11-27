@@ -104,6 +104,35 @@ pub struct WindowsProtectedArtifactParent {
     original: Arc<Parent>,
 }
 impl WindowsProtectedArtifactParent {
+    pub(crate) fn original_sidecar_file(
+        &self,
+        name: &str,
+    ) -> Result<File, crate::WindowsOriginalResourceOpenFailure> {
+        let before = |error| crate::WindowsOriginalResourceOpenFailure {
+            error,
+            original_resources: None,
+        };
+        component(name).map_err(before)?;
+        self.original.verify().map_err(before)?;
+        directory_create::create_original_sidecar_file_attempt(
+            &self.original.directory().map_err(before)?.file, name,
+        ).map_err(|failure| {
+            let mut close = crate::WindowsOriginalCloseAttempt::new();
+            if let Some(original) = failure.original_created {
+                close.close_file(original);
+            }
+            crate::WindowsOriginalResourceOpenFailure {
+                error: failure.error,
+                original_resources: close.finish().err(),
+            }
+        })
+    }
+
+    /// A lifetime loan of the existing parent; it acquires no new HANDLE.
+    pub(crate) fn sidecar_loan(&self) -> Self {
+        Self { original: Arc::clone(&self.original) }
+    }
+
     pub fn open_private(path: &Path) -> io::Result<Self> {
         Self::open_private_retaining(path)
             .map_err(crate::WindowsOriginalResourceOpenFailure::retain_and_report)

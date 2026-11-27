@@ -10,11 +10,69 @@ pub struct SidecarConfig {
     path: PathBuf,
     #[cfg(windows)]
     _parents: Vec<crate::LockedDirectory>,
+    #[cfg(windows)]
+    original_parent: Option<crate::WindowsProtectedArtifactParent>,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     _owner: File,
 }
 
 impl SidecarConfig {
+    /// CREATE relative to the retained installation parent; no path reacquisition.
+    #[cfg(windows)]
+    pub fn create_in_original_parent(
+        parent: &crate::WindowsProtectedArtifactParent,
+        instance: &str,
+        bytes: &[u8],
+    ) -> Result<Self, crate::WindowsOriginalResourceOpenFailure> {
+        let before = |error| crate::WindowsOriginalResourceOpenFailure {
+            error,
+            original_resources: None,
+        };
+        if bytes.len() > 65536
+            || instance.len() != 32
+            || !instance.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(before(io::Error::other(
+                "bounded original sidecar configuration required",
+            )));
+        }
+        parent.verify_original().map_err(before)?;
+        let name = format!("sidecar-{instance}.toml");
+        let file = parent.original_sidecar_file(&name)?;
+        let mut config = Self {
+            file,
+            path: parent.path().join(name),
+            _parents: Vec::new(),
+            original_parent: Some(parent.sidecar_loan()),
+        };
+        let written = (|| {
+            config.file.write_all(bytes)?;
+            config.file.sync_all()?;
+            config.verify_content(bytes)?;
+            parent.verify_original()
+        })();
+        if let Err(error) = written {
+            let mut close = crate::WindowsOriginalCloseAttempt::new();
+            config.close_into_attempt(&mut close);
+            return Err(crate::WindowsOriginalResourceOpenFailure {
+                error,
+                original_resources: close.finish().err(),
+            });
+        }
+        Ok(config)
+    }
+
+    #[cfg(windows)]
+    pub fn close_into_attempt(self, close: &mut crate::WindowsOriginalCloseAttempt) {
+        close.close_file(self.file);
+        // This Arc is only a loan; the installation retains the actual parent
+        // HANDLEs and performs their separate terminal after all actors end.
+        drop(self.original_parent);
+        for parent in self._parents {
+            close.close_directory(parent);
+        }
+    }
+
     pub fn create(state: &Path, instance: &str, bytes: &[u8]) -> io::Result<Self> {
         if !state.is_absolute()
             || bytes.len() > 65536
@@ -39,13 +97,13 @@ impl SidecarConfig {
                 ptr,
             };
             use windows_sys::Win32::{
-                Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree},
+                Foundation::{LocalFree, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE},
                 Security::{
                     Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
                     PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
                 },
                 Storage::FileSystem::{
-                    CREATE_NEW, CreateFileW, DELETE, FILE_FLAG_DELETE_ON_CLOSE,
+                    CreateFileW, CREATE_NEW, DELETE, FILE_FLAG_DELETE_ON_CLOSE,
                     FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
                 },
             };
@@ -108,6 +166,7 @@ impl SidecarConfig {
                 file,
                 path,
                 _parents: parents,
+                original_parent: None,
             })
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -140,6 +199,9 @@ impl SidecarConfig {
     pub fn path(&self) -> io::Result<&Path> {
         #[cfg(windows)]
         {
+            if let Some(parent) = &self.original_parent {
+                parent.verify_original()?;
+            }
             crate::verify_regular_file(&self.file)?;
             if !crate::regular_file_matches_path(&self.file, &self.path)? {
                 return Err(io::Error::other("sidecar config slot changed"));

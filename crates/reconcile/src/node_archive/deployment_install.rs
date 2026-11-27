@@ -17,6 +17,12 @@ use std::{
 };
 use sync_extend_core_model::{ContentId, EntryId, PortablePath};
 
+#[cfg(windows)]
+#[path = "deployment_install/easytier_runtime.rs"]
+mod easytier_runtime;
+#[cfg(windows)]
+pub use easytier_runtime::InstalledEasyTierRuntime;
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentNodeCompletionReceipt {

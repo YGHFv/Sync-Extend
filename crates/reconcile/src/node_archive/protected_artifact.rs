@@ -354,6 +354,26 @@ impl OriginalProtectedArtifact {
         &self.path
     }
 
+    #[cfg(windows)]
+    pub(crate) fn duplicate_pinned_program(
+        &self,
+    ) -> std::result::Result<
+        sync_extend_platform_fs::PinnedProgram,
+        sync_extend_platform_fs::WindowsOriginalResourceOpenFailure,
+    > {
+        self.verify_original().map_err(|error| {
+            sync_extend_platform_fs::WindowsOriginalResourceOpenFailure {
+                error: std::io::Error::other(error.to_string()),
+                original_resources: None,
+            }
+        })?;
+        let parents: Vec<_> = self.source.ancestors.iter()
+            .map(|(path, directory, _)| (path.as_path(), directory)).collect();
+        sync_extend_platform_fs::PinnedProgram::from_original_windows(
+            &self.source.path, &self.source.original, &parents, 256 * 1024 * 1024,
+        )
+    }
+
     pub(crate) fn native_identity(&self) -> Result<String> {
         self.verify_original()?;
         #[cfg(windows)]

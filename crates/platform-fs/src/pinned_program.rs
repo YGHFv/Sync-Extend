@@ -13,6 +13,94 @@ pub struct PinnedProgram {
 }
 
 impl PinnedProgram {
+    /// Borrowed authority stays with the retained original installation. This
+    /// wrapper owns only a duplicate of that same read-excluding HANDLE.
+    #[cfg(windows)]
+    pub fn from_original_windows(
+        path: &Path,
+        original: &crate::GuardedReadFile,
+        original_parents: &[(&Path, &crate::LockedDirectory)],
+        max_bytes: u64,
+    ) -> Result<Self, crate::WindowsOriginalResourceOpenFailure> {
+        let before = |error| crate::WindowsOriginalResourceOpenFailure {
+            error,
+            original_resources: None,
+        };
+        if !path.is_absolute()
+            || max_bytes == 0
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(before(io::Error::other(
+                "exact original pinned program path required",
+            )));
+        }
+        let paths: Vec<_> = path
+            .parent()
+            .into_iter()
+            .flat_map(Path::ancestors)
+            .collect();
+        if paths.len() != original_parents.len()
+            || paths
+                .iter()
+                .zip(original_parents)
+                .any(|(expected, (actual, _))| expected != actual)
+        {
+            return Err(before(io::Error::other(
+                "complete original program ancestor chain required",
+            )));
+        }
+        if original.reader().metadata().map_err(before)?.len() > max_bytes
+            || !original.matches_path(path).map_err(before)?
+        {
+            return Err(before(io::Error::other(
+                "original pinned program slot or size differs",
+            )));
+        }
+        let mut parents = Vec::new();
+        let duplicates = (|| {
+            for (path, parent) in original_parents {
+                if !parent.matches_path(path).map_err(before)? {
+                    return Err(before(io::Error::other(
+                        "original program ancestor slot differs",
+                    )));
+                }
+                parents.push(parent.duplicate_original()?);
+            }
+            original.duplicate_original()
+        })();
+        match duplicates {
+            Ok(file) => Ok(Self {
+                path: path.to_path_buf(),
+                file,
+                _parents: parents,
+            }),
+            Err(mut failure) => {
+                let mut close = crate::WindowsOriginalCloseAttempt::new();
+                for parent in parents {
+                    close.close_directory(parent);
+                }
+                if let Some(original) = failure.original_resources.take() {
+                    close.append_failure(original);
+                }
+                failure.original_resources = close.finish().err();
+                Err(failure)
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn close_into_attempt(self, close: &mut crate::WindowsOriginalCloseAttempt) {
+        self.file.close_into_attempt(close);
+        for parent in self._parents {
+            close.close_directory(parent);
+        }
+    }
+
     pub fn open(path: &Path, max_bytes: u64) -> io::Result<Self> {
         if !path.is_absolute()
             || max_bytes == 0

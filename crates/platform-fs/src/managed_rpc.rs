@@ -32,45 +32,17 @@ fn refused(reason: &'static str) -> io::Error {
 }
 
 impl ManagedRpcOwner {
+    #[cfg(windows)]
+    pub fn close_into_attempt(self, close: &mut crate::WindowsOriginalCloseAttempt) {
+        close.close_file(self.image);
+        close.close_identity_handle(self.process);
+    }
+
     pub(crate) fn new(child: &Child, program: &crate::PinnedProgram) -> io::Result<Self> {
         #[cfg(windows)]
         {
-            use std::{
-                os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
-                ptr,
-            };
-            use windows_sys::Win32::{
-                Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle},
-                System::Threading::GetCurrentProcess,
-            };
-            let mut duplicate = ptr::null_mut();
-            // SAFETY: the live Child owns the source process handle and the
-            // current-process pseudo handle remains valid through duplication.
-            if unsafe {
-                DuplicateHandle(
-                    GetCurrentProcess(),
-                    child.as_raw_handle(),
-                    GetCurrentProcess(),
-                    &mut duplicate,
-                    0,
-                    0,
-                    DUPLICATE_SAME_ACCESS,
-                )
-            } == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: DuplicateHandle returned exactly one owned process handle.
-            let process = unsafe { OwnedHandle::from_raw_handle(duplicate) };
-            let mut owner = Self {
-                pid: child.id(),
-                start: 0,
-                image: program.reader().try_clone()?,
-                process,
-            };
-            owner.start = owner.windows_start()?;
-            owner.verify_live()?;
-            Ok(owner)
+            Self::new_retaining(child, program)
+                .map_err(crate::WindowsOriginalResourceOpenFailure::retain_and_report)
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
@@ -105,6 +77,73 @@ impl ManagedRpcOwner {
                 "RPC owner proof unavailable",
             ))
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn new_retaining(
+        child: &Child,
+        program: &crate::PinnedProgram,
+    ) -> Result<Self, crate::WindowsOriginalResourceOpenFailure> {
+        use std::{
+            os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+            ptr,
+        };
+        use windows_sys::Win32::{
+            Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS},
+            System::Threading::GetCurrentProcess,
+        };
+        let mut duplicate = ptr::null_mut();
+        // SAFETY: the live Child owns the source process handle and the
+        // current-process pseudo handle remains valid through duplication.
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                child.as_raw_handle(),
+                GetCurrentProcess(),
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            return Err(crate::WindowsOriginalResourceOpenFailure {
+                error: io::Error::last_os_error(),
+                original_resources: None,
+            });
+        }
+        // SAFETY: DuplicateHandle returned exactly one owned process handle.
+        let process = unsafe { OwnedHandle::from_raw_handle(duplicate) };
+        let image = match program.reader().try_clone() {
+            Ok(image) => image,
+            Err(error) => {
+                let mut close = crate::WindowsOriginalCloseAttempt::new();
+                close.close_identity_handle(process);
+                return Err(crate::WindowsOriginalResourceOpenFailure {
+                    error,
+                    original_resources: close.finish().err(),
+                });
+            }
+        };
+        let mut owner = Self {
+            pid: child.id(),
+            start: 0,
+            image,
+            process,
+        };
+        let checked = (|| {
+            owner.start = owner.windows_start()?;
+            owner.verify_live()
+        })();
+        if let Err(error) = checked {
+            let mut close = crate::WindowsOriginalCloseAttempt::new();
+            owner.close_into_attempt(&mut close);
+            return Err(crate::WindowsOriginalResourceOpenFailure {
+                error,
+                original_resources: close.finish().err(),
+            });
+        }
+        Ok(owner)
     }
 
     pub fn pid(&self) -> u32 {

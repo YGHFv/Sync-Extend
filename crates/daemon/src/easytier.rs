@@ -5,20 +5,26 @@ use std::{
     path::Path,
     process::{Command, Stdio},
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use sync_extend_core_model::{
+    easytier::{compatible_version, peer_observations, EasyTierConfig},
     ContentId,
-    easytier::{EasyTierConfig, compatible_version, peer_observations},
 };
 use sync_extend_platform_fs::{ManagedChild, ManagedRpcOwner, SidecarConfig};
 
 mod observation;
+#[cfg(windows)]
+mod recovered;
+mod terminal;
 pub(crate) use observation::{clear as clear_observations, latest as latest_observation};
+#[cfg(windows)]
+pub(crate) use recovered::{ActiveRecoveredEasyTier, RecoveredEasyTierFailure};
+use terminal::Terminal;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -38,34 +44,161 @@ pub fn load(path: &Path) -> Result<EasyTierConfig> {
 }
 
 struct Binary {
-    program: sync_extend_platform_fs::PinnedProgram,
+    program: Option<sync_extend_platform_fs::PinnedProgram>,
+    terminal: Terminal,
+}
+
+impl Drop for Binary {
+    fn drop(&mut self) {
+        if let Some(original) = self.program.take() {
+            #[cfg(windows)]
+            {
+                let mut close = sync_extend_platform_fs::WindowsOriginalCloseAttempt::new();
+                original.close_into_attempt(&mut close);
+                self.terminal.handles(close);
+            }
+            #[cfg(not(windows))]
+            drop(original);
+        }
+    }
+}
+
+struct ChildScope {
+    original: Option<ManagedChild>,
+    terminal: Terminal,
+}
+impl ChildScope {
+    fn new(original: ManagedChild, terminal: Terminal) -> Self {
+        Self {
+            original: Some(original),
+            terminal,
+        }
+    }
+    fn child(&mut self) -> &mut std::process::Child {
+        self.original.as_mut().expect("same managed child").child()
+    }
+}
+impl Drop for ChildScope {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            self.terminal.child(original);
+        }
+    }
+}
+
+struct PipeScope {
+    original: Option<std::process::ChildStdout>,
+    terminal: Terminal,
+}
+impl Drop for PipeScope {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            #[cfg(windows)]
+            self.terminal.pipe(original);
+            #[cfg(not(windows))]
+            drop(original);
+        }
+    }
+}
+
+struct RpcScope {
+    original: Option<ManagedRpcOwner>,
+    terminal: Terminal,
+}
+impl std::ops::Deref for RpcScope {
+    type Target = ManagedRpcOwner;
+    fn deref(&self) -> &Self::Target {
+        self.original.as_ref().expect("same actual RPC owner")
+    }
+}
+impl Drop for RpcScope {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            self.terminal.rpc(original);
+        }
+    }
+}
+
+struct PrivateConfig {
+    original: Option<SidecarConfig>,
+    terminal: Terminal,
+}
+impl std::ops::Deref for PrivateConfig {
+    type Target = SidecarConfig;
+    fn deref(&self) -> &Self::Target {
+        self.original
+            .as_ref()
+            .expect("original private sidecar configuration")
+    }
+}
+impl Drop for PrivateConfig {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            #[cfg(windows)]
+            {
+                let mut close = sync_extend_platform_fs::WindowsOriginalCloseAttempt::new();
+                original.close_into_attempt(&mut close);
+                self.terminal.handles(close);
+            }
+            #[cfg(not(windows))]
+            drop(original);
+        }
+    }
 }
 
 impl Binary {
     fn open(path: &Path, expected: &ContentId) -> Result<Self> {
         let program = sync_extend_platform_fs::PinnedProgram::open(path, 256 * 1024 * 1024)?;
-        let file = program.reader();
+        Self::from_program(program, expected, Terminal::default())
+    }
+
+    fn from_program(
+        program: sync_extend_platform_fs::PinnedProgram,
+        expected: &ContentId,
+        terminal: Terminal,
+    ) -> Result<Self> {
+        let binary = Self {
+            program: Some(program),
+            terminal,
+        };
+        let file = binary.program().reader();
         if !file.metadata()?.is_file() || file.metadata()?.len() > 256 * 1024 * 1024 {
             return Err("EasyTier binary file limit".into());
         }
         let mut hasher = blake3::Hasher::new();
-        let mut reader = file;
         let mut buffer = [0; 65536];
+        let mut offset = 0;
         loop {
-            let count = reader.read(&mut buffer)?;
+            #[cfg(windows)]
+            let count = {
+                use std::os::windows::fs::FileExt;
+                file.seek_read(&mut buffer, offset)?
+            };
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let count = {
+                use std::os::unix::fs::FileExt;
+                file.read_at(&mut buffer, offset)?
+            };
+            #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+            let count = return Err("pinned program reads unavailable on this platform".into());
             if count == 0 {
                 break;
             }
             hasher.update(&buffer[..count]);
+            offset += count as u64;
         }
         if hasher.finalize().to_hex().as_str() != expected.as_str() {
             return Err("EasyTier pinned binary hash differs".into());
         }
-        Ok(Self { program })
+        Ok(binary)
+    }
+
+    fn program(&self) -> &sync_extend_platform_fs::PinnedProgram {
+        self.program.as_ref().expect("retained original binary")
     }
 
     fn command(&self) -> Command {
-        let mut command = self.program.command();
+        let mut command = self.program().command();
         // EasyTier CLI also consumes environment values independently of TOML parsing.
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("ET_") {
@@ -77,20 +210,27 @@ impl Binary {
 }
 
 fn capture(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
-    capture_cancel(command, timeout, None)
+    capture_cancel(command, timeout, None, &Terminal::default())
 }
 
 fn capture_cancel(
     command: &mut Command,
     timeout: Duration,
     cancel: Option<&AtomicBool>,
+    terminal: &Terminal,
 ) -> Result<Vec<u8>> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let mut child = ManagedChild::spawn(command)?;
-    let mut stdout = child.child().stdout.take().ok_or("managed stdout absent")?;
+    let mut child = ChildScope::new(terminal.spawn(command)?, terminal.clone());
+    let mut stdout = PipeScope {
+        original: child.child().stdout.take(),
+        terminal: terminal.clone(),
+    };
+    if stdout.original.is_none() {
+        return Err("managed stdout absent".into());
+    }
     let mut bytes = Vec::new();
     let mut buffer = [0; 65536];
     let deadline = Instant::now() + timeout;
@@ -98,7 +238,10 @@ fn capture_cancel(
         if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
             break Err("EasyTier command cancelled");
         }
-        while let Some(count) = sync_extend_platform_fs::read_available(&mut stdout, &mut buffer)? {
+        while let Some(count) = sync_extend_platform_fs::read_available(
+            stdout.original.as_mut().expect("same stdout"),
+            &mut buffer,
+        )? {
             if count == 0 {
                 break;
             }
@@ -113,9 +256,10 @@ fn capture_cancel(
             }
         }
         if let Some(status) = child.child().try_wait()? {
-            while let Some(count) =
-                sync_extend_platform_fs::read_available(&mut stdout, &mut buffer)?
-            {
+            while let Some(count) = sync_extend_platform_fs::read_available(
+                stdout.original.as_mut().expect("same stdout"),
+                &mut buffer,
+            )? {
                 if count == 0 {
                     break;
                 }
@@ -138,7 +282,11 @@ fn capture_cancel(
         }
         thread::sleep(Duration::from_millis(20));
     };
+    drop(stdout);
     drop(child);
+    if !terminal.succeeded() {
+        return Err("original EasyTier command terminal failed".into());
+    }
     outcome?;
     if bytes.len() > 1024 * 1024 {
         return Err("EasyTier command output limit".into());
@@ -156,7 +304,12 @@ fn check_version_cancel(
     timeout: Duration,
     cancel: Option<&AtomicBool>,
 ) -> Result<()> {
-    let output = capture_cancel(binary.command().arg("--version"), timeout, cancel)?;
+    let output = capture_cancel(
+        binary.command().arg("--version"),
+        timeout,
+        cancel,
+        &binary.terminal,
+    )?;
     if !compatible_version(std::str::from_utf8(&output)?, program) {
         return Err("EasyTier pinned version differs or has dirty build suffix".into());
     }
@@ -204,14 +357,15 @@ struct Sampler {
     cancel: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
     watcher: Option<thread::JoinHandle<()>>,
+    terminal: Terminal,
 }
 
 impl Sampler {
     fn start(
         config: EasyTierConfig,
         cli: Arc<Binary>,
-        owner: ManagedRpcOwner,
-        private: Arc<SidecarConfig>,
+        owner: RpcScope,
+        private: Arc<PrivateConfig>,
         config_bytes: Arc<Vec<u8>>,
         producer: observation::Producer,
     ) -> std::io::Result<Self> {
@@ -221,6 +375,7 @@ impl Sampler {
             cancel,
             thread: None,
             watcher: None,
+            terminal: cli.terminal.clone(),
         };
         let owner = Arc::new(owner);
         let watching = Arc::clone(&sampler.cancel);
@@ -267,6 +422,7 @@ impl Sampler {
                                     .args(["--output", "json", "peer", "list"]),
                                 remaining,
                                 Some(&stopping),
+                                &cli.terminal,
                             )
                             .map_err(|_| "rpc_query_unavailable")?;
                             let after = owner
@@ -311,10 +467,14 @@ impl Drop for Sampler {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);
         if let Some(worker) = self.thread.take() {
-            let _ = worker.join();
+            if worker.join().is_err() {
+                self.terminal.error("original sampler thread failed");
+            }
         }
         if let Some(watcher) = self.watcher.take() {
-            let _ = watcher.join();
+            if watcher.join().is_err() {
+                self.terminal.error("original watcher thread failed");
+            }
         }
     }
 }
@@ -326,18 +486,57 @@ pub fn run(config: EasyTierConfig, seconds: u64, shutdown: Arc<AtomicBool>) -> R
         return Err("EasyTier requires explicit enable and bounded runtime".into());
     }
     let config_bytes = Arc::new(config.native_config()?.into_bytes());
+    let terminal = Terminal::default();
+    let private = Arc::new(PrivateConfig {
+        original: Some(SidecarConfig::create(
+            &config.state_dir,
+            config.instance_id.as_str(),
+            &config_bytes,
+        )?),
+        terminal: terminal.clone(),
+    });
+    let core = Binary::from_program(
+        sync_extend_platform_fs::PinnedProgram::open(&config.core_binary, 256 * 1024 * 1024)?,
+        &config.core_blake3,
+        terminal.clone(),
+    )?;
+    let cli = Arc::new(Binary::from_program(
+        sync_extend_platform_fs::PinnedProgram::open(&config.cli_binary, 256 * 1024 * 1024)?,
+        &config.cli_blake3,
+        terminal.clone(),
+    )?);
+    let result = run_resources(
+        config,
+        seconds,
+        shutdown,
+        config_bytes,
+        private,
+        core,
+        cli,
+        None,
+    );
+    if !terminal.succeeded() {
+        terminal.retain_until_process_exit();
+        return Err("original EasyTier runtime terminal failed".into());
+    }
+    result
+}
+
+fn run_resources(
+    config: EasyTierConfig,
+    seconds: u64,
+    shutdown: Arc<AtomicBool>,
+    config_bytes: Arc<Vec<u8>>,
+    private: Arc<PrivateConfig>,
+    core: Binary,
+    cli: Arc<Binary>,
+    recovered_ready: Option<Arc<AtomicBool>>,
+) -> Result<()> {
     let config_pin = blake3::hash(&config_bytes)
         .to_hex()
         .as_str()
         .parse::<ContentId>()?;
-    let private = Arc::new(SidecarConfig::create(
-        &config.state_dir,
-        config.instance_id.as_str(),
-        &config_bytes,
-    )?);
     {
-        let core = Binary::open(&config.core_binary, &config.core_blake3)?;
-        let cli = Arc::new(Binary::open(&config.cli_binary, &config.cli_blake3)?);
         let timeout = Duration::from_secs(config.command_timeout_secs);
         for (binary, program) in [(&core, "easytier-core"), (&*cli, "easytier-cli")] {
             let checked = check_version_cancel(binary, program, timeout, Some(&shutdown));
@@ -364,6 +563,7 @@ pub fn run(config: EasyTierConfig, seconds: u64, shutdown: Arc<AtomicBool>) -> R
             core.command().args(&arguments).arg("--check-config"),
             timeout,
             Some(&shutdown),
+            &core.terminal,
         );
         if shutdown.load(Ordering::Acquire) {
             return Ok(());
@@ -382,9 +582,16 @@ pub fn run(config: EasyTierConfig, seconds: u64, shutdown: Arc<AtomicBool>) -> R
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            let mut child = ManagedChild::spawn(&mut command)?;
+            let mut child =
+                ChildScope::new(core.terminal.spawn(&mut command)?, core.terminal.clone());
             let generation = sync_extend_core_model::EntryId::random()?;
-            let rpc_owner = child.rpc_owner(&core.program);
+            let rpc_owner = core
+                .terminal
+                .rpc_owner(child.original.as_ref().expect("same child"), core.program())
+                .map(|original| RpcScope {
+                    original: Some(original),
+                    terminal: core.terminal.clone(),
+                });
             let process_start = rpc_owner
                 .as_ref()
                 .map(|owner| owner.process_start())
@@ -428,15 +635,22 @@ pub fn run(config: EasyTierConfig, seconds: u64, shutdown: Arc<AtomicBool>) -> R
                     None
                 }
             };
-            println!(
-                "{}",
-                serde_json::json!({
-                    "sidecar_pid":child.child().id(),"instance_id":config.instance_id,
-                    "state":"started","restart":restart,"child_generation":generation,
-                    "path_observed":false,
-                    "sync_device_authenticated":false,
-                })
-            );
+            if let Some(ready) = &recovered_ready {
+                if sampler.is_none() || !core.terminal.succeeded() {
+                    return Err("original recovered EasyTier child ownership unavailable".into());
+                }
+                ready.store(true, Ordering::Release);
+            } else {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "sidecar_pid":child.child().id(),"instance_id":config.instance_id,
+                        "state":"started","restart":restart,"child_generation":generation,
+                        "path_observed":false,
+                        "sync_device_authenticated":false,
+                    })
+                );
+            }
             let exit = loop {
                 if shutdown.load(Ordering::Acquire) || Instant::now() >= deadline {
                     super::shutdown::set_resources_ready(false);
@@ -453,6 +667,9 @@ pub fn run(config: EasyTierConfig, seconds: u64, shutdown: Arc<AtomicBool>) -> R
                 thread::sleep(Duration::from_millis(50));
             };
             drop(child);
+            if !core.terminal.succeeded() {
+                return Err("original EasyTier child terminal failed before restart".into());
+            }
             if exit.success() || restart >= config.max_restarts {
                 return Err("EasyTier sidecar stopped before requested runtime".into());
             }

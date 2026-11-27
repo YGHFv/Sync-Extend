@@ -53,6 +53,7 @@ pub use deployment_install::{
 #[cfg(windows)]
 pub use deployment_install::{
     DeploymentCompletionPreflightFailure, DeploymentTargetsPreflightFailure,
+    InstalledEasyTierRuntime,
 };
 #[cfg(windows)]
 pub use deployment_runtime::{

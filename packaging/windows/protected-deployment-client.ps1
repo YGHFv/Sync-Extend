@@ -1,5 +1,29 @@
 #Requires -Version 7.0
+. (Join-Path $PSScriptRoot 'client-view.ps1')
 . (Join-Path $PSScriptRoot 'protected-deployment-owner.ps1')
+
+function New-SyncExtendProtectedRuntimeRows($Status) {
+    if ($null -eq $Status) { return }
+    Assert-SyncExtendViewObject $Status
+    if (!$Status.Contains('easytier')) { return }
+    Assert-SyncExtendProtectedFields $Status @('easytier', 'runtime', 'gateway')
+    $sidecar = $Status.easytier
+    Assert-SyncExtendProtectedFields $sidecar @('same_original_installation_verified',
+        'node_free_runtime', 'observation')
+    Assert-SyncExtendViewFlag $sidecar.same_original_installation_verified
+    Assert-SyncExtendViewFlag $sidecar.node_free_runtime
+    if ($sidecar.same_original_installation_verified -cne $true -or
+        $sidecar.node_free_runtime -cne $true -or
+        $null -ne $Status.runtime -or $null -ne $Status.gateway) {
+        throw 'The original recovered sidecar binding cannot be verified.'
+    }
+    ,@('EasyTier 安装核验', '同一本次已核验安装；原进程资源受管')
+    if ($null -eq $sidecar.observation) {
+        ,@('EasyTier 状态', '尚无当前进程的有效 RPC 样本；链路可达性未知')
+        return
+    }
+    New-SyncExtendEasyTierView $sidecar.observation
+}
 
 function Test-SyncExtendProtectedClientActive($Client) {
     return [bool]($Client -and ($Client.Worker -or
@@ -195,6 +219,9 @@ function Update-SyncExtendProtectedClient($Client) {
                     Add-SyncExtendProtectedClientRow $Client '运行代次' ([string]$value.generation)
                     Add-SyncExtendProtectedClientRow $Client '资源就绪' ([string]$value.resources_ready)
                     Add-SyncExtendProtectedClientRow $Client '服务启动' ([string]$value.services_started)
+                    foreach ($row in @(New-SyncExtendProtectedRuntimeRows $value.status)) {
+                        Add-SyncExtendProtectedClientRow $Client $row[0] $row[1]
+                    }
                     if ($value.event -ceq 'response' -and !$value.accepted) {
                         Add-SyncExtendProtectedClientRow $Client '拒绝类别' $value.error
                         $Client.Notes.Text = '原控制进程拒绝了本次请求。请根据公开拒绝类别处理后，在同一控制进程中重试或关闭。'

@@ -197,7 +197,6 @@ impl Descriptor {
             if capture.selection.format_version != 2
                 || capture.selection.artifacts.is_empty()
                 || capture.selection.artifacts.len() > self.bundle_bounds.artifacts
-                || capture.nodes.is_empty()
                 || capture.nodes.len() > 64
             {
                 return Err("bounded complete explicit deployment capture selection".into());
@@ -575,6 +574,7 @@ struct OwnerFailures {
     nodes: Vec<(u32, DeploymentNodeRuntimeCloseFailure)>,
     gateway: Vec<super::webdav::RecoveredGatewayCloseFailure>,
     management: Vec<super::management::ManagementResourceCloseFailure>,
+    easytier: Vec<super::easytier::RecoveredEasyTierFailure>,
     original_closed_prefix: Vec<sync_extend_platform_fs::ClosedWindowsOriginalResources>,
     failed_generation_closed_history: Vec<BTreeMap<u32, DeploymentClosedNodeRuntime>>,
 }
@@ -582,6 +582,7 @@ struct OwnerFailures {
 impl OwnerFailures {
     fn any(&self) -> bool {
         !self.nodes.is_empty() || !self.gateway.is_empty() || !self.management.is_empty()
+            || !self.easytier.is_empty()
     }
 
     fn has_retained_originals(&self) -> bool {
@@ -596,11 +597,14 @@ impl OwnerFailures {
                 .management
                 .iter()
                 .any(|original| original.has_retained_originals())
+            || self.easytier.iter().any(|original| original.has_retained_originals())
     }
 
     /// Retry same-object terminals while all original installed files,
     /// provider, input and descriptor scopes still remain with this child.
     fn retry_terminal_resources(&mut self) {
+        self.easytier = std::mem::take(&mut self.easytier).into_iter()
+            .map(|original| original.close_remaining()).collect();
         self.gateway = std::mem::take(&mut self.gateway)
             .into_iter()
             .map(|original| original.close_remaining())
@@ -653,6 +657,7 @@ struct DeploymentOwner<'authority> {
     run: Option<DeploymentRun<'authority>>,
     gateway: Option<super::webdav::ActiveRecoveredGateway>,
     management: Option<super::management::ManagementGuard>,
+    easytier: Option<super::easytier::ActiveRecoveredEasyTier<'authority>>,
     closed_history: BTreeMap<u32, DeploymentClosedNodeRuntime>,
     failures: OwnerFailures,
 }
@@ -692,6 +697,7 @@ impl<'authority> DeploymentOwner<'authority> {
             run: None,
             gateway: None,
             management: None,
+            easytier: None,
             closed_history: BTreeMap::new(),
             failures: OwnerFailures::default(),
         }
@@ -723,6 +729,7 @@ impl<'authority> DeploymentOwner<'authority> {
             || self.run.is_some()
             || self.gateway.is_some()
             || self.management.is_some()
+            || self.easytier.is_some()
             || self.failures.any()
         {
             return Err(OwnerStartFailure::BeforeAcquisition(
@@ -737,6 +744,11 @@ impl<'authority> DeploymentOwner<'authority> {
             .checked_add(1)
             .filter(|generation| *generation <= self.bounds.max_generations)
             .ok_or(OwnerStartFailure::BeforeAcquisition("generation_limit"))?;
+        let configuration = self.files.deployment_configuration(self.provider)
+            .map_err(|_| OwnerStartFailure::BeforeAcquisition("runtime_configuration_invalid"))?;
+        if matches!(configuration.role, DeploymentRole::EasyTier { .. }) {
+            return self.start_easytier(next_generation);
+        }
         // Parse roles, all TLS choices and actual credentials before any
         // fresh native acquisition or listener effect.
         let (prepared_gateway, prepared_management, role_name, inputs) = (|| -> Result<_> {
@@ -912,10 +924,59 @@ impl<'authority> DeploymentOwner<'authority> {
         Ok(())
     }
 
-    /// Continue all independent original terminal paths after the first error.
-    /// Reusable closed history is kept only after every actual actor and
-    /// native session completed its full terminal successfully.
+    /// The node-free sidecar borrows the same original installation and provider.
+    fn start_easytier(&mut self, next_generation: u64) -> std::result::Result<(), OwnerStartFailure> {
+        let (prepared, management) = (|| -> Result<_> {
+            if !self.installed_nodes.is_empty() {
+                return Err("node-free installed EasyTier runtime required".into());
+            }
+            let prepared = self.files.prepare_installed_easytier(self.provider)?;
+            let management = self.files.management_configuration(self.provider)?
+                .map(super::management::PreparedManagement::new).transpose()?;
+            prepared.verify()?;
+            Ok((prepared, management))
+        })().map_err(|_| OwnerStartFailure::BeforeAcquisition("easytier_configuration_invalid"))?;
+        self.generation = next_generation;
+        super::management::reset_lifecycle_state();
+        if let Some(prepared) = management {
+            match prepared.start_retaining("easytier") {
+                Ok(original) => self.management = Some(original),
+                Err(original) => {
+                    if let Some(resources) = original.original_resources { self.failures.management.push(resources); }
+                    self.stop_runtime();
+                    self.state = OwnerState::Uncertain;
+                    return Err(OwnerStartFailure::OriginalAcquisition("management_start_failed"));
+                }
+            }
+        }
+        match super::easytier::ActiveRecoveredEasyTier::start(prepared) {
+            Ok(original) => self.easytier = Some(original),
+            Err(original) => {
+                self.failures.easytier.push(original);
+                self.stop_runtime();
+                self.state = OwnerState::Uncertain;
+                return Err(OwnerStartFailure::OriginalAcquisition("easytier_start_failed"));
+            }
+        }
+        self.require_start_deadline()?;
+        if self.easytier.as_ref().is_none_or(|original| original.status().is_err())
+            || self.management.as_ref().is_some_and(|original| original.finished())
+            || super::management::control_stop_requested()
+        {
+            self.stop_runtime();
+            self.state = OwnerState::Uncertain;
+            return Err(OwnerStartFailure::OriginalAcquisition("easytier_verification_failed"));
+        }
+        self.state = OwnerState::Running;
+        super::management::resources_ready();
+        Ok(())
+    }
+
+    /// Continue independent original terminals; any failure forbids restart.
     fn stop_runtime(&mut self) -> bool {
+        if let Some(original) = self.easytier.take() {
+            if let Err(original) = original.close() { self.failures.easytier.push(original); }
+        }
         if let Some(original) = self.gateway.take() {
             if let Err(original) = original.close() {
                 self.failures.gateway.push(original);
@@ -961,6 +1022,12 @@ impl<'authority> DeploymentOwner<'authority> {
 
     fn status(&self) -> Result<serde_json::Value> {
         self.files.verify(self.provider)?;
+        if let Some(original) = &self.easytier {
+            if self.state != OwnerState::Running || self.run.is_some() || self.gateway.is_some() {
+                return Err("same original EasyTier runtime state differs".into());
+            }
+            return Ok(serde_json::json!({ "easytier": original.status()?, "runtime": null, "gateway": null }));
+        }
         match (&self.run, &self.gateway, self.state) {
             (Some(run), Some(gateway), OwnerState::Running) => Ok(serde_json::json!({
                 "runtime": run.status()?,
@@ -1132,6 +1199,9 @@ impl<'authority> DeploymentOwner<'authority> {
             }
             if self.deadline_expired() {
                 return self.end("owner_timeout", None, None, false);
+            }
+            if self.easytier.as_ref().is_some_and(|original| original.poll().is_err()) {
+                return self.end("runtime_failed", None, Some("easytier_failed"), true);
             }
             if self.input_frames >= self.bounds.max_input_frames
                 || self
