@@ -1,3 +1,4 @@
+mod path_comparison;
 mod cleanup;
 mod conflict_admission;
 #[cfg(windows)]
