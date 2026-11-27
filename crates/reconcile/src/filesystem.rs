@@ -64,6 +64,13 @@ fn portable_captured_flag(value: sync_extend_platform_fs::CapturedFlag) -> Porta
 #[cfg(any(windows, target_os = "linux", target_os = "android"))]
 pub(crate) fn portable_metadata(file: &File) -> Result<Option<PortableEntryMetadata>> {
     let capture = sync_extend_platform_fs::capture_portable_file_metadata(file)?;
+    Ok(Some(portable_metadata_from_capture(capture)?))
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+pub(crate) fn portable_metadata_from_capture(
+    capture: sync_extend_platform_fs::PortableMetadataCapture,
+) -> Result<PortableEntryMetadata> {
     let mut metadata = PortableEntryMetadata::new(
         portable_time(capture.metadata.modified)?,
         PortableReadonly::captured(capture.metadata.readonly),
@@ -71,7 +78,7 @@ pub(crate) fn portable_metadata(file: &File) -> Result<Option<PortableEntryMetad
     metadata.creation = Some(portable_captured_time(capture.metadata.creation)?);
     metadata.unix_executable = Some(portable_captured_flag(capture.metadata.unix_executable));
     metadata.validate()?;
-    Ok(Some(metadata))
+    Ok(metadata)
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "android"))]
@@ -158,6 +165,19 @@ pub(crate) fn platform_metadata_for_apply(
     })
 }
 
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+pub(crate) fn apply_portable_metadata(file: &File, metadata: &PortableEntryMetadata) -> Result<()> {
+    let requested = platform_metadata_for_apply(metadata)?;
+    sync_extend_platform_fs::apply_portable_file_metadata(file, &requested)?;
+    let observed = portable_metadata(file)?.ok_or(ReconcileError::Invariant(
+        "portable metadata capture unavailable",
+    ))?;
+    if !metadata_matches_observed(metadata, &observed) {
+        return Err(ReconcileError::Unstable);
+    }
+    Ok(())
+}
+
 #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
 pub(crate) fn portable_metadata(_file: &File) -> Result<Option<PortableEntryMetadata>> {
     Ok(None)
@@ -176,14 +196,17 @@ pub(crate) fn metadata_matches_observed(
     expected: &PortableEntryMetadata,
     observed: &PortableEntryMetadata,
 ) -> bool {
-    expected.modified == observed.modified
-        && expected.readonly == observed.readonly
-        && expected.creation.is_none_or(|value| {
-            value.captured_value().is_none() || Some(value) == observed.creation
-        })
-        && expected
-            .unix_executable
-            .is_none_or(|value| value.value().is_none() || Some(value) == observed.unix_executable)
+    expected.matches_observed(observed)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+pub(crate) fn apply_portable_metadata(
+    _file: &File,
+    _metadata: &PortableEntryMetadata,
+) -> Result<()> {
+    Err(ReconcileError::Invariant(
+        "portable metadata apply is unsupported on this platform",
+    ))
 }
 
 pub(crate) struct PathIdentity {

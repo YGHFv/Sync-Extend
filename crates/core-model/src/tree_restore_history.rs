@@ -273,16 +273,26 @@ pub fn plan_tree_restore_history(
         }
         operations.push(operation);
     }
-    let desired: BTreeMap<_, _> = desired_entries
-        .into_iter()
-        .map(|(path, entry)| (path, (entry.kind, &entry.content)))
-        .collect();
     let actual: BTreeMap<_, _> = manifest
         .entries
         .values()
-        .map(|e| (e.path.clone(), (e.kind, &e.content)))
+        .map(|e| {
+            (
+                e.path.clone(),
+                (e.kind, e.content.as_ref(), e.metadata.as_ref()),
+            )
+        })
         .collect();
-    if actual != desired {
+    let matches = actual.len() == desired_entries.len()
+        && actual.iter().all(|(path, (kind, content, metadata))| {
+            desired_entries.get(path).is_some_and(|entry| {
+                entry.kind == *kind
+                    && entry.content.as_ref() == *content
+                    // Missing historical metadata does not strip current values.
+                    && (entry.metadata.is_none() || entry.metadata.as_ref() == *metadata)
+            })
+        });
+    if !matches {
         return Err(ModelError::InvalidData(
             "tree history final portable tree mismatch",
         ));

@@ -1,8 +1,8 @@
 //! Ordered native C/D effects. Each effect retains exact original handles.
 use super::*;
 use sync_extend_core_model::{
-    PortablePath,
     tree_native_action_layout::{TreeNativeActionIntent, TreeNativeActionObservation},
+    PortablePath,
 };
 
 pub struct TreeNativeExecution {
@@ -76,6 +76,7 @@ impl TreeNativeExecutionFileView<'_> {
         let key = FileKey::from_file(file)?;
         Ok(Some(crate::NativePublicationFileObservation {
             metadata: file.metadata()?,
+            portable: None,
             physical_identity: ContentId::hash(
                 format!("windows:{}:{}", key.volume, key.id).as_bytes(),
             ),
@@ -1101,6 +1102,13 @@ impl Journal {
                     .ok_or(invalid("tree action ordinal missing"))?
                     .action_ordinal,
             );
+            let expected_metadata = |step_index: usize| {
+                preparation
+                    .steps
+                    .get(step_index)
+                    .and_then(|step| step.historical_target_entry.as_ref())
+                    .and_then(|entry| entry.metadata.as_ref())
+            };
             let observation = match &intent {
                 I::MoveOriginal {
                     path,
@@ -1171,6 +1179,7 @@ impl Journal {
                 I::MaterializeEntry {
                     creator: expected,
                     content,
+                    step_index,
                     ..
                 } => {
                     let Some(Creator::File(file, key)) = &mut creator else {
@@ -1205,6 +1214,10 @@ impl Journal {
                     }
                     file.writer().sync_all()?;
                     verify_content(file.reader(), content)?;
+                    if let Some(metadata) = expected_metadata(*step_index) {
+                        crate::portable_file_metadata::apply(file.reader(), metadata)?;
+                    }
+                    file.writer().sync_all()?;
                     checkpoint_index(
                         "after_tree_entry_materialized",
                         progress
@@ -1249,6 +1262,16 @@ impl Journal {
                                 .and_then(|entry| entry.content.clone())
                                 .ok_or(invalid("tree publish target content absent"))?;
                             verify_content(file.reader(), &content)?;
+                            if let Some(metadata) = expected_metadata(*step_index) {
+                                let observed =
+                                    crate::portable_file_metadata::capture(file.reader())?
+                                        .ok_or_else(|| {
+                                            invalid("tree publish portable metadata unavailable")
+                                        })?;
+                                if !metadata.matches_observed(&observed) {
+                                    return Err(invalid("tree publish portable metadata differs"));
+                                }
+                            }
                             file.rename_no_replace(&destination)?;
                             (*key, Some(content))
                         }
@@ -1273,6 +1296,18 @@ impl Journal {
                                 return Err(invalid("tree recovered creator fullID differs"));
                             }
                             verify_content(file.reader(), content)?;
+                            if let Some(metadata) = expected_metadata(*step_index) {
+                                let observed =
+                                    crate::portable_file_metadata::capture(file.reader())?
+                                        .ok_or_else(|| {
+                                            invalid("tree recovered portable metadata unavailable")
+                                        })?;
+                                if !metadata.matches_observed(&observed) {
+                                    return Err(invalid(
+                                        "tree recovered portable metadata differs",
+                                    ));
+                                }
+                            }
                             file.rename_no_replace(&destination)?;
                             (*key, Some(content.clone()))
                         }
@@ -1379,6 +1414,24 @@ impl Journal {
                                     "tree original creator current file slot changed",
                                 ));
                             }
+                            if let I::MaterializeEntry { step_index, .. }
+                            | I::PublishEntry { step_index, .. } = &intent
+                            {
+                                if let Some(metadata) = expected_metadata(*step_index) {
+                                    let observed =
+                                        crate::portable_file_metadata::capture(file.reader())?
+                                            .ok_or_else(|| {
+                                                invalid(
+                                                    "tree observed portable metadata unavailable",
+                                                )
+                                            })?;
+                                    if !metadata.matches_observed(&observed) {
+                                        return Err(invalid(
+                                            "tree observed portable metadata differs",
+                                        ));
+                                    }
+                                }
+                            }
                         }
                         Creator::Directory(directory, key) => {
                             let path = match &intent {
@@ -1402,6 +1455,22 @@ impl Journal {
                                 return Err(invalid("tree recovered sealed creator differs"));
                             }
                             verify_content(file.reader(), content)?;
+                            if let I::PublishEntry { step_index, .. } = &intent {
+                                if let Some(metadata) = expected_metadata(*step_index) {
+                                    let observed =
+                                        crate::portable_file_metadata::capture(file.reader())?
+                                            .ok_or_else(|| {
+                                                invalid(
+                                                    "tree observed portable metadata unavailable",
+                                                )
+                                            })?;
+                                    if !metadata.matches_observed(&observed) {
+                                        return Err(invalid(
+                                            "tree observed portable metadata differs",
+                                        ));
+                                    }
+                                }
+                            }
                         }
                     }
                 }

@@ -1,4 +1,8 @@
-use crate::{fault::checkpoint, scan, LocalSpace, ReconcileError, Result};
+use crate::{
+    fault::checkpoint,
+    filesystem::{apply_portable_metadata, metadata_matches_observed},
+    scan, LocalSpace, ReconcileError, Result,
+};
 use serde::Serialize;
 use std::{io::Write, path::Path};
 use sync_extend_core_model::{EntryId, PortablePath, SnapshotId};
@@ -29,7 +33,7 @@ impl LocalSpace {
         self.recover()?;
         let (source, observed) = self.observe_source(source)?;
         self.scan_without_recovery()?;
-        let content = self.import_observed_source(&source, observed)?;
+        let (content, metadata) = self.import_observed_source_with_metadata(&source, observed)?;
         let peak = content
             .length
             .checked_mul(17)
@@ -38,13 +42,15 @@ impl LocalSpace {
                 "native internal reservation overflow",
             ))?;
         self.reserve_internal_worktree(peak)?;
-        let id = self.begin_content_selected(
+        let id = self.begin_content_selected_slot_with_metadata(
             path,
             content,
+            metadata,
             None,
             EntryId::random()?,
             EntryId::random()?,
             true,
+            false,
         )?;
         checkpoint("after_native_selection");
         let outcome = self.create_native_pipeline(&id, peak);
@@ -59,6 +65,17 @@ impl LocalSpace {
         let publication = self.journal.publication(id)?;
         self.check_publication_limits(&publication.intent.content)?;
         self.cas.verify(&publication.intent.content)?;
+        let expected_metadata = publication
+            .intent
+            .completion
+            .as_ref()
+            .and_then(|completion| {
+                completion
+                    .manifest
+                    .entries
+                    .get(&publication.intent.entry_id)
+            })
+            .and_then(|entry| entry.metadata.clone());
         let mut creation = self.journal.begin_native_publication_creation(id, peak)?;
         checkpoint("after_native_creators");
         self.reserve_native_internal_worktree(&creation.file_view())?;
@@ -67,7 +84,14 @@ impl LocalSpace {
         self.reserve_native_internal_worktree(&creation.file_view())?;
         self.cas
             .write_file(&publication.intent.content, creation.payload_writer())?;
+        // Content must be durable before the original handle's metadata is
+        // applied; the final sync below then preserves that exact state.
+        creation.payload_writer().sync_all()?;
+        if let Some(metadata) = &expected_metadata {
+            apply_portable_metadata(creation.payload_reader(), metadata)?;
+        }
         checkpoint("after_native_payload");
+        creation.payload_writer().sync_all()?;
         self.reserve_native_internal_worktree(&creation.file_view())?;
         let ready = self.journal.seal_native_publication_creation(creation)?;
         checkpoint("after_native_seal");
@@ -116,9 +140,15 @@ impl LocalSpace {
         if first != second
             || second.len() != completion.manifest.entries.len()
             || completion.manifest.entries.values().any(|entry| {
-                second
-                    .get(&entry.path)
-                    .is_none_or(|seen| seen.kind != entry.kind || seen.content != entry.content)
+                second.get(&entry.path).is_none_or(|seen| {
+                    seen.kind != entry.kind
+                        || seen.content != entry.content
+                        || entry.metadata.as_ref().is_some_and(|expected| {
+                            seen.metadata.as_ref().is_none_or(|observed| {
+                                !metadata_matches_observed(expected, observed)
+                            })
+                        })
+                })
             })
         {
             return Err(ReconcileError::Unstable);

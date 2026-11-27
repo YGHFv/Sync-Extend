@@ -204,6 +204,20 @@ impl PortableEntryMetadata {
         let readonly = self.readonly.value()?;
         Some((seconds, nanos, readonly))
     }
+
+    /// Compare a requested historical value with a fresh capture. Unknown or
+    /// unsupported requested fields stay explicit and are not treated as a
+    /// mismatch, because they were never claimed as captured values.
+    pub fn matches_observed(&self, observed: &Self) -> bool {
+        self.modified == observed.modified
+            && self.readonly == observed.readonly
+            && self.creation.is_none_or(|value| {
+                value.captured_value().is_none() || Some(value) == observed.creation
+            })
+            && self.unix_executable.is_none_or(|value| {
+                value.value().is_none() || Some(value) == observed.unix_executable
+            })
+    }
 }
 
 /// A field's implemented support on the running platform. `Supported` means

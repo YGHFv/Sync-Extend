@@ -69,7 +69,7 @@ mod windows {
     use sync_extend_cas::is_reparse;
     use sync_extend_core_model::{
         tree_restore_history::encode_history_record, tree_restore_identity::TreeNativeIdentity,
-        EntryKind, FileManifest, PortablePath,
+        EntryKind, FileManifest, PortableEntryMetadata, PortablePath,
     };
     use sync_extend_journal::TreeFinalObservationInspection;
     use sync_extend_platform_fs::{FileKey, GuardedReadFile, LockedDirectory};
@@ -90,6 +90,7 @@ mod windows {
         guard: GuardedReadFile,
         key: FileKey,
         content: Option<FileManifest>,
+        metadata: Option<PortableEntryMetadata>,
         marker: Option<Vec<u8>>,
     }
     struct Guards {
@@ -141,6 +142,7 @@ mod windows {
             path: &Path,
             expected: &TreeNativeIdentity,
             content: Option<&FileManifest>,
+            metadata: Option<&PortableEntryMetadata>,
             marker: Option<&[u8]>,
             max: usize,
         ) -> Result<()> {
@@ -160,6 +162,7 @@ mod windows {
                 guard,
                 key,
                 content: content.cloned(),
+                metadata: metadata.cloned(),
                 marker: marker.map(|m| m.to_vec()),
             };
             verify_file(&held)?;
@@ -350,6 +353,14 @@ mod windows {
                 "final observation file has no expected payload",
             ));
         }
+        if let Some(expected) = &file.metadata {
+            let observed = filesystem::portable_metadata(file.guard.reader())?.ok_or(
+                ReconcileError::Invariant("final portable metadata unavailable"),
+            )?;
+            if !filesystem::metadata_matches_observed(expected, &observed) {
+                return Err(ReconcileError::Unstable);
+            }
+        }
         if !filesystem::same_metadata(&before, &file.guard.reader().metadata()?)
             || !filesystem::same_metadata(&before, &fs::symlink_metadata(&file.path)?)
         {
@@ -466,6 +477,7 @@ mod windows {
             &marker_parent.join("space-id"),
             &p.identity().inventory().marker_file,
             None,
+            None,
             Some(local.space_id.as_str().as_bytes()),
             max,
         )?;
@@ -477,6 +489,7 @@ mod windows {
         g.file(
             &owner_directory.join(&owner.marker_component),
             marker,
+            None,
             None,
             Some(p.owner().marker_bytes()),
             max,
@@ -491,7 +504,14 @@ mod windows {
                     let entry = p.final_manifest().entries.get(&e.entry_id).ok_or(
                         ReconcileError::Invariant("final native logical entry missing"),
                     )?;
-                    g.file(&native_path, &e.identity, entry.content.as_ref(), None, max)?;
+                    g.file(
+                        &native_path,
+                        &e.identity,
+                        entry.content.as_ref(),
+                        entry.metadata.as_ref(),
+                        None,
+                        max,
+                    )?;
                 }
             }
         }
@@ -506,6 +526,7 @@ mod windows {
                 &owner_directory.join(&original.retained_component),
                 &original.original.original_identity,
                 Some(&original.original.original_content),
+                None,
                 None,
                 max,
             )?;

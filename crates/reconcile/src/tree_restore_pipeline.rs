@@ -212,9 +212,15 @@ impl LocalSpace {
         let native = self.stable_scan()?;
         if native.len() != baseline.manifest.entries.len()
             || baseline.manifest.entries.values().any(|entry| {
-                native
-                    .get(&entry.path)
-                    .is_none_or(|seen| seen.kind != entry.kind || seen.content != entry.content)
+                native.get(&entry.path).is_none_or(|seen| {
+                    seen.kind != entry.kind
+                        || seen.content != entry.content
+                        || entry.metadata.as_ref().is_some_and(|expected| {
+                            seen.metadata.as_ref().is_none_or(|observed| {
+                                !crate::filesystem::metadata_matches_observed(expected, observed)
+                            })
+                        })
+                })
             })
         {
             return Err(ReconcileError::Unstable);

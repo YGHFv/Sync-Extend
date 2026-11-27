@@ -5,11 +5,10 @@ use crate::Journal;
 use rusqlite::{Transaction, TransactionBehavior};
 use std::{fs, path::PathBuf};
 use sync_extend_core_model::{
-    EntryKind, FileManifest, SpaceId,
     tree_native_final_layout::TreeNativeFinalLayoutPlan,
     tree_original_terminal_layout::{
-        TreeOriginalTerminalLayoutPlan, TreeOriginalTerminalRowsLayout,
-        plan_tree_original_release_layout,
+        plan_tree_original_release_layout, TreeOriginalTerminalLayoutPlan,
+        TreeOriginalTerminalRowsLayout,
     },
     tree_owner_cleanup_layout::TreeOwnerCleanupRecordLayout,
     tree_owner_cleanup_values::{
@@ -17,8 +16,9 @@ use sync_extend_core_model::{
     },
     tree_restore_identity::TreeNativeIdentity,
     tree_storage_footprint::{
-        TreeStorageRowValues, TreeStorageTable, tree_original_terminal_row_values,
+        tree_original_terminal_row_values, TreeStorageRowValues, TreeStorageTable,
     },
+    EntryKind, FileManifest, SpaceId,
 };
 use sync_extend_platform_fs::{FileKey, LockedDirectory, LockedDirectoryMutation, LockedFile};
 
@@ -454,7 +454,7 @@ impl Journal {
                 self.tree_owner_state(space, id, max)?;
                 scope.verify()?;
                 members(&owner_path, &expected)?;
-                scope.files[file_index].held.delete_on_close()?;
+                scope.files[file_index].held.delete_readonly_on_close()?;
                 drop(scope.files.remove(file_index));
             }
             absent(&path)?;

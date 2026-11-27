@@ -388,6 +388,7 @@ impl ConflictNativeObservation {
         }
         Ok(Some(NativePublicationFileObservation {
             metadata: file.reader().metadata()?,
+            portable: crate::portable_file_metadata::capture(file.reader())?,
             physical_identity: super::super::physical(file.key()?),
             content: entry.content.clone(),
         }))
