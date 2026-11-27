@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{LocalSpace, ReconcileError, Result};
 use std::collections::BTreeMap;
-use sync_extend_core_model::{ContentId, SpaceId};
+use sync_extend_core_model::{ContentId, PortableEntryMetadata, SpaceId};
 use sync_extend_platform_fs::{
     ClosedWindowsOriginalResources, FileKey, OriginalFileSealFailure, OriginalSqliteMainHandoff,
     OriginalSqliteMainHandoffFailure, OwnedFileCreation, ReleasedOriginalCoordinationFile,
@@ -27,6 +27,7 @@ struct OriginalFileContext {
     parent: FileKey,
     bytes: u64,
     digest: ContentId,
+    metadata: Option<PortableEntryMetadata>,
 }
 
 #[derive(Default)]
@@ -47,6 +48,7 @@ impl OriginalContentPreparation {
             parent,
             bytes,
             digest,
+            metadata,
         } = file;
         self.context = Some(OriginalFileContext {
             slot,
@@ -55,6 +57,7 @@ impl OriginalContentPreparation {
             parent,
             bytes,
             digest,
+            metadata,
         });
         self.creator = Some(creator);
     }
@@ -124,6 +127,7 @@ impl OriginalContentPreparation {
             .as_ref()
             .expect("same protected content retained");
         super::read_content::verify(original, context.bytes, &context.digest)?;
+        super::created_current_file::verify_metadata(original.reader(), context.metadata.as_ref())?;
         if !original.matches_path(&context.path)? {
             return Err(ReconcileError::Invariant(
                 "original content read handoff slot differs",
@@ -140,6 +144,7 @@ impl OriginalContentPreparation {
             parent,
             bytes,
             digest,
+            metadata: _,
         } = context;
         // Keys/path are still checked by the same protected object and slot.
         let _ = (path, key, parent);

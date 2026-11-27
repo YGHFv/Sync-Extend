@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
 };
-use sync_extend_core_model::ContentId;
+use sync_extend_core_model::{ContentId, PortableEntryMetadata};
 use sync_extend_journal::NodeInspectionBounds;
 use sync_extend_platform_fs::{FileKey, OwnedFileCreation};
 
@@ -27,6 +27,7 @@ pub(super) struct CreatedFile {
     pub(super) parent: FileKey,
     pub(super) bytes: u64,
     pub(super) digest: ContentId,
+    pub(super) metadata: Option<PortableEntryMetadata>,
 }
 impl CreatedNodeFileSet<'_> {
     pub fn close_into_attempt<'scope>(
@@ -44,8 +45,8 @@ impl CreatedNodeFileSet<'_> {
             source_journal_digest, mapped_journal_digest,
         ));
         for (slot, original) in files {
-            let CreatedFile { creator, path, key, parent, bytes, digest } = original;
-            attempt.keep_context((slot, path, key, parent, bytes, digest));
+            let CreatedFile { creator, path, key, parent, bytes, digest, metadata } = original;
+            attempt.keep_context((slot, path, key, parent, bytes, digest, metadata));
             creator.close_into_attempt(&mut attempt.native);
         }
     }
@@ -74,6 +75,7 @@ impl CreatedNodeFileSet<'_> {
                 original.bytes,
                 &original.digest,
             )?;
+            super::created_current_file::verify_metadata(original.creator.reader(), original.metadata.as_ref())?;
             if !sync_extend_platform_fs::regular_file_matches_path(
                 original.creator.reader(),
                 &original.path,
@@ -208,12 +210,12 @@ impl VerifiedNodeStateArchive {
             let mut creator = parent.create_new_file(name)?;
             ledger.created_file(&mut intended, &creator.original_creation()?)?;
             crate::fault::checkpoint("node_layout_file_created");
-            let (digest, bytes) = match source {
+            let (digest, bytes, metadata) = match source {
                 NodeRestoreFile::Journal => {
                     let receipt = mapped.restore_created(&mut creator)?;
                     receipt.verify()?;
                     ledger.close_created_journal(&mut intended, &receipt)?;
-                    (receipt.digest().parse()?, receipt.bytes())
+                    (receipt.digest().parse()?, receipt.bytes(), None)
                 }
                 NodeRestoreFile::WorktreeCurrent { entry_id, .. } => {
                     let receipt = self.materialize_created_current_file(
@@ -224,7 +226,7 @@ impl VerifiedNodeStateArchive {
                     )?;
                     receipt.verify()?;
                     ledger.close_current_file(&mut intended, &receipt)?;
-                    (receipt.digest().clone(), receipt.bytes())
+                    (receipt.digest().clone(), receipt.bytes(), receipt.metadata().cloned())
                 }
                 other => {
                     let role = match other {
@@ -244,7 +246,7 @@ impl VerifiedNodeStateArchive {
                     let receipt = self.materialize_created_section(&role, &mut creator)?;
                     receipt.verify()?;
                     ledger.close_section(&mut intended, &receipt)?;
-                    (receipt.digest().clone(), receipt.bytes())
+                    (receipt.digest().clone(), receipt.bytes(), None)
                 }
             };
             total = total
@@ -268,6 +270,7 @@ impl VerifiedNodeStateArchive {
                         parent,
                         bytes,
                         digest,
+                        metadata,
                     },
                 )
                 .is_some()

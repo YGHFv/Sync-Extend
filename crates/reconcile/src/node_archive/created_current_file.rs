@@ -2,7 +2,7 @@
 use super::{ArchiveRole, VerifiedNodeStateArchive};
 use crate::{ReconcileError, Result};
 use std::io::{Seek, SeekFrom, Write};
-use sync_extend_core_model::{ContentId, EntryId, EntryKind, PortablePath};
+use sync_extend_core_model::{ContentId, EntryId, EntryKind, PortableEntryMetadata, PortablePath};
 use sync_extend_journal::NodeInspectionBounds;
 use sync_extend_platform_fs::{FileKey, OriginalFileCreation, OwnedFileCreation};
 
@@ -15,6 +15,7 @@ pub struct CreatedNodeCurrentFile<'a> {
     original_path: PortablePath,
     digest: ContentId,
     bytes: u64,
+    metadata: Option<PortableEntryMetadata>,
 }
 impl CreatedNodeCurrentFile<'_> {
     pub fn key(&self) -> FileKey {
@@ -35,6 +36,9 @@ impl CreatedNodeCurrentFile<'_> {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
+    pub(super) fn metadata(&self) -> Option<&PortableEntryMetadata> {
+        self.metadata.as_ref()
+    }
     pub fn verify(&self) -> Result<()> {
         super::created_bytes::verify(
             self.creator,
@@ -42,12 +46,28 @@ impl CreatedNodeCurrentFile<'_> {
             self.parent_key,
             self.bytes,
             &self.digest,
-        )
+        )?;
+        verify_metadata(self.creator.reader(), self.metadata.as_ref())
     }
     pub fn original(&self) -> Result<OriginalFileCreation<'_>> {
         self.verify()?;
         self.creator.original_creation().map_err(Into::into)
     }
+}
+
+pub(super) fn verify_metadata(
+    file: &std::fs::File,
+    expected: Option<&PortableEntryMetadata>,
+) -> Result<()> {
+    if let Some(expected) = expected {
+        let observed = crate::filesystem::portable_metadata(file)?.ok_or(
+            ReconcileError::Invariant("restored current metadata capture absent"),
+        )?;
+        if !crate::filesystem::metadata_matches_observed(expected, &observed) {
+            return Err(ReconcileError::Unstable);
+        }
+    }
+    Ok(())
 }
 
 impl VerifiedNodeStateArchive {
@@ -83,6 +103,13 @@ impl VerifiedNodeStateArchive {
             "original current node file manifest absent",
         ))?;
         content.validate()?;
+        // Resolve the supported local values before the first payload write.
+        // The signed historical Entry is retained unchanged in the Journal.
+        let metadata = entry
+            .metadata
+            .as_ref()
+            .map(crate::filesystem::projected_metadata)
+            .transpose()?;
         if content.length > max_file_bytes
             || content.chunks.len() > inspection.capacity.inventory.max_rows
         {
@@ -166,6 +193,11 @@ impl VerifiedNodeStateArchive {
             ));
         }
         creator.writer().flush()?;
+        if let Some(metadata) = &metadata {
+            // Apply to the original CREATE handle. The platform implementation
+            // applies timestamps/executable before readonly and reads them back.
+            crate::filesystem::apply_portable_metadata(creator.reader(), metadata)?;
+        }
         creator.writer().sync_all()?;
         crate::fault::checkpoint("node_current_file_created_synced");
         let receipt = CreatedNodeCurrentFile {
@@ -176,6 +208,7 @@ impl VerifiedNodeStateArchive {
             original_path: entry.path.clone(),
             digest: content.content_id.clone(),
             bytes: written,
+            metadata,
         };
         receipt.verify()?;
         crate::fault::checkpoint("node_current_file_created_verified");
