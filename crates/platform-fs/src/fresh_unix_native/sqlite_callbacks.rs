@@ -153,7 +153,9 @@ unsafe extern "C" fn open(
             ));
         }
         if class != 0 && !owner.main_active.get() {
-            return Err(refuse("original Unix SQLite sidecar requires its active main"));
+            return Err(refuse(
+                "original Unix SQLite sidecar requires its active main",
+            ));
         }
         let count = owner
             .active_files
@@ -233,11 +235,10 @@ unsafe extern "C" fn read(
     unsafe {
         io(file, ffi::SQLITE_IOERR_READ, |opened, owner| {
             let original = &owner.files[opened.class];
-            let (offset, count) = range(offset, count, original.maximum)?;
+            let (offset, count) = range(offset, count, original.maximum())?;
             let output = std::slice::from_raw_parts_mut(output.cast::<u8>(), count);
             output.fill(0);
-            let done =
-                crate::unix_descriptor_io::read_until_eof(&original.original.file, output, offset)?;
+            let done = crate::unix_descriptor_io::read_until_eof(&original.file(), output, offset)?;
             Ok(if done == count {
                 ffi::SQLITE_OK
             } else {
@@ -260,9 +261,9 @@ unsafe extern "C" fn write(
     unsafe {
         io(file, ffi::SQLITE_FULL, |opened, owner| {
             let original = &owner.files[opened.class];
-            let (offset, count) = range(offset, count, original.maximum)?;
+            let (offset, count) = range(offset, count, original.maximum())?;
             let input = std::slice::from_raw_parts(input.cast::<u8>(), count);
-            crate::unix_descriptor_io::write_all(&original.original.file, input, offset)?;
+            crate::unix_descriptor_io::write_all(&original.file(), input, offset)?;
             Ok(ffi::SQLITE_OK)
         })
     }
@@ -273,8 +274,8 @@ unsafe extern "C" fn truncate(file: *mut ffi::sqlite3_file, size: i64) -> c_int 
     unsafe {
         io(file, ffi::SQLITE_IOERR_TRUNCATE, |opened, owner| {
             let original = &owner.files[opened.class];
-            let (size, _) = range(size, 0, original.maximum)?;
-            original.original.file.set_len(size)?;
+            let (size, _) = range(size, 0, original.maximum())?;
+            original.file().set_len(size)?;
             Ok(ffi::SQLITE_OK)
         })
     }
@@ -283,7 +284,7 @@ unsafe extern "C" fn sync(file: *mut ffi::sqlite3_file, _: c_int) -> c_int {
     // SAFETY: actual initialized IO descriptor supplied by SQLite.
     unsafe {
         io(file, ffi::SQLITE_IOERR_FSYNC, |opened, owner| {
-            owner.files[opened.class].original.file.sync_all()?;
+            owner.files[opened.class].file().sync_all()?;
             Ok(ffi::SQLITE_OK)
         })
     }
@@ -295,7 +296,7 @@ unsafe extern "C" fn size(file: *mut ffi::sqlite3_file, output: *mut i64) -> c_i
     // SAFETY: actual initialized IO and one sized writable integer output.
     unsafe {
         io(file, ffi::SQLITE_IOERR_FSTAT, |opened, owner| {
-            *output = i64::try_from(owner.files[opened.class].original.file.metadata()?.len())
+            *output = i64::try_from(owner.files[opened.class].file().metadata()?.len())
                 .map_err(|_| refuse("original SQLite file length overflow"))?;
             Ok(ffi::SQLITE_OK)
         })
@@ -386,7 +387,7 @@ unsafe extern "C" fn shm_map(
             let offset = i64::from(region)
                 .checked_mul(i64::from(size))
                 .ok_or_else(|| refuse("original SQLite SHM offset overflow"))?;
-            let _ = range(offset, size, owner.files[3].maximum)?;
+            let _ = range(offset, size, owner.files[3].maximum())?;
             let mut mappings = owner
                 .mappings
                 .try_borrow_mut()
@@ -400,7 +401,7 @@ unsafe extern "C" fn shm_map(
                 size as usize,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
-                owner.files[3].original.file.as_raw_fd(),
+                owner.files[3].file().as_raw_fd(),
                 offset,
             );
             if address == libc::MAP_FAILED {
@@ -485,7 +486,7 @@ unsafe extern "C" fn delete(vfs: *mut ffi::sqlite3_vfs, name: *const c_char, _: 
         if !matches!(class, 1 | 2) {
             return Err(refuse("original SQLite namespace deletion refused"));
         }
-        let file = &owner.files[class].original.file;
+        let file = &owner.files[class].file();
         file.set_len(0)?;
         file.sync_all()?;
         Ok(ffi::SQLITE_OK)
@@ -513,7 +514,7 @@ unsafe extern "C" fn access(
         ) {
             return Err(refuse("original SQLite access flags invalid"));
         }
-        let present = class == 0 || owner.files[class].original.file.metadata()?.len() != 0;
+        let present = class == 0 || owner.files[class].file().metadata()?.len() != 0;
         // SAFETY: the nonnull integer output belongs to SQLite.
         unsafe {
             *output = i32::from(present);

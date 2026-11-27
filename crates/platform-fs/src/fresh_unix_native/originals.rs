@@ -400,6 +400,23 @@ impl<'namespace> OriginalUnixNativeRoot<'namespace> {
 }
 
 impl<'namespace> AcquiredUnixChildDirectory<'namespace> {
+    /// End a superseded polling observation; pathname continuity is not asserted.
+    pub fn end_observation(
+        self,
+    ) -> Result<ClosedUnixOriginalResources, UnixOriginalResourceCloseFailure> {
+        let mut close = UnixOriginalCloseAttempt::new();
+        if let Err(error) = self.namespace.verify_current() {
+            close.note_error(error);
+        }
+        match Arc::try_unwrap(self.original.original) {
+            Ok(parent) => parent.close_into_attempt(&mut close),
+            Err(parent) => {
+                close.note_error(refuse("Unix directory observation still borrowed"));
+                close.close_artifact_parent(UnixProtectedArtifactParent { original: parent });
+            }
+        }
+        close.finish()
+    }
     pub fn parent_key(&self) -> io::Result<UnixProtectedArtifactKey> {
         self.verify()?;
         let anchors = &self.original.original.directories;

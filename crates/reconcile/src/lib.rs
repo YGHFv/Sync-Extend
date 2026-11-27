@@ -1594,7 +1594,7 @@ mod unix_node_archive;
 pub use unix_node_archive::{ArchiveBounds, ArchiveRole, FramedNodeArchive, VerifiedNodeStateArchive};
 #[cfg(target_os = "linux")]
 pub use unix_node_archive::{ClosedOriginalUnixRestore, OriginalUnixRestoredNode, OriginalUnixRestoreFailure,
-    PreparedUnixNodeRestore, UnixNodeRestoreBounds};
+    PreparedUnixNodeRestore, UnixNodeRestoreBounds, ReacquiredOriginalUnixNode, UnixGenerationReacquireFailure, ClosedReacquiredUnixGeneration};
 #[cfg(windows)]
 pub use node_archive::{
     ArchiveBounds, ArchiveRole, CapturedNodeArchive, CreatedNodeCurrentFile, CreatedNodeDataLocks,

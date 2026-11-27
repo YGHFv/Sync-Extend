@@ -2,6 +2,9 @@
 //! Directory acquisition and actual O_EXCL file creation have distinct types.
 mod namespace;
 mod originals;
+mod reacquired;
+pub use reacquired::{ReacquiredUnixSqliteFile, ReacquiredUnixSqliteFileFailure, ReacquiredUnixSqliteLock};
+mod sqlite_resources;
 mod observed;
 pub use observed::ObservedUnixNativeFile;
 mod sealed;

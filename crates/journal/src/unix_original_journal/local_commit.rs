@@ -6,7 +6,7 @@ use sync_extend_platform_fs::{OriginalUnixSqliteSessionBinding, SealedUnixNative
 
 const MAX_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 
-pub(crate) struct PreparedOriginalUnixLocalCommit {
+pub struct PreparedOriginalUnixLocalCommit {
     binding: OriginalUnixSqliteSessionBinding,
     before: ContentId,
     turn: u32,
@@ -17,7 +17,7 @@ pub(crate) struct PreparedOriginalUnixLocalCommit {
     intent: Vec<u8>,
 }
 impl PreparedOriginalUnixLocalCommit {
-    pub(crate) fn durable_intent_bytes(&self) -> &[u8] {
+    pub fn durable_intent_bytes(&self) -> &[u8] {
         &self.intent
     }
 }
@@ -172,7 +172,7 @@ impl Drop for LocalCall<'_> {
 impl OriginalUnixRestoredJournal<'_> {
     /// Prepare complete immutable inputs while the actual target's prior rows
     /// are still exactly audited. No SQL write or filesystem creator occurs.
-    pub(crate) fn prepare_local_commit(
+    pub fn prepare_local_commit(
         &mut self,
         expected_root: Option<&SnapshotId>,
         manifest: &Manifest,
@@ -246,7 +246,7 @@ impl OriginalUnixRestoredJournal<'_> {
     /// Consumes the prepared input only after the complete same-parent intent
     /// is durably sealed. Every mutation uses the target's actual live Journal;
     /// the memory preparation writer and all native source rows remain inert.
-    pub(crate) fn commit_prepared_local(
+    pub fn commit_prepared_local(
         &mut self,
         prepared: PreparedOriginalUnixLocalCommit,
         intent: &SealedUnixNativeFile<'_>,

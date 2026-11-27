@@ -118,6 +118,25 @@ impl<'n> AcquiredUnixChildDirectory<'n> {
     }
 }
 impl ObservedUnixNativeFile<'_> {
+    /// End an old polling observation after external edits. This proves only
+    /// descriptor closure, never that its former path/content is unchanged.
+    pub fn end_observation(
+        mut self,
+    ) -> Result<ClosedUnixOriginalResources, UnixOriginalResourceCloseFailure> {
+        let mut close = UnixOriginalCloseAttempt::new();
+        if let Err(error) = self.namespace.verify_current() {
+            close.note_error(error);
+        }
+        if let Some(original) = self.original.take() {
+            close.close_file(original);
+        }
+        if let Some(parent) = self.parent.take() {
+            if let Ok(parent) = Arc::try_unwrap(parent) {
+                parent.close_into_attempt(&mut close);
+            }
+        }
+        close.finish()
+    }
     pub fn verify(&self) -> io::Result<()> {
         self.namespace.verify_current()?;
         let parent = self

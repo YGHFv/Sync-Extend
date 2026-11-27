@@ -19,6 +19,13 @@ pub(super) struct Key {
     uid: u32,
 }
 impl Key {
+    pub(super) fn described(&self) -> sync_extend_platform_fs::UnixProtectedArtifactKey {
+        sync_extend_platform_fs::UnixProtectedArtifactKey {
+            device: self.device,
+            inode: self.inode,
+            uid: self.uid,
+        }
+    }
     pub(super) fn observed(key: sync_extend_platform_fs::UnixProtectedArtifactKey) -> Self {
         Self {
             device: key.device,
@@ -116,6 +123,7 @@ fn objects<'de, D: serde::Deserializer<'de>>(
 pub(super) fn encode(record: &Record) -> Result<Vec<u8>> {
     if record.version != 1
         || record.generation >= MAX_GENERATIONS
+        || (record.generation == 0) != record.predecessor.is_none()
         || record.turns > MAX_TURNS
         || record.objects.len() > MAX_OBJECTS
     {
@@ -153,13 +161,35 @@ pub(super) fn encode(record: &Record) -> Result<Vec<u8>> {
     if record
         .objects
         .iter()
-        .any(|object| !slots.insert((&object.role, &object.path)))
+        .any(|object| !slots.insert((object.role.starts_with("work_"), &object.path)))
     {
         return Err(ReconcileError::Invariant(
             "Unix generation duplicate descriptor slot",
         ));
     }
     completion_codec::bytes(record, completion_frames::MAX_RECORD_BYTES)
+}
+
+pub(super) fn future_metadata() -> PortableEntryMetadata {
+    use sync_extend_core_model::{
+        PortableMetadataUnsupportedReason, PortableReadonly, PortableTimestamp,
+        PortableUnixExecutable,
+    };
+    PortableEntryMetadata {
+        format_version: 1,
+        modified: PortableTimestamp::Captured {
+            seconds: i64::MIN,
+            nanos: 999_999_999,
+        },
+        readonly: PortableReadonly::Unknown,
+        creation: Some(PortableTimestamp::Captured {
+            seconds: i64::MIN,
+            nanos: 999_999_999,
+        }),
+        unix_executable: Some(PortableUnixExecutable::Unsupported {
+            reason: PortableMetadataUnsupportedReason::Filesystem,
+        }),
+    }
 }
 
 /// The envelope includes worst-case physical keys and descriptor counts for

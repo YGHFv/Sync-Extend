@@ -13,6 +13,8 @@ mod completion_codec;
 #[path = "node_archive/completion_frames.rs"]
 mod completion_frames;
 mod generation_budget;
+mod reacquire;
+pub use reacquire::{ReacquiredOriginalUnixNode, UnixGenerationReacquireFailure, ClosedReacquiredUnixGeneration};
 pub use layout::{ArchiveBounds, ArchiveRole, FramedNodeArchive};
 pub use verifier::VerifiedNodeStateArchive;
 mod plan;

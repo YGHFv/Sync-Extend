@@ -2,7 +2,11 @@
 use super::super::{
     refuse, ClosedUnixOriginalResources, UnixOriginalCloseAttempt, UnixOriginalResourceCloseFailure,
 };
-use super::{FreshUnixNativeFile, OriginalUnixCasSentinel, SealedUnixNativeFile};
+use super::sqlite_resources::{SqliteCoordination, SqliteOriginalFile};
+use super::{
+    FreshUnixNativeFile, OriginalUnixCasSentinel, ReacquiredUnixSqliteFile,
+    ReacquiredUnixSqliteLock, SealedUnixNativeFile,
+};
 use crate::original_sqlite_dispatch::{reserve_registration, Dispatch, MAX_NAME_BYTES};
 use rusqlite::ffi;
 use std::{
@@ -32,8 +36,8 @@ struct Mapping {
 
 struct State<'namespace> {
     session: Rc<()>,
-    files: [FreshUnixNativeFile<'namespace>; 4],
-    coordination: OriginalUnixCasSentinel<'namespace>,
+    files: [SqliteOriginalFile<'namespace>; 4],
+    coordination: SqliteCoordination<'namespace>,
     paths: [CString; 4],
     poisoned: Cell<bool>,
     active_files: Cell<usize>,
@@ -46,7 +50,7 @@ struct State<'namespace> {
 
 impl State<'_> {
     fn on_original_thread(&self) -> bool {
-        self.files[0].namespace.on_original_thread()
+        self.files[0].namespace().on_original_thread()
     }
     fn verify(&self) -> io::Result<()> {
         if !self.on_original_thread() {
@@ -154,13 +158,13 @@ impl OriginalUnixSqliteSessionLoan<'_, '_> {
             .expect("actual original session")
             .state;
         Ok([
-            state.files[0].namespace.key()?,
-            state.files[0].original.parent.key()?,
+            state.files[0].namespace().key()?,
+            state.files[0].parent().key()?,
             state.files[0].key()?,
             state.files[1].key()?,
             state.files[2].key()?,
             state.files[3].key()?,
-            state.coordination.original.key()?,
+            state.coordination.key()?,
         ])
     }
 
@@ -180,14 +184,15 @@ impl OriginalUnixSqliteSessionLoan<'_, '_> {
             .state;
         file.verify_ordered_bytes(&[expected])?;
         if !state.files[0]
-            .namespace
+            .namespace()
             .same_original(&file.original.namespace)
-            || state.files[0].original.parent.key()? != file.original.original.parent.key()?
-            || state
-                .files
-                .iter()
-                .any(|native| native.original.key() == file.original.original.key())
-            || state.coordination.original.original.key() == file.original.original.key()
+            || state.files[0].parent().key()? != file.original.original.parent.key()?
+            || state.files.iter().any(|native| {
+                native
+                    .key()
+                    .is_ok_and(|key| key == file.original.original.key())
+            })
+            || state.coordination.key()? == file.original.original.key()
         {
             return Err(refuse("original Unix session intent scope differs"));
         }
@@ -250,6 +255,31 @@ impl<'namespace> FreshUnixNativeSqliteIo<'namespace> {
         files: [FreshUnixNativeFile<'namespace>; 4],
         coordination: OriginalUnixCasSentinel<'namespace>,
     ) -> Result<Self, FreshUnixNativeSqliteIoFailure<'namespace>> {
+        Self::acquire_resources(
+            files.map(SqliteOriginalFile::Created),
+            SqliteCoordination::Created(coordination),
+            false,
+        )
+    }
+
+    /// Consume independently acquired existing originals. These retain their
+    /// distinct acquisition type throughout the shared native VFS protocol.
+    pub fn reacquire(
+        files: [ReacquiredUnixSqliteFile<'namespace>; 4],
+        coordination: ReacquiredUnixSqliteLock<'namespace>,
+    ) -> Result<Self, FreshUnixNativeSqliteIoFailure<'namespace>> {
+        Self::acquire_resources(
+            files.map(SqliteOriginalFile::Acquired),
+            SqliteCoordination::Acquired(coordination),
+            true,
+        )
+    }
+
+    fn acquire_resources(
+        files: [SqliteOriginalFile<'namespace>; 4],
+        coordination: SqliteCoordination<'namespace>,
+        existing: bool,
+    ) -> Result<Self, FreshUnixNativeSqliteIoFailure<'namespace>> {
         // Each successful reservation is permanently consumed, even if a later
         // open fails. Admission occurs before any registration allocation.
         let reserved = reserve_registration();
@@ -274,13 +304,13 @@ impl<'namespace> FreshUnixNativeSqliteIo<'namespace> {
             }
         };
         let paths = std::array::from_fn(|index| {
-            let source = &files[index].original;
+            let source = &files[index];
             // Components were bounded and NUL checked by the actual creator.
             CString::new(
                 source
-                    .parent
+                    .parent()
                     .path
-                    .join(OsStr::from_bytes(source.component.as_bytes()))
+                    .join(OsStr::from_bytes(source.component().to_bytes()))
                     .as_os_str()
                     .as_bytes(),
             )
@@ -325,7 +355,7 @@ impl<'namespace> FreshUnixNativeSqliteIo<'namespace> {
                 return Err(refuse("bounded permanent Unix SQLite dispatch payload"));
             }
             let first = &reg.state.files[0];
-            let parent = first.original.parent.key()?;
+            let parent = first.parent().key()?;
             let expected = [
                 "journal.sqlite",
                 "journal.sqlite-wal",
@@ -333,11 +363,11 @@ impl<'namespace> FreshUnixNativeSqliteIo<'namespace> {
                 "journal.sqlite-shm",
             ];
             for (index, file) in reg.state.files.iter().enumerate() {
-                if !file.namespace.same_original(&first.namespace)
-                    || file.original.parent.key()? != parent
-                    || file.original.component.as_bytes() != expected[index].as_bytes()
-                    || file.maximum > MAX_FILE
-                    || index > 0 && file.original.file.metadata()?.len() != 0
+                if !file.namespace().same_original(first.namespace())
+                    || file.parent().key()? != parent
+                    || file.component().to_bytes() != expected[index].as_bytes()
+                    || file.maximum() > MAX_FILE
+                    || index > 0 && !existing && file.file().metadata()?.len() != 0
                 {
                     return Err(refuse("exact original Unix SQLite creator set required"));
                 }
@@ -345,20 +375,24 @@ impl<'namespace> FreshUnixNativeSqliteIo<'namespace> {
             if !reg
                 .state
                 .coordination
-                .original
-                .namespace
-                .same_original(&first.namespace)
-                || reg.state.coordination.original.original.parent.key()? != parent
-                || reg.state.files[3].maximum < SHM_REGION as u64
-                || reg.state.files[3].maximum % SHM_REGION as u64 != 0
+                .namespace()
+                .same_original(first.namespace())
+                || reg.state.coordination.parent().key()? != parent
+                || reg.state.files[3].maximum() < SHM_REGION as u64
+                || reg.state.files[3].maximum() % SHM_REGION as u64 != 0
             {
                 return Err(refuse("original Unix SQLite CAS/SHM owner scope differs"));
             }
-            reg.state.files[3]
-                .original
-                .file
-                .set_len(reg.state.files[3].maximum)?;
-            reg.state.files[3].original.file.sync_all()?;
+            if existing {
+                if reg.state.files[3].file().metadata()?.len() != reg.state.files[3].maximum() {
+                    return Err(refuse("existing Unix SHM original allocation differs"));
+                }
+            } else {
+                reg.state.files[3]
+                    .file()
+                    .set_len(reg.state.files[3].maximum())?;
+                reg.state.files[3].file().sync_all()?;
+            }
             reg.table.zName = reg.name.as_ptr();
             reg.dispatch
                 .publish((&*reg.state as *const State<'_>).cast_mut().cast());

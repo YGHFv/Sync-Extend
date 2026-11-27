@@ -187,6 +187,10 @@ impl OriginalUnixNamespace {
     pub fn verify_current(&self) -> io::Result<()> {
         self.state.verify_current()
     }
+    pub fn observed_key(&self) -> io::Result<UnixProtectedArtifactKey> {
+        self.verify_current()?;
+        Ok(self.state.key)
+    }
 
     pub(super) fn loan(&self) -> NamespaceLoan<'_> {
         NamespaceLoan {

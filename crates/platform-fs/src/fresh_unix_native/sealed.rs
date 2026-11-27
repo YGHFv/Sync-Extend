@@ -136,6 +136,21 @@ impl<'namespace> FreshUnixNativeFile<'namespace> {
 }
 
 impl SealedUnixNativeFile<'_> {
+    /// Explicitly end a superseded worktree observation for polling. This is
+    /// only an actual descriptor terminal, not proof that content is unchanged.
+    pub fn end_observation(
+        self,
+    ) -> Result<ClosedUnixOriginalResources, UnixOriginalResourceCloseFailure> {
+        let mut close = UnixOriginalCloseAttempt::new();
+        if let Err(error) = self.original.namespace.verify_current() {
+            close.note_error(error);
+        }
+        close.close_file(self.original.original.file);
+        if let Ok(parent) = std::sync::Arc::try_unwrap(self.original.original.parent) {
+            parent.close_into_attempt(&mut close);
+        }
+        close.finish()
+    }
     pub fn verify(&self) -> io::Result<()> {
         self.original.verify()?;
         if observe_fd(self.original.original.file.as_raw_fd())? != self.captured

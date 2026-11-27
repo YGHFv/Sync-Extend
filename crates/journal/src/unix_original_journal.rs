@@ -15,6 +15,7 @@ use sync_extend_platform_fs::{
     ClosedUnixOriginalResources, FreshUnixNativeSqliteIo, FreshUnixNativeSqliteIoFailure,
 };
 mod local_commit;
+pub use local_commit::PreparedOriginalUnixLocalCommit;
 
 struct OriginalInspectionCall<'a> {
     connection: &'a mut crate::journal_connection_owner::JournalConnectionOwner,
@@ -196,6 +197,37 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
         space: &SpaceId,
         bounds: NodeInspectionBounds,
     ) -> std::result::Result<Self, OriginalUnixRestoredJournalFailure<'namespace>> {
+        Self::open_original_binding(io, Some(image), None, space, bounds)
+    }
+
+    /// Reopen independently acquired original IO. The complete current row
+    /// digest and root must match before any fixed live commit is admitted.
+    pub fn reopen_original(
+        io: FreshUnixNativeSqliteIo<'namespace>,
+        expected_rows: &sync_extend_core_model::ContentId,
+        expected_root: &sync_extend_core_model::SnapshotId,
+        space: &SpaceId,
+        bounds: NodeInspectionBounds,
+    ) -> std::result::Result<Self, OriginalUnixRestoredJournalFailure<'namespace>> {
+        Self::open_original_binding(
+            io,
+            None,
+            Some((expected_rows, expected_root)),
+            space,
+            bounds,
+        )
+    }
+
+    fn open_original_binding(
+        io: FreshUnixNativeSqliteIo<'namespace>,
+        image: Option<&JournalBackupImage>,
+        closed: Option<(
+            &sync_extend_core_model::ContentId,
+            &sync_extend_core_model::SnapshotId,
+        )>,
+        space: &SpaceId,
+        bounds: NodeInspectionBounds,
+    ) -> std::result::Result<Self, OriginalUnixRestoredJournalFailure<'namespace>> {
         let mut original = Self {
             journal: None,
             unprepared: None,
@@ -209,15 +241,17 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
         };
         let checked = (|| -> Result<()> {
             bounds.validate()?;
-            original.expected = JournalBackupImage::inspect_current_node_image_with_audit_rows(
-                image.bytes(),
-                image.digest(),
-                image.bytes().len(),
-                space,
-                bounds,
-                |_, rows, _| Ok(rows.to_vec()),
-            )?
-            .1;
+            if let Some(image) = image {
+                original.expected = JournalBackupImage::inspect_current_node_image_with_audit_rows(
+                    image.bytes(),
+                    image.digest(),
+                    image.bytes().len(),
+                    space,
+                    bounds,
+                    |_, rows, _| Ok(rows.to_vec()),
+                )?
+                .1;
+            }
             let io = original.io.as_ref().expect("actual original Unix IO owner");
             io.verify()?;
             let scope = io.single_open_scope()?;
@@ -294,6 +328,20 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
             bounded?;
             cleared?;
             connection.authorizer(Some(restricted))?;
+            if let Some((expected_rows, expected_root)) = closed {
+                let actual = original.audit_rows()?;
+                if local_commit::rows_digest(&actual) != *expected_rows {
+                    return Err(JournalError::Invariant(
+                        "reacquired Unix complete rows differ from closed generation",
+                    ));
+                }
+                original.expected = actual;
+                if original.observe_original_session()?.root != *expected_root {
+                    return Err(JournalError::Invariant(
+                        "reacquired Unix manifest frontier differs",
+                    ));
+                }
+            }
             original.verify()
         })();
         match checked {
@@ -355,6 +403,58 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
             rows: local_commit::rows_digest(&self.expected),
             local_turns: self.next_local_turn,
         })
+    }
+
+    pub fn current_original_manifest(&mut self) -> Result<sync_extend_core_model::Manifest> {
+        self.verify()?;
+        let call = OriginalInspectionCall::begin(
+            &mut self
+                .journal
+                .as_mut()
+                .expect("verified original Journal")
+                .connection,
+            self.bounds,
+        )?;
+        let current = JournalReadView {
+            connection: &call.connection,
+            dav_read_charge_cache: None,
+        }
+        .current(&self.space);
+        let manifest = call.finish(current)?.ok_or(JournalError::Invariant(
+            "actual Unix current manifest absent",
+        ))?;
+        self.verify()?;
+        Ok(manifest)
+    }
+
+    pub fn verify_original_archive_source(
+        &mut self,
+        source: &sync_extend_core_model::ContentId,
+        image: &sync_extend_core_model::ContentId,
+    ) -> Result<()> {
+        self.verify()?;
+        let call = OriginalInspectionCall::begin(
+            &mut self
+                .journal
+                .as_mut()
+                .expect("verified original Journal")
+                .connection,
+            self.bounds,
+        )?;
+        let inspected = crate::backup_image::native_history_persistence::inspect_source(
+            &call.connection,
+            source,
+        )
+        .and_then(|observed| {
+            if observed.source_image_digest() != image || observed.space() != &self.space {
+                return Err(JournalError::Invariant(
+                    "reacquired Unix inert original archive source differs",
+                ));
+            }
+            Ok(())
+        });
+        call.finish(inspected)?;
+        self.verify()
     }
 
     fn audit_rows(&mut self) -> Result<Vec<JournalStoredRow>> {

@@ -956,7 +956,7 @@ fn source_local_state<'a>(
     }
 }
 
-pub(super) fn inspect_source(
+pub(crate) fn inspect_source(
     connection: &Connection,
     expected: &ContentId,
 ) -> Result<PersistedNativeHistorySource> {
