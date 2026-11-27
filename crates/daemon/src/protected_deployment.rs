@@ -704,6 +704,20 @@ impl<'authority> DeploymentOwner<'authority> {
         }
     }
 
+    fn deadline_expired(&self) -> bool {
+        let now = Instant::now();
+        now.duration_since(self.born).as_secs() >= self.bounds.max_lifetime_secs
+            || now.duration_since(self.last_activity).as_secs() >= self.bounds.max_idle_secs
+    }
+
+    fn require_start_deadline(&mut self) -> std::result::Result<(), OwnerStartFailure> {
+        if !self.deadline_expired() { return Ok(()); }
+        // Ending a possibly acquired owner is mandatory; a deadline never
+        // abandons native resources or fabricates a reusable closed generation.
+        self.stop_runtime();
+        Err(OwnerStartFailure::OriginalAcquisition("owner_timeout"))
+    }
+
     fn start(&mut self) -> std::result::Result<(), OwnerStartFailure> {
         if self.state != OwnerState::Installed
             || self.run.is_some()
@@ -714,6 +728,9 @@ impl<'authority> DeploymentOwner<'authority> {
             return Err(OwnerStartFailure::BeforeAcquisition(
                 "runtime_state_refused",
             ));
+        }
+        if self.deadline_expired() {
+            return Err(OwnerStartFailure::BeforeAcquisition("owner_timeout"));
         }
         let next_generation = self
             .generation
@@ -807,6 +824,10 @@ impl<'authority> DeploymentOwner<'authority> {
                 }
             }
         }
+        if self.deadline_expired() {
+            for (id, original) in acquired { self.retain_failed_node(id, original); }
+            return Err(OwnerStartFailure::OriginalAcquisition("owner_timeout"));
+        }
         let run = match self.files.bind_fresh_runtime_nodes(self.provider, acquired) {
             Ok(run) => run,
             Err(original) => {
@@ -821,6 +842,7 @@ impl<'authority> DeploymentOwner<'authority> {
         };
         self.run = Some(run);
         self.generation = next_generation;
+        self.require_start_deadline()?;
         super::management::reset_lifecycle_state();
         if let Some(prepared) = prepared_management {
             match prepared.start_retaining(role_name) {
@@ -849,6 +871,7 @@ impl<'authority> DeploymentOwner<'authority> {
             self.state = OwnerState::Uncertain;
             return Err(OwnerStartFailure::OriginalAcquisition("polling_start_failed"));
         }
+        self.require_start_deadline()?;
         if let Some(prepared_gateway) = prepared_gateway {
             let run = self.run.as_ref().expect("same acquired native run retained");
             match prepared_gateway.start(run) {
@@ -883,6 +906,7 @@ impl<'authority> DeploymentOwner<'authority> {
                 "runtime_verification_failed",
             ));
         }
+        self.require_start_deadline()?;
         self.state = OwnerState::Running;
         super::management::resources_ready();
         Ok(())
@@ -1106,10 +1130,7 @@ impl<'authority> DeploymentOwner<'authority> {
             if super::management::control_stop_requested() {
                 return self.end("authenticated_management_stop", None, None, false);
             }
-            let now = Instant::now();
-            if now.duration_since(self.born).as_secs() >= self.bounds.max_lifetime_secs
-                || now.duration_since(self.last_activity).as_secs() >= self.bounds.max_idle_secs
-            {
+            if self.deadline_expired() {
                 return self.end("owner_timeout", None, None, false);
             }
             if self.input_frames >= self.bounds.max_input_frames
@@ -1139,6 +1160,9 @@ impl<'authority> DeploymentOwner<'authority> {
                                     return self.end("input_protocol_error", None, None, true)
                                 }
                             };
+                            if self.deadline_expired() {
+                                return self.end("owner_timeout", Some(request), Some("owner_timeout"), false);
+                            }
                             if binding_matches {
                                 if let Some(ended) = self.command(request, output) {
                                     return ended;
@@ -1175,9 +1199,18 @@ impl<'authority> DeploymentOwner<'authority> {
                 Ok(None) => (),
                 Err(_) => return self.end("input_read_failed", None, None, true),
             }
+            if self.deadline_expired() {
+                return self.end("owner_timeout", None, None, false);
+            }
             if let Some(run) = self.run.as_mut() {
                 if run.poll_configured_space().is_err() {
                     return self.end("runtime_failed", None, Some("polling_failed"), true);
+                }
+                let now = Instant::now();
+                if now.duration_since(self.born).as_secs() >= self.bounds.max_lifetime_secs
+                    || now.duration_since(self.last_activity).as_secs() >= self.bounds.max_idle_secs
+                {
+                    return self.end("owner_timeout", None, None, false);
                 }
                 if let Some(gateway) = self.gateway.as_mut() {
                     if gateway.poll(run).is_err() {
