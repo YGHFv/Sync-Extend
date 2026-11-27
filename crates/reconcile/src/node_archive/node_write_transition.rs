@@ -9131,7 +9131,7 @@ impl super::VerifiedNodeStateArchive {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn reacquire_closed_history_chain8_with_mutation_for_deployment(
+    pub(crate) fn reacquire_closed_history_chain8_for_deployment(
         &self,
         worktree: &std::path::Path,
         data: &std::path::Path,
@@ -9151,7 +9151,7 @@ impl super::VerifiedNodeStateArchive {
             chain_frames,
             bounds,
             ledger_bounds,
-            true,
+            false,
             None,
             Some(&configs),
         )?;

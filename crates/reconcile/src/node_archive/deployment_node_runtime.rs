@@ -318,7 +318,7 @@ impl VerifiedNodeStateArchive {
         }
         let session = if let Some(previous) = previous.filter(|previous| previous.history_chain) {
             match configs {
-                Some(configs) => self.reacquire_closed_history_chain8_with_mutation_for_deployment(
+                Some(configs) => self.reacquire_closed_history_chain8_for_deployment(
                     worktree,
                     data,
                     original_frames,
@@ -328,7 +328,7 @@ impl VerifiedNodeStateArchive {
                     ledger_bounds,
                     configs,
                 ),
-                None => self.reacquire_closed_history_chain8_with_mutation(
+                None => self.reacquire_closed_history_chain8(
                     worktree,
                     data,
                     original_frames,
