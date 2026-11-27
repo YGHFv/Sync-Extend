@@ -50,6 +50,8 @@ pub type Result<T> = std::result::Result<T, JournalError>;
 #[allow(unsafe_code)]
 mod raw_open;
 
+#[cfg(target_os = "linux")]
+pub use backup_image::{NativeHistoryPreparedProjectionEvidence, PreparedNativeHistoryProjectionImage};
 #[cfg(windows)]
 mod fresh_native_wal;
 #[cfg(windows)]

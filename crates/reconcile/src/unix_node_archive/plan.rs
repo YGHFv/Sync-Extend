@@ -6,7 +6,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 use sync_extend_core_model::{ContentId, EntryId, EntryKind, Manifest, PortableEntryMetadata};
-use sync_extend_journal::{JournalBackupImage, NodeInspectionBounds};
+use sync_extend_journal::{JournalBackupImage, NativeHistoryPreparedProjectionEvidence, NodeInspectionBounds};
 
 #[derive(Clone, Copy)]
 pub struct UnixNodeRestoreBounds {
@@ -79,6 +79,7 @@ pub struct PreparedUnixNodeRestore<'archive> {
     pub(super) directories: Vec<Slot>,
     pub(super) files: BTreeMap<Slot, PlannedFile>,
     pub(super) mapped: JournalBackupImage,
+    pub(super) native_projection: Option<NativeHistoryPreparedProjectionEvidence>,
     pub(super) manifest: Manifest,
     pub(super) bounds: UnixNodeRestoreBounds,
     pub(super) inspection: NodeInspectionBounds,
@@ -115,6 +116,30 @@ impl VerifiedNodeStateArchive {
         inspection: NodeInspectionBounds,
         bounds: UnixNodeRestoreBounds,
     ) -> Result<PreparedUnixNodeRestore<'archive>> {
+        self.prepare_unix_restore_inner(data, worktree, inspection, bounds, false)
+    }
+
+    /// Preserve every original native row and hold as inert history while
+    /// preparing the existing safe active projection. Logical preparation
+    /// records are not actual target creator or restart certificates.
+    pub fn prepare_unix_restore_with_native_history<'archive>(
+        &'archive self,
+        data: &Path,
+        worktree: &Path,
+        inspection: NodeInspectionBounds,
+        bounds: UnixNodeRestoreBounds,
+    ) -> Result<PreparedUnixNodeRestore<'archive>> {
+        self.prepare_unix_restore_inner(data, worktree, inspection, bounds, true)
+    }
+
+    fn prepare_unix_restore_inner<'archive>(
+        &'archive self,
+        data: &Path,
+        worktree: &Path,
+        inspection: NodeInspectionBounds,
+        bounds: UnixNodeRestoreBounds,
+        native_history: bool,
+    ) -> Result<PreparedUnixNodeRestore<'archive>> {
         bounds.validate()?;
         inspection.validate()?;
         root(data)?;
@@ -147,13 +172,18 @@ impl VerifiedNodeStateArchive {
             self.space(),
             inspection,
         )?;
-        let mapped = image.mapped_portable_worktree_image(
-            self.space(),
-            self.original_worktree(),
-            worktree,
-            inspection,
-            bounds.maximum_journal_bytes,
-        )?;
+        let (mapped, native_projection) = if native_history {
+            let (image, evidence) = image.prepare_native_history_projection(
+                self.space(), self.device(), self.original_worktree(), worktree,
+                inspection, bounds.maximum_journal_bytes,
+            )?.into_parts();
+            (image, Some(evidence))
+        } else {
+            (image.mapped_portable_worktree_image(
+                self.space(), self.original_worktree(), worktree, inspection,
+                bounds.maximum_journal_bytes,
+            )?, None)
+        };
         let manifest = self.current_node_manifest(inspection)?;
         let mut directories = BTreeSet::from([
             Slot::new(true, &["cas"]),
@@ -162,7 +192,9 @@ impl VerifiedNodeStateArchive {
             Slot::new(false, &[".sync-extend"]),
         ]);
         let mut files = BTreeMap::new();
-        let mut total = mapped.bytes().len() as u64;
+        // The live original database may grow after entering WAL mode. Reserve
+        // its entire admitted creator capacity alongside all sidecar bounds.
+        let mut total = bounds.maximum_journal_bytes as u64;
         for role in self.archive.roles() {
             let slot = match role {
                 ArchiveRole::Journal => continue,
@@ -303,6 +335,7 @@ impl VerifiedNodeStateArchive {
             directories,
             files,
             mapped,
+            native_projection,
             manifest,
             bounds,
             inspection,
@@ -312,6 +345,9 @@ impl VerifiedNodeStateArchive {
 }
 
 impl PreparedUnixNodeRestore<'_> {
+    pub fn native_projection_evidence(&self) -> Option<&NativeHistoryPreparedProjectionEvidence> {
+        self.native_projection.as_ref()
+    }
     pub fn required_bytes(&self) -> u64 {
         self.total_bytes
     }

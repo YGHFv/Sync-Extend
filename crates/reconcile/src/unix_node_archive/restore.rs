@@ -120,6 +120,7 @@ impl<'archive> PreparedUnixNodeRestore<'archive> {
             &serde_json::json!({"format":1,"platform":"unix_acquired_directory",
             "archive_digest":self.archive.digest(),"mapped_journal":self.mapped.digest(),"data":self.data,
             "worktree":self.worktree,"planned_files":self.files.len(),"planned_directories":self.directories.len(),
+            "prepared_native_projection":self.native_projection,
             "state":"original_acquisition_intent","restart_authority":false}),
         );
         let mut original = OriginalUnixRestoredNode {

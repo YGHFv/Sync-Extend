@@ -222,6 +222,10 @@ pub use native_history_source_proof::{
 };
 
 mod map_worktree;
+#[cfg(target_os = "linux")]
+mod native_restore_projection;
+#[cfg(target_os = "linux")]
+pub use native_restore_projection::{NativeHistoryPreparedProjectionEvidence, PreparedNativeHistoryProjectionImage};
 mod portable_scope;
 pub use portable_scope::{ArchivedReadLeaseHold, PortableNodeImageScope};
 
