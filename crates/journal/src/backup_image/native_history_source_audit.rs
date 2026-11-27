@@ -1528,7 +1528,7 @@ fn audit_inner(
     let transaction = Transaction::new_unchecked(&database, TransactionBehavior::Deferred)?;
     let before_changes = database.total_changes();
     let version: u32 = database.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let registry = NativeHistoryFamilyRegistry::for_schema(version)?;
+    let registry = NativeHistoryFamilyRegistry::for_database(&database, version)?;
     registry.verify_complete()?;
     let catalog_digest = catalog(&database, registry)?;
     let specs = registry.row_specs();
@@ -1951,7 +1951,7 @@ pub(super) fn migrate_schema74(database: &mut Connection) -> Result<()> {
             tx.pragma_query_value(Some("main"), "page_size", |r| crate::sql_u64(r, 0))?;
         let temp_size: u64 =
             tx.pragma_query_value(Some("temp"), "page_size", |r| crate::sql_u64(r, 0))?;
-        let registry = NativeHistoryFamilyRegistry::for_schema(73)?;
+        let registry = NativeHistoryFamilyRegistry::for_database(&tx, 73)?;
         catalog(&tx, registry)?;
         integrity(&tx)?;
         let before = read_complete_rows(&tx, registry, bounds)?;

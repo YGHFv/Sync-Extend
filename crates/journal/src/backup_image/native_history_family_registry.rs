@@ -72,6 +72,7 @@ pub struct NativeHistoryTableRule {
 #[derive(Clone, Copy)]
 pub struct NativeHistoryFamilyRegistry {
     version: u32,
+    lineage: super::schema_catalog::CatalogLineage,
 }
 impl NativeHistoryFamilyRegistry {
     /// Limits include the outer source and every occurrence of a nested source.
@@ -86,15 +87,68 @@ impl NativeHistoryFamilyRegistry {
     pub const FAMILY_COUNT: usize = 22;
     pub const SLICE_COUNT: usize = 27;
     pub fn schema69() -> Self {
-        Self { version: 69 }
+        Self {
+            version: 69,
+            lineage: super::schema_catalog::CatalogLineage::Canonical,
+        }
     }
     pub fn for_schema(version: u32) -> Result<Self> {
         match version {
-            69 | 70 | 71 | 72 | 73 | 74 => Ok(Self { version }),
+            69 | 70 | 71 | 72 | 73 | 74 => Ok(Self {
+                version,
+                lineage: super::schema_catalog::CatalogLineage::Canonical,
+            }),
             _ => Err(JournalError::Invariant(
                 "native history unregistered source schema",
             )),
         }
+    }
+    pub(crate) fn for_database(connection: &rusqlite::Connection, version: u32) -> Result<Self> {
+        let mut registry = Self::for_schema(version)?;
+        if version != 69 {
+            registry.lineage = super::schema_catalog::select_lineage(connection, version)?;
+        } else {
+            let expected = registry
+                .catalog()?
+                .into_iter()
+                .map(|entry| (entry.kind, entry.name, entry.table, entry.sql))
+                .collect::<Vec<_>>();
+            let actual: u32 =
+                connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            if actual != 69 || !super::schema_catalog::matches_definitions(connection, &expected)? {
+                return Err(JournalError::Invariant(
+                    "frozen schema69 complete catalog differs",
+                ));
+            }
+        }
+        Ok(registry)
+    }
+    pub(crate) fn from_digest_pair(
+        version: u32,
+        catalog: &sync_extend_core_model::ContentId,
+        digest: &sync_extend_core_model::ContentId,
+    ) -> Result<Self> {
+        let canonical = Self::for_schema(version)?;
+        let mut candidates = vec![canonical];
+        if matches!(version, 73 | 74) {
+            candidates.push(Self {
+                version,
+                lineage: super::schema_catalog::CatalogLineage::HistoricalCrlf,
+            });
+        }
+        for candidate in candidates {
+            let raw = crate::storage_inventory::reader::hash(&(
+                "sync-extend.native-history-source-catalog.v1",
+                version,
+                candidate.catalog()?,
+            ))?;
+            if &raw == catalog && &candidate.digest()? == digest {
+                return Ok(candidate);
+            }
+        }
+        Err(JournalError::Invariant(
+            "persisted native history exact catalog registry pair",
+        ))
     }
     pub fn source_schema(self) -> u32 {
         self.version
@@ -135,7 +189,21 @@ impl NativeHistoryFamilyRegistry {
                 })
                 .collect())
         } else {
-            Ok(current::catalog(self.version)?.to_vec())
+            if self.lineage == super::schema_catalog::CatalogLineage::Canonical {
+                Ok(current::catalog(self.version)?.to_vec())
+            } else {
+                Ok(
+                    super::schema_catalog::definitions_for(self.version, self.lineage)?
+                        .iter()
+                        .map(|(kind, name, table, sql)| current::CatalogDefinition {
+                            kind: kind.clone(),
+                            name: name.clone(),
+                            table: table.clone(),
+                            sql: sql.clone(),
+                        })
+                        .collect(),
+                )
+            }
         }
     }
     pub(crate) fn digest(self) -> Result<sync_extend_core_model::ContentId> {
@@ -160,7 +228,7 @@ impl NativeHistoryFamilyRegistry {
         }
     }
     pub(crate) fn known_table(name: &str) -> Result<&'static NativeHistoryTableRule> {
-        Self { version: 73 }.table(name)
+        Self::for_schema(74)?.table(name)
     }
     pub(crate) fn table(self, name: &str) -> Result<&'static NativeHistoryTableRule> {
         self.tables()

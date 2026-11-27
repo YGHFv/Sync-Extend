@@ -1013,7 +1013,11 @@ pub(super) fn inspect_source(
         .ok_or(JournalError::Invariant(
             "persisted native history source absent",
         ))?;
-    let registry = NativeHistoryFamilyRegistry::for_schema(header.1)?;
+    let registry = NativeHistoryFamilyRegistry::from_digest_pair(
+        header.1,
+        &header.5.parse::<ContentId>()?,
+        &header.7.parse::<ContentId>()?,
+    )?;
     if header.0 != FORMAT_VERSION {
         return Err(JournalError::Invariant(
             "persisted native history source format or schema",
@@ -1066,6 +1070,29 @@ pub(super) fn inspect_source(
             "persisted native history image digest differs",
         ));
     }
+    // The persisted digest pair selects only a known complete lineage. Verify
+    // that the original embedded bytes actually contain that exact catalog;
+    // neither a digest alias nor a caller-supplied version grants acceptance.
+    if header.3.get(..16) != Some(b"SQLite format 3\0") || header.3.get(18..20) != Some(&[1, 1]) {
+        return Err(JournalError::Invariant(
+            "persisted history standalone original image",
+        ));
+    }
+    let mut original = Connection::open_in_memory()?;
+    original.deserialize_read_exact(
+        rusqlite::MAIN_DB,
+        std::io::Cursor::new(&header.3),
+        header.3.len(),
+        true,
+    )?;
+    super::readonly::configure_inspection(&mut original, bounds)?;
+    let selected = NativeHistoryFamilyRegistry::for_database(&original, header.1)?;
+    if selected.digest()? != registry.digest()? {
+        return Err(JournalError::Invariant(
+            "persisted history original catalog lineage differs",
+        ));
+    }
+    drop(original);
     let space = header.2.parse::<SpaceId>()?;
     let row_specs = registry.row_specs();
     let tables = connection

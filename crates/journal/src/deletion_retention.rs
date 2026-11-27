@@ -110,8 +110,9 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<()> {
     if !(66..=74).contains(&version) {
         return Err(invalid("retention exact registered schema version"));
     }
-    let expected = crate::backup_image::retention_catalog(version)?;
-    if objects(connection)? != expected {
+    let expected = crate::backup_image::retention_catalog_variants(version)?;
+    let observed = objects(connection)?;
+    if !expected.iter().any(|candidate| *candidate == observed) {
         return Err(invalid("retention exact schema/immutable guards differ"));
     }
     Ok(())

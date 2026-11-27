@@ -18,15 +18,90 @@ fn definitions(database: &Connection, max_count: usize) -> Result<Vec<Definition
     Ok(values.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CatalogLineage {
+    Canonical,
+    HistoricalCrlf,
+}
+
 pub(super) fn validate_schema(database: &Connection, version: u32) -> Result<()> {
-    let expected = compiled_definitions(version)?;
-    let observed = definitions(database, expected.len() + 1)?;
-    if observed != expected {
-        return Err(JournalError::Invariant(
-            "backup complete Journal schema differs",
-        ));
+    select_lineage(database, version).map(|_| ())
+}
+
+/// Select one whole known catalog, never individual object aliases. Comparison
+/// borrows observed text and bounds it against fixed expected bytes before copy.
+pub(super) fn select_lineage(database: &Connection, version: u32) -> Result<CatalogLineage> {
+    let actual: u32 = database.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if actual != version {
+        return Err(JournalError::Invariant("backup exact catalog version"));
     }
-    Ok(())
+    if matches_definitions(database, compiled_definitions(version)?)? {
+        return Ok(CatalogLineage::Canonical);
+    }
+    if matches!(version, 73 | 74)
+        && matches_definitions(
+            database,
+            definitions_for(version, CatalogLineage::HistoricalCrlf)?,
+        )?
+    {
+        return Ok(CatalogLineage::HistoricalCrlf);
+    }
+    Err(JournalError::Invariant(
+        "backup complete Journal schema differs",
+    ))
+}
+
+pub(super) fn matches_definitions(database: &Connection, expected: &[Definition]) -> Result<bool> {
+    use rusqlite::types::ValueRef;
+    let mut query = database.prepare(
+        "SELECT type,name,tbl_name,sql FROM main.sqlite_schema ORDER BY type,name LIMIT ?1",
+    )?;
+    let mut rows = query.query([expected.len() as i64 + 1])?;
+    for entry in expected {
+        let Some(row) = rows.next()? else {
+            return Ok(false);
+        };
+        for (index, text) in [(0, &entry.0), (1, &entry.1), (2, &entry.2)] {
+            if !matches!(row.get_ref(index)?,ValueRef::Text(raw) if raw==text.as_bytes()) {
+                return Ok(false);
+            }
+        }
+        if !match (row.get_ref(3)?, entry.3.as_deref()) {
+            (ValueRef::Null, None) => true,
+            (ValueRef::Text(raw), Some(text)) => raw == text.as_bytes(),
+            _ => false,
+        } {
+            return Ok(false);
+        }
+    }
+    Ok(rows.next()?.is_none())
+}
+
+pub(super) fn definitions_for(
+    version: u32,
+    lineage: CatalogLineage,
+) -> Result<&'static [Definition]> {
+    if lineage == CatalogLineage::Canonical {
+        return compiled_definitions(version);
+    }
+    static V73: OnceLock<Vec<Definition>> = OnceLock::new();
+    static V74: OnceLock<Vec<Definition>> = OnceLock::new();
+    let cached = match version {
+        73 => &V73,
+        74 => &V74,
+        _ => {
+            return Err(JournalError::Invariant(
+                "unregistered historical SQL lineage",
+            ));
+        }
+    };
+    if cached.get().is_none() {
+        let _ = cached.set(build_definitions(version, Some(version))?);
+    }
+    cached
+        .get()
+        .map(Vec::as_slice)
+        .ok_or(JournalError::Invariant("historical SQL catalog absent"))
 }
 
 pub(super) fn compiled_definitions(version: u32) -> Result<&'static [Definition]> {
@@ -54,6 +129,10 @@ pub(super) fn compiled_definitions(version: u32) -> Result<&'static [Definition]
 }
 
 fn build_compiled_definitions(version: u32) -> Result<Vec<Definition>> {
+    build_definitions(version, None)
+}
+
+fn build_definitions(version: u32, historical_crlf: Option<u32>) -> Result<Vec<Definition>> {
     let reference = Connection::open_in_memory()?;
     reference.execute_batch(SCHEMA_SCRIPTS[0])?;
     let count = usize::try_from(version)
@@ -63,8 +142,13 @@ fn build_compiled_definitions(version: u32) -> Result<Vec<Definition>> {
             "backup schema catalog version absent",
         ));
     }
-    for script in &SCHEMA_SCRIPTS[1..count] {
-        reference.execute_batch(script)?;
+    for (index, script) in SCHEMA_SCRIPTS[1..count].iter().enumerate() {
+        if historical_crlf == Some(index as u32 + 2) {
+            // Trusted fixed historical input only. Never transform observed SQL.
+            reference.execute_batch(&script.replace("\n", "\r\n"))?;
+        } else {
+            reference.execute_batch(script)?;
+        }
     }
     let actual_version: u32 =
         reference.pragma_query_value(None, "user_version", |row| row.get(0))?;

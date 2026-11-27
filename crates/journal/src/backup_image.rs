@@ -230,11 +230,15 @@ pub use detached_history::{
     OriginalNodeHistoryMappingEvidence, RetainedOriginalNodeHistory,
 };
 
-// Finite exact catalog selected by the retention reader, including frozen archives.
-pub(crate) fn retention_catalog(version: u32) -> Result<Vec<(String, String, Option<String>)>> {
-    Ok(schema_catalog::compiled_definitions(version)?.iter()
-        .filter(|(_, name, table, _)| name.starts_with("deletion_retention_") || table.starts_with("deletion_retention_"))
-        .map(|(kind, name, _, sql)| (kind.clone(), name.clone(), sql.clone())).collect())
+// Component guards accept only a complete matching component from a known
+// catalog. Full original/current catalog admission still excludes mixed lineages.
+pub(crate) fn retention_catalog_variants(version: u32) -> Result<Vec<Vec<(String,String,Option<String>)>>> {
+    use schema_catalog::CatalogLineage;
+    let mut candidates=vec![CatalogLineage::Canonical];
+    if version==74 { candidates.push(CatalogLineage::HistoricalCrlf); }
+    candidates.into_iter().map(|lineage| Ok(schema_catalog::definitions_for(version,lineage)?.iter()
+        .filter(|(_,name,table,_)|name.starts_with("deletion_retention_") || table.starts_with("deletion_retention_"))
+        .map(|(kind,name,_,sql)|(kind.clone(),name.clone(),sql.clone())).collect())).collect()
 }
 
 pub(crate) fn validate_current_catalog(connection: &Connection) -> Result<()> {
