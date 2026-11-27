@@ -12,9 +12,8 @@ use crate::{
     Result,
 };
 use rusqlite::{
-    params,
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params,
     types::{Value, ValueRef},
-    Connection, OptionalExtension, Transaction, TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -768,7 +767,9 @@ pub(super) fn audit_nested_writers(
         let events = load_events(connection, &id)?;
         let observed = verify_event_chain(&id, &stored, source, &events)?;
         if observed.space() != space || observed.device() != device {
-            return Err(JournalError::Invariant("nested native history writer identity differs"));
+            return Err(JournalError::Invariant(
+                "nested native history writer identity differs",
+            ));
         }
     }
     Ok(())

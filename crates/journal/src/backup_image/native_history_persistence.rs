@@ -13,7 +13,7 @@ use crate::{
     Journal, JournalCapacityLimits, JournalError, JournalStorageColumn, JournalStorageColumnValue,
     JournalStoredRow, NodeInspectionBounds, Result, TreeRestoreInventoryLimits,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -29,6 +29,10 @@ pub use fresh_writer::{
 
 const FORMAT_VERSION: u32 = 1;
 const MAX_SOURCE_ROWS: usize = 100_000;
+
+pub(crate) fn migrate_schema73(connection: &mut Connection) -> Result<()> {
+    super::native_history_source_audit::migrate_schema73(connection)
+}
 
 /// The complete native-history persistence inventory. Storage-role capacity
 /// audits may accept these rows only when the exact fresh-writer/source
@@ -327,7 +331,6 @@ fn rows_digest(
             .collect::<Vec<_>>(),
     ))
 }
-
 
 impl Journal {
     /// Persist one sealed audit in a single transaction. Re-persisting the same
@@ -696,7 +699,10 @@ fn reference_source_table(reference: &NativeHistoryCasReference) -> &str {
     reference.source_table()
 }
 
-fn key_ordinals(registry: NativeHistoryFamilyRegistry, rows: &[JournalStoredRow]) -> Result<BTreeMap<NativeHistoryRowKey, usize>> {
+fn key_ordinals(
+    registry: NativeHistoryFamilyRegistry,
+    rows: &[JournalStoredRow],
+) -> Result<BTreeMap<NativeHistoryRowKey, usize>> {
     let mut result = BTreeMap::new();
     for (ordinal, row) in rows.iter().enumerate() {
         let key = NativeHistoryRowKey {
@@ -953,10 +959,15 @@ pub(super) fn inspect_source(
     // recursive source auditor also reserves the complete sibling aggregate.
     let image_length: u64 = connection.query_row(
         "SELECT length(image) FROM native_history_sources WHERE source_digest=?1",
-        [expected.as_str()], |row| crate::sql_u64(row, 0),
+        [expected.as_str()],
+        |row| crate::sql_u64(row, 0),
     )?;
-    if !(512..=NativeHistoryFamilyRegistry::MAX_AGGREGATE_IMAGE_BYTES as u64).contains(&image_length) {
-        return Err(JournalError::Invariant("persisted native history image length bound"));
+    if !(512..=NativeHistoryFamilyRegistry::MAX_AGGREGATE_IMAGE_BYTES as u64)
+        .contains(&image_length)
+    {
+        return Err(JournalError::Invariant(
+            "persisted native history image length bound",
+        ));
     }
     let header = connection
         .query_row(
@@ -997,7 +1008,7 @@ pub(super) fn inspect_source(
         .ok_or(JournalError::Invariant(
             "persisted native history source absent",
         ))?;
-    let registry=NativeHistoryFamilyRegistry::for_schema(header.1)?;
+    let registry = NativeHistoryFamilyRegistry::for_schema(header.1)?;
     if header.0 != FORMAT_VERSION {
         return Err(JournalError::Invariant(
             "persisted native history source format or schema",

@@ -4,7 +4,7 @@ use sync_extend_core_model::*;
 
 const MAX_OPERATION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_OPS: u64 = 10_000;
-const SCHEMA_VERSION: u32 = 72;
+const SCHEMA_VERSION: u32 = 73;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -1008,6 +1008,14 @@ impl Journal {
         let statement_capacity = 256;
         connection.set_prepared_statement_cache_capacity(statement_capacity);
         connection.busy_timeout(Duration::from_secs(5))?;
+        // Reject an invalid exact predecessor before changing persistent WAL
+        // mode, so a refused schema-72 migration leaves original bytes intact.
+        let opening_version: u32 =
+            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if opening_version == 72 {
+            connection.pragma_update(None, "foreign_keys", true)?;
+            backup_image::native_history_persistence::migrate_schema73(&mut connection)?;
+        }
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", true)?;
@@ -1389,6 +1397,9 @@ impl Journal {
             let tx = connection.transaction()?;
             tx.execute_batch(include_str!("migration-072.sql"))?;
             tx.commit()?;
+        }
+        if version < 73 {
+            backup_image::native_history_persistence::migrate_schema73(&mut connection)?;
         }
         backup_image::native_history_persistence::schema::validate(&connection)?;
         deletion_retention::validate_schema(&connection)?;
@@ -3617,8 +3628,8 @@ pub use backup_image::{
 pub use backup_image::native_history_persistence::{
     NativeHistoryAuthorityObservation, NativeHistoryFreshWriter,
     NativeHistoryFreshWriterAdmissionRequest, NativeHistoryFreshWriterAuthorityObservation,
-    NativeHistoryFreshWriterInspection, NativeHistoryFreshWriterState,
-    NativeHistorySourceBinding, PersistedNativeHistorySource,
+    NativeHistoryFreshWriterInspection, NativeHistoryFreshWriterState, NativeHistorySourceBinding,
+    PersistedNativeHistorySource,
 };
 pub use recovered_history_tables::{
     RecoveredArchiveTableSummaries, RecoveredHistoryTable, RecoveredHistoryTables,

@@ -91,43 +91,76 @@ impl NativeHistoryFamilyRegistry {
     pub fn for_schema(version: u32) -> Result<Self> {
         match version {
             69 | 70 | 71 | 72 | 73 => Ok(Self { version }),
-            _ => Err(JournalError::Invariant("native history unregistered source schema")),
+            _ => Err(JournalError::Invariant(
+                "native history unregistered source schema",
+            )),
         }
     }
-    pub fn source_schema(self) -> u32 { self.version }
-    pub fn table_count(self) -> usize { if self.version == 69 { 141 } else { 151 } }
+    pub fn source_schema(self) -> u32 {
+        self.version
+    }
+    pub fn table_count(self) -> usize {
+        if self.version == 69 { 141 } else { 151 }
+    }
     pub fn tables(self) -> &'static [NativeHistoryTableRule] {
-        if self.version == 69 { TABLE_RULES } else { current::tables() }
+        if self.version == 69 {
+            TABLE_RULES
+        } else {
+            current::tables()
+        }
     }
     pub fn families(self) -> &'static [&'static str] {
-        if self.version == 69 { FAMILIES } else { current::families() }
+        if self.version == 69 {
+            FAMILIES
+        } else {
+            current::families()
+        }
     }
     pub fn slices(self) -> &'static [NativeHistorySliceSpec] {
-        if self.version == 69 { SLICES } else { current::slices() }
+        if self.version == 69 {
+            SLICES
+        } else {
+            current::slices()
+        }
     }
     pub fn catalog(self) -> Result<Vec<current::CatalogDefinition>> {
         if self.version == 69 {
-            Ok(CATALOG.iter().map(|d| current::CatalogDefinition {
-                kind:d.kind.into(),name:d.name.into(),table:d.table.into(),sql:d.sql.map(str::to_owned)
-            }).collect())
+            Ok(CATALOG
+                .iter()
+                .map(|d| current::CatalogDefinition {
+                    kind: d.kind.into(),
+                    name: d.name.into(),
+                    table: d.table.into(),
+                    sql: d.sql.map(str::to_owned),
+                })
+                .collect())
         } else {
             Ok(current::catalog(self.version)?.to_vec())
         }
     }
     pub(crate) fn digest(self) -> Result<sync_extend_core_model::ContentId> {
-        let catalog=self.catalog()?;
+        let catalog = self.catalog()?;
         if self.version == 69 {
             crate::storage_inventory::reader::hash(&(
                 "sync-extend.native-history-compiled-schema69-registry.v1",
-                self.families(),self.slices(),self.tables(),catalog))
+                self.families(),
+                self.slices(),
+                self.tables(),
+                catalog,
+            ))
         } else {
             crate::storage_inventory::reader::hash(&(
-                "sync-extend.native-history-compiled-versioned-registry.v1",self.version,
-                self.families(),self.slices(),self.tables(),catalog))
+                "sync-extend.native-history-compiled-versioned-registry.v1",
+                self.version,
+                self.families(),
+                self.slices(),
+                self.tables(),
+                catalog,
+            ))
         }
     }
     pub(crate) fn known_table(name: &str) -> Result<&'static NativeHistoryTableRule> {
-        Self {version:73}.table(name)
+        Self { version: 73 }.table(name)
     }
     pub(crate) fn table(self, name: &str) -> Result<&'static NativeHistoryTableRule> {
         self.tables()
@@ -168,14 +201,16 @@ impl NativeHistoryFamilyRegistry {
             slice_26::TABLES,
         ]
         .concat();
-        if self.version != 69 { specs.extend_from_slice(super::native_history_persistence::schema::TABLES); }
+        if self.version != 69 {
+            specs.extend_from_slice(super::native_history_persistence::schema::TABLES);
+        }
         specs
     }
     pub(crate) fn verify_complete(self) -> Result<()> {
         let specs = self.row_specs();
-        let tables=self.tables();
-        let slices=self.slices();
-        let catalog=self.catalog()?;
+        let tables = self.tables();
+        let slices = self.slices();
+        let catalog = self.catalog()?;
         let names: BTreeSet<_> = specs.iter().map(|spec| spec.name).collect();
         let rules: BTreeSet<_> = tables.iter().map(|rule| rule.table).collect();
         let families: BTreeSet<_> = tables.iter().map(|rule| rule.family).collect();
@@ -189,13 +224,34 @@ impl NativeHistoryFamilyRegistry {
             || names != rules
             || families.len() != self.families().len()
             || families != self.families().iter().copied().collect()
-            || slices.len() != if self.version == 69 { Self::SLICE_COUNT } else { 28 }
+            || slices.len()
+                != if self.version == 69 {
+                    Self::SLICE_COUNT
+                } else {
+                    28
+                }
             || sliced.len() != self.table_count()
             || sliced.iter().copied().collect::<BTreeSet<_>>() != names
-            || catalog.len() != self.table_count() + if self.version == 69 { Self::INDEX_COUNT + Self::TRIGGER_COUNT } else { 191 + 869 }
+            || catalog.len()
+                != self.table_count()
+                    + if self.version == 69 {
+                        Self::INDEX_COUNT + Self::TRIGGER_COUNT
+                    } else {
+                        191 + 869
+                    }
             || catalog.iter().filter(|item| item.kind == "table").count() != self.table_count()
-            || catalog.iter().filter(|item| item.kind == "index").count() != if self.version == 69 { Self::INDEX_COUNT } else { 191 }
-            || catalog.iter().filter(|item| item.kind == "trigger").count() != if self.version == 69 { Self::TRIGGER_COUNT } else { 869 }
+            || catalog.iter().filter(|item| item.kind == "index").count()
+                != if self.version == 69 {
+                    Self::INDEX_COUNT
+                } else {
+                    191
+                }
+            || catalog.iter().filter(|item| item.kind == "trigger").count()
+                != if self.version == 69 {
+                    Self::TRIGGER_COUNT
+                } else {
+                    869
+                }
         {
             return Err(JournalError::Invariant(
                 "native history compiled registry incomplete",
@@ -218,7 +274,9 @@ impl NativeHistoryFamilyRegistry {
                     ColumnKind::Text(n) => NativeHistoryColumnKind::HexText(n),
                     ColumnKind::Utf8 { min, max } => NativeHistoryColumnKind::Utf8 { min, max },
                     ColumnKind::Integer => NativeHistoryColumnKind::NonnegativeInteger,
-                    ColumnKind::Blob { min, max } => NativeHistoryColumnKind::BoundedBlob { min, max },
+                    ColumnKind::Blob { min, max } => {
+                        NativeHistoryColumnKind::BoundedBlob { min, max }
+                    }
                 };
                 if physical.name != public.name
                     || kind != public.kind

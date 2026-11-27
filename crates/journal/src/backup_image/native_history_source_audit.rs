@@ -42,8 +42,7 @@ fn invalid(message: &'static str) -> JournalError {
 
 fn key(row: &JournalStoredRow) -> Result<NativeHistoryRowKey> {
     Ok(NativeHistoryRowKey {
-        table: NativeHistoryFamilyRegistry::known_table(row.table())?
-            .table,
+        table: NativeHistoryFamilyRegistry::known_table(row.table())?.table,
         primary_key: row.primary_key().to_vec(),
     })
 }
@@ -93,7 +92,9 @@ fn required_state<'a>(rows: &'a [JournalStoredRow], name: &str) -> Result<&'a st
 fn catalog(connection: &Connection, registry: NativeHistoryFamilyRegistry) -> Result<ContentId> {
     let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version != registry.source_schema() {
-        return Err(invalid("native history requires exact registered source schema"));
+        return Err(invalid(
+            "native history requires exact registered source schema",
+        ));
     }
     let expected_catalog = registry.catalog()?;
     let mut query = connection.prepare(
@@ -106,7 +107,11 @@ fn catalog(connection: &Connection, registry: NativeHistoryFamilyRegistry) -> Re
             .ok_or(invalid("native history original catalog object absent"))?;
         // Borrow original SQLite text. An oversized malicious catalog value is
         // rejected against the compiled length before copying into Rust.
-        for (index, expected) in [(0, expected.kind.as_str()), (1, expected.name.as_str()), (2, expected.table.as_str())] {
+        for (index, expected) in [
+            (0, expected.kind.as_str()),
+            (1, expected.name.as_str()),
+            (2, expected.table.as_str()),
+        ] {
             match row.get_ref(index)? {
                 rusqlite::types::ValueRef::Text(value) if value == expected.as_bytes() => (),
                 _ => return Err(invalid("native history original catalog identity differs")),
@@ -830,11 +835,22 @@ fn references(
             };
             let content_id = text(row, "content_id")?.parse::<ContentId>()?;
             let length = integer(row, "length")?;
-            remaining = remaining.checked_sub(1).ok_or(invalid("native history nested reference count"))?;
-            if kind.is_cas_object() { insert_length(&mut lengths, content_id.clone(), length)?; }
-            result.entry(key(row)?).or_default().push(NativeHistoryCasReference {
-                kind, content_id, length, source: key(row)?, source_column: "content_id".into(),
-            });
+            remaining = remaining
+                .checked_sub(1)
+                .ok_or(invalid("native history nested reference count"))?;
+            if kind.is_cas_object() {
+                insert_length(&mut lengths, content_id.clone(), length)?;
+            }
+            result
+                .entry(key(row)?)
+                .or_default()
+                .push(NativeHistoryCasReference {
+                    kind,
+                    content_id,
+                    length,
+                    source: key(row)?,
+                    source_column: "content_id".into(),
+                });
         }
         let mut embedded = rule.audited_embedded_columns.to_vec();
         if row.table() == "local_state" {
@@ -851,6 +867,13 @@ fn references(
             let original = match column(row, name)? {
                 JournalStorageColumnValue::Null => continue,
                 JournalStorageColumnValue::Text(value) => value,
+                // Frozen schema-69 labels included integer native step enums
+                // among embedded fields. Their exact typed family validator
+                // already checks the phase/owner relationship; they encode no
+                // JSON or CAS reference. Preserve the frozen registry digest.
+                JournalStorageColumnValue::Integer(_)
+                    if rule.columns.iter().any(|column| column.name == name
+                        && column.kind == super::native_history_family_registry::NativeHistoryColumnKind::NonnegativeInteger) => continue,
                 _ => {
                     return Err(invalid(
                         "native history embedded original JSON type differs",
@@ -1141,11 +1164,7 @@ fn projection(
                 operation_devices.insert(text(row, "op_id")?.to_owned(), key);
             }
             "received" | "pending" => (),
-            _ => {
-                return Err(invalid(
-                    "native history original operation state differs",
-                ))
-            }
+            _ => return Err(invalid("native history original operation state differs")),
         }
     }
     let mut cursors = BTreeMap::new();
@@ -1276,18 +1295,79 @@ pub(super) fn audit(
     roots: &[NativeHistoryRootMapping],
     bounds: NodeInspectionBounds,
 ) -> Result<AuditedNativeHistorySource> {
-    let mut budget = NestedBudget { sources: 0, bytes: 0 };
+    bounds.validate()?;
+    let mut budget = NestedBudget {
+        sources: 0,
+        bytes: 0,
+        rows: 0,
+        logical_bytes: 0,
+        max_rows: bounds
+            .capacity
+            .max_rows
+            .min(bounds.capacity.inventory.max_rows as u64),
+        max_logical_bytes: bounds
+            .capacity
+            .max_logical_bytes
+            .min(bounds.capacity.inventory.max_logical_bytes),
+        deadline: std::time::Instant::now() + bounds.max_query_time,
+        vm_remaining: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            bounds.max_vm_instructions,
+        )),
+    };
     budget.reserve(1, image.len())?;
-    audit_inner(image, expected_digest, max_image_bytes, space, roots, bounds, 1, &mut budget)
+    audit_inner(
+        image,
+        expected_digest,
+        max_image_bytes,
+        space,
+        roots,
+        bounds,
+        1,
+        &mut budget,
+    )
 }
 
-struct NestedBudget { sources: usize, bytes: usize }
+struct NestedBudget {
+    sources: usize,
+    bytes: usize,
+    rows: u64,
+    logical_bytes: u64,
+    max_rows: u64,
+    max_logical_bytes: u64,
+    deadline: std::time::Instant,
+    vm_remaining: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
 impl NestedBudget {
+    fn check_time(&self) -> Result<()> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(invalid("native history aggregate inspection deadline"));
+        }
+        Ok(())
+    }
+    fn reserve_rows(&mut self, rows: u64, bytes: u64) -> Result<()> {
+        self.check_time()?;
+        self.rows = self
+            .rows
+            .checked_add(rows)
+            .filter(|n| *n <= self.max_rows)
+            .ok_or(invalid("native history aggregate inspected rows"))?;
+        self.logical_bytes = self
+            .logical_bytes
+            .checked_add(bytes)
+            .filter(|n| *n <= self.max_logical_bytes)
+            .ok_or(invalid("native history aggregate inspected logical bytes"))?;
+        Ok(())
+    }
     fn reserve(&mut self, count: usize, bytes: usize) -> Result<()> {
-        self.sources = self.sources.checked_add(count)
+        self.check_time()?;
+        self.sources = self
+            .sources
+            .checked_add(count)
             .filter(|n| *n <= NativeHistoryFamilyRegistry::MAX_NESTED_SOURCE_COUNT)
             .ok_or(invalid("native history aggregate nested source count"))?;
-        self.bytes = self.bytes.checked_add(bytes)
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
             .filter(|n| *n <= NativeHistoryFamilyRegistry::MAX_AGGREGATE_IMAGE_BYTES)
             .ok_or(invalid("native history aggregate nested image bytes"))?;
         Ok(())
@@ -1297,62 +1377,108 @@ impl NestedBudget {
 fn nested_sources(
     database: &Connection,
     registry: NativeHistoryFamilyRegistry,
-    space: &SpaceId,
+    space: Option<&SpaceId>,
     depth: usize,
     budget: &mut NestedBudget,
 ) -> Result<()> {
-    if registry.source_schema() == 69 { return Ok(()); }
+    if registry.source_schema() == 69 {
+        return Ok(());
+    }
     // Inspect only keys and lengths first. Reserve every sibling before any
     // embedded image is copied or deserialized. Recursion has a hard depth cap.
     let mut query = database.prepare(
         "SELECT source_digest,length(image) FROM native_history_sources ORDER BY source_digest LIMIT ?1",
     )?;
-    let headers = query.query_map([NativeHistoryFamilyRegistry::MAX_NESTED_SOURCE_COUNT as i64 + 1],
-        |row| Ok((row.get::<_, String>(0)?, crate::sql_u64(row, 1)?)))?
+    let headers = query
+        .query_map(
+            [NativeHistoryFamilyRegistry::MAX_NESTED_SOURCE_COUNT as i64 + 1],
+            |row| Ok((row.get::<_, String>(0)?, crate::sql_u64(row, 1)?)),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if headers.is_empty() { return Ok(()); }
+    if headers.is_empty() {
+        return Ok(());
+    }
     if depth >= NativeHistoryFamilyRegistry::MAX_NESTING_DEPTH {
         return Err(invalid("native history nested source depth"));
     }
     let total = headers.iter().try_fold(0usize, |total, (_, length)| {
-        let length = usize::try_from(*length).map_err(|_| invalid("native history nested length overflow"))?;
+        let length = usize::try_from(*length)
+            .map_err(|_| invalid("native history nested length overflow"))?;
         if !(512..=NativeHistoryFamilyRegistry::MAX_AGGREGATE_IMAGE_BYTES).contains(&length) {
             return Err(invalid("native history nested image length"));
         }
-        total.checked_add(length).ok_or(invalid("native history nested byte overflow"))
+        total
+            .checked_add(length)
+            .ok_or(invalid("native history nested byte overflow"))
     })?;
     budget.reserve(headers.len(), total)?;
-    let device: DeviceId = database.query_row(
-        "SELECT value FROM local_state WHERE key='device_id'", [], |row| row.get::<_, String>(0),
-    )?.parse()?;
     for (digest, _) in headers {
         let digest = digest.parse::<ContentId>()?;
         let stored = super::native_history_persistence::inspect_source(database, &digest)?;
-        if stored.space() != space { return Err(invalid("native history nested source space")); }
-        let roots = stored.projection().root_columns().iter().map(|mapping|
-            NativeHistoryRootMapping::worktree(mapping.original().into(), mapping.projected().into()))
+        if space.is_some_and(|space| stored.space() != space) {
+            return Err(invalid("native history nested source space"));
+        }
+        let device: DeviceId = if space.is_some() {
+            database
+                .query_row(
+                    "SELECT value FROM local_state WHERE key='device_id'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )?
+                .parse()?
+        } else {
+            required_state(stored.rows(), "device_id")?.parse()?
+        };
+        let roots = stored
+            .projection()
+            .root_columns()
+            .iter()
+            .map(|mapping| {
+                NativeHistoryRootMapping::worktree(
+                    mapping.original().into(),
+                    mapping.projected().into(),
+                )
+            })
             .collect::<Vec<_>>();
         let audited = audit_inner(
-            stored.source_image().to_vec(), stored.source_image_digest().as_str(),
-            NativeHistoryFamilyRegistry::MAX_AGGREGATE_IMAGE_BYTES, space, &roots,
-            stored.inspection_bounds(), depth + 1, budget,
+            stored.source_image().to_vec(),
+            stored.source_image_digest().as_str(),
+            NativeHistoryFamilyRegistry::MAX_AGGREGATE_IMAGE_BYTES,
+            stored.space(),
+            &roots,
+            stored.inspection_bounds(),
+            depth + 1,
+            budget,
         )?;
         if audited.parts.source_digest != *stored.source_digest()
             || audited.parts.catalog_digest != *stored.source_catalog_digest()
             || audited.parts.rows_digest != *stored.source_rows_digest()
             || audited.parts.registry_digest != *stored.registry_digest()
-        { return Err(invalid("native history nested original proof differs")); }
-        super::native_history_persistence::audit_nested_writers(database, &stored, space, &device)?;
+        {
+            return Err(invalid("native history nested original proof differs"));
+        }
+        super::native_history_persistence::audit_nested_writers(
+            database,
+            &stored,
+            stored.space(),
+            &device,
+        )?;
     }
     Ok(())
 }
 
 fn audit_inner(
-    image: Vec<u8>, expected_digest: &str, max_image_bytes: usize,
-    space: &SpaceId, roots: &[NativeHistoryRootMapping], bounds: NodeInspectionBounds,
-    depth: usize, budget: &mut NestedBudget,
+    image: Vec<u8>,
+    expected_digest: &str,
+    max_image_bytes: usize,
+    space: &SpaceId,
+    roots: &[NativeHistoryRootMapping],
+    bounds: NodeInspectionBounds,
+    depth: usize,
+    budget: &mut NestedBudget,
 ) -> Result<AuditedNativeHistorySource> {
     bounds.validate()?;
+    budget.check_time()?;
     super::limit(max_image_bytes)?;
     if image.len() < super::MIN_IMAGE_BYTES
         || image.len() > max_image_bytes
@@ -1374,11 +1500,35 @@ fn audit_inner(
     let mut database = Connection::open_in_memory()?;
     database.deserialize_read_exact(MAIN_DB, std::io::Cursor::new(&image), image.len(), true)?;
     configure_inspection(&mut database, bounds)?;
+    // All recursive connections consume the outer caller's VM/deadline budget.
+    // Keep each archived bound for its digest, and enforce its own smaller limit
+    // in addition to the shared total instead of granting a fresh budget.
+    let global_vm = budget.vm_remaining.clone();
+    let deadline = budget
+        .deadline
+        .min(std::time::Instant::now() + bounds.max_query_time);
+    let mut local_vm = bounds.max_vm_instructions;
+    database.progress_handler(
+        1_000,
+        Some(move || {
+            if std::time::Instant::now() >= deadline || local_vm < 1_000 {
+                return true;
+            }
+            local_vm -= 1_000;
+            global_vm
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |remaining| remaining.checked_sub(1_000),
+                )
+                .is_err()
+        }),
+    )?;
     database.busy_timeout(std::time::Duration::ZERO)?;
     let transaction = Transaction::new_unchecked(&database, TransactionBehavior::Deferred)?;
     let before_changes = database.total_changes();
-    let version:u32=database.pragma_query_value(None,"user_version",|row|row.get(0))?;
-    let registry=NativeHistoryFamilyRegistry::for_schema(version)?;
+    let version: u32 = database.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let registry = NativeHistoryFamilyRegistry::for_schema(version)?;
     registry.verify_complete()?;
     let catalog_digest = catalog(&database, registry)?;
     let specs = registry.row_specs();
@@ -1390,7 +1540,14 @@ fn audit_inner(
         bounds.capacity.inventory.max_rows,
         bounds.capacity.inventory.max_logical_bytes,
     )?;
-    nested_sources(&database, registry, space, depth, budget)?;
+    let (counted_rows, counted_bytes) =
+        table_counts
+            .iter()
+            .try_fold((0u64, 0u64), |(rows, bytes), table| {
+                Ok::<_, JournalError>((add(rows, table.rows)?, add(bytes, table.logical_bytes)?))
+            })?;
+    budget.reserve_rows(counted_rows, counted_bytes)?;
+    nested_sources(&database, registry, Some(space), depth, budget)?;
     let mut rows = Vec::new();
     let mut tables = Vec::new();
     let mut total_bytes = 0;
@@ -1465,6 +1622,7 @@ fn audit_inner(
         ));
     }
     transaction.rollback()?;
+    budget.check_time()?;
     database
         .close()
         .map_err(|(_, error)| JournalError::from(error))?;
@@ -1485,4 +1643,166 @@ fn audit_inner(
             bounds,
         },
     })
+}
+
+/// Migration checks the unchanged schema-72 snapshot before allocating temporary
+/// copies. The caller holds its migration transaction, so any error rolls back.
+pub(super) fn migrate_schema73(database: &mut Connection) -> Result<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    const MAX_PEAK_BYTES: u64 = 1024 * 1024 * 1024;
+    let original_main_limit: u64 =
+        database.pragma_query_value(Some("main"), "max_page_count", |r| crate::sql_u64(r, 0))?;
+    let original_temp_limit: u64 =
+        database.pragma_query_value(Some("temp"), "max_page_count", |r| crate::sql_u64(r, 0))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let vm = Arc::new(AtomicU64::new(100_000_000));
+    let meter = vm.clone();
+    database.progress_handler(
+        1_000,
+        Some(move || {
+            std::time::Instant::now() >= deadline
+                || meter
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                        n.checked_sub(1_000)
+                    })
+                    .is_err()
+        }),
+    )?;
+    let result = (|| {
+        let transaction = database.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        super::schema_catalog::validate_schema(&transaction, 72)?;
+        integrity(&transaction)?;
+        let counts = preflight(
+            &transaction,
+            super::native_history_persistence::schema::TABLES,
+            100_000,
+            100_000 * 1024,
+        )?;
+        let mut budget = NestedBudget {
+            sources: 0,
+            bytes: 0,
+            rows: 0,
+            logical_bytes: 0,
+            max_rows: 100_000,
+            max_logical_bytes: 100_000 * 1024,
+            deadline,
+            vm_remaining: vm,
+        };
+        let (rows, bytes) = counts.iter().try_fold((0u64, 0u64), |(r, b), c| {
+            Ok::<_, JournalError>((add(r, c.rows)?, add(b, c.logical_bytes)?))
+        })?;
+        budget.reserve_rows(rows, bytes)?;
+        nested_sources(
+            &transaction,
+            NativeHistoryFamilyRegistry::for_schema(72)?,
+            None,
+            1,
+            &mut budget,
+        )?;
+        budget.check_time()?;
+        let page_size: u64 =
+            transaction.pragma_query_value(Some("main"), "page_size", |r| crate::sql_u64(r, 0))?;
+        let old_pages: u64 =
+            transaction.pragma_query_value(Some("main"), "page_count", |r| crate::sql_u64(r, 0))?;
+        let temp_page_size: u64 =
+            transaction.pragma_query_value(Some("temp"), "page_size", |r| crate::sql_u64(r, 0))?;
+        let temp_pages: u64 =
+            transaction.pragma_query_value(Some("temp"), "page_count", |r| crate::sql_u64(r, 0))?;
+        let temp_objects: u64 =
+            transaction.query_row("SELECT count(*) FROM temp.sqlite_schema", [], |r| {
+                crate::sql_u64(r, 0)
+            })?;
+        if page_size == 0 || temp_page_size == 0 || temp_objects != 0 {
+            return Err(invalid("native history migration original page scope"));
+        }
+        // Conservative page bounds cover copied payloads, row/index overhead,
+        // fresh schema pages, and a complete WAL/rollback image of both old and
+        // new main pages. This is an allocation ceiling, not a free-disk promise.
+        let copied = bytes
+            .checked_mul(2)
+            .and_then(|n| rows.checked_mul(4096).and_then(|r| n.checked_add(r)))
+            .and_then(|n| n.checked_add(8 * 1024 * 1024))
+            .ok_or(invalid("native history migration copy bound overflow"))?;
+        let old_bytes = old_pages
+            .checked_mul(page_size)
+            .ok_or(invalid("native history migration old page overflow"))?;
+        let main_bytes = old_bytes
+            .checked_add(copied)
+            .ok_or(invalid("native history migration main bound overflow"))?;
+        let main_pages = main_bytes.div_ceil(page_size).min(original_main_limit);
+        let temp_limit = copied
+            .div_ceil(temp_page_size)
+            .checked_add(temp_pages)
+            .ok_or(invalid("native history migration temp page overflow"))?
+            .min(original_temp_limit);
+        let peak = main_pages
+            .checked_mul(page_size)
+            .and_then(|main| {
+                main.checked_mul(2).and_then(|main_and_wal| {
+                    temp_limit
+                        .checked_mul(temp_page_size)
+                        .and_then(|temp| main_and_wal.checked_add(temp))
+                })
+            })
+            .and_then(|n| {
+                old_pages
+                    .checked_add(main_pages)
+                    .and_then(|frames| frames.checked_mul(24))
+                    .and_then(|frames| n.checked_add(frames))
+            })
+            .ok_or(invalid("native history migration peak bound overflow"))?;
+        if peak > MAX_PEAK_BYTES || main_pages < old_pages || temp_limit == 0 {
+            return Err(invalid("native history migration peak page budget"));
+        }
+        transaction.pragma_update(
+            Some("main"),
+            "max_page_count",
+            i64::try_from(main_pages)
+                .map_err(|_| invalid("native history migration page range"))?,
+        )?;
+        transaction.pragma_update(
+            Some("temp"),
+            "max_page_count",
+            i64::try_from(temp_limit)
+                .map_err(|_| invalid("native history migration page range"))?,
+        )?;
+        if transaction
+            .pragma_query_value(Some("main"), "max_page_count", |r| crate::sql_u64(r, 0))?
+            > main_pages
+            || transaction
+                .pragma_query_value(Some("temp"), "max_page_count", |r| crate::sql_u64(r, 0))?
+                > temp_limit
+        {
+            return Err(invalid("native history migration page limits not applied"));
+        }
+        transaction.execute_batch(include_str!("../migration-073.sql"))?;
+        integrity(&transaction)?;
+        super::schema_catalog::validate_schema(&transaction, 73)?;
+        super::native_history_persistence::schema::validate(&transaction)?;
+        budget.check_time()?;
+        transaction.commit()?;
+        Ok(())
+    })();
+    database.progress_handler(0, None::<fn() -> bool>)?;
+    let restore_main = database.pragma_update(
+        Some("main"),
+        "max_page_count",
+        i64::try_from(original_main_limit)
+            .map_err(|_| invalid("native history migration page range"))?,
+    );
+    let restore_temp = database.pragma_update(
+        Some("temp"),
+        "max_page_count",
+        i64::try_from(original_temp_limit)
+            .map_err(|_| invalid("native history migration page range"))?,
+    );
+    if let Err(error) = result {
+        return Err(error);
+    }
+    restore_main?;
+    restore_temp?;
+    Ok(())
 }
