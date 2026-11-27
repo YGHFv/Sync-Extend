@@ -451,7 +451,7 @@ fn typed_families(
     crate::history_reservation::audit_source_native_terminals(connection, bounds.max_entries)
 }
 
-fn typed_local_state(
+pub(crate) fn typed_local_state(
     rows: &[JournalStoredRow],
     native_finals: &[crate::OriginalLinuxNativeFinalDiagnostic],
 ) -> Result<()> {

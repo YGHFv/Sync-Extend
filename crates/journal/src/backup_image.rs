@@ -208,6 +208,7 @@ pub use readonly::NodeInspectionBounds;
 // is sealed by that audit and contains no recovered native issuer.
 mod native_history_family_registry;
 mod native_history_source_audit;
+pub(crate) use native_history_source_audit::typed_local_state as audit_native_history_typed_local_state;
 mod native_history_source_proof;
 pub(crate) mod native_history_persistence;
 pub use native_history_family_registry::{
