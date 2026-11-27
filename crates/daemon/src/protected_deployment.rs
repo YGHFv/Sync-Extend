@@ -1153,6 +1153,9 @@ impl<'authority> DeploymentOwner<'authority> {
                 Ok(Some(count)) => {
                     for byte in &available[..count] {
                         if *byte == b'\n' {
+                            if self.deadline_expired() {
+                                return self.end("owner_timeout", None, None, false);
+                            }
                             let frame = std::mem::take(&mut self.input_frame);
                             let (request, binding_matches) = match self.decode_request(&frame) {
                                 Ok(request) => request,
