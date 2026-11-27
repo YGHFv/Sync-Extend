@@ -1,8 +1,6 @@
 //! Original owner history preflight before any target or ledger effects.
 use crate::{ReconcileError, Result};
-#[cfg(windows)]
-use std::path::Component;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use sync_extend_core_model::{ContentId, DeviceId, SpaceId};
 use sync_extend_journal::{
     ArchivedReadLeaseHold, JournalBackupImage, NodeInspectionBounds,
@@ -42,11 +40,48 @@ pub(crate) fn path_components(value: &Path) -> Vec<String> {
 }
 
 pub(crate) fn path_equal(left: &Path, right: &Path) -> bool {
-    path_components(left) == path_components(right)
+    // Equality grants access to a selected artifact/root. Only the drive
+    // prefix has two equivalent spellings; ordinary components must retain
+    // their original OsStr bytes. Unicode case expansion and Win32 trailing
+    // character trimming are useful for conservative alias rejection, but
+    // cannot establish that two selected paths identify the same object.
+    #[cfg(windows)]
+    {
+        let mut left = left.components();
+        let mut right = right.components();
+        loop {
+            match (left.next(), right.next()) {
+                (None, None) => return true,
+                (Some(Component::Prefix(a)), Some(Component::Prefix(b))) => {
+                    use std::path::Prefix::{Disk, VerbatimDisk};
+                    match (a.kind(), b.kind()) {
+                        (Disk(a) | VerbatimDisk(a), Disk(b) | VerbatimDisk(b))
+                            if a.eq_ignore_ascii_case(&b) => {}
+                        _ if a == b => {}
+                        _ => return false,
+                    }
+                }
+                (Some(a), Some(b)) if a == b => {}
+                _ => return false,
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
 }
 
 pub(crate) fn path_within(path: &Path, parent: &Path) -> bool {
-    path_components(path).starts_with(&path_components(parent))
+    #[cfg(windows)]
+    {
+        // Used only to reject overlapping roots, never to grant access.
+        path_components(path).starts_with(&path_components(parent))
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(parent)
+    }
 }
 
 #[derive(serde::Serialize)]
