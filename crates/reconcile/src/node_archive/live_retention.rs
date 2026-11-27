@@ -1036,6 +1036,7 @@ impl FreshRecoveredNodeWalV2Session {
 
     fn require_metadata_boundary(&self) -> Result<()> {
         self.verify()?;
+        self.preflight_history_close_envelope(None, false, 0, 0, 1)?;
         if !self.committed
             || self.closed
             || !self.mutation_requested

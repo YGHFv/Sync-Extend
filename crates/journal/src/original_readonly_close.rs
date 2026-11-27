@@ -13,6 +13,8 @@ use sync_extend_platform_fs::{
 /// failure keeps an empty slot; no substitute memory DB or native open exists.
 pub(crate) struct JournalConnectionOwner {
     original: JournalConnectionKind,
+    inspection_budget: Option<crate::original_observation_budget::OriginalObservationBudget>,
+    observation_terminal: crate::original_observation_terminal::OriginalObservationTerminal,
 }
 
 enum JournalConnectionKind {
@@ -24,6 +26,8 @@ impl From<Connection> for JournalConnectionOwner {
     fn from(original: Connection) -> Self {
         Self {
             original: JournalConnectionKind::Ordinary(Some(original)),
+            inspection_budget: None,
+            observation_terminal: Default::default(),
         }
     }
 }
@@ -43,6 +47,8 @@ impl JournalConnectionOwner {
     pub(crate) fn from_original_readonly(original: OriginalReadonlySqliteConnection) -> Self {
         Self {
             original: JournalConnectionKind::Readonly(original),
+            inspection_budget: None,
+            observation_terminal: Default::default(),
         }
     }
 
@@ -62,6 +68,9 @@ impl JournalConnectionOwner {
     }
 
     pub(crate) fn has_retained_originals(&self) -> bool {
+        if self.observation_terminal.has_retained_originals() {
+            return true;
+        }
         match &self.original {
             JournalConnectionKind::Ordinary(original) => original.is_some(),
             JournalConnectionKind::Readonly(original) => original.has_retained_originals(),
@@ -72,6 +81,7 @@ impl JournalConnectionOwner {
         &mut self,
         terminal: &mut WindowsOriginalCloseAttempt,
     ) -> Result<bool, JournalError> {
+        self.observation_terminal.append_to(terminal);
         match &mut self.original {
             JournalConnectionKind::Readonly(original) => original
                 .close_original_resources_into_attempt(terminal)
@@ -91,6 +101,8 @@ impl JournalConnectionOwner {
     where
         F: FnMut() -> bool + Send + 'static,
     {
+        // Any other hook invalidates this typed observation entry point.
+        self.inspection_budget = None;
         match &mut self.original {
             JournalConnectionKind::Ordinary(original) => original
                 .as_mut()
@@ -100,6 +112,40 @@ impl JournalConnectionOwner {
                 original.progress_handler(num_ops, handler)
             }
         }
+    }
+
+    pub(crate) fn install_inspection_budget(
+        &mut self,
+        bounds: crate::NodeInspectionBounds,
+    ) -> rusqlite::Result<()> {
+        let budget = crate::original_observation_budget::OriginalObservationBudget::new(bounds);
+        let callback = budget.clone();
+        self.progress_handler(1_000, Some(move || callback.interrupt()))?;
+        self.inspection_budget = Some(budget);
+        Ok(())
+    }
+
+    pub(crate) fn begin_original_observation(
+        &mut self,
+    ) -> crate::Result<crate::original_observation_budget::OriginalObservationScope> {
+        self.observation_terminal.require_available()?;
+        if !self.is_original_readonly() || !self.is_present() || !self.is_autocommit() {
+            return Err(JournalError::Invariant(
+                "bounded observation requires the same idle original readonly connection",
+            ));
+        }
+        self.inspection_budget
+            .as_ref()
+            .ok_or(JournalError::Invariant(
+                "original observation requires its installed inspection budget",
+            ))?
+            .begin()
+    }
+
+    pub(crate) fn original_observation_terminal(
+        &self,
+    ) -> crate::original_observation_terminal::OriginalObservationTerminal {
+        self.observation_terminal.clone()
     }
 
     pub(crate) fn transaction(&mut self) -> rusqlite::Result<Transaction<'_>> {

@@ -294,6 +294,7 @@ impl FreshRecoveredNodeWalV2Session {
             read,
             locks,
             external,
+            metadata_observations: _,
         } = read;
         let ReacquiredClosedNodeReadScope {
             directories,

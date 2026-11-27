@@ -338,6 +338,11 @@ impl VerifiedNodeStateArchive {
             completion_manifest_reserve = completion_manifest_reserve
                 .checked_add(component_bytes)
                 .and_then(|count| count.checked_add(4096))
+                .and_then(|count| count.checked_add(
+                    if slot.root() == NodeTargetRoot::Worktree {
+                        sync_extend_core_model::portable_entry_metadata::MAX_PORTABLE_ENTRY_METADATA_BYTES as u64 + 32
+                    } else { 0 }
+                ))
                 .ok_or(ReconcileError::ResourceLimit(
                     "completion fullobject reservation overflow",
                 ))?;

@@ -234,6 +234,7 @@ impl OriginalRestoredLocalSpace<'_> {
                 parent_key: parent.to_string(),
                 content_bytes: Some(bytes.len() as u64),
                 content_digest: Some(ContentId::hash(&bytes)),
+                local_metadata: None,
             });
         }
         if root == super::NodeTargetRoot::Worktree && parts == [".sync-extend", "space-id"] {
@@ -263,6 +264,9 @@ impl OriginalRestoredLocalSpace<'_> {
             object_key: content.original.original_key()?.to_string(),
             content_bytes: Some(content.bytes),
             content_digest: Some(content.digest.clone()),
+            local_metadata: if root == super::NodeTargetRoot::Worktree {
+                crate::filesystem::portable_metadata(content.original.reader())?
+            } else { None },
         })
     }
 
@@ -294,6 +298,7 @@ impl OriginalRestoredLocalSpace<'_> {
                 object_key: original.key()?.to_string(),
                 content_bytes: Some(0),
                 content_digest: Some(ContentId::hash(&[])),
+                local_metadata: None,
             });
         }
         let (key, parent) = self.local.journal.original_completion_cas_identity()?;
@@ -306,6 +311,7 @@ impl OriginalRestoredLocalSpace<'_> {
             object_key: key.to_string(),
             content_bytes: Some(0),
             content_digest: Some(ContentId::hash(&[])),
+            local_metadata: None,
         });
         Ok(result)
     }

@@ -13,6 +13,7 @@ mod deployment_close;
 mod polling;
 pub use deployment_close::DeploymentFreshNodeResourceCloseFailure;
 mod runtime_budget;
+mod history_close_budget;
 pub use runtime_budget::DeploymentNativeRuntimeLiability;
 use runtime_budget::{
     FRESH_CAS_OBJECT_MAXIMUM, FRESH_HELD_HISTORY_AGGREGATE_MAXIMUM,
@@ -2127,6 +2128,7 @@ pub struct ReacquiredClosedNodeLockedReadScope {
     read: ReacquiredClosedNodeReadScope,
     locks: Vec<sync_extend_platform_fs::ReacquiredNodeLock>,
     external: Vec<ReacquiredExternalEvidence>,
+    metadata_observations: Vec<HistoryCurrentObject>,
 }
 impl ReacquiredClosedNodeLockedReadScope {
     pub fn verify(&self) -> Result<()> {
@@ -2290,18 +2292,12 @@ impl super::VerifiedNodeStateArchive {
         }
         let file = held.file.reacquire_existing_node_read_file(ledger_name)?;
         let bytes = file.exact_bytes(ledger_bounds.max_database_bytes)?;
-        let classification = if let Some(configs) = separated_configs {
-            self.classify_original_node_restart_for_deployment(
-                restore_ledger,
-                ledger_bounds,
-                bounds,
-                worktree,
-                data,
-                configs,
-            )?
-        } else {
-            self.classify_original_node_restart(restore_ledger, ledger_bounds, bounds)?
-        };
+        if let Some(configs) = separated_configs {
+            configs.verify_for_archive(self, worktree, data)?;
+        }
+        let (classification, completion) = self.classify_original_node_restart_inner(
+            restore_ledger, ledger_bounds, bounds, separated_configs,
+        )?;
         if !matches!(classification, super::OriginalNodeRestartClassification::CompletedEvidence {
             completion_digest, .. } if completion_digest == scope.completion)
         {
@@ -2315,10 +2311,24 @@ impl super::VerifiedNodeStateArchive {
             bytes: bytes.len() as u64,
             file,
         });
+        let completion = completion.ok_or(ReconcileError::Invariant("recovery completion objects absent"))?;
+        let metadata_observations = completion.objects.into_iter()
+            .filter(|object| object.root == "worktree" && object.kind == "file")
+            .map(|object| HistoryCurrentObject {
+                root: "work".into(),
+                path: object.components.join("/"),
+                directory: false,
+                key: object.object_key,
+                parent: object.parent_key,
+                digest: object.content_digest,
+                bytes: object.content_bytes.unwrap_or(0),
+                local_metadata: object.local_metadata,
+            }).collect();
         let result = ReacquiredClosedNodeLockedReadScope {
             read,
             locks,
             external,
+            metadata_observations,
         };
         result.verify()?;
         Ok(result)
@@ -4934,6 +4944,7 @@ impl FreshRecoveredNodeWalV2Session {
         timestamp: u64,
     ) -> Result<sync_extend_core_model::SnapshotId> {
         self.verify()?;
+        self.preflight_history_close_envelope(None, false, 0, 0, 1)?;
         if self.metadata_count != 0
             || self.history_count >= FRESH_OPERATION_MAXIMUM
             || self
@@ -5026,6 +5037,10 @@ impl FreshRecoveredNodeWalV2Session {
             self.poisoned = true;
             return Err(error);
         }
+        if let Err(error) = self.refresh_polling_after_commit(&operations) {
+            self.poisoned = true;
+            return Err(error);
+        }
         Ok(root)
     }
 }
@@ -5100,6 +5115,7 @@ impl FreshRecoveredNodeWalV2Session {
                 "recovered file preCREATE path content entry budget",
             ));
         }
+        self.preflight_history_close_envelope(Some(path), true, 0, 1, 3)?;
         let name = components
             .last()
             .ok_or(ReconcileError::Invariant("recovered file component"))?;
@@ -5351,7 +5367,8 @@ impl crate::native_file_view::NativeFileView for RecoveredSessionScanView<'_> {
         Ok(Some(
             sync_extend_journal::NativePublicationFileObservation {
                 metadata: file.file.metadata()?,
-                portable: Some(
+                portable: Some(self.0.recovered_logical_metadata_for_observed_file(
+                    path, key, &plan.manifest,
                     crate::filesystem::portable_metadata_from_capture(
                         file.file.portable_metadata()?,
                     )
@@ -5360,7 +5377,7 @@ impl crate::native_file_view::NativeFileView for RecoveredSessionScanView<'_> {
                             "recovered scan portable metadata",
                         )
                     })?,
-                ),
+                ).map_err(|_| sync_extend_journal::JournalError::Invariant("recovered logical metadata proof"))?),
                 physical_identity: ContentId::hash(
                     format!("windows:{}:{}", key.volume, key.id).as_bytes(),
                 ),
@@ -5382,6 +5399,7 @@ impl FreshRecoveredNodeWalV2Session {
         path: &sync_extend_core_model::PortablePath,
         content: &sync_extend_core_model::FileManifest,
     ) -> Result<()> {
+        self.preflight_history_close_envelope(Some(path), true, content.chunks.len(), 1, 3)?;
         if !self.committed
             || self.closed
             || self.next != 2
@@ -5790,6 +5808,7 @@ impl FreshRecoveredNodeWalV2Session {
         content: &sync_extend_core_model::FileManifest,
     ) -> Result<()> {
         self.verify()?;
+        self.preflight_history_close_envelope(Some(path), true, content.chunks.len(), 1, 3)?;
         if !self.mutation_requested
             || !self.committed
             || self.closed
@@ -5915,7 +5934,7 @@ impl FreshRecoveredNodeWalV2Session {
         let metadata = self.verified_metadata_close_evidence()?;
         if self.closed
             || (self.history_count == 0 && metadata.is_none())
-            || self.history_count >= FRESH_OPERATION_MAXIMUM
+            || self.history_count > FRESH_OPERATION_MAXIMUM
         {
             return Err(ReconcileError::Invariant(
                 "explicit live recovered history required",
@@ -6162,7 +6181,7 @@ impl super::VerifiedNodeStateArchive {
                 || first.archive != *self.digest()
                 || first.wal2_frames.is_some()
                 || (first.history_count == 0 && first.metadata.is_none())
-                || first.history_count >= FRESH_OPERATION_MAXIMUM
+                || first.history_count > FRESH_OPERATION_MAXIMUM
                 || terminal.index != 1
                 || terminal.phase != "closed"
                 || terminal.wal2_frames.as_ref() != Some(&ContentId::hash(wal2_frames))
@@ -7351,6 +7370,7 @@ impl FreshRecoveredNodeWalV2Session {
             Change, EntryKind, Operation, OperationPayload, FORMAT_VERSION,
         };
         self.verify()?;
+        self.preflight_history_close_envelope(Some(path), replacement.is_some(), 0, 1, 3)?;
         if !self.mutation_requested
             || !self.committed
             || self.closed
@@ -7758,7 +7778,7 @@ impl FreshRecoveredNodeWalV2Session {
             && self.retained_receipts.is_empty();
         if self.closed
             || (!empty_chain_continuation && self.history_count == 0 && metadata.is_none())
-            || self.history_count >= FRESH_OPERATION_MAXIMUM
+            || self.history_count > FRESH_OPERATION_MAXIMUM
         {
             return Err(ReconcileError::Invariant(
                 "explicit live recovered history required",
@@ -8015,7 +8035,7 @@ impl super::VerifiedNodeStateArchive {
                 || (first.history_count == 0
                     && first.metadata.is_none()
                     && !first.receipts.is_empty())
-                || first.history_count >= FRESH_OPERATION_MAXIMUM
+                || first.history_count > FRESH_OPERATION_MAXIMUM
                 || terminal.index != 1
                 || terminal.phase != "closed"
                 || terminal.wal2_frames.as_ref() != Some(&ContentId::hash(wal2_frames))
@@ -8116,6 +8136,8 @@ struct HistoryCurrentObject {
     parent: String,
     digest: Option<ContentId>,
     bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_metadata: Option<sync_extend_core_model::PortableEntryMetadata>,
 }
 fn history_current_objects(
     read: &ReacquiredClosedNodeReadScope,
@@ -8149,6 +8171,7 @@ fn history_current_objects(
                 parent: held.key.to_string(),
                 digest: None,
                 bytes: 0,
+                local_metadata: None,
             });
         }
         for file in &read.files {
@@ -8185,6 +8208,9 @@ fn history_current_objects(
                 parent: file.file.parent_key()?.to_string(),
                 digest: Some(file.digest.clone()),
                 bytes: file.bytes,
+                local_metadata: if label == "work" && polling::managed(&file.path, root) {
+                    Some(crate::filesystem::portable_metadata_from_capture(file.file.portable_metadata()?)?)
+                } else { None },
             });
         }
     }
@@ -8202,6 +8228,26 @@ fn history_current_objects(
     for object in &objects {
         if !keys.insert(object.key.clone()) {
             return Err(ReconcileError::Invariant("current objects native alias"));
+        }
+    }
+    Ok(objects)
+}
+
+fn history_current_objects_with_metadata_proof(
+    read: &ReacquiredClosedNodeLockedReadScope,
+) -> Result<Vec<HistoryCurrentObject>> {
+    let mut objects = history_current_objects(&read.read)?;
+    let previous: std::collections::BTreeMap<_, _> = read.metadata_observations.iter()
+        .map(|object| (object.key.as_str(), object)).collect();
+    for object in &mut objects {
+        // Closing an old record must not turn a fresh capture into an original
+        // projection assertion. Only completed Put or retained original proof
+        // may carry full local metadata into the next generation.
+        if previous.get(object.key.as_str()).is_none_or(|prior| {
+            prior.local_metadata.is_none() || prior.local_metadata != object.local_metadata
+                || prior.digest != object.digest || prior.bytes != object.bytes
+        }) {
+            object.local_metadata = None;
         }
     }
     Ok(objects)
@@ -8288,6 +8334,15 @@ fn history_chain8_records(bytes: &[u8]) -> Result<HistoryChain8Record> {
     }
     let first: HistoryChain8Record = serde_json::from_slice(payloads[0])?;
     let terminal: HistoryChain8Record = serde_json::from_slice(payloads[1])?;
+    for object in &terminal.current_objects {
+        if let Some(metadata) = &object.local_metadata {
+            metadata.validate()?;
+            if object.root != "work" || object.directory
+                || object.path.split('/').next().is_none_or(|part| part == ".sync-extend") {
+                return Err(ReconcileError::Invariant("history local metadata scope"));
+            }
+        }
+    }
     if offset != bytes.len()
         || first.version != 8
         || first.index != 0
@@ -8322,6 +8377,7 @@ impl FreshRecoveredNodeWalV2Session {
     /// and final complete history. The original descriptive close remains intact.
     pub fn close_recovered_history_for_chain8(&mut self) -> Result<PathBuf> {
         self.verify()?;
+        self.preflight_history_close_envelope(None, false, 0, 0, 0)?;
         self.verified_metadata_close_evidence()?;
         if (self.history_count == 0
             && self.metadata_count == 0
@@ -8544,11 +8600,11 @@ impl FreshRecoveredNodeWalV2Session {
             baseline,
             receipts,
             retained_originals,
-            current_objects: history_current_objects(&self.read.read)?,
+            current_objects: history_current_objects_with_metadata_proof(&self.read)?,
             history_close: None,
             wal2: None,
         };
-        let intended = serde_json::to_vec(&record)?;
+        let intended = history_close_budget::encode(&record)?;
         if intended.len() > 384 * 1024 {
             return Err(ReconcileError::ResourceLimit(
                 "history restart intended bound",
@@ -8615,7 +8671,7 @@ impl FreshRecoveredNodeWalV2Session {
             });
             record.index = 1;
             record.phase = "closed".into();
-            let terminal = serde_json::to_vec(&record)?;
+            let terminal = history_close_budget::encode(&record)?;
             if terminal.len() > 384 * 1024 {
                 return Err(ReconcileError::ResourceLimit(
                     "history restart terminal bound",
@@ -9515,13 +9571,20 @@ impl super::VerifiedNodeStateArchive {
                 "history actual retained roots changed",
             ));
         }
-        if serde_json::to_vec(&history_current_objects(&read.read)?)?
-            != serde_json::to_vec(&record.current_objects)?
-        {
+        let mut current_objects = history_current_objects(&read.read)?;
+        for (object, old) in current_objects.iter_mut().zip(&record.current_objects) {
+            // An older record has no full metadata proof. Keep its original
+            // fields exact without manufacturing a new captured assertion.
+            if old.local_metadata.is_none() {
+                object.local_metadata = None;
+            }
+        }
+        if serde_json::to_vec(&current_objects)? != serde_json::to_vec(&record.current_objects)? {
             return Err(ReconcileError::Invariant(
                 "history8 complete current native objects key parent bytes changed",
             ));
         }
+        read.metadata_observations = record.current_objects.clone();
         let main = read
             .read
             .files
@@ -10057,6 +10120,7 @@ impl FreshRecoveredNodeWalV2Session {
         adding: bool,
     ) -> Result<(PathBuf, PathBuf, String)> {
         self.verify()?;
+        self.preflight_history_close_envelope(Some(path), true, 0, 1, 3)?;
         if !self.mutation_requested
             || !self.committed
             || self.closed
@@ -10527,6 +10591,7 @@ impl FreshRecoveredNodeWalV2Session {
         usize,
     )> {
         self.verify()?;
+        self.preflight_history_close_envelope(None, false, 0, 1, 3)?;
         if !self.mutation_requested
             || !self.committed
             || self.closed

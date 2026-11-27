@@ -350,7 +350,7 @@ pub(super) fn assemble_retaining(
     let cas = Cas::open_existing_session_coordinated_with_read_handoff(
         &data_dir.join("cas"),
         move |id| {
-            let state = access_readers
+            let mut state = access_readers
                 .lock()
                 .map_err(|_| "original CAS readers poisoned")?;
             if state.suspended {
@@ -358,13 +358,10 @@ pub(super) fn assemble_retaining(
             }
             let access = state
                 .access
-                .as_ref()
+                .as_mut()
                 .ok_or("original CAS access reader absent")?;
             access
-                .verify_original_created_image()
-                .map_err(|error| error.to_string())?;
-            access
-                .acquire_cas_access(id)
+                .acquire_original_cas_access_observed(id)
                 .map(|guard| -> Box<dyn Send> {
                     crate::fault::checkpoint("after_cas_access_lock");
                     Box::new(guard)

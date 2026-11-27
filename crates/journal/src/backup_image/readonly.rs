@@ -189,13 +189,7 @@ impl super::JournalBackupImage {
 pub(super) trait InspectionConnection {
     fn inspection_connection(&self) -> Result<&Connection>;
 
-    fn inspection_progress_handler<F>(
-        &mut self,
-        num_ops: i32,
-        handler: Option<F>,
-    ) -> rusqlite::Result<()>
-    where
-        F: FnMut() -> bool + Send + 'static;
+    fn install_inspection_budget(&mut self, bounds: NodeInspectionBounds) -> rusqlite::Result<()>;
 }
 
 impl InspectionConnection for Connection {
@@ -203,15 +197,19 @@ impl InspectionConnection for Connection {
         Ok(self)
     }
 
-    fn inspection_progress_handler<F>(
-        &mut self,
-        num_ops: i32,
-        handler: Option<F>,
-    ) -> rusqlite::Result<()>
-    where
-        F: FnMut() -> bool + Send + 'static,
-    {
-        self.progress_handler(num_ops, handler)
+    fn install_inspection_budget(&mut self, bounds: NodeInspectionBounds) -> rusqlite::Result<()> {
+        let started = Instant::now();
+        let mut remaining = bounds.max_vm_instructions;
+        self.progress_handler(
+            1_000,
+            Some(move || {
+                if remaining < 1_000 || started.elapsed() >= bounds.max_query_time {
+                    return true;
+                }
+                remaining -= 1_000;
+                false
+            }),
+        )
     }
 }
 
@@ -223,15 +221,8 @@ impl InspectionConnection for crate::original_readonly_close::JournalConnectionO
         ))
     }
 
-    fn inspection_progress_handler<F>(
-        &mut self,
-        num_ops: i32,
-        handler: Option<F>,
-    ) -> rusqlite::Result<()>
-    where
-        F: FnMut() -> bool + Send + 'static,
-    {
-        self.progress_handler(num_ops, handler)
+    fn install_inspection_budget(&mut self, bounds: NodeInspectionBounds) -> rusqlite::Result<()> {
+        self.install_inspection_budget(bounds)
     }
 }
 
@@ -253,18 +244,7 @@ pub(super) fn configure_inspection(
             return Err(JournalError::Invariant("node SQL limit not applied"));
         }
     }
-    let started = Instant::now();
-    let mut remaining = bounds.max_vm_instructions;
-    connection.inspection_progress_handler(
-        1_000,
-        Some(move || {
-            if remaining < 1_000 || started.elapsed() >= bounds.max_query_time {
-                return true;
-            }
-            remaining -= 1_000;
-            false
-        }),
-    )?;
+    connection.install_inspection_budget(bounds)?;
     let original = connection.inspection_connection()?;
     original.pragma_update(None, "query_only", true)?;
     original.pragma_update(None, "trusted_schema", false)?;

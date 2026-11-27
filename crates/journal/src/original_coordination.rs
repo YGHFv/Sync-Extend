@@ -2,6 +2,48 @@
 use crate::{Journal, JournalError, Result};
 
 impl Journal {
+    /// A long-lived original CAS reader budgets each complete fence observation.
+    /// The same connection, native IO and sentinel remain owned throughout;
+    /// all SQL shares one finite budget, and its prior hook state is restored.
+    #[cfg(windows)]
+    pub fn acquire_original_cas_access_observed(
+        &mut self,
+        content: &sync_extend_core_model::ContentId,
+    ) -> Result<crate::CasAccessGuard> {
+        if !self.original_coordination_observer {
+            return Err(JournalError::Invariant(
+                "bounded original CAS observation requires its coordination reader",
+            ));
+        }
+        let scope = self.connection.begin_original_observation()?;
+        struct Guard {
+            original: Option<crate::CasAccessGuard>,
+            terminal: crate::original_observation_terminal::OriginalObservationTerminal,
+        }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                if let Some(guard) = self.original.take() {
+                    self.terminal
+                        .record(guard.end_rejected_original_observation());
+                }
+            }
+        }
+        self.verify_original_created_image()?;
+        let mut guard = Guard {
+            original: Some(self.acquire_cas_coordination()?),
+            terminal: self.connection.original_observation_terminal(),
+        };
+        self.require_cas_access(content)?;
+        self.verify_original_created_image()?;
+        // Errors and unwinding close the actual temporary lock and restore
+        // the previous budget. Even sub-callback SQL checks this deadline.
+        scope.finish()?;
+        Ok(guard
+            .original
+            .take()
+            .expect("same verified original CAS guard"))
+    }
+
     /// Internal coordination readers must not fall back to unverified pathname
     /// Journal::open after the first restored connection has checked ownership.
     /// The additional connection receives only metadata identity continuity,

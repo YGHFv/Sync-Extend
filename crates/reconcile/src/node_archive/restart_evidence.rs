@@ -34,7 +34,7 @@ impl VerifiedNodeStateArchive {
         limits: LedgerBounds,
         inspection: sync_extend_journal::NodeInspectionBounds,
     ) -> Result<OriginalNodeRestartClassification> {
-        self.classify_original_node_restart_inner(path, limits, inspection, None)
+        self.classify_original_node_restart_inner(path, limits, inspection, None).map(|value| value.0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -52,17 +52,17 @@ impl VerifiedNodeStateArchive {
                 reason: error.to_string().chars().take(1024).collect(),
             });
         }
-        self.classify_original_node_restart_inner(path, limits, inspection, Some(configs))
+        self.classify_original_node_restart_inner(path, limits, inspection, Some(configs)).map(|value| value.0)
     }
 
-    fn classify_original_node_restart_inner(
+    pub(super) fn classify_original_node_restart_inner(
         &self,
         path: &Path,
         limits: LedgerBounds,
         inspection: sync_extend_journal::NodeInspectionBounds,
         configs: Option<&crate::SeparatedDeploymentNodeConfigs>,
-    ) -> Result<OriginalNodeRestartClassification> {
-        let inspected = (|| -> Result<OriginalNodeRestartClassification> {
+    ) -> Result<(OriginalNodeRestartClassification, Option<super::completion::OriginalNodeCompletionManifest>)> {
+        let inspected = (|| -> Result<_> {
             super::ledger::bounds::validate(limits)?;
             let parent = path
                 .parent()
@@ -172,17 +172,17 @@ impl VerifiedNodeStateArchive {
                 } else {
                     manifest.verify_archive_source(self, inspection)?;
                 }
-                OriginalNodeRestartClassification::CompletedEvidence {
+                (OriginalNodeRestartClassification::CompletedEvidence {
                     records: chain.count,
                     original_terminal: chain.previous.parse()?,
                     completion_digest: digest,
-                    read_lease_hold: manifest.read_lease_hold,
-                }
+                    read_lease_hold: manifest.read_lease_hold.clone(),
+                }, Some(manifest))
             } else {
-                OriginalNodeRestartClassification::PartialEvidence {
+                (OriginalNodeRestartClassification::PartialEvidence {
                     records: chain.count,
                     original_terminal: chain.previous.parse()?,
-                }
+                }, None)
             };
             snapshot.rollback()?;
             no_sidecars(path)?;
@@ -203,9 +203,9 @@ impl VerifiedNodeStateArchive {
         })();
         match inspected {
             Ok(value) => Ok(value),
-            Err(error) => Ok(OriginalNodeRestartClassification::RefusedEvidence {
+            Err(error) => Ok((OriginalNodeRestartClassification::RefusedEvidence {
                 reason: error.to_string().chars().take(1024).collect(),
-            }),
+            }, None)),
         }
     }
 }

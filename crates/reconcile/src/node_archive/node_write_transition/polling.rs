@@ -6,6 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use sync_extend_core_model::{
     limits::LocalLimits, Change, EntryKind, Operation, OperationPayload, PortablePath,
+    persisted_rename::{RenameObservationMap, RenameObservationScope, RenamePathObservation,
+        PriorRenameObservation, preserves_logical_metadata},
+    PortableMetadataProjectionPlatform, Manifest, EntryId,
     FORMAT_VERSION,
 };
 use sync_extend_platform_fs::{
@@ -20,6 +23,7 @@ pub(super) struct RecoveredPollingState {
     failed: Option<WindowsOriginalResourceCloseFailure>,
     pending_files: Vec<RecoveredFileProtection>,
     pending_directories: Vec<LockedDirectory>,
+    observations: Option<RenameObservationMap>,
 }
 impl RecoveredPollingState {
     pub(super) fn close_into_attempt(self, attempt: &mut WindowsOriginalCloseAttempt) {
@@ -37,7 +41,7 @@ impl RecoveredPollingState {
         }
     }
 }
-fn managed(path: &Path, root: &Path) -> bool {
+pub(super) fn managed(path: &Path, root: &Path) -> bool {
     path.strip_prefix(root).ok().is_some_and(|relative| {
         !relative.as_os_str().is_empty()
             && relative.components().next().is_some_and(|part| {
@@ -51,6 +55,32 @@ fn managed(path: &Path, root: &Path) -> bool {
 }
 
 impl FreshRecoveredNodeWalV2Session {
+    pub(super) fn recovered_logical_metadata_for_observed_file(
+        &self, path: &Path, key: FileKey, content: &sync_extend_core_model::FileManifest,
+        actual: sync_extend_core_model::PortableEntryMetadata,
+    ) -> Result<sync_extend_core_model::PortableEntryMetadata> {
+        let identity = key.to_string();
+        let Some(proof) = self.read.metadata_observations.iter().find(|proof| proof.key == identity) else {
+            return Ok(actual);
+        };
+        if proof.local_metadata.as_ref() != Some(&actual)
+            || proof.digest.as_ref() != Some(&content.content_id) || proof.bytes != content.length {
+            return Ok(actual);
+        }
+        let Some(entry) = self.read.read.manifest.entries.values()
+            .find(|entry| entry.path.as_str() == proof.path && entry.content.as_ref() == Some(content)) else {
+            return Ok(actual);
+        };
+        let Some(logical) = &entry.metadata else { return Ok(actual); };
+        // The caller holds this exact physical file and its retained parent;
+        // the proof may follow a real rename, never a same-byte replacement.
+        if managed(path, &self.read.read.worktree)
+            && logical.matches_local_projection(&actual, PortableMetadataProjectionPlatform::Windows)? {
+            return Ok(logical.clone());
+        }
+        Ok(actual)
+    }
+
     pub(crate) fn finish_deployment_polling(&mut self) -> Result<()> {
         if self.polling.is_some() {
             self.scan_deployment_polling(crate::now_ms()?)?;
@@ -75,7 +105,34 @@ impl FreshRecoveredNodeWalV2Session {
             failed: None,
             pending_files: Vec::new(),
             pending_directories: Vec::new(),
+            observations: None,
         });
+        let raw = self.held_polling_scan()?;
+        let mut observations = self.polling_observations(&self.read.read.manifest, &raw)?;
+        let proofs: BTreeMap<_, _> = self.read.metadata_observations.iter()
+            .filter(|object| object.root == "work" && !object.directory)
+            .map(|object| (object.path.as_str(), object)).collect();
+        let parents: BTreeMap<_, _> = self.read.read.files.iter()
+            .filter(|file| managed(&file.path, &self.read.read.worktree))
+            .map(|file| Ok((portable_relative(&file.path, &self.read.read.worktree)?, file.file.parent_key()?.to_string())))
+            .collect::<Result<_>>()?;
+        for row in &mut observations.entries {
+            if row.observed.kind != EntryKind::File { continue; }
+            // Only the actual original CREATE completion or the verified closed
+            // generation may supply the previous capture. A new FD alone cannot.
+            let proof = proofs.get(row.observed.path.as_str());
+            row.observed.local_metadata = proof.and_then(|proof| {
+                row.observed.content.as_ref().filter(|content| {
+                    proof.digest.as_ref() == Some(&content.content_id) && proof.bytes == content.length
+                        && parents.get(&row.observed.path) == Some(&proof.parent)
+                }).and(proof.local_metadata.clone())
+            });
+            if let Some(proof) = proof {
+                row.observed.physical_identity = ContentId::hash(proof.key.as_bytes());
+            }
+        }
+        observations.validate(&self.read.read.manifest, self.manifest_entry_limit)?;
+        self.polling.as_mut().expect("selected polling").observations = Some(observations);
         // Full original scope has been audited before any observation protection ends.
         self.release_polling_observation()
     }
@@ -484,6 +541,102 @@ impl FreshRecoveredNodeWalV2Session {
         Ok(scan)
     }
 
+    fn polling_scope(&self, manifest: &Manifest) -> Result<RenameObservationScope> {
+        let root = self.read.read.directories.iter()
+            .find(|held| held.path == self.read.read.worktree).ok_or(ReconcileError::Unstable)?;
+        Ok(RenameObservationScope {
+            format_version: FORMAT_VERSION,
+            space_id: self.space.clone(),
+            prior_snapshot: manifest.root()?,
+            local_root_identity: ContentId::hash(root.key.to_string().as_bytes()),
+            platform_epoch: ContentId::hash(format!("recovered-windows-observation-v1:{}", self.fresh).as_bytes()),
+        })
+    }
+
+    pub(super) fn refresh_polling_after_commit(&mut self, operations: &[Operation]) -> Result<()> {
+        let mut observations = super::history_current_objects(&self.read.read)?;
+        let put_paths: BTreeSet<_> = operations.iter().filter_map(|op| match &op.payload.change {
+            Change::Put { entry } => Some(entry.path.as_str()), _ => None,
+        }).collect();
+        let old: BTreeMap<_, _> = self.read.metadata_observations.iter()
+            .map(|object| (object.key.as_str(), object)).collect();
+        for object in &mut observations {
+            if !put_paths.contains(object.path.as_str()) {
+                object.local_metadata = old.get(object.key.as_str())
+                    .and_then(|prior| prior.local_metadata.clone());
+            }
+        }
+        self.read.metadata_observations = observations;
+        if self.polling.is_none() { return Ok(()); }
+        let raw = self.held_polling_scan()?;
+        let mut map = self.polling_observations(&self.read.read.manifest, &raw)?;
+        let old: BTreeMap<_, _> = self.polling.as_ref().and_then(|state| state.observations.as_ref())
+            .into_iter().flat_map(|map| &map.entries).map(|row| (&row.entry_id, &row.observed)).collect();
+        for row in &mut map.entries {
+            if !put_paths.contains(row.observed.path.as_str()) {
+                if let Some(prior) = old.get(&row.entry_id) {
+                    row.observed.local_metadata = prior.local_metadata.clone();
+                    row.observed.physical_identity = prior.physical_identity.clone();
+                } else {
+                    row.observed.local_metadata = None;
+                }
+            }
+        }
+        self.polling.as_mut().expect("selected polling").observations = Some(map);
+        Ok(())
+    }
+
+    fn polling_observations(&self, manifest: &Manifest, scanned: &crate::scan::Scan) -> Result<RenameObservationMap> {
+        let map = RenameObservationMap {
+            scope: self.polling_scope(manifest)?,
+            entries: manifest.entries.values().map(|entry| {
+                let actual = scanned.get(&entry.path).ok_or(ReconcileError::Unstable)?;
+                if actual.kind != entry.kind || actual.content != entry.content {
+                    return Err(ReconcileError::Unstable);
+                }
+                Ok(PriorRenameObservation { entry_id: entry.entry_id.clone(), observed: polling_observation(&entry.path, actual) })
+            }).collect::<Result<Vec<_>>>()?,
+        };
+        map.validate(manifest, self.manifest_entry_limit)?;
+        Ok(map)
+    }
+
+    fn polling_logical_scan(&self, prior: &Manifest, raw: &crate::scan::Scan) -> Result<(crate::scan::Scan, BTreeSet<EntryId>)> {
+        let map = self.polling.as_ref().and_then(|state| state.observations.as_ref())
+            .ok_or(ReconcileError::Invariant("polling original observation absent"))?;
+        if map.scope != self.polling_scope(prior)? {
+            return Err(ReconcileError::Invariant("polling original observation scope differs"));
+        }
+        map.validate(prior, self.manifest_entry_limit)?;
+        let mut result = raw.clone();
+        let mut changed = BTreeSet::new();
+        let mut by_identity = BTreeMap::new();
+        for (path, observed) in raw {
+            if observed.kind == EntryKind::File && observed.single_link
+                && by_identity.insert(&observed.physical_identity, path).is_some() {
+                return Err(ReconcileError::Invariant("polling ambiguous physical observation"));
+            }
+        }
+        for row in &map.entries {
+            let entry = prior.entries.get(&row.entry_id).ok_or(ReconcileError::Unstable)?;
+            if entry.kind != EntryKind::File { continue; }
+            if raw.get(&entry.path).is_some_and(|actual| actual.kind == entry.kind
+                && actual.physical_identity != row.observed.physical_identity) {
+                changed.insert(entry.entry_id.clone());
+            }
+            let Some(path) = by_identity.get(&row.observed.physical_identity) else { continue; };
+            let actual = result.get_mut(*path).ok_or(ReconcileError::Unstable)?;
+            if preserves_logical_metadata(entry, &row.observed, &polling_observation(path, actual), PortableMetadataProjectionPlatform::Windows)? {
+                actual.metadata = entry.metadata.clone();
+            } else if entry.metadata.is_some() {
+                // A missing old capture or any changed field becomes a genuine
+                // Put, even if the logical supported fields happen to compare equal.
+                changed.insert(entry.entry_id.clone());
+            }
+        }
+        Ok((result, changed))
+    }
+
     pub(crate) fn scan_deployment_polling(&mut self, timestamp: u64) -> Result<crate::ScanResult> {
         let result = self.scan_deployment_polling_inner(timestamp);
         if result.is_err() {
@@ -492,8 +645,9 @@ impl FreshRecoveredNodeWalV2Session {
         result
     }
     fn scan_deployment_polling_inner(&mut self, timestamp: u64) -> Result<crate::ScanResult> {
-        let scanned = self.acquire_polling_observation()?;
+        let raw = self.acquire_polling_observation()?;
         let previous = self.read.read.manifest.clone();
+        let (scanned, changed_physical) = self.polling_logical_scan(&previous, &raw)?;
         let mut manifest = crate::build_manifest(&previous, &scanned, &BTreeMap::new())?;
         let origin = self.recovered_device_id()?;
         let mut changes = Vec::new();
@@ -512,6 +666,7 @@ impl FreshRecoveredNodeWalV2Session {
                     if old.kind != entry.kind
                         || old.content != entry.content
                         || old.metadata != entry.metadata
+                        || changed_physical.contains(&entry.entry_id)
                     {
                         changes.push(Change::Put {
                             entry: entry.clone(),
@@ -555,6 +710,13 @@ impl FreshRecoveredNodeWalV2Session {
         let root = if operations.is_empty() {
             manifest.root()?
         } else {
+            let held: BTreeSet<_> = self.read.read.files.iter()
+                .filter(|file| file.path.starts_with(self.read.read.data.join("cas/objects")))
+                .map(|file| &file.digest).collect();
+            let missing: BTreeSet<_> = scanned.values().filter_map(|entry| entry.content.as_ref())
+                .flat_map(|content| &content.chunks).map(|chunk| &chunk.content_id)
+                .filter(|id| !held.contains(id)).collect();
+            self.preflight_history_close_envelope(None, false, missing.len(), 1, 3)?;
             let bytes = self.native.exact_main_bytes()?;
             let image = sync_extend_journal::JournalBackupImage::from_current_node_image(
                 bytes.clone(),
@@ -575,6 +737,8 @@ impl FreshRecoveredNodeWalV2Session {
             self.publish_polling_content(&scanned, timestamp)?;
             self.commit_exact_recovered_history(manifest.clone(), operations, timestamp)?
         };
+        let observations = self.polling_observations(&manifest, &raw)?;
+        self.polling.as_mut().expect("selected polling").observations = Some(observations);
         self.verify()?;
         Ok(crate::ScanResult {
             space_id: self.space.clone(),
@@ -795,6 +959,14 @@ impl FreshRecoveredNodeWalV2Session {
         self.retain_recovered_receipt(receipt)?;
         self.poisoned = false;
         self.verify()
+    }
+}
+
+fn polling_observation(path: &PortablePath, entry: &crate::scan::ScannedEntry) -> RenamePathObservation {
+    RenamePathObservation {
+        path: path.clone(), kind: entry.kind, content: entry.content.clone(),
+        physical_identity: entry.physical_identity.clone(), single_link: entry.single_link,
+        local_metadata: entry.metadata.clone(),
     }
 }
 fn portable_relative(path: &Path, root: &Path) -> Result<PortablePath> {

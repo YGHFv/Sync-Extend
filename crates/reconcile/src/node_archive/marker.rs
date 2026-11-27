@@ -233,6 +233,7 @@ impl CreatedNodeWorktreeMarker<'_> {
             object_key: self.key.to_string(),
             content_bytes: Some(self.marker_bytes),
             content_digest: Some(self.marker_digest.clone()),
+            local_metadata: None,
         })
     }
 }

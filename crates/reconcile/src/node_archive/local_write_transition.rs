@@ -1012,6 +1012,7 @@ impl OriginalRestoredLocalSpace<'_> {
                     object_key: original.key()?.to_string(),
                     content_bytes: None,
                     content_digest: None,
+                    local_metadata: None,
                 }
             } else if let Some(value) = sentinels
                 .iter()
@@ -1037,6 +1038,7 @@ impl OriginalRestoredLocalSpace<'_> {
                     object_key: key.to_string(),
                     content_bytes: Some(bytes.len() as u64),
                     content_digest: Some(ContentId::hash(&bytes)),
+                    local_metadata: None,
                 }
             } else {
                 let content = self.readers.get(&(root, object.components.clone())).ok_or(
@@ -1064,6 +1066,9 @@ impl OriginalRestoredLocalSpace<'_> {
                     object_key: content.original.original_key()?.to_string(),
                     content_bytes: Some(content.bytes),
                     content_digest: Some(content.digest.clone()),
+                    local_metadata: if object.local_metadata.is_some() {
+                        crate::filesystem::portable_metadata(content.original.reader())?
+                    } else { None },
                 }
             };
             if actual != *object {

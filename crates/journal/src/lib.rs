@@ -3656,6 +3656,12 @@ pub use recovered_history_tables::{
 mod original_coordination;
 
 #[cfg(windows)]
+mod original_observation_budget;
+
+#[cfg(windows)]
+mod original_observation_terminal;
+
+#[cfg(windows)]
 mod original_image_rows;
 
 #[cfg(windows)]

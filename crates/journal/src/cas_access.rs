@@ -46,6 +46,26 @@ pub struct CasAccessGuard {
 }
 
 impl CasAccessGuard {
+    /// A rejected observation returns no lock capability. End the actual
+    /// borrowed descriptors explicitly; an OS close refusal retains them.
+    #[cfg(windows)]
+    pub(crate) fn end_rejected_original_observation(
+        self,
+    ) -> std::result::Result<
+        sync_extend_platform_fs::ClosedWindowsOriginalResources,
+        sync_extend_platform_fs::WindowsOriginalResourceCloseFailure,
+    > {
+        let mut terminal = sync_extend_platform_fs::WindowsOriginalCloseAttempt::new();
+        let Self { file, _directories, .. } = self;
+        if let Some(file) = file {
+            terminal.close_file(file);
+        }
+        for directory in _directories {
+            terminal.close_directory(directory);
+        }
+        terminal.finish()
+    }
+
     fn shared(database: &Path) -> Result<Self> {
         Self::shared_impl(database, true)
     }

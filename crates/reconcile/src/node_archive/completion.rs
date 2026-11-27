@@ -24,6 +24,8 @@ pub(super) struct ObjectEvidence {
     pub(super) object_key: String,
     pub(super) content_bytes: Option<u64>,
     pub(super) content_digest: Option<ContentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) local_metadata: Option<sync_extend_core_model::PortableEntryMetadata>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -101,6 +103,15 @@ impl OriginalNodeCompletionManifest {
         let mut directories = std::collections::BTreeMap::new();
         let mut aliases = BTreeSet::new();
         for object in &self.objects {
+            if let Some(metadata) = &object.local_metadata {
+                metadata.validate()?;
+                if object.root != "worktree"
+                    || object.kind != "file"
+                    || object.components.first().is_none_or(|part| part == ".sync-extend")
+                {
+                    return Err(ReconcileError::Invariant("completion metadata ordinary file scope"));
+                }
+            }
             if !matches!(object.root.as_str(), "worktree" | "data")
                 || !matches!(object.kind.as_str(), "file" | "directory")
                 || object.components.len() > 128
@@ -280,6 +291,7 @@ impl<'scope> OriginalRestoredLocalSpace<'scope> {
                 object_key: original.key()?.to_string(),
                 content_bytes: None,
                 content_digest: None,
+                local_metadata: None,
             });
         }
         for slot in plan.mapped_layout().directories() {
@@ -384,6 +396,7 @@ fn directory_evidence(
         object_key: original.key()?.to_string(),
         content_bytes: None,
         content_digest: None,
+        local_metadata: None,
     })
 }
 
@@ -476,6 +489,19 @@ impl OriginalNodeCompletionManifest {
             )?
         };
         let mapped = layout.map_original_slots(super::completion_codec::MAX_OBJECTS)?;
+        let current = archive.current_node_manifest(inspection)?;
+        for object in &self.objects {
+            if let Some(observed) = &object.local_metadata {
+                let path = object.components.join("/");
+                let entry = current.entries.values().find(|entry| entry.path.as_str() == path)
+                    .ok_or(ReconcileError::Invariant("completion metadata source entry absent"))?;
+                if let Some(logical) = &entry.metadata {
+                    if !logical.matches_local_projection(observed, sync_extend_core_model::PortableMetadataProjectionPlatform::Windows)? {
+                        return Err(ReconcileError::Invariant("completion metadata source projection differs"));
+                    }
+                }
+            }
+        }
         if self.object_count != mapped.directories().len() + mapped.files().len() + 5 {
             return Err(ReconcileError::Invariant(
                 "completion restart original source inventory count differs",
