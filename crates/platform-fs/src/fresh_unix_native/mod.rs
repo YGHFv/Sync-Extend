@@ -13,4 +13,5 @@ pub use originals::{
 };
 pub use sqlite::{
     FreshUnixNativeSqliteIo, FreshUnixNativeSqliteIoFailure, FreshUnixSqliteOpenScope,
+    OriginalUnixSqliteSessionBinding, OriginalUnixSqliteSessionLoan,
 };

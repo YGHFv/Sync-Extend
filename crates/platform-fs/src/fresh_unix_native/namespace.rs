@@ -233,6 +233,10 @@ pub(super) struct NamespaceLoan<'namespace> {
     _scope: PhantomData<&'namespace OriginalUnixNamespace>,
 }
 impl NamespaceLoan<'_> {
+    pub(super) fn key(&self) -> io::Result<UnixProtectedArtifactKey> {
+        self.verify_current()?;
+        Ok(self.state.key)
+    }
     pub(super) fn verify_current(&self) -> io::Result<()> {
         self.state.verify_current()
     }

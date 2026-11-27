@@ -14,6 +14,7 @@ use sync_extend_core_model::SpaceId;
 use sync_extend_platform_fs::{
     ClosedUnixOriginalResources, FreshUnixNativeSqliteIo, FreshUnixNativeSqliteIoFailure,
 };
+mod local_commit;
 
 struct OriginalInspectionCall<'a> {
     connection: &'a mut crate::journal_connection_owner::JournalConnectionOwner,
@@ -47,20 +48,20 @@ impl<'a> OriginalInspectionCall<'a> {
             cleared: false,
         })
     }
-    fn finish(mut self, result: Result<()>) -> Result<()> {
+    fn finish<T>(mut self, result: Result<T>) -> Result<T> {
         let elapsed = self.started.elapsed();
         let clear = self.connection.progress_handler(0, None::<fn() -> bool>);
         self.cleared = clear.is_ok();
         match result {
             Err(error) => Err(error),
-            Ok(()) => {
+            Ok(value) => {
                 clear?;
                 if elapsed >= self.duration {
                     return Err(JournalError::Invariant(
                         "original Unix inspection deadline completed late",
                     ));
                 }
-                Ok(())
+                Ok(value)
             }
         }
     }
@@ -81,6 +82,8 @@ pub struct OriginalUnixRestoredJournal<'namespace> {
     space: SpaceId,
     expected: Vec<JournalStoredRow>,
     bounds: NodeInspectionBounds,
+    poisoned: bool,
+    next_local_turn: u32,
 }
 
 pub struct OriginalUnixRestoredJournalFailure<'namespace> {
@@ -192,6 +195,8 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
             space: space.clone(),
             expected: Vec::new(),
             bounds,
+            poisoned: false,
+            next_local_turn: 0,
         };
         let checked = (|| -> Result<()> {
             bounds.validate()?;
@@ -293,6 +298,26 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
     }
 
     pub fn verify(&mut self) -> Result<()> {
+        if self.poisoned {
+            return Err(JournalError::Invariant(
+                "original Unix Journal failed mutation retained",
+            ));
+        }
+        let actual = self.audit_rows()?;
+        if actual.len() != self.expected.len()
+            || actual
+                .iter()
+                .zip(&self.expected)
+                .any(|(a, b)| a.fingerprint() != b.fingerprint())
+        {
+            return Err(JournalError::Invariant(
+                "actual original Unix Journal mapped rows differ",
+            ));
+        }
+        Ok(())
+    }
+
+    fn audit_rows(&mut self) -> Result<Vec<JournalStoredRow>> {
         self.bounds.validate()?;
         let io = self
             .io
@@ -312,7 +337,7 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
             ));
         }
         let call = OriginalInspectionCall::begin(connection, self.bounds)?;
-        let checked = (|| -> Result<()> {
+        let checked = (|| -> Result<Vec<JournalStoredRow>> {
             let connection = &*call.connection;
             if crate::backup_image::validate(connection)? != crate::SCHEMA_VERSION {
                 return Err(JournalError::Invariant(
@@ -330,20 +355,9 @@ impl<'namespace> OriginalUnixRestoredJournal<'namespace> {
                 self.bounds.max_entries,
                 self.bounds.capacity,
             )?;
-            if actual.rows.len() != self.expected.len()
-                || actual
-                    .rows
-                    .iter()
-                    .zip(&self.expected)
-                    .any(|(a, b)| a.fingerprint() != b.fingerprint())
-            {
-                return Err(JournalError::Invariant(
-                    "actual original Unix Journal mapped rows differ",
-                ));
-            }
             transaction.rollback()?;
             io.verify()?;
-            Ok(())
+            Ok(actual.rows)
         })();
         call.finish(checked)
     }

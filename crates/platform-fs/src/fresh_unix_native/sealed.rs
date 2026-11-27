@@ -8,7 +8,7 @@ use crate::{CapturedFileMetadata, PortableMetadataCapture};
 use std::{io, os::fd::AsRawFd};
 
 pub struct SealedUnixNativeFile<'namespace> {
-    original: FreshUnixNativeFile<'namespace>,
+    pub(super) original: FreshUnixNativeFile<'namespace>,
     captured: FileObservation,
     metadata: PortableMetadataCapture,
 }

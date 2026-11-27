@@ -249,7 +249,7 @@ impl Write for BoundedHashWriter {
     }
 }
 
-fn bounded_digest<T: Serialize>(value: &T, max: u64) -> Result<(ContentId, u64)> {
+pub(crate) fn bounded_digest<T: Serialize>(value: &T, max: u64) -> Result<(ContentId, u64)> {
     let mut writer = BoundedHashWriter {
         hasher: blake3::Hasher::new(),
         bytes: 0,

@@ -2,7 +2,7 @@
 use super::super::{
     refuse, ClosedUnixOriginalResources, UnixOriginalCloseAttempt, UnixOriginalResourceCloseFailure,
 };
-use super::{FreshUnixNativeFile, OriginalUnixCasSentinel};
+use super::{FreshUnixNativeFile, OriginalUnixCasSentinel, SealedUnixNativeFile};
 use crate::original_sqlite_dispatch::{reserve_registration, Dispatch, MAX_NAME_BYTES};
 use rusqlite::ffi;
 use std::{
@@ -11,14 +11,17 @@ use std::{
     ffi::CString,
     io,
     os::unix::ffi::OsStrExt,
+    rc::{Rc, Weak},
 };
 
 #[path = "sqlite_callbacks.rs"]
 mod callbacks;
 /// Permanent dispatch payloads are capped at 1024 * 512 bytes, excluding the
 /// allocator's bookkeeping. Names never repeat; consumed slots are not reused.
-pub const FRESH_UNIX_SQLITE_MAX_REGISTRATIONS: u64 = crate::original_sqlite_dispatch::MAX_REGISTRATIONS;
-pub const FRESH_UNIX_SQLITE_MAX_DISPATCH_BYTES: usize = crate::original_sqlite_dispatch::MAX_DISPATCH_BYTES;
+pub const FRESH_UNIX_SQLITE_MAX_REGISTRATIONS: u64 =
+    crate::original_sqlite_dispatch::MAX_REGISTRATIONS;
+pub const FRESH_UNIX_SQLITE_MAX_DISPATCH_BYTES: usize =
+    crate::original_sqlite_dispatch::MAX_DISPATCH_BYTES;
 const MAX_FILE: u64 = 256 * 1024 * 1024;
 const SHM_REGION: usize = 32 * 1024;
 
@@ -28,6 +31,7 @@ struct Mapping {
 }
 
 struct State<'namespace> {
+    session: Rc<()>,
     files: [FreshUnixNativeFile<'namespace>; 4],
     coordination: OriginalUnixCasSentinel<'namespace>,
     paths: [CString; 4],
@@ -91,6 +95,104 @@ struct Registration<'namespace> {
 /// returned; the higher-level Journal owner retains its single Connection.
 pub struct FreshUnixNativeSqliteIo<'namespace> {
     registration: Option<Registration<'namespace>>,
+}
+
+/// An opaque identity issued by one actual live IO owner. Descriptive keys
+/// cannot construct it, and it does not keep the IO or namespace alive.
+pub struct OriginalUnixSqliteSessionBinding {
+    session: Weak<()>,
+}
+
+/// Borrowed access to the already opened four originals and CAS lock. There is
+/// no serialized form or constructor from paths, descriptors, keys or hashes.
+pub struct OriginalUnixSqliteSessionLoan<'owner, 'namespace> {
+    original: &'owner FreshUnixNativeSqliteIo<'namespace>,
+}
+
+impl OriginalUnixSqliteSessionLoan<'_, '_> {
+    pub fn verify(&self) -> io::Result<()> {
+        self.original.verify_connection_opened()
+    }
+
+    pub fn binding(&self) -> io::Result<OriginalUnixSqliteSessionBinding> {
+        self.verify()?;
+        Ok(OriginalUnixSqliteSessionBinding {
+            session: Rc::downgrade(
+                &self
+                    .original
+                    .registration
+                    .as_ref()
+                    .expect("actual original session")
+                    .state
+                    .session,
+            ),
+        })
+    }
+
+    pub fn verify_binding(&self, binding: &OriginalUnixSqliteSessionBinding) -> io::Result<()> {
+        self.verify()?;
+        let state = &self
+            .original
+            .registration
+            .as_ref()
+            .expect("actual original session")
+            .state;
+        if !binding.session.ptr_eq(&Rc::downgrade(&state.session)) {
+            return Err(refuse("different original Unix SQLite session"));
+        }
+        Ok(())
+    }
+
+    /// Namespace, actual parent, main/WAL/rollback/SHM and CAS descriptors are
+    /// observations only. They never recreate this loan or the session binding.
+    pub fn observed_keys(&self) -> io::Result<[super::super::UnixProtectedArtifactKey; 7]> {
+        self.verify()?;
+        let state = &self
+            .original
+            .registration
+            .as_ref()
+            .expect("actual original session")
+            .state;
+        Ok([
+            state.files[0].namespace.key()?,
+            state.files[0].original.parent.key()?,
+            state.files[0].key()?,
+            state.files[1].key()?,
+            state.files[2].key()?,
+            state.files[3].key()?,
+            state.coordination.original.key()?,
+        ])
+    }
+
+    /// The complete intent must be durable on a sealed original creator in the
+    /// same actual data parent and namespace before the Journal admits effects.
+    pub fn verify_durable_intent(
+        &self,
+        file: &SealedUnixNativeFile<'_>,
+        expected: &[u8],
+    ) -> io::Result<()> {
+        self.verify()?;
+        let state = &self
+            .original
+            .registration
+            .as_ref()
+            .expect("actual original session")
+            .state;
+        file.verify_ordered_bytes(&[expected])?;
+        if !state.files[0]
+            .namespace
+            .same_original(&file.original.namespace)
+            || state.files[0].original.parent.key()? != file.original.original.parent.key()?
+            || state
+                .files
+                .iter()
+                .any(|native| native.original.key() == file.original.original.key())
+            || state.coordination.original.original.key() == file.original.original.key()
+        {
+            return Err(refuse("original Unix session intent scope differs"));
+        }
+        self.verify()
+    }
 }
 
 pub struct FreshUnixNativeSqliteIoFailure<'namespace> {
@@ -191,6 +293,7 @@ impl<'namespace> FreshUnixNativeSqliteIo<'namespace> {
         ))
         .expect("fixed Unix SQLite registration encoding");
         let state = Box::new(State {
+            session: Rc::new(()),
             files,
             coordination,
             paths,
@@ -257,7 +360,8 @@ impl<'namespace> FreshUnixNativeSqliteIo<'namespace> {
                 .set_len(reg.state.files[3].maximum)?;
             reg.state.files[3].original.file.sync_all()?;
             reg.table.zName = reg.name.as_ptr();
-            reg.dispatch.publish((&*reg.state as *const State<'_>).cast_mut().cast());
+            reg.dispatch
+                .publish((&*reg.state as *const State<'_>).cast_mut().cast());
             reg.table.pAppData = (&*reg.dispatch as *const Dispatch).cast_mut().cast();
             reg.published = true;
             // SAFETY: table/name/state are stable boxed values retained until
@@ -320,6 +424,11 @@ impl<'namespace> FreshUnixNativeSqliteIo<'namespace> {
             ));
         }
         Ok(())
+    }
+
+    pub fn session_loan(&self) -> io::Result<OriginalUnixSqliteSessionLoan<'_, 'namespace>> {
+        self.verify_connection_opened()?;
+        Ok(OriginalUnixSqliteSessionLoan { original: self })
     }
 
     pub fn close_retaining(
