@@ -176,6 +176,7 @@ impl FreshRecoveredNodeWalV2Session {
                 continue;
             }
             let old_key = self.read.read.files[index].file.key()?;
+            let old_metadata = self.read.read.files[index].file.portable_metadata()?;
             let parent = path.parent().ok_or(ReconcileError::Unstable)?;
             let name = path
                 .file_name()
@@ -218,6 +219,7 @@ impl FreshRecoveredNodeWalV2Session {
             );
             let retained = &self.read.read.files[index];
             if retained.file.key()? != old_key
+                || retained.file.portable_metadata()? != old_metadata
                 || retained.file.parent_key()? != parent_key
                 || !retained.file.matches_path(&retained.path)?
                 || ContentId::hash(&retained.file.exact_bytes(retained.bytes)?) != retained.digest
