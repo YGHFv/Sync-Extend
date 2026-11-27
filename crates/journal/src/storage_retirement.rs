@@ -78,6 +78,25 @@ pub(crate) fn retained_scope(
     object: RetainedScope<'_>,
 ) -> Result<()> {
     config.validate()?;
+    retained_scope_validated(connection, config, device, object, None)
+}
+
+pub(crate) fn retained_scope_archived_unix(
+    connection: &Connection,
+    policy: &sync_extend_core_model::storage_node::ArchivedUnixStoragePolicy<'_>,
+    device: &DeviceId,
+    object: RetainedScope<'_>,
+) -> Result<()> {
+    retained_scope_validated(connection, policy.config(), device, object, Some(policy))
+}
+
+fn retained_scope_validated(
+    connection: &Connection,
+    config: &StorageNodeConfig,
+    device: &DeviceId,
+    object: RetainedScope<'_>,
+    archived: Option<&sync_extend_core_model::storage_node::ArchivedUnixStoragePolicy<'_>>,
+) -> Result<()> {
     let identity: Vec<(String, String)> = connection
         .prepare("SELECT key,value FROM main.local_state ORDER BY key")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -104,9 +123,14 @@ pub(crate) fn retained_scope(
         return Err(invalid());
     }
     let (fingerprint, chunks) = if let Some(page) = page {
-        page.clone()
-            .verify_current(config, &page.retained.receiver)
-            .map_err(|_| invalid())?;
+        if let Some(policy) = archived {
+            page.audit_archived_unix(policy, &page.retained.receiver)
+                .map_err(|_| invalid())?;
+        } else {
+            page.clone()
+                .verify_current(config, &page.retained.receiver)
+                .map_err(|_| invalid())?;
+        }
         if page.retained.receiver.device_id != *device {
             return Err(invalid());
         }
@@ -130,10 +154,16 @@ pub(crate) fn retained_scope(
         )
     } else {
         let snapshot = snapshot.ok_or_else(invalid)?;
-        snapshot
-            .clone()
-            .verify_current(config, &snapshot.retained.receiver)
-            .map_err(|_| invalid())?;
+        if let Some(policy) = archived {
+            snapshot
+                .audit_archived_unix(policy, &snapshot.retained.receiver)
+                .map_err(|_| invalid())?;
+        } else {
+            snapshot
+                .clone()
+                .verify_current(config, &snapshot.retained.receiver)
+                .map_err(|_| invalid())?;
+        }
         if snapshot.retained.receiver.device_id != *device {
             return Err(invalid());
         }

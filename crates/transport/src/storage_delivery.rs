@@ -5,11 +5,11 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use sync_extend_core_model::{
-    storage_node::StorageNodeConfig,
+    DeviceId, Result as ModelResult,
+    storage_node::{ArchivedUnixStoragePolicy, StorageNodeConfig},
     storage_retention::{
         StorageRetentionAssessment, StorageRetentionPolicy, StorageRetentionState,
     },
-    DeviceId, Result as ModelResult,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -87,6 +87,24 @@ impl StoragePageDeliveryRecord {
         storage: &PeerIdentity,
     ) -> crate::Result<VerifiedStoragePageDelivery> {
         config.validate()?;
+        self.verify_policy(config, storage)?;
+        Ok(VerifiedStoragePageDelivery { record: self })
+    }
+
+    /// Inert archived evidence only: never returns a current delivery token.
+    pub fn audit_archived_unix(
+        &self,
+        policy: &ArchivedUnixStoragePolicy<'_>,
+        storage: &PeerIdentity,
+    ) -> crate::Result<()> {
+        self.verify_policy(policy.config(), storage)
+    }
+
+    fn verify_policy(
+        &self,
+        config: &StorageNodeConfig,
+        storage: &PeerIdentity,
+    ) -> crate::Result<()> {
         storage.validate()?;
         self.validate()?;
         let key = |peer: &PeerIdentity| {
@@ -119,7 +137,7 @@ impl StoragePageDeliveryRecord {
                 "storage delivery current independent policy keys",
             ));
         }
-        Ok(VerifiedStoragePageDelivery { record: self })
+        Ok(())
     }
 }
 

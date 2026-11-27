@@ -430,8 +430,8 @@ fn typed_families(
     crate::storage_retirement::payload::audit(connection)?;
     crate::storage_retirement::disposal::audit(connection)?;
     crate::storage_retirement::terminal::audit(connection)?;
-    crate::storage_retirement_unix::audit(connection)?;
-    crate::storage_retirement_unix::native::audit(connection)?;
+    crate::storage_retirement_unix::audit_archived_unix(connection)?;
+    crate::storage_retirement_unix::native::audit_archived_unix(connection)?;
     crate::remote_rename::obligations(rows, connection)?;
     crate::remote_delete::obligations(rows, connection)?;
     crate::remote_replace::obligations(rows, connection)?;
@@ -930,7 +930,7 @@ fn references(
             u64::from(admission.request.length),
         )?;
     }
-    for admission in crate::storage_retirement_unix::audit(connection)? {
+    for admission in crate::storage_retirement_unix::audit_archived_unix(connection)? {
         insert_length(
             &mut lengths,
             admission.request.content_id,

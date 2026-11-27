@@ -71,6 +71,22 @@ fn values(
     time: u64,
 ) -> Result<Vec<Value>> {
     request.validate(config, device)?;
+    values_validated(
+        request,
+        config,
+        device,
+        time,
+        request.fingerprint(config, device)?,
+    )
+}
+
+fn values_validated(
+    request: &UnixStorageRetirementRequest,
+    config: &StorageNodeConfig,
+    device: &DeviceId,
+    time: u64,
+    fingerprint: sync_extend_core_model::ContentId,
+) -> Result<Vec<Value>> {
     if time < request.grace_until_ms || time >= request.expires_at_ms {
         return Err(invalid());
     }
@@ -89,7 +105,7 @@ fn values(
         Value::Text(request.content_id.to_string()),
         Value::Text(request.original_metadata_hash.to_string()),
         Value::Text(request.binding.fingerprint()?.to_string()),
-        Value::Text(request.fingerprint(config, device)?.to_string()),
+        Value::Text(fingerprint.to_string()),
         Value::Integer(crate::sql_integer(request.requested_at_ms)?),
         Value::Integer(crate::sql_integer(request.grace_until_ms)?),
         Value::Integer(crate::sql_integer(request.expires_at_ms)?),
@@ -113,6 +129,21 @@ fn referenced(connection: &Connection, content: &ContentId) -> Result<bool> {
 }
 
 pub(crate) fn audit(connection: &Connection) -> Result<Vec<UnixStorageRetirementAdmission>> {
+    audit_with_policy(connection, false)
+}
+
+/// Selected only by the registered inert Unix v1 archive family. No host
+/// fallback, live path access, or native authority is granted.
+pub(crate) fn audit_archived_unix(
+    connection: &Connection,
+) -> Result<Vec<UnixStorageRetirementAdmission>> {
+    audit_with_policy(connection, true)
+}
+
+fn audit_with_policy(
+    connection: &Connection,
+    archived_unix: bool,
+) -> Result<Vec<UnixStorageRetirementAdmission>> {
     schema::validate(connection)?;
     preflight(
         connection,
@@ -158,12 +189,39 @@ pub(crate) fn audit(connection: &Connection) -> Result<Vec<UnixStorageRetirement
             return Err(invalid());
         };
         let time = u64::try_from(time).map_err(|_| invalid())?;
-        if values(&request, &config, &device, time)? != row
+        let archived_policy = if archived_unix {
+            Some(
+                sync_extend_core_model::storage_node::ArchivedUnixStoragePolicy::validate(&config)?,
+            )
+        } else {
+            None
+        };
+        let fingerprint = if let Some(policy) = &archived_policy {
+            request.fingerprint_archived_unix(policy, &device)?
+        } else {
+            request.fingerprint(&config, &device)?
+        };
+        if values_validated(&request, &config, &device, time, fingerprint.clone())? != row
             || clock.is_none_or(|clock| clock < time)
         {
             return Err(invalid());
         }
-        scope(connection, &request, &config, &device)?;
+        if let Some(policy) = &archived_policy {
+            crate::storage_retirement::retained_scope_archived_unix(
+                connection,
+                policy,
+                &device,
+                RetainedScope {
+                    storage_id: &request.storage_id,
+                    original_owner_id: &request.original_owner_id,
+                    content_id: &request.content_id,
+                    metadata_hash: &request.original_metadata_hash,
+                    length: request.binding.length,
+                },
+            )?;
+        } else {
+            scope(connection, &request, &config, &device)?;
+        }
         let cancelled: Option<u64> = connection
             .query_row(
                 "SELECT cancelled_at_ms FROM main.unix_storage_retirement_v1_cancellations
@@ -187,7 +245,7 @@ pub(crate) fn audit(connection: &Connection) -> Result<Vec<UnixStorageRetirement
             return Err(invalid());
         }
         result.push(UnixStorageRetirementAdmission {
-            request_fingerprint: request.fingerprint(&config, &device)?,
+            request_fingerprint: fingerprint,
             binding_fingerprint: request.binding.fingerprint()?,
             request,
             admitted_at_ms: time,

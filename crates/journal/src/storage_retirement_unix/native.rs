@@ -453,6 +453,19 @@ impl UnixStorageRetirementNativeState {
 }
 
 pub(crate) fn audit(connection: &Connection) -> Result<Vec<UnixStorageRetirementNativeState>> {
+    audit_with_requests(connection, super::audit)
+}
+
+pub(crate) fn audit_archived_unix(
+    connection: &Connection,
+) -> Result<Vec<UnixStorageRetirementNativeState>> {
+    audit_with_requests(connection, super::audit_archived_unix)
+}
+
+fn audit_with_requests(
+    connection: &Connection,
+    audit_requests: fn(&Connection) -> Result<Vec<super::UnixStorageRetirementAdmission>>,
+) -> Result<Vec<UnixStorageRetirementNativeState>> {
     super::native_schema::validate(connection)?;
     preflight(
         connection,
@@ -460,7 +473,7 @@ pub(crate) fn audit(connection: &Connection) -> Result<Vec<UnixStorageRetirement
         crate::limits::MAX_ENTRIES,
         crate::limits::MAX_ENTRIES as u64 * 1024,
     )?;
-    let requests = super::audit(connection)?;
+    let requests = audit_requests(connection)?;
     let clock: Option<u64> = connection.query_row(
         "SELECT observed_at_ms FROM main.unix_storage_retirement_native_v1_clock WHERE singleton=1",
         [], |row| crate::sql_u64(row, 0),

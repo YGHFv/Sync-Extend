@@ -1,5 +1,5 @@
 //! Explicit worktree-free storage policy; a stored prefix is not a complete backup.
-use crate::{ContentId, DeviceId, ModelError, Result, SpaceId, FORMAT_VERSION};
+use crate::{ContentId, DeviceId, FORMAT_VERSION, ModelError, Result, SpaceId};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf};
 
@@ -30,8 +30,12 @@ pub struct StorageNodeConfig {
 
 impl StorageNodeConfig {
     pub fn validate(&self) -> Result<()> {
+        self.validate_with_absolute_path(self.data_dir.is_absolute())
+    }
+
+    fn validate_with_absolute_path(&self, absolute: bool) -> Result<()> {
         if self.format_version != FORMAT_VERSION
-            || !self.data_dir.is_absolute()
+            || !absolute
             || self.max_stored_bytes == 0
             || self.max_stored_bytes > i64::MAX as u64
             || self.max_request_bytes == 0
@@ -77,6 +81,10 @@ impl StorageNodeConfig {
 
     pub fn fingerprint(&self) -> Result<ContentId> {
         self.validate()?;
+        self.validated_fingerprint()
+    }
+
+    fn validated_fingerprint(&self) -> Result<ContentId> {
         Ok(ContentId::hash(&serde_json::to_vec(&(
             "sync-extend-explicit-storage-policy-v1",
             self,
@@ -110,5 +118,35 @@ impl StorageNodeConfig {
             ));
         }
         Ok(())
+    }
+}
+
+/// An immutable historical Unix policy description. This does not authorize
+/// opening its data directory, delivery, admission, or any native effect.
+/// Only a versioned Unix archive family may select this path grammar.
+pub struct ArchivedUnixStoragePolicy<'a> {
+    config: &'a StorageNodeConfig,
+}
+
+impl<'a> ArchivedUnixStoragePolicy<'a> {
+    pub fn validate(config: &'a StorageNodeConfig) -> Result<Self> {
+        let path = config.data_dir.to_str().ok_or(ModelError::InvalidConfig(
+            "archived Unix storage path encoding",
+        ))?;
+        // Match Unix Path::is_absolute without normalizing the original bytes.
+        // Unix permits //, dot components, colons and backslashes within an
+        // absolute path; drive-letter paths and backslash UNC are not absolute.
+        // NUL cannot name a Unix filesystem path. No filesystem access occurs.
+        let absolute = path.starts_with('/') && !path.contains('\0');
+        config.validate_with_absolute_path(absolute)?;
+        Ok(Self { config })
+    }
+
+    pub fn config(&self) -> &'a StorageNodeConfig {
+        self.config
+    }
+
+    pub fn fingerprint(&self) -> Result<ContentId> {
+        self.config.validated_fingerprint()
     }
 }

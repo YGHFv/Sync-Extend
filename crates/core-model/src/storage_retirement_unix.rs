@@ -1,7 +1,7 @@
 //! Versioned Unix provenance descriptions. Deserialization never acquires an FD.
 use crate::{
-    storage_node::StorageNodeConfig, ContentId, DeviceId, EntryId, ModelError, Result, SpaceId,
-    FORMAT_VERSION,
+    ContentId, DeviceId, EntryId, FORMAT_VERSION, ModelError, Result, SpaceId,
+    storage_node::{ArchivedUnixStoragePolicy, StorageNodeConfig},
 };
 use serde::{Deserialize, Serialize};
 
@@ -205,6 +205,25 @@ strict_tagged_unix_description! {
 
 impl UnixStorageRetirementRequest {
     pub fn validate(&self, config: &StorageNodeConfig, device: &DeviceId) -> Result<()> {
+        self.validate_policy(config, device, &config.fingerprint()?)
+    }
+
+    /// Validate inert v1 Unix archive evidence without interpreting its path
+    /// using the current host or granting current storage authority.
+    pub fn validate_archived_unix(
+        &self,
+        policy: &ArchivedUnixStoragePolicy<'_>,
+        device: &DeviceId,
+    ) -> Result<()> {
+        self.validate_policy(policy.config(), device, &policy.fingerprint()?)
+    }
+
+    fn validate_policy(
+        &self,
+        config: &StorageNodeConfig,
+        device: &DeviceId,
+        fingerprint: &ContentId,
+    ) -> Result<()> {
         self.binding.validate()?;
         LogicalScope {
             format_version: self.format_version,
@@ -219,7 +238,7 @@ impl UnixStorageRetirementRequest {
             grace_until_ms: self.grace_until_ms,
             expires_at_ms: self.expires_at_ms,
         }
-        .validate(config, device)?;
+        .validate_policy(config, device, fingerprint)?;
         if serde_json::to_vec(self)?.len() > UNIX_STORAGE_RETIREMENT_REQUEST_BYTES {
             return Err(ModelError::InvalidData(
                 "Unix storage retirement request byte limit",
@@ -230,6 +249,19 @@ impl UnixStorageRetirementRequest {
 
     pub fn fingerprint(&self, config: &StorageNodeConfig, device: &DeviceId) -> Result<ContentId> {
         self.validate(config, device)?;
+        self.validated_fingerprint(config)
+    }
+
+    pub fn fingerprint_archived_unix(
+        &self,
+        policy: &ArchivedUnixStoragePolicy<'_>,
+        device: &DeviceId,
+    ) -> Result<ContentId> {
+        self.validate_archived_unix(policy, device)?;
+        self.validated_fingerprint(policy.config())
+    }
+
+    fn validated_fingerprint(&self, config: &StorageNodeConfig) -> Result<ContentId> {
         Ok(ContentId::hash(&serde_json::to_vec(&(
             "sync-extend.unix-storage-retirement.request.v1",
             config,
@@ -444,12 +476,21 @@ struct LogicalScope<'a> {
 impl LogicalScope<'_> {
     fn validate(&self, config: &StorageNodeConfig, device: &DeviceId) -> Result<()> {
         config.validate()?;
+        self.validate_policy(config, device, &config.fingerprint()?)
+    }
+
+    fn validate_policy(
+        &self,
+        config: &StorageNodeConfig,
+        device: &DeviceId,
+        fingerprint: &ContentId,
+    ) -> Result<()> {
         let grace = self.grace_until_ms.checked_sub(self.requested_at_ms);
         if self.format_version != FORMAT_VERSION
             || self.space_id != &config.space_id
             || !config.enabled
             || self.storage_device != device
-            || self.storage_policy != &config.fingerprint()?
+            || self.storage_policy != fingerprint
             || self.request_id == self.original_owner_id
             || !self
                 .storage_id

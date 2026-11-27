@@ -6,7 +6,8 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use sync_extend_core_model::{
-    storage_node::StorageNodeConfig, ContentId, DeviceId, SpaceId, FORMAT_VERSION,
+    ContentId, DeviceId, FORMAT_VERSION, SpaceId,
+    storage_node::{ArchivedUnixStoragePolicy, StorageNodeConfig},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -121,6 +122,24 @@ impl SnapshotStorageHandoffRecord {
         storage: &PeerIdentity,
     ) -> crate::Result<VerifiedSnapshotStorageHandoff> {
         config.validate()?;
+        self.verify_policy(config, storage)?;
+        Ok(VerifiedSnapshotStorageHandoff { record: self })
+    }
+
+    /// Inert archived evidence only: never returns a current handoff token.
+    pub fn audit_archived_unix(
+        &self,
+        policy: &ArchivedUnixStoragePolicy<'_>,
+        storage: &PeerIdentity,
+    ) -> crate::Result<()> {
+        self.verify_policy(policy.config(), storage)
+    }
+
+    fn verify_policy(
+        &self,
+        config: &StorageNodeConfig,
+        storage: &PeerIdentity,
+    ) -> crate::Result<()> {
         storage.validate()?;
         self.validate()?;
         let key = |peer: &PeerIdentity| {
@@ -154,6 +173,6 @@ impl SnapshotStorageHandoffRecord {
                 "snapshot replacement storage independently current approved keys",
             ));
         }
-        Ok(VerifiedSnapshotStorageHandoff { record: self })
+        Ok(())
     }
 }
