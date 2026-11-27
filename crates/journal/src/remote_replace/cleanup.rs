@@ -217,7 +217,7 @@ impl Journal {
                             verify,
                         )?;
                     }
-                    file.delete_on_close()?;
+                    file.delete_readonly_on_close()?;
                 } else {
                     let directory = LockedDirectoryMutation::open(&path)?;
                     let verify = || -> Result<()> {

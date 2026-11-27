@@ -205,6 +205,16 @@ impl RemoteReplaceSource {
                 return Err(invalid("remote Replace original payload fullkey differs"));
             }
             verify_file(payload, &self.incoming()?)?;
+            if let Some(expected) = &self.incoming()?.metadata {
+                let observed = crate::portable_file_metadata::capture(payload.reader())?
+                    .ok_or(invalid("remote Replace payload metadata unavailable"))?;
+                if !expected.matches_local_projection(
+                    &observed,
+                    PortableMetadataProjectionPlatform::Windows,
+                )? {
+                    return Err(invalid("remote Replace original payload metadata differs"));
+                }
+            }
         }
         Ok(())
     }
@@ -384,6 +394,11 @@ impl Journal {
             return Err(invalid("remote Replace caller transaction"));
         }
         proof.verify()?;
+        if let Change::Put { entry } = &proof.operation.payload.change {
+            if let Some(metadata) = &entry.metadata {
+                metadata.local_projection(PortableMetadataProjectionPlatform::Windows)?;
+            }
+        }
         let replay = self.replay_remote_operation(proof)?;
         if replay.disposition != crate::RemoteReplayDisposition::NativeMutationUnavailable {
             return Err(invalid(
@@ -674,6 +689,12 @@ impl Journal {
             return Err(invalid("remote Replace recovery caller transaction"));
         }
         let header = self.replace_header(id)?;
+        if let Some(metadata) = header.target.entries
+            .get(&header.source.entry_id)
+            .and_then(|entry| entry.metadata.as_ref())
+        {
+            metadata.local_projection(PortableMetadataProjectionPlatform::Windows)?;
+        }
         let receipt = self
             .remote_replace_receipts(&header.baseline.space_id)?
             .into_iter()

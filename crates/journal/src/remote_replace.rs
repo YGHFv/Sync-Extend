@@ -74,6 +74,59 @@ impl Key {
         }
         Ok(())
     }
+
+    #[cfg(windows)]
+    fn physical_identity(&self) -> Result<ContentId> {
+        self.validate()?;
+        let key = sync_extend_platform_fs::FileKey {
+            volume: u64::from_str_radix(&self.volume, 16)
+                .map_err(|_| invalid("remote Replace key volume"))?,
+            id: u128::from_str_radix(&self.id, 16)
+                .map_err(|_| invalid("remote Replace full file id"))?,
+        };
+        Ok(ContentId::hash(key.to_string().as_bytes()))
+    }
+}
+
+/// The complete audited original creator and committed Final retain an exact
+/// physical identity. This describes history only and grants no native custody.
+#[cfg(windows)]
+pub(crate) fn metadata_final_identities(
+    rows: &[JournalStoredRow],
+    space: &SpaceId,
+    root: &ContentId,
+) -> Result<Vec<(Entry, ContentId)>> {
+    let mut result = Vec::new();
+    for row in rows.iter().filter(|row| row.table() == "remote_replace_headers") {
+        let header: Header = serde_json::from_str(field(row, "header")?)?;
+        header.validate()?;
+        if &header.baseline.space_id != space || &header.root.key.physical_identity()? != root {
+            continue;
+        }
+        if !rows.iter().any(|row| row.table() == "remote_replace_phases"
+            && row.primary_key() == [header.transaction_id.as_str(), "final"])
+        {
+            continue;
+        }
+        let creator = rows.iter().find(|row| row.table() == "remote_replace_creators"
+            && row.primary_key() == [header.transaction_id.as_str(), "2"])
+            .ok_or(invalid("remote Replace Final original payload creator missing"))?;
+        if field(creator, "generation")? != header.generation.as_str()
+            || field(creator, "header_hash")? != hash(&header)?.as_str()
+            || field(creator, "component")? != "payload-0"
+            || field(creator, "kind")? != "file"
+        {
+            return Err(invalid("remote Replace Final original payload lineage differs"));
+        }
+        let identity = Key {
+            volume: field(creator, "volume")?.into(),
+            id: field(creator, "full_id")?.into(),
+        }.physical_identity()?;
+        let entry = header.target.entries.get(&header.source.entry_id)
+            .ok_or(invalid("remote Replace Final incoming entry missing"))?;
+        result.push((entry.clone(), identity));
+    }
+    Ok(result)
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

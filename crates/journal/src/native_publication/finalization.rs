@@ -68,6 +68,11 @@ impl Journal {
                 .map_err(|_| invalid("remote metadata final identity"))?;
             result.push((entry.clone(), identity));
         }
+        result.extend(crate::remote_replace::metadata_final_identities(
+            &snapshot.rows,
+            space,
+            root,
+        )?);
         transaction.rollback()?;
         Ok(result)
     }

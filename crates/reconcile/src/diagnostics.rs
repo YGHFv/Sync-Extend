@@ -191,7 +191,7 @@ impl LocalSpace {
             portable_metadata_capability: metadata_capability,
             remote_metadata_logical_values_preserved: cfg!(windows),
             remote_metadata_projection_identity_checked: cfg!(windows),
-            remote_metadata_projection_scope: "Windows explicit signed new-file native Put only; remote replacement projection is not implemented. Logical values remain immutable; locally supported fields are projected and verified at native timestamp precision, and complete local captures plus physical identity detect subsequent edits.",
+            remote_metadata_projection_scope: "Windows explicit signed new-file native Put and same-path remote Replace. Logical values remain immutable; locally supported fields are projected through the original writer and verified after sealing and recovery at native timestamp precision. Complete local captures plus original full file identity detect subsequent edits.",
             remote_metadata_optional_fields_not_applied: if cfg!(windows) {
                 vec!["unix_executable"]
             } else { vec!["creation"] },

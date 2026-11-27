@@ -65,6 +65,9 @@ impl LocalSpace {
         let Change::Put { entry } = &signed.operation.payload.change else {
             return Err(ReconcileError::Invariant("remote Replace original action"));
         };
+        if let Some(metadata) = &entry.metadata {
+            crate::filesystem::projected_metadata(metadata)?;
+        }
         // Terminal/restart replay does not depend on a sender file remaining online.
         let id = remote_replace_transaction(&signed.operation.op_id)?;
         if self
@@ -102,6 +105,12 @@ impl LocalSpace {
             signature: signed.signature.clone(),
         };
         self.replace_approval(&proof)?;
+        let Change::Put { entry } = &signed.operation.payload.change else {
+            return Err(ReconcileError::Invariant("remote Replace original action"));
+        };
+        if let Some(metadata) = &entry.metadata {
+            crate::filesystem::projected_metadata(metadata)?;
+        }
         let id = remote_replace_transaction(&signed.operation.op_id)?;
         let receipts = self.journal.remote_replace_receipts(&self.space_id)?;
         if let Some(receipt) = receipts.iter().find(|r| r.transaction_id == id) {
@@ -170,6 +179,12 @@ impl LocalSpace {
             self.reserve_native_internal_worktree(&creation.file_view())?;
             checkpoint("after_remote_replace_payload_creator");
             self.cas.write_file(content, creation.payload_writer())?;
+            // Finish content writes before setting the original handle's times.
+            creation.payload_writer().sync_all()?;
+            if let Some(metadata) = &entry.metadata {
+                let projected = crate::filesystem::projected_metadata(metadata)?;
+                crate::filesystem::apply_portable_metadata(creation.payload_writer(), &projected)?;
+            }
             checkpoint("after_remote_replace_payload_written");
             self.replace_approval(&proof)?;
             self.verify_root()?;
@@ -214,7 +229,13 @@ impl LocalSpace {
         if scan.len() != observation.manifest().entries.len()
             || observation.manifest().entries.values().any(|entry| {
                 scan.get(&entry.path)
-                    .is_none_or(|seen| seen.kind != entry.kind || seen.content != entry.content)
+                    .is_none_or(|seen| seen.kind != entry.kind || seen.content != entry.content
+                        || entry.metadata.as_ref().is_some_and(|expected| {
+                            seen.metadata.as_ref().is_none_or(|actual| {
+                                !crate::filesystem::projected_metadata_matches(expected, actual)
+                                    .unwrap_or(false)
+                            })
+                        }))
             })
         {
             return Err(ReconcileError::Unstable);
@@ -253,6 +274,12 @@ impl LocalSpace {
         self.verify_root()?;
         let proof = self.journal.remote_replace_original(id)?;
         self.replace_approval(&proof)?;
+        let Change::Put { entry } = &proof.operation.payload.change else {
+            return Err(ReconcileError::Invariant("remote Replace recovery original action"));
+        };
+        if let Some(metadata) = &entry.metadata {
+            crate::filesystem::projected_metadata(metadata)?;
+        }
         let current = self.replace_result(id, None)?;
         if current.receipt.native_cleanup_complete {
             let error = self.journal.cleanup_remote_replace(id).err().map(|e| e.to_string());
