@@ -342,6 +342,10 @@ pub fn stream_exact_content<R: Read, E: From<CasError>>(
         return Err(CasError::ResourceLimit("exact content admitted bytes/chunks").into());
     }
     let max_chunks = max_chunks.min(MAX_CHUNKS);
+    let maximum_chunks = length.div_ceil(MIN_CHUNK as u64);
+    if maximum_chunks > max_chunks as u64 {
+        return Err(CasError::ResourceLimit("exact content worst-case chunk count").into());
+    }
     let mut hasher = blake3::Hasher::new();
     let mut chunks = Vec::new();
     let mut received = 0u64;
