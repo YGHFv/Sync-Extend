@@ -327,6 +327,61 @@ pub fn observe_bounded_content(
     })
 }
 
+/// Process exactly the admitted bytes without reading a sentinel from a live
+/// protocol stream. The caller retains its own native authority; this function
+/// only supplies one bounded CDC chunk at a time and descriptive references.
+/// Callback failures preserve their concrete error type for native ownership.
+pub fn stream_exact_content<R: Read, E: From<CasError>>(
+    reader: R,
+    length: u64,
+    max_bytes: u64,
+    max_chunks: usize,
+    mut on_chunk: impl FnMut(&ChunkRef, &[u8]) -> std::result::Result<(), E>,
+) -> std::result::Result<FileManifest, E> {
+    if max_bytes == 0 || max_chunks == 0 || length > max_bytes {
+        return Err(CasError::ResourceLimit("exact content admitted bytes/chunks").into());
+    }
+    let max_chunks = max_chunks.min(MAX_CHUNKS);
+    let mut hasher = blake3::Hasher::new();
+    let mut chunks = Vec::new();
+    let mut received = 0u64;
+    for chunk in StreamCDC::with_level_and_seed(
+        reader.take(length), MIN_CHUNK, AVG_CHUNK, MAX_CHUNK, Normalization::Level1, 0,
+    ) {
+        let chunk = chunk.map_err(|error| E::from(CasError::Chunking(error.to_string())))?;
+        if chunk.data.is_empty() || chunk.data.len() > MAX_CHUNK || chunk.length != chunk.data.len()
+            || chunks.len() >= max_chunks
+        {
+            return Err(CasError::ResourceLimit("exact content chunk bound").into());
+        }
+        received = received.checked_add(chunk.length as u64)
+            .filter(|total| *total <= length).ok_or_else(|| E::from(CasError::Integrity))?;
+        hasher.update(&chunk.data);
+        let reference = ChunkRef {
+            content_id: ContentId::hash(&chunk.data),
+            length: chunk.length as u32,
+        };
+        on_chunk(&reference, &chunk.data)?;
+        chunks.push(reference);
+    }
+    if received != length {
+        return Err(CasError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof, "exact admitted content was truncated",
+        )).into());
+    }
+    let manifest = FileManifest {
+        format_version: FORMAT_VERSION,
+        chunking: "fastcdc-2020-v1".into(),
+        hash_algorithm: "blake3".into(),
+        compression: "none".into(),
+        content_id: ContentId::from_hasher(&hasher),
+        length,
+        chunks,
+    };
+    manifest.validate().map_err(CasError::from).map_err(E::from)?;
+    Ok(manifest)
+}
+
 fn bounded_content(
     reader: impl Read,
     max_bytes: u64,
